@@ -80,11 +80,20 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
 - `py/a14_journey.py` (chapter A14): picks tile 0's 48 journey events out of a trace written by ttsim +
   `patches/a14-journey.patch`: `python3 $W/py/a14_journey.py $LAB_HOME/journey.trace [--json]`.
+- `py/a18_*.py` (chapter A18): TT-NN from the user's side. `a18_pad` and `a18_devtilize` (padding and pages,
+  host vs device tilize), `a18_ops` (add/matmul/softmax PCC), `a18_ladder` (dtype x fidelity), `a18_shard` and
+  `a18_shard_edge` (interleaved, height/width/block sharding and two invalid specs), `a18_progcfg` (the silent LoFi
+  default with a program config, plus a torch MLP port), `a18_fid` (fidelity vs Dst format; aborts by design at
+  `fp32_dest_acc_en=True` under ttsim v1.15.0), `a18_addpath` (program cache and JIT; set an empty `TT_METAL_CACHE`).
+  Activate `$TT_METAL_HOME/python_env`, source `env.sh`, export `TT_METAL_INSPECTOR=0`, then run `python $W/py/a18_ops.py`.
 - `py/a20_count.py`, `py/a20_summary.py` (chapter A20): run one ttnn op (format, fidelity, block size, fusion,
   sharding cases) under a ttsim built with `../patches/a20-counters.patch`, then summarise its exact DRAM/NoC byte
   counts and Tensix instruction counts. Counts only; the simulator's clocks are not performance.
 - `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
   built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
+- `py/b07_mvmul.py` (lab B07): reproduces every Dst element of an MVMUL dump bit for bit (independent and chained
+  checks, `--isa`, `--trace M ROW COL`, `--json OUT`). The dump comes from a ttsim built with
+  `../patches/b07-mvmul-dump.patch` and run with `B07_OUT=file` (`B07_TILE`, `B07_SKIP`, `B07_COUNT`).
 - `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
   program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
   Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.

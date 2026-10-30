@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A18 · TT-NN as a user · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a17-dispatch-host.html">&larr; Prev</a>
+  <a href="a19-op-anatomy-compilers.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 18</span><span class="tag">Prerequisites: A05, A06, A09, A11, A12, A15</span>
+  <h1><span class="num">18.</span> TT-NN as a user</h1>
+  <p class="subtitle">TT-NN is the library most people actually call. By the end you will know what a <code>ttnn.Tensor</code> really is, why a 3×40 tensor occupies 2048 elements, what each memory config does to your data, which knobs decide accuracy, and how one <code>ttnn.add</code> becomes three kernels on five RISC-V cores. Every number on this page was measured on ttsim in this orb.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#where">Where TT-NN sits</a></li>
+      <li><a href="#tensor">Anatomy of a ttnn.Tensor</a></li>
+      <li><a href="#layout">ROW_MAJOR vs TILE: what padding costs</a></li>
+      <li><a href="#dtypes">Dtypes: bfloat16, bfloat8_b, bfloat4_b</a></li>
+      <li><a href="#memory">Memory configs: DRAM or L1, interleaved or sharded</a></li>
+      <li><a href="#ops">Ops, and checking them with PCC</a></li>
+      <li><a href="#configs">Program configs and compute kernel configs</a></li>
+      <li><a href="#path">From ttnn.add down to the kernels</a></li>
+      <li><a href="#model">From a torch model to ttnn calls</a></li>
+      <li><a href="#sim">Running it in the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here is a small PyTorch tensor: 3 rows, 40 columns, the numbers 1 to 120 in bfloat16. It occupies 240 bytes. Hand it to TT-NN and ask it to put the tensor in the layout the hardware computes on:</p>
+<pre><code>t  = ttnn.from_torch(x, dtype=ttnn.bfloat16)      # x.shape == (3, 40)
+tt = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
+d  = ttnn.to_device(tt, device)</code></pre>
+  <p>Then ask it what it built. This is the real output from ttsim (script <code>a18_pad.py</code>, shown in <a href="#sim">the simulator section</a>):</p>
+<pre><code>from_torch    : Layout.ROW_MAJOR Shape([3, 40]) padded Shape([3, 40])
+to_layout TILE: Layout.TILE Shape([3, 40]) padded Shape([32, 64]) tile Tile with shape: [32, 32]
+on device     : BufferType.DRAM TensorMemoryLayout.INTERLEAVED
+pages 2 x 2048 bytes
+padded view   : (32, 64)  nonzero: 120 of 2048
+row 0, cols 36..43: [37.0, 38.0, 39.0, 40.0, 0.0, 0.0, 0.0, 0.0]
+row 3, cols 0..3  : [0.0, 0.0, 0.0, 0.0]
+to_torch      : (3, 40) bit-identical: True</code></pre>
+  <p>Our 120 numbers now live inside 2048 slots, in two 2048-byte pages, in DRAM. The tensor still says its shape is <code>[3, 40]</code>, but it carries a second shape, <code>[32, 64]</code>. When we bring it back to torch, the 120 numbers return bit for bit, and the 1928 zeros silently disappear.</p>
+  <p><strong>What does <code>ttnn.from_torch</code> (and its friends) do to your tensor?</strong> Answering that question properly is most of what it takes to use TT-NN well. The rest of this chapter is about the choices TT-NN asks you to make: layout, dtype, where the bytes live, and how hard the math engine should work.</p>
+
+  <h2 id="where">Where TT-NN sits</h2>
+  <p>Chapters A10 to A17 built programs the hard way. To add two tensors in <a href="a10-first-program.html">A10</a>–<a href="a12-compute-kernels.html">A12</a> we wrote a reader kernel, a compute kernel and a writer kernel, created circular buffers, set runtime arguments, built a <code>Program</code> and enqueued it. That is <em>TT-Metalium</em>: a low-level runtime that gives you cores, L1, the NoC and a kernel compiler, and nothing else.</p>
+  <p><em>TT-NN</em> is the operator library built on top of it. It is the layer a PyTorch user recognises: tensors, <code>ttnn.add</code>, <code>ttnn.matmul</code>, <code>ttnn.softmax</code>, about the size of a deep-learning framework's op set. Each op is C++ code that, when you call it, picks kernels, sizes circular buffers, splits the work across cores, builds a Metalium program, caches it, and enqueues it. Python reaches it through nanobind bindings. Model code (<code>models/</code> in tt-metal) and compilers (TT-MLIR, TT-Forge, TT-XLA, the subject of <a href="a19-op-anatomy-compilers.html">A19</a>) emit TT-NN calls rather than kernels.</p>
+  <table>
+    <tr><th>Layer</th><th>You write</th><th>You still decide</th></tr>
+    <tr><td>TT-Metalium (A10–A17)</td><td>kernels, CBs, Programs, runtime args</td><td>everything</td></tr>
+    <tr><td>TT-NN (this chapter)</td><td>op calls on tensors</td><td>layout, dtype, memory config, sometimes the core grid, program config and fidelity</td></tr>
+    <tr><td>Compilers (A19)</td><td>a PyTorch or JAX model</td><td>mostly nothing; the compiler chooses the TT-NN calls</td></tr>
+  </table>
+  <p>The right-hand column is the interesting one. TT-NN removes the kernel writing, but it does not hide the hardware. The 32×32 tile, the split between DRAM and L1, block floating point and math fidelity all show up as arguments you are expected to understand. Chapters A05–A09 are the reason those arguments exist.</p>
+  <div class="callout gpu">On a GPU, PyTorch picks the memory for you (global memory, through a caching allocator) and every tensor is a flat strided array. Layout and placement are mostly invisible; caches and the hardware scheduler take care of locality. TT-NN cannot do that, because there are no caches (<a href="a09-memory.html">A09</a>). So placement becomes part of the tensor: a <code>ttnn.Tensor</code> knows whether it is tiled, which kind of memory holds it and which cores own which piece. The nearest GPU analogue is the choice between a row-major array and a tensor-core-friendly swizzled layout, except that here every op consumes and produces the swizzled form.</div>
+
+  <p>Opening a device is one call. Even for a single chip, TT-NN gives you a mesh, because the Python <code>open_device</code> is bound directly to the mesh version:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn-nanobind/device.cpp:73-82 @7aad8aac</div>
+<pre><code>mod.def(
+    "open_device",
+    &amp;ttnn::open_mesh_device,
+    ...
+    nb::arg("device_id"),
+    nb::arg("l1_small_size") = DEFAULT_L1_SMALL_SIZE,
+    nb::arg("trace_region_size") = DEFAULT_TRACE_REGION_SIZE,
+    nb::arg("num_command_queues") = 1,</code></pre>
+  <p>So <code>ttnn.open_device(device_id=0)</code> returns a 1×1 <code>MeshDevice</code>, the same object that <a href="a17-dispatch-host.html">A17</a>'s command queues belong to. The extra arguments reserve L1 regions up front (<code>l1_small_size</code> for convolution, <code>trace_region_size</code> for trace).</p>
+
+  <h2 id="tensor">Anatomy of a ttnn.Tensor</h2>
+  <p>A <code>ttnn.Tensor</code> is data plus a description of how that data is laid out. The description has six parts, and the opening output already showed all of them:</p>
+  <ul>
+    <li><b>shape</b>, the <em>logical</em> shape you asked for: <code>[3, 40]</code>.</li>
+    <li><b>padded_shape</b>, the shape of what is actually stored: <code>[32, 64]</code> once tiled.</li>
+    <li><b>dtype</b>: <code>BFLOAT16</code>, <code>BFLOAT8_B</code>, <code>FLOAT32</code>, <code>UINT32</code> and so on.</li>
+    <li><b>layout</b>: <code>ROW_MAJOR</code> or <code>TILE</code>, plus the tile shape (32×32 by default).</li>
+    <li><b>storage</b>: <code>HOST</code> (a buffer in your process) or <code>DEVICE</code> (a buffer in DRAM or L1).</li>
+    <li><b>memory_config</b>, for device tensors: which memory, and how the pages are spread out.</li>
+  </ul>
+  <p>Four functions move a tensor between these states, and it pays to know which ones touch the device:</p>
+  <table>
+    <tr><th>Call</th><th>What changes</th><th>Where the work happens</th></tr>
+    <tr><td><code>ttnn.from_torch(x, dtype, layout, device, memory_config)</code></td><td>torch → ttnn; optionally tilize, convert dtype and upload in one go</td><td>host, then a write to the device if <code>device</code> is given</td></tr>
+    <tr><td><code>ttnn.to_layout(t, ttnn.TILE_LAYOUT)</code></td><td>ROW_MAJOR ↔ TILE (adds or strips padding)</td><td>on the host for a host tensor; a tilize/untilize op on the device for a device tensor</td></tr>
+    <tr><td><code>ttnn.to_device(t, device, memory_config)</code> / <code>ttnn.from_device(t)</code></td><td>storage HOST ↔ DEVICE; layout and dtype unchanged</td><td>a buffer write or read (A17)</td></tr>
+    <tr><td><code>ttnn.to_torch(t)</code></td><td>ttnn → torch; untilize, strip padding, convert dtype</td><td>host (reads back first if needed)</td></tr>
+  </table>
+  <p>Two defaults matter. <code>from_torch</code> gives you <code>ROW_MAJOR</code> unless you ask for <code>TILE</code>, except for the block-float dtypes, which only exist as tiles:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn-nanobind/pytensor.cpp:781-783 @7aad8aac</div>
+<pre><code>const bool tile_layout_by_default =
+    (dst_dtype == DataType::BFLOAT4_B || dst_dtype == DataType::BFLOAT8_B || is_mx(dst_dtype));
+auto layout_ = layout.value_or(tile_layout_by_default ? Layout::TILE : Layout::ROW_MAJOR);</code></pre>
+  <p>And when you pass <code>device=</code>, you get <code>DRAM_MEMORY_CONFIG</code> (DRAM, interleaved) unless you say otherwise. That default is what the opening output printed.</p>
+
+  <h2 id="layout">ROW_MAJOR vs TILE: what padding costs</h2>
+  <p>You met the 32×32 tile and its four 16×16 faces in <a href="a05-tiles-and-formats.html#faces">A05</a>, and saw a host program tilize matrices by hand in <a href="a15-matmul-one-to-many.html#tilize">A15</a>. TT-NN does the same thing, but now the unit of storage, the <em>page</em>, depends on the layout. The tensor-layouts tech report puts it in one sentence each: in row-major layout "each row of a 2D tensor corresponds to a single page", and in tiled layout "pages are represented as 2D tiles" (<code>tech_reports/tensor_layouts/tensor_layouts.md:33-50</code>). Higher dimensions are folded into the height first, so a <code>[1, 4, 6, 8]</code> tensor is stored as <code>[24, 8]</code> (same file, line 20).</p>
+  <p>You can watch both page shapes on the device. This run uploads the 3×40 tensor in row-major layout and then asks the <em>device</em> to tilize and untilize it (<code>a18_devtilize.py</code>):</p>
+<pre><code>device RM  : Layout.ROW_MAJOR Shape([3, 40]) padded Shape([3, 40]) pages 3 x 80 B
+device TILE: Layout.TILE Shape([3, 40]) padded Shape([32, 64]) pages 2 x 2048 B
+padding is zero: True  data intact: True
+untilized  : Layout.ROW_MAJOR Shape([3, 40]) equal: True</code></pre>
+  <p>Row-major: three pages, one per row, 40 × 2 bytes = 80 B each. Tiled: two pages of 32 × 32 × 2 = 2048 B. Step through what happened in between. Use the shape buttons to try other sizes.</p>
+
+  <div class="viz" id="figTilize"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figTilize");
+    var g = TT.canvas(root, 900, 540), ctx = g.ctx, C = TT.C;
+    var SHAPES = [[3, 40], [33, 33], [64, 64], [20, 100]];
+    var H = 3, W = 40;
+    function pad(n) { return Math.ceil(n / 32) * 32; }
+    function info() {
+      var Hp = pad(H), Wp = pad(W), tr = Hp / 32, tc = Wp / 32;
+      return { Hp: Hp, Wp: Wp, tr: tr, tc: tc, nt: tr * tc, util: (H * W) / (Hp * Wp) };
+    }
+    function valColor(r, c) {
+      var f = (r * W + c) / Math.max(1, H * W - 1);
+      return "hsl(" + Math.round(200 - 160 * f) + ",70%,58%)";
+    }
+    var steps = [
+      { dur: 1.2, text: "" }, { dur: 1.2, text: "" }, { dur: 1.2, text: "" },
+      { dur: 1.2, text: "" }, { dur: 2.2, text: "" }, { dur: 1.8, text: "" }
+    ];
+    function narrate() {
+      var I = info();
+      steps[0].text = "<b>1. The torch tensor.</b> " + H + "×" + W + " bfloat16 values, coloured by their position in memory. In <code>ROW_MAJOR</code> layout each row is one page: " + H + " pages of " + (W * 2) + " B.";
+      steps[1].text = "<b>2. Pad.</b> A tile is 32×32, so each dimension is rounded up to a multiple of 32: <code>shape [" + H + ", " + W + "]</code>, <code>padded_shape [" + I.Hp + ", " + I.Wp + "]</code>. Grey cells are padding (zeros by default; <code>from_torch</code> takes a <code>pad_value</code>). Only " + (100 * I.util).toFixed(1) + "% of the stored elements are your data.";
+      steps[2].text = "<b>3. Cut into tiles.</b> The padded tensor is " + I.tr + "×" + I.tc + " = " + I.nt + " tile" + (I.nt > 1 ? "s" : "") + ", numbered in row-major order. Each tile will become one page of 32·32·2 = 2048 B.";
+      steps[3].text = "<b>4. Split each tile into faces.</b> Four 16×16 faces: f0 top-left, f1 top-right, f2 bottom-left, f3 bottom-right. The matrix engine works on faces (A05, A06).";
+      steps[4].text = "<b>5. Lay the bytes out.</b> Memory order is tile 0, tile 1, …; inside a tile f0, f1, f2, f3; inside a face 16 rows of 16. Each small square below shows one face in that order (left to right). Notice how the data is no longer contiguous: row 0 of the tensor is now spread over " + Math.min(I.tc * 2, Math.ceil(W / 16)) + " separate 16-element runs.";
+      steps[5].text = "<b>6. Pages into DRAM banks.</b> With <code>DRAM_MEMORY_CONFIG</code> (interleaved), page p goes to bank p mod 12 on Wormhole (8 banks on Blackhole), starting at bank 0 (A09). " + I.nt + " page" + (I.nt > 1 ? "s" : "") + " × 2048 B = " + (I.nt * 2048) + " B for " + (H * W * 2) + " B of data.";
+    }
+    // geometry
+    var GX = 40, GY = 50, GW = 420, GHmax = 250;
+    function cell() { var I = info(); return Math.min(GW / I.Wp, GHmax / I.Hp, 9); }
+    function drawGrid(i, t) {
+      var I = info(), cs = cell();
+      var shownW = i >= 1 ? I.Wp : W, shownH = i >= 1 ? I.Hp : H;
+      TT.text(ctx, i >= 1 ? "padded_shape [" + I.Hp + ", " + I.Wp + "]" : "shape [" + H + ", " + W + "]", GX, GY - 22, { color: C.yellow, font: "bold 14px" });
+      for (var r = 0; r < shownH; r++) for (var c = 0; c < shownW; c++) {
+        var real = r < H && c < W;
+        if (!real && i === 1) ctx.globalAlpha = t; else ctx.globalAlpha = 1;
+        ctx.fillStyle = real ? valColor(r, c) : "#2a2f38";
+        ctx.fillRect(GX + c * cs, GY + r * cs, Math.max(1, cs - (cs > 4 ? 0.6 : 0.2)), Math.max(1, cs - (cs > 4 ? 0.6 : 0.2)));
+      }
+      ctx.globalAlpha = 1;
+      if (i >= 3) {
+        ctx.strokeStyle = C.blue; ctx.lineWidth = 1; ctx.globalAlpha = i === 3 ? t : 1;
+        for (var x = 16; x < I.Wp; x += 32) { ctx.beginPath(); ctx.moveTo(GX + x * cs, GY); ctx.lineTo(GX + x * cs, GY + I.Hp * cs); ctx.stroke(); }
+        for (var y = 16; y < I.Hp; y += 32) { ctx.beginPath(); ctx.moveTo(GX, GY + y * cs); ctx.lineTo(GX + I.Wp * cs, GY + y * cs); ctx.stroke(); }
+        ctx.globalAlpha = 1;
+      }
+      if (i >= 2) {
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 2.5; ctx.globalAlpha = i === 2 ? t : 1;
+        for (var tr = 0; tr < I.tr; tr++) for (var tc = 0; tc < I.tc; tc++) {
+          ctx.strokeRect(GX + tc * 32 * cs, GY + tr * 32 * cs, 32 * cs, 32 * cs);
+          TT.text(ctx, "tile " + (tr * I.tc + tc), GX + tc * 32 * cs + 4, GY + (tr * 32 + 32) * cs - 9, { color: C.yellow, font: "bold 11px" });
+        }
+        ctx.globalAlpha = 1;
+      }
+      if (i >= 3 && cs * 16 > 30) {
+        for (var tr2 = 0; tr2 < I.tr; tr2++) for (var tc2 = 0; tc2 < I.tc; tc2++) for (var f = 0; f < 4; f++) {
+          var fx = GX + (tc2 * 32 + (f % 2) * 16) * cs, fy = GY + (tr2 * 32 + Math.floor(f / 2) * 16) * cs;
+          TT.text(ctx, "f" + f, fx + 16 * cs - 14, fy + 16 * cs - 8, { color: C.blue, font: "10px" });
+        }
+      }
+      // right panel: page summary
+      var PX = 500;
+      TT.text(ctx, i === 0 ? "ROW_MAJOR pages (1 row = 1 page)" : "TILE pages (1 tile = 1 page)", PX, GY - 22, { color: C.fg, font: "bold 14px" });
+      if (i === 0) {
+        var n = Math.min(H, 12);
+        for (var p = 0; p < n; p++) {
+          TT.box(ctx, PX, GY + p * 20, 300, 16, { fill: valColor(p, 0), alpha: 0.35, stroke: valColor(p, 0), r: 3 });
+          TT.text(ctx, "page " + p + ": row " + p + ", " + (W * 2) + " B", PX + 8, GY + p * 20 + 8, { font: "11px" });
+        }
+        if (H > n) TT.text(ctx, "… " + (H - n) + " more rows", PX, GY + n * 20 + 10, { color: C.muted, font: "12px" });
+      } else {
+        TT.text(ctx, "logical  " + H + " × " + W + " = " + (H * W) + " values", PX, GY + 6, { font: "13px", mono: true });
+        TT.text(ctx, "stored   " + I.Hp + " × " + I.Wp + " = " + (I.Hp * I.Wp) + " values", PX, GY + 28, { font: "13px", mono: true });
+        TT.text(ctx, "pages    " + I.nt + " × 2048 B", PX, GY + 50, { font: "13px", mono: true });
+        TT.text(ctx, "useful   " + (100 * I.util).toFixed(1) + " %", PX, GY + 72, { font: "13px", mono: true, color: I.util < 0.5 ? C.red : C.green });
+      }
+    }
+    function drawStrip(i, t) {
+      var I = info();
+      var SY = 330, n = I.nt * 4, gap = 4, tgap = 14;
+      var sq = Math.min(48, (820 - (I.nt - 1) * tgap - n * gap) / n);
+      TT.text(ctx, "memory order →  (each square = one 16×16 face, 512 B in bf16)", 40, SY - 16, { color: C.muted, font: "12px" });
+      var shown = i === 4 ? Math.floor(t * n + 0.001) : n;
+      var x = 40;
+      for (var k = 0; k < n; k++) {
+        var tile = Math.floor(k / 4), f = k % 4;
+        var tr = Math.floor(tile / I.tc), tc = tile % I.tc;
+        if (k > 0 && f === 0) x += tgap;
+        if (k < shown) {
+          ctx.fillStyle = "#2a2f38"; ctx.fillRect(x, SY, sq, sq);
+          var e = sq / 16;
+          for (var rr = 0; rr < 16; rr++) for (var cc = 0; cc < 16; cc++) {
+            var R = tr * 32 + Math.floor(f / 2) * 16 + rr, Cc = tc * 32 + (f % 2) * 16 + cc;
+            if (R < H && Cc < W) { ctx.fillStyle = valColor(R, Cc); ctx.fillRect(x + cc * e, SY + rr * e, Math.max(0.8, e), Math.max(0.8, e)); }
+          }
+          ctx.strokeStyle = C.blue; ctx.lineWidth = 1; ctx.strokeRect(x, SY, sq, sq);
+          TT.text(ctx, "t" + tile + "f" + f, x + sq / 2, SY + sq + 9, { align: "center", font: "10px", color: C.muted });
+        }
+        if (f === 3 && k < shown) {
+          ctx.strokeStyle = C.yellow; ctx.lineWidth = 2;
+          ctx.strokeRect(x - 3 * (sq + gap) - 2, SY - 3, 4 * sq + 3 * gap + 4, sq + 6);
+          TT.text(ctx, "page " + tile, x - 3 * (sq + gap) + (4 * sq + 3 * gap) / 2, SY + sq + 22, { align: "center", font: "bold 11px", color: C.yellow });
+        }
+        x += sq + gap;
+      }
+    }
+    function drawBanks(t) {
+      var I = info(), BY = 440, bw = 64, bh = 54;
+      TT.text(ctx, "Wormhole DRAM banks (interleaved: page p → bank p mod 12)", 40, BY - 14, { color: C.muted, font: "12px" });
+      for (var b = 0; b < 12; b++) {
+        TT.box(ctx, 40 + b * (bw + 6), BY, bw, bh, { stroke: C.border, fill: C.bg2, r: 4 });
+        TT.text(ctx, "bank " + b, 40 + b * (bw + 6) + bw / 2, BY + bh - 9, { align: "center", font: "10px", color: C.muted });
+      }
+      for (var p = 0; p < I.nt; p++) {
+        var b2 = p % 12, slot = Math.floor(p / 12);
+        var x1 = 40 + b2 * (bw + 6) + 8, y1 = BY + 6 + slot * 16;
+        var x0 = 40 + p * 60, y0 = 330;
+        var x = TT.lerp(x0, x1, t), y = TT.lerp(y0, y1, t);
+        TT.box(ctx, x, y, bw - 16, 14, { fill: C.yellow, alpha: 0.8, r: 3, label: "page " + p, color: "#000", font: "10px" });
+      }
+    }
+    var stepperObj = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        narrate();
+        TT.clear(ctx, g.W, g.H);
+        drawGrid(i, t);
+        if (i >= 4) drawStrip(i, t);
+        if (i >= 5) drawBanks(t);
+      }
+    });
+    var ctrl = root.querySelector(".controls");
+    var lab = document.createElement("label"); lab.textContent = "shape:";
+    SHAPES.forEach(function (s) {
+      var b = document.createElement("button"); b.textContent = s[0] + "×" + s[1];
+      if (s[0] === H && s[1] === W) b.className = "on";
+      b.onclick = function () {
+        H = s[0]; W = s[1];
+        ctrl.querySelectorAll("button.shp").forEach(function (x) { x.className = "shp"; });
+        b.className = "shp on"; stepperObj.render();
+      };
+      b.className = (s[0] === H && s[1] === W) ? "shp on" : "shp";
+      lab.appendChild(b);
+    });
+    ctrl.insertBefore(lab, ctrl.lastChild);
+    stepperObj.render();
+  })();
+  </script>
+
+  <p>The face order inside a tile comes from the host tilizer, the same loop A15 quoted: for each tile, for each face row, for each face column, write a 16×16 face.</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/tilize_utils.cpp:309-316 @7aad8aac</div>
+<pre><code>for (size_t row_tile = 0; row_tile &lt; row_tiles; row_tile++) {
+    size_t row_tile_start = tile_start;
+    for (size_t col_tile = 0; col_tile &lt; col_tiles; col_tile++) {
+        if (!transpose_face_order) {
+            for (size_t face_h_index = 0; face_h_index &lt; tile_H / face_H; face_h_index++) {
+                for (size_t face_w_index = 0; face_w_index &lt; tile_W / face_W; face_w_index++) {
+                    size_t src_idx = row_tile_start + (face_w_index * face_W) + (face_h_index * face_H * W);
+                    write_face(src_idx, face_H, face_W, W);</code></pre>
+
+  <div class="callout key">A TILE tensor stores <code>padded_shape</code>, not <code>shape</code>. Every dimension you hand TT-NN is rounded up to a multiple of 32 in the last two dimensions, and one page is one tile. A [1, 32] vector costs as much as a [32, 32] matrix.</div>
+
+  <p>Why accept the padding? Because every compute kernel from A12 onward moves and computes whole tiles: the unpacker reads a tile from a circular buffer, the FPU multiplies faces, the packer writes a tile back. A row-major tensor would have to be tilized before any math, and many ops require <code>TILE_LAYOUT</code> on their inputs. ROW_MAJOR is still useful for things the math engine never touches, such as embedding tables and index tensors, and for the moment you hand data back to torch.</p>
+  <p>Where does the tilizing happen? Two places, and in this commit TT-NN prefers the host for a single device. The C++ behind <code>from_torch</code> can upload the raw row-major data first and convert it on the device, but for a single device it takes that path only when no layout, dtype or sharding change is needed, so there is nothing to convert. The comment says why:</p>
+  <div class="filename">tt-metal/ttnn/core/tensor/py_to_tt_tensor.cpp:305-314 @7aad8aac</div>
+<pre><code>// TODO: #https://github.com/tenstorrent/tt-metal/issues/40850
+// For single-device tensors, we cannot enable layout/data type changes due to tt-sim CI failures
+// caused by limited support for the SFPLOADMACRO instruction.
+// ...
+const bool is_data_transformation_required = layout != Layout::ROW_MAJOR ||
+                                             src_dtype != convert_to_data_type&lt;T&gt;() || src_dtype != dst_dtype ||
+                                             memory_config.is_sharded();</code></pre>
+  <p>That "tt-sim" is the simulator this series uses. So <code>from_torch(..., layout=TILE_LAYOUT, device=d)</code> tilizes on the CPU and uploads tiles. Calling <code>ttnn.to_layout</code> on a tensor that is already on the device runs a real tilize op on the Tensix cores instead, which is what <code>a18_devtilize.py</code> did. Both produce the same bytes.</p>
+  <div class="callout warn">The word <em>page</em> changes meaning with the layout. For a TILE tensor a page is one tile (2048 B in bf16); for a ROW_MAJOR tensor it is one row (<code>W × element size</code>). <code>buffer_page_size()</code> tells you which you have. Anything that reasons about "page p goes to bank p mod 12" (A09) is reasoning about these pages.</div>
+
+  <h2 id="dtypes">Dtypes: bfloat16, bfloat8_b, bfloat4_b</h2>
+  <p>A05 built the formats from first principles: bfloat16 is a truncated float32 (8 exponent bits, 7 stored mantissa bits); <em>bfloat8_b</em> and <em>bfloat4_b</em> are block-floating-point formats in which 16 values share one 8-bit exponent and each value keeps a sign and 7 or 3 mantissa bits. In TT-NN these are just <code>dtype=</code> arguments. What you should know as a user is what they cost and what they buy.</p>
+  <p>The cost side is in the tile-size function. A bfp tile stores its mantissas plus one exponent byte per 16-value face row, padded to the L1 alignment:</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/tile.cpp:136-145 @7aad8aac</div>
+<pre><code>uint32_t Tile::get_tile_size(const DataFormat&amp; format) const {
+    uint32_t l1_alignment = MetalContext::instance().hal().get_alignment(HalMemType::L1);
+    uint32_t aligned_exp_size = tt::round_up(face_shape[0] * num_faces, l1_alignment);
+    switch (format) {
+        case DataFormat::Bfp2:
+        case DataFormat::Bfp2_b: return (tile_hw / 4) + aligned_exp_size;
+        case DataFormat::Bfp4:
+        case DataFormat::Bfp4_b: return (tile_hw / 2) + aligned_exp_size;
+        case DataFormat::Bfp8:
+        case DataFormat::Bfp8_b: return tile_hw + aligned_exp_size;</code></pre>
+  <p>For a 32×32 tile, <code>face_shape[0] × num_faces</code> = 16 × 4 = 64 exponent bytes. So a bfloat8_b tile is 1024 + 64 = 1088 B and a bfloat4_b tile is 512 + 64 = 576 B, against 2048 B for bfloat16. The device reported exactly those page sizes in the run below. Halving the bytes halves the DRAM traffic, which, as A01 and A22 argue, is what bounds most inference.</p>
+  <p>The accuracy side has to be measured. This script stores a 256×128 random weight matrix in each dtype, then multiplies a 64×256 bfloat16 activation by it at three math fidelities and compares with an fp32 torch matmul (<code>a18_ladder.py</code>, WH, seed 42):</p>
+<pre><code>-- weight storage only (host round trip) --
+DataType.BFLOAT16      PCC 0.999999  mean|err| 0.00114
+DataType.BFLOAT8_B     PCC 0.999973  mean|err| 0.00606
+DataType.BFLOAT4_B     PCC 0.993131  mean|err| 0.09770
+-- matmul 64x256 @ 256x128, x in bf16 --
+w=DataType.BFLOAT16    MathFidelity.HiFi4     PCC 0.999964  mean|err| 0.1139  page 2048 B
+w=DataType.BFLOAT16    MathFidelity.HiFi2     PCC 0.999964  mean|err| 0.1071  page 2048 B
+w=DataType.BFLOAT16    MathFidelity.LoFi      PCC 0.999886  mean|err| 0.3177  page 2048 B
+w=DataType.BFLOAT8_B   MathFidelity.HiFi4     PCC 0.999941  mean|err| 0.1477  page 1088 B
+w=DataType.BFLOAT8_B   MathFidelity.HiFi2     PCC 0.999942  mean|err| 0.1422  page 1088 B
+w=DataType.BFLOAT8_B   MathFidelity.LoFi      PCC 0.999870  mean|err| 0.2704  page 1088 B
+w=DataType.BFLOAT4_B   MathFidelity.HiFi4     PCC 0.993218  mean|err| 1.5286  page 576 B
+w=DataType.BFLOAT4_B   MathFidelity.HiFi2     PCC 0.993217  mean|err| 1.5266  page 576 B
+w=DataType.BFLOAT4_B   MathFidelity.LoFi      PCC 0.993217  mean|err| 1.5266  page 576 B</code></pre>
+  <p>The output values have a standard deviation of about √256 = 16, so a mean error of 0.11 is under 1%. Explore the same numbers as a chart:</p>
+
+  <div class="viz" id="figLadder"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figLadder");
+    var g = TT.canvas(root, 900, 360), ctx = g.ctx, C = TT.C;
+    // measured on ttsim WH, a18_ladder.py, seed 42 (see text)
+    var D = {
+      "bfloat16":  { bytes: 2048, store: 0.00114, HiFi4: 0.1139, HiFi2: 0.1071, LoFi: 0.3177, pcc: [0.999964, 0.999964, 0.999886] },
+      "bfloat8_b": { bytes: 1088, store: 0.00606, HiFi4: 0.1477, HiFi2: 0.1422, LoFi: 0.2704, pcc: [0.999941, 0.999942, 0.999870] },
+      "bfloat4_b": { bytes: 576,  store: 0.09770, HiFi4: 1.5286, HiFi2: 1.5266, LoFi: 1.5266, pcc: [0.993218, 0.993217, 0.993217] }
+    };
+    var FID = ["HiFi4", "HiFi2", "LoFi"], FC = [C.green, C.blue, C.orange];
+    var log = true;
+    var steps = [
+      { dur: 1, text: "<b>Bytes per tile.</b> bfloat8_b is 53% and bfloat4_b 28% of a bfloat16 tile, because 16 values share each exponent byte." },
+      { dur: 1, text: "<b>Matmul error by weight dtype and fidelity.</b> For bf16 and bfp8 weights, LoFi roughly doubles or triples the error, and HiFi2 already matches HiFi4. For bfp4 weights the bars are flat: the error is decided when the weights are stored, not when they are multiplied." },
+      { dur: 1, text: "<b>Why bfp4 ignores LoFi.</b> In a matmul the weights (in1) go to SrcA (A15). A bfp4 value has at most 3 significant bits, which fits SrcA's 5-bit slice, so the second phase multiplies nothing (A06). LoFi and HiFi2 agree to the last digit; HiFi4's extra phases only add SrcB's last bit." }
+    ];
+    function bar(x, y0, h, w, col, label) {
+      ctx.fillStyle = col; ctx.globalAlpha = 0.85; ctx.fillRect(x, y0 - h, w, h); ctx.globalAlpha = 1;
+      if (label) TT.text(ctx, label, x + w / 2, y0 - h - 9, { align: "center", font: "11px", mono: true });
+    }
+    var st = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var keys = Object.keys(D), y0 = 300;
+        if (i === 0) {
+          TT.text(ctx, "bytes per 32×32 tile (page size reported by the device)", 40, 30, { color: C.yellow, font: "bold 14px" });
+          keys.forEach(function (k, j) {
+            var h = 230 * D[k].bytes / 2048 * t;
+            bar(160 + j * 220, y0, h, 120, [C.blue, C.purple, C.pink][j], D[k].bytes + " B");
+            TT.text(ctx, k, 220 + j * 220, y0 + 18, { align: "center", font: "13px", mono: true });
+          });
+          return;
+        }
+        TT.text(ctx, "mean |error| of the matmul vs fp32 torch  (" + (log ? "log scale" : "linear scale") + ")", 40, 30, { color: C.yellow, font: "bold 14px" });
+        function sc(v) { return log ? 230 * (Math.log10(v) + 2) / 2.4 : 230 * v / 1.6; }
+        keys.forEach(function (k, j) {
+          var gx = 110 + j * 260;
+          FID.forEach(function (f, m) {
+            var v = D[k][f];
+            var hl = (i === 2 && k === "bfloat4_b") || i === 1;
+            ctx.globalAlpha = hl ? 1 : 0.35;
+            bar(gx + m * 58, y0, Math.max(1, sc(v) * t), 48, FC[m], v.toFixed(3));
+            ctx.globalAlpha = 1;
+          });
+          TT.text(ctx, "weights " + k, gx + 84, y0 + 18, { align: "center", font: "13px", mono: true });
+          TT.text(ctx, "storage-only error " + D[k].store.toFixed(4), gx + 84, y0 + 38, { align: "center", font: "11px", color: C.muted });
+        });
+        FID.forEach(function (f, m) { TT.box(ctx, 700 + m * 64, 46, 14, 14, { fill: FC[m] }); TT.text(ctx, f, 718 + m * 64, 53, { font: "12px" }); });
+      }
+    });
+    var ctrl = root.querySelector(".controls");
+    var b = document.createElement("button"); b.textContent = "log / linear";
+    b.onclick = function () { log = !log; st.render(); };
+    ctrl.insertBefore(b, ctrl.lastChild);
+  })();
+  </script>
+
+  <p>Three lessons fall out of those twelve numbers. First, bfloat8_b weights cost almost nothing in accuracy (PCC 0.99994 against 0.99996) for 47% fewer bytes. The LLM tech report puts it bluntly: "BFP8 weights always work and BFP4 weights work for some matmuls particularly in the MLP" (<code>tech_reports/LLMs/llms.md:1883</code>). Second, bfloat4_b loses about 0.7% PCC <em>at storage time</em>: the round-trip alone gives PCC 0.993, and no fidelity setting can win it back. Third, fidelity and dtype interact through the hardware described in <a href="a06-matrix-engine.html#formats">A06</a>: a format that fits SrcA's 5-bit slice needs only phase 0.</p>
+  <div class="callout warn">The BFP formats share an exponent along each 16-value face row. One large value in a row of small ones flushes the small ones toward zero (A05's draggable outlier). Random Gaussian weights, as here, are the friendly case. Activations with outliers are not, which is one reason to quantize weights before activations and to check PCC after each step.</div>
+
+  <h2 id="memory">Memory configs: DRAM or L1, interleaved or sharded</h2>
+  <p>A device tensor's pages have to live somewhere. A09 described the hardware: 12 DRAM banks on Wormhole (8 on Blackhole), and one L1 bank per Tensix core. TT-NN describes the choice with a <code>MemoryConfig</code>, which has two independent axes:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/buffer_types.hpp:12-16, 38-44 @7aad8aac</div>
+<pre><code>enum class TensorMemoryLayout {
+    INTERLEAVED = 0,
+    HEIGHT_SHARDED = 2,
+    WIDTH_SHARDED = 3,
+    BLOCK_SHARDED = 4,
+...
+enum class BufferType {
+    DRAM,
+    L1,
+    SYSTEM_MEMORY,
+    L1_SMALL,
+    TRACE,
+};</code></pre>
+  <p><b>Buffer type</b> picks the memory. DRAM is large (gigabytes) and far away; L1 is 1464 KiB per core on Wormhole (A09) and next to the compute. <b>Memory layout</b> picks how pages are spread. <em>Interleaved</em> deals pages round-robin across all banks of that memory, so every core reads from everywhere and no bank is a hot spot. <em>Sharded</em> cuts the tensor into rectangles and gives each one to a specific core (for L1) so that the core computing on a rectangle already holds it.</p>
+  <p>The shard rectangle is described by a <code>ShardSpec</code>:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/buffer.hpp:36-44 @7aad8aac</div>
+<pre><code>struct ShardSpec {
+    /* The individual cores the shard grid is mapped to */
+    CoreRangeSet grid;
+
+    /* Canonical tensor shape where the depth dimensions ([:-2] are folded along y) */
+    std::array&lt;uint32_t, 2&gt; shape;
+
+    /* The sequence order of the grid cores that the shards are laid out onto. */
+    ShardOrientation orientation = ShardOrientation::ROW_MAJOR;</code></pre>
+  <p>Three numbers decide everything: which cores, the shard's height and width, and the order in which shards are handed to cores. Height sharding uses full-width shards, width sharding uses full-height shards, block sharding cuts both ways. This animation follows a 128×128 bfloat16 tensor (4×4 tiles) into each layout, using the exact grids and shard shapes that ttsim printed in the run below.</p>
+
+  <div class="viz" id="figShard"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figShard");
+    var g = TT.canvas(root, 900, 560), ctx = g.ctx, C = TT.C;
+    var TS = 40, TX = 30, TY = 80;                        // source tensor tiles
+    var CX = 330, CY = 60, CWd = 128, CHt = 116, GAP = 10;  // 4x4 core grid
+    var ms = 24;                                            // mini tile size at destination
+    var PAL = ["#58c4dd", "#ffd866", "#83c167", "#fc6255"];
+    function tileColor(p) { return PAL[Math.floor(p / 4)]; }
+    var MODES = [
+      { name: "host", text: "<b>The tensor.</b> 128×128 bfloat16 in TILE layout: 16 tiles, 16 pages of 2048 B. Colours mark tile rows. Right: the top-left 4×4 corner of the 8×8 worker grid, cores labelled (x,y)." },
+      { name: "dram", text: "<b>DRAM interleaved</b> (<code>ttnn.DRAM_MEMORY_CONFIG</code>, the default). Page p goes to DRAM bank p mod 12. Banks 0–3 get two pages each. No core owns anything: every op reads its tiles over the NoC from all 12 banks." },
+      { name: "height", text: "<b>HEIGHT_SHARDED</b> on <code>CoreGrid(y=4, x=1)</code>. ttsim printed <code>grid {[0-0 - 0-3]} shard [32, 128]</code>: each core (0,y) holds one full-width band of 32 rows = 4 tiles. Good for row-wise work: elementwise ops, layernorm over the width, matmul activations split along M." },
+      { name: "width", text: "<b>WIDTH_SHARDED</b> on <code>CoreGrid(y=1, x=4)</code>. ttsim printed <code>grid {[0-0 - 3-0]} shard [128, 32]</code>: each core (x,0) holds one full-height strip of 32 columns. Typical for decode activations: few rows, a very wide hidden dimension (A22)." },
+      { name: "block", text: "<b>BLOCK_SHARDED</b> on <code>CoreGrid(y=2, x=2)</code>. ttsim printed <code>grid {[0-0 - 1-1]} shard [64, 64]</code>: block (row r, column c) goes to core (x=c, y=r), as the sharding tech report describes. Each core holds a 2×2-tile block, the natural input for a 2D matmul (A15, A16)." }
+    ];
+    var steps = MODES.map(function (m) { return { dur: 1.6, text: m.text }; });
+    function coreXY(x, y) { return [CX + x * (CWd + GAP), CY + y * (CHt + GAP)]; }
+    function dest(mode, p) {
+      var r = Math.floor(p / 4), c = p % 4, o;
+      if (mode === "host") return [TX + c * TS + 2, TY + r * TS + 2, TS - 4];
+      if (mode === "dram") {
+        var b = p % 12, slot = Math.floor(p / 12);
+        var bx = CX + (b % 4) * (CWd + GAP), by = CY + Math.floor(b / 4) * (CHt * 4 / 3 + GAP * 0.3);
+        return [bx + 10 + slot * (ms + 6), by + 34, ms];
+      }
+      if (mode === "height") { o = coreXY(0, r); return [o[0] + 8 + c * (ms + 4), o[1] + 30, ms]; }
+      if (mode === "width") { o = coreXY(c, 0); return [o[0] + 96, o[1] + 6 + r * (ms + 3), ms]; }
+      if (mode === "block") { o = coreXY(c >> 1, r >> 1); return [o[0] + 30 + (c % 2) * (ms + 4), o[1] + 34 + (r % 2) * (ms + 4), ms]; }
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var mode = MODES[i].name, prev = MODES[Math.max(0, i - 1)].name;
+        // source tensor (ghost)
+        TT.text(ctx, "tensor 128×128 (4×4 tiles)", TX, TY - 24, { color: C.yellow, font: "bold 13px" });
+        for (var p = 0; p < 16; p++) {
+          var r = Math.floor(p / 4), c = p % 4;
+          TT.box(ctx, TX + c * TS, TY + r * TS, TS - 2, TS - 2, { stroke: C.border, fill: tileColor(p), alpha: i === 0 ? 0.0 : 0.12, r: 2 });
+        }
+        // destination frames
+        if (mode === "dram") {
+          TT.text(ctx, "Wormhole DRAM banks", CX, CY - 24, { color: C.fg, font: "bold 13px" });
+          for (var b = 0; b < 12; b++) {
+            var bx = CX + (b % 4) * (CWd + GAP), by = CY + Math.floor(b / 4) * (CHt * 4 / 3 + GAP * 0.3);
+            TT.box(ctx, bx, by, CWd, CHt, { stroke: C.purple, fill: C.bg2, r: 6 });
+            TT.text(ctx, "DRAM bank " + b, bx + 8, by + 14, { color: C.purple, font: "12px" });
+          }
+        } else {
+          TT.text(ctx, "Tensix cores, L1 (top-left of the 8×8 grid)", CX, CY - 24, { color: C.fg, font: "bold 13px" });
+          for (var y = 0; y < 4; y++) for (var x = 0; x < 4; x++) {
+            var o = coreXY(x, y), used = false;
+            if (mode === "height") used = x === 0; else if (mode === "width") used = y === 0; else if (mode === "block") used = x < 2 && y < 2;
+            TT.box(ctx, o[0], o[1], CWd, CHt, { stroke: used ? C.green : C.border, fill: C.bg2, r: 6, lw: used ? 2 : 1 });
+            TT.text(ctx, "core (" + x + "," + y + ")", o[0] + 8, o[1] + 14, { color: used ? C.green : C.muted, font: "12px" });
+          }
+        }
+        // moving tiles
+        for (var q = 0; q < 16; q++) {
+          var a = dest(i === 0 ? "host" : "host", q), d = dest(mode, q);
+          var x0 = a[0], y0 = a[1], s0 = a[2];
+          var xx = TT.lerp(x0, d[0], t), yy = TT.lerp(y0, d[1], t), ss = TT.lerp(s0, d[2], t);
+          TT.box(ctx, xx, yy, ss, ss, { fill: tileColor(q), alpha: 0.85, r: 3, label: String(q), color: "#000", font: (ss > 30 ? "13px" : "10px") });
+        }
+        if (mode !== "host" && mode !== "dram") {
+          var lab = { height: "shard [32,128] = 1×4 tiles per core", width: "shard [128,32] = 4×1 tiles per core", block: "shard [64,64] = 2×2 tiles per core" }[mode];
+          TT.text(ctx, lab, TX, TY + 4 * TS + 30, { color: C.green, font: "bold 13px" });
+        }
+        if (mode === "dram") TT.text(ctx, "page p → bank p mod 12", TX, TY + 4 * TS + 30, { color: C.purple, font: "bold 13px" });
+      }
+    });
+  })();
+  </script>
+
+  <p>All four layouts run under ttsim. The script converts two DRAM tensors to each sharded layout with <code>ttnn.to_memory_config</code>, adds them there, and checks the sum (<code>a18_shard.py</code>):</p>
+<pre><code>compute grid: 8-8
+interleaved DRAM: pages 16 addr 0x2d4c40
+interleaved L1  : addr 0x16d800 BufferType.L1
+HEIGHT layout TensorMemoryLayout.HEIGHT_SHARDED  grid {[0-0 - 0-3]}  shard [32, 128]  PCC 0.999998
+WIDTH  layout TensorMemoryLayout.WIDTH_SHARDED  grid {[0-0 - 3-0]}  shard [128, 32]  PCC 0.999998
+BLOCK  layout TensorMemoryLayout.BLOCK_SHARDED  grid {[0-0 - 1-1]}  shard [64, 64]  PCC 0.999998</code></pre>
+  <p>Blackhole gives the same shard specs and PCCs, with a compute grid of <code>11-10</code> instead of <code>8-8</code>. Notice the two addresses. The DRAM tensor starts at 0x2d4c40, the first free DRAM address that A09's probe found. The L1 tensor starts at 0x16d800, exactly 2048 B below the top of Wormhole's 1464 KiB (0x16E000) L1: its 16 pages are spread over 64 L1 banks, so each bank needs at most one page, placed at the top. That is A09's allocator at work, DRAM bottom-up and L1 top-down. The core grid prints as <code>x-y</code>, so <code>[0-0 - 0-3]</code> means cores (0,0) through (0,3), one column of four.</p>
+  <p>The helper that built these configs is short and worth reading, because its checks are the rules of 2D sharding:</p>
+  <div class="filename">tt-metal/ttnn/ttnn/core.py:214-223 @7aad8aac</div>
+<pre><code>elif strategy == ShardStrategy.HEIGHT:
+    total_cores = core_grid.x * core_grid.y
+    if shard_height % total_cores != 0:
+        raise RuntimeError("Invalid sharding core_grid")
+    shard_shape = shard_height // total_cores, shard_width
+elif strategy == ShardStrategy.WIDTH:
+    total_cores = core_grid.x * core_grid.y
+    if shard_width % total_cores != 0:
+        raise RuntimeError("Invalid sharding core_grid")
+    shard_shape = shard_height, shard_width // total_cores</code></pre>
+  <p>Two ways to get it wrong, both tried on ttsim (<code>a18_shard_edge.py</code>):</p>
+<pre><code>3-core height shard helper FAILED: Invalid sharding core_grid
+16-row shards FAILED: TT_FATAL: Physical shard shape (16, 128) must be tile {32, 32} sized!</code></pre>
+  <p>128 rows do not split over 3 cores, and a hand-written <code>ShardSpec</code> with 16-row shards cannot hold whole 32×32 tiles. A TILE tensor's shard must be a whole number of tiles in both directions.</p>
+  <div class="callout key">Interleaved spreads <em>pages</em> over <em>banks</em> for bandwidth balance. Sharded assigns <em>rectangles</em> to <em>cores</em> for locality. Height, width and block only differ in which way you cut.</div>
+  <div class="callout gpu">The nearest GPU idea is choosing which thread block loads which tile into shared memory, except that on a GPU that choice lives inside the kernel and disappears when it returns. A sharded TT-NN tensor stays in the cores' L1 <em>between</em> ops, so the next op can start from data that is already local. The closest analogue is keeping activations resident in shared memory across a fused kernel; TT-NN gets that effect across separate ops.</div>
+  <div class="callout warn">The ready-made <code>ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG</code> (and its WIDTH and BLOCK siblings) has <code>shard_spec=std::nullopt</code>; you can print it to check. It tells an op "produce a sharded output and work out the spec yourself", which some ops accept as an output config. To shard an existing tensor you need a full spec, from <code>create_sharded_memory_config</code> or a hand-built <code>ShardSpec</code>.</div>
+
+  <h2 id="ops">Ops, and checking them with PCC</h2>
+  <p>With tensors in place, ops look like PyTorch. Inputs in TILE layout, outputs in TILE layout, and unless you pass <code>memory_config=</code> the output lands in DRAM interleaved. These are the TT-NN calls of the script for the three ops below; the full script (<code>a18_ops.py</code>) adds the seed, the input tensors, the torch references and the PCC helper:</p>
+<pre><code>a = torch.randn(64, 64, dtype=torch.bfloat16); b = torch.randn(64, 64, dtype=torch.bfloat16)
+ta = ttnn.from_torch(a, layout=ttnn.TILE_LAYOUT, device=device)
+tb = ttnn.from_torch(b, layout=ttnn.TILE_LAYOUT, device=device)
+tc = ttnn.add(ta, tb)
+
+tx = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=device)   # 64x128
+tw = ttnn.from_torch(w, layout=ttnn.TILE_LAYOUT, device=device)   # 128x96
+ty = ttnn.matmul(tx, tw)
+
+ts = ttnn.softmax(ttnn.from_torch(s, layout=ttnn.TILE_LAYOUT, device=device), dim=-1)</code></pre>
+<pre><code>add     64x64     PCC 0.999998  max|err| 0.0312  out BufferType.DRAM
+matmul  64x128@128x96 PCC 0.999984  mean|err| 0.0472  shape Shape([64, 96])
+softmax 32x64     PCC 0.999722  row sums [0.9995536804199219, 1.000579833984375, 0.9993896484375]</code></pre>
+  <p>The same script on the Blackhole build of ttsim prints identical numbers. How should you read them? <a href="a05-tiles-and-formats.html#pcc">A05</a> defined PCC, the Pearson correlation between the device result and a torch reference; it checks the <em>shape</em> of the answer but not its scale, so pair it with an absolute error. The LLM tech report asks for a PCC of about 0.999 for small submodules such as an MLP, about 0.998 for a decoder layer and about 0.99 for the full model (<code>tech_reports/LLMs/llms.md:1665-1666</code>).</p>
+  <ul>
+    <li>The <b>add</b> is not bit-identical to torch's bfloat16 add. The largest error, 0.0312, is one bfloat16 step for values between 4 and 8. Both sides round to bfloat16, and the research notes for this series found about 12% of elements one ulp apart on a 32×32 add, so expect PCC near, but not at, 1.</li>
+    <li>The <b>matmul</b> accumulates 128 products per output. Its error depends on the fidelity and on how the accumulator is rounded, the subject of the next section.</li>
+    <li><b>softmax</b> uses the SFPU's exponential (A07) in an approximate mode by default for bfloat16 inputs, and the rows sum to 1 only within about 0.1%.</li>
+  </ul>
+
+  <h2 id="configs">Program configs and compute kernel configs</h2>
+  <p>Most ops take two optional configuration objects, and they answer different questions.</p>
+  <p>A <b>compute kernel config</b> answers "how should each core's math engine work?" It is one struct, shared by all ops and architectures:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/core/compute_kernel/compute_kernel_config.hpp:19-27 @7aad8aac</div>
+<pre><code>struct ComputeKernelConfig {
+    tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi;
+    bool math_approx_mode = true;
+    bool fp32_dest_acc_en = false;
+    bool packer_l1_acc = false;
+    bool dst_full_sync_en = false;
+    ttnn::operations::compute_throttle_utils::ThrottleLevel throttle_level =
+        ttnn::operations::compute_throttle_utils::ThrottleLevel::NO_THROTTLE;
+};</code></pre>
+  <p>Each field is something you met at the kernel level. <code>math_fidelity</code> is the number of multiplier phases from <a href="a06-matrix-engine.html#phases">A06</a>. <code>math_approx_mode</code> selects the SFPU's approximate functions (<a href="a07-vector-engine.html">A07</a>). <code>fp32_dest_acc_en</code> makes Dst hold float32 instead of bfloat16, at the cost of half of its capacity (<a href="a12-compute-kernels.html">A12</a>). <code>packer_l1_acc</code> lets the packer add into the output buffer in L1 rather than overwrite it, a second way to combine partial sums over K blocks (A15 reloaded them into Dst instead). In C++, <code>WormholeComputeKernelConfig</code> and <code>BlackholeComputeKernelConfig</code> are both aliases of this one struct (same file, lines 38-40); the scripts here use the Wormhole name.</p>
+  <p>A <b>program config</b> answers "how should the work be split across cores?" It is op-specific. For matmul there are several, and the 2D multicast one is the program of <a href="a15-matmul-one-to-many.html#blocking">A15</a> and <a href="a16-multicast-sync.html">A16</a> with its blocking parameters exposed:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp:25-38 @7aad8aac</div>
+<pre><code>struct MatmulMultiCoreReuseMultiCastProgramConfig {
+    tt::tt_metal::CoreCoord compute_with_storage_grid_size;
+    std::size_t in0_block_w{};
+    std::size_t out_subblock_h{};
+    std::size_t out_subblock_w{};
+    std::size_t out_block_h{};
+    std::size_t out_block_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    bool transpose_mcast{};
+    std::optional&lt;ttnn::operations::unary::UnaryWithParam&gt; fused_activation;
+    bool fuse_batch = true;
+    std::optional&lt;tt::tt_metal::CoreRangeSet&gt; allowed_worker_cores = std::nullopt;
+};</code></pre>
+  <p>Here is one for a 128×256 by 256×128 matmul, which is 4×8 by 8×4 tiles, on a 2×2 grid. Each core owns a 2×2-tile block of the output (<code>per_core_M = per_core_N = 2</code>), consumes K two tiles at a time (<code>in0_block_w = 2</code>, which must divide Kt = 8), and computes its block in 1×2-tile subblocks that fit in Dst:</p>
+<pre><code>pc = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    compute_with_storage_grid_size=(2, 2), in0_block_w=2,
+    out_subblock_h=1, out_subblock_w=2, per_core_M=2, per_core_N=2,
+    transpose_mcast=False, fused_activation=None)
+y = ttnn.matmul(tx, tw, program_config=pc)</code></pre>
+  <p>Now the trap. Run that matmul four ways (<code>a18_progcfg.py</code>):</p>
+<pre><code>default (auto config)    PCC 0.999977  mean|err| 0.0831
+auto + HiFi2             PCC 0.999963  mean|err| 0.1079
+auto + HiFi2 + l1_acc    PCC 0.999977  mean|err| 0.0831
+program_config + HiFi2   PCC 0.999963  mean|err| 0.1079
+program_config only      PCC 0.999888  mean|err| 0.3181
+program_config + HiFi4   PCC 0.999963  mean|err| 0.1133</code></pre>
+  <p>Passing a program config, and nothing else, made the answer almost four times worse. The program config itself is innocent: with HiFi2 it gives exactly the auto path's 0.1079. What changed is the default fidelity, which the matmul op chooses like this:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp:3331-3336, 3382-3388 @7aad8aac</div>
+<pre><code>const bool has_program_config = parameters.program_config.has_value();
+bool are_inputs_low_precision_df =
+    ((input_tensor_a.dtype() == DataType::BFLOAT8_B || input_tensor_a.dtype() == DataType::BFLOAT4_B) &amp;&amp;
+     (input_tensor_b.dtype() == DataType::BFLOAT8_B || input_tensor_b.dtype() == DataType::BFLOAT4_B));
+const auto increase_fidelity = !has_program_config &amp;&amp; !has_user_grid &amp;&amp; !are_inputs_low_precision_df;
+auto math_fidelity = increase_fidelity ? tt::tt_metal::MathFidelity::HiFi2 : tt::tt_metal::MathFidelity::LoFi;
+...
+auto kernel_config_val = init_device_compute_kernel_config(
+    arch,
+    parameters.compute_kernel_config,
+    math_fidelity,
+    /*default_approx_mode=*/false,
+    /*default_fp32_acc=*/is_float_32,
+    /*default_l1_acc=*/!is_float_32);</code></pre>
+  <p>Read it as a rule. If you let TT-NN choose everything, a bfloat16 matmul runs at HiFi2 with <code>packer_l1_acc</code> on. The moment you pass a <code>program_config</code> or a <code>core_grid</code>, or both inputs are block-float, the default drops to LoFi. And if you pass a compute kernel config, it replaces all of these defaults, including <code>packer_l1_acc</code>, which is why "auto + HiFi2" lost the auto path's 0.0831: the struct's own default turns L1 accumulation off. With it back on, the result matches the auto path exactly.</p>
+  <div class="callout warn">Whenever you pass a <code>program_config</code> to a matmul, pass a <code>compute_kernel_config</code> too, and state every field. The op will not warn you that it lowered the fidelity.</div>
+
+  <p>One more measurement separates fidelity from the accumulator. With bf16 inputs, the reference is now the fp32 product of the <em>same</em> bf16-rounded inputs, so only the device's arithmetic is being judged (<code>a18_fid.py</code>, <code>packer_l1_acc=False</code>):</p>
+<pre><code>fp32_dest_acc_en=False MathFidelity.LoFi    mean|err| 0.31691  max|err| 1.7826
+fp32_dest_acc_en=False MathFidelity.HiFi2   mean|err| 0.10234  max|err| 0.9157
+fp32_dest_acc_en=False MathFidelity.HiFi3   mean|err| 0.10931  max|err| 0.9344
+fp32_dest_acc_en=False MathFidelity.HiFi4   mean|err| 0.10931  max|err| 0.9344
+[10142] ERROR: UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code></pre>
+  <p>Two findings. HiFi3 and HiFi4 are identical, and both slightly <em>worse</em> than HiFi2. That fits A06's reading of ttsim's MVMUL: with a bfloat16 Dst, each phase's partial products are aligned and rounded to Dst's 8-bit significand before they are added, so extra phases add rounding steps without adding bits that survive. The error floor here is the bfloat16 accumulator, not the multiplier. The way to lower it is <code>fp32_dest_acc_en=True</code>, and that is where the run stopped: the first matmul with an FP32 Dst hit an unpacker configuration (<code>cfg_context_id=1</code>) that ttsim v1.15.0 reports as <code>UnsupportedFunctionality</code>. On silicon this setting is common; under this simulator it is out of reach for matmul.</p>
+  <div class="callout warn">The fidelity effects above are for random Gaussian inputs on one shape. They are a measurement, not a law. The general rule from A06 holds: fidelity buys bits on the multiplier side, the Dst format decides how many of them survive, and the weight dtype can make both moot.</div>
+
+  <h2 id="path">From ttnn.add down to the kernels</h2>
+  <p>What actually runs when you call <code>ttnn.add(ta, tb)</code>? To find out without reading every layer, give the run its own kernel cache directory (<code>TT_METAL_CACHE</code>) so it starts empty, call add three times, and list what got compiled (<code>a18_addpath.py</code>):</p>
+<pre><code>ttnn.add call 1: 1.13 s wall   program cache entries: 1
+ttnn.add call 2: 0.01 s wall   program cache entries: 1
+ttnn.add call 3: 0.01 s wall   program cache entries: 1
+eltwise_binary_no_bcast/10083976056017848008/trisc0
+eltwise_binary_no_bcast/10083976056017848008/trisc1
+eltwise_binary_no_bcast/10083976056017848008/trisc2
+reader_interleaved_no_bcast/10456270060302663221/ncrisc
+writer_interleaved_no_bcast/2689147808996234265/brisc</code></pre>
+  <p>Three kernels, five binaries: a reader on NCRISC, a compute kernel compiled three times for TRISC0/1/2, a writer on BRISC. That is exactly the shape of the program you wrote by hand in <a href="a11-dataflow-and-cbs.html">A11</a>–<a href="a12-compute-kernels.html">A12</a>. The first call paid for compilation. When the device closes, tt-metal's log reports <code>JIT cache stats: 0/13 hits (0.0%)</code>: besides these five binaries, the cold cache also had to build the firmware (seven images, one per RISC-V type, in <code>$TT_METAL_CACHE/*/firmware/</code>); the next two found the program in the program cache and only had to run it. The animation follows the call down the stack. <a href="a19-op-anatomy-compilers.html">A19</a> opens each box.</p>
+
+  <div class="viz" id="figPath"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figPath");
+    var g = TT.canvas(root, 900, 560), ctx = g.ctx, C = TT.C;
+    var hit = false;
+    var L = [
+      { k: "py",   name: "Python: ttnn.add(ta, tb)", src: "your script", art: "two device tensors, TILE, DRAM interleaved", col: C.yellow },
+      { k: "bind", name: "nanobind binding \"add\"", src: "binary/binary_nanobind.cpp:2160", art: "Python args → C++ Tensor refs", col: C.yellow },
+      { k: "api",  name: "ttnn::add → invoke_binary_ng", src: "binary/binary.cpp:864", art: "BinaryOpType::ADD, dtype, memory_config", col: C.blue },
+      { k: "prim", name: "ttnn::prim::binary_ng", src: "binary_ng_device_operation.cpp:618-807", art: "operation_attributes + tensor_args; output spec computed", col: C.blue },
+      { k: "cache",name: "launch → look_up_program_cache", src: "ttnn/api/ttnn/device_operation.hpp:395-418", art: "64-bit hash + canonical key of the op", col: C.purple },
+      { k: "fact", name: "program factory", src: "binary_ng_program_factory.cpp + _utils.cpp:81-115", art: "kernel paths, CBs, core split, runtime args", col: C.purple, miss: true },
+      { k: "jit",  name: "JIT build (A13)", src: "tt_metal/jit_build", art: "5 ELFs: ncrisc, trisc0-2, brisc", col: C.orange, miss: true },
+      { k: "enq",  name: "Metalium enqueue (A17)", src: "MeshWorkload on the command queue", art: "binaries + runtime args written to L1, go signal", col: C.orange },
+      { k: "core", name: "Tensix cores (A11, A12)", src: "reader → compute → writer", art: "tiles: DRAM → CB → FPU add → CB → DRAM", col: C.green }
+    ];
+    var steps = L.map(function (l, i) {
+      var t = "<b>" + (i + 1) + ". " + l.name + ".</b> ";
+      var extra = {
+        py: "Both tensors are already on the device in TILE layout; nothing is copied yet.",
+        bind: "The Python name is a thin nanobind binding around C++ functions; Python adds no logic of its own here.",
+        api: "Every binary op funnels into one routine, <code>invoke_binary_ng</code>, which handles row-major inputs, scalar operands and optional activations, then calls the device operation.",
+        prim: "The <em>device operation</em>: a struct of attributes (op type, dtypes, memory config) and tensor arguments. It validates the inputs and computes the output's TensorSpec, then calls <code>launch</code>.",
+        cache: "The attributes and tensor properties are hashed. Same shapes, dtypes and configs → same key. Here call 1 misses; calls 2 and 3 hit.",
+        fact: "Only on a miss: the factory picks kernels by name (<code>ReaderNoBcastNg</code>, <code>ComputeNoBcast</code>, <code>WriterNoBcastNg</code>), sizes circular buffers, splits tiles across cores and fills runtime args. On a hit only the runtime args (buffer addresses) are patched.",
+        jit: "Only on a miss and only if the kernel cache is cold: compile each kernel for each RISC-V it runs on. Our cold run built eltwise_binary_no_bcast ×3, reader_interleaved_no_bcast, writer_interleaved_no_bcast.",
+        enq: "The program becomes commands. Under ttsim's slow dispatch the host writes them directly; on silicon the prefetcher and dispatcher cores do it (A17).",
+        core: "NCRISC reads tile pairs into CBs, TRISC0/1/2 unpack, add on the FPU and pack, BRISC writes the result tiles to DRAM."
+      }[l.k];
+      return { dur: 1.1, text: t + extra };
+    });
+    var st = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var x = 30, w = 380, h = 46, gap = 12, y0 = 30;
+        TT.text(ctx, hit ? "call 2 or 3 (program cache HIT)" : "call 1 (program cache MISS, cold kernel cache)", 450, 14, { color: hit ? C.green : C.red, font: "bold 13px" });
+        for (var k = 0; k < L.length; k++) {
+          var y = y0 + k * (h + gap), l = L[k];
+          var skipped = hit && l.miss;
+          var active = k === i, done = k < i;
+          TT.box(ctx, x, y, w, h, { fill: skipped ? C.bg2 : l.col, alpha: active ? 0.45 : (done ? 0.22 : 0.08), stroke: active ? l.col : C.border, lw: active ? 2.5 : 1 });
+          TT.text(ctx, l.name, x + 12, y + 16, { font: "bold 13px", color: skipped ? C.muted : C.fg });
+          TT.text(ctx, l.src, x + 12, y + 34, { font: "11px", mono: true, color: C.muted });
+          if (skipped) TT.text(ctx, "skipped", x + w - 10, y + 16, { align: "right", font: "bold 12px", color: C.green });
+          if (k < L.length - 1) TT.arrow(ctx, x + w / 2, y + h + 1, x + w / 2, y + h + gap - 1, { color: C.border, head: 6, lw: 1.5 });
+          if (k <= i) {
+            var a = k === i ? t : 1;
+            ctx.globalAlpha = a;
+            TT.arrow(ctx, x + w + 6, y + h / 2, x + w + 34, y + h / 2, { color: l.col, head: 6, lw: 1.5 });
+            TT.box(ctx, x + w + 40, y + 6, 440, h - 12, { fill: C.bg3, stroke: skipped ? C.border : l.col, r: 4 });
+            TT.text(ctx, skipped ? "(reuse cached program: patch runtime args only)" : l.art, x + w + 50, y + h / 2, { font: "12px", color: skipped ? C.green : C.fg });
+            ctx.globalAlpha = 1;
+          }
+        }
+        // token
+        var ty = y0 + i * (h + gap) + h / 2;
+        ctx.fillStyle = C.yellow; ctx.beginPath(); ctx.arc(x - 12, ty, 6, 0, 7); ctx.fill();
+      }
+    });
+    var ctrl = root.querySelector(".controls");
+    var lab = document.createElement("label");
+    var cb = document.createElement("input"); cb.type = "checkbox";
+    cb.onchange = function () { hit = cb.checked; st.render(); };
+    lab.appendChild(cb); lab.appendChild(document.createTextNode(" second call (cache hit)"));
+    ctrl.insertBefore(lab, ctrl.lastChild);
+  })();
+  </script>
+
+  <p>The program factory chooses the kernel files by name. The three that compiled in our run are all in this table:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp:81-88, 107-115 @7aad8aac (condensed)</div>
+<pre><code>std::string get_kernel_file_path(KernelName kernel_name, bool is_sfpu, bool is_where_op) {
+    constexpr std::string_view root = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels";
+    constexpr std::string_view root_ng = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng";
+    ...
+        case KernelName::ReaderNoBcastNg: return fmt::format(dataflow, root_ng, "reader_interleaved_no_bcast.cpp");
+    ...
+        case KernelName::WriterNoBcastNg: return fmt::format(dataflow, root_ng, "writer_interleaved_no_bcast.cpp");
+    ...
+        case KernelName::ComputeNoBcast:
+            return fmt::format(
+                compute,
+                root,
+                is_where_op ? "eltwise_where_no_bcast.cpp"
+                            : (is_sfpu ? "eltwise_binary_sfpu_no_bcast.cpp" : "eltwise_binary_no_bcast.cpp"));</code></pre>
+  <p>The generated sources in our private cache confirm it: the reader's and writer's <code>kernel_includes.hpp</code> include files from <code>kernels_ng/dataflow/</code>, and the compute kernel's <code>chlkc_math.cpp</code> (and its unpack and pack siblings) include <code>kernels/compute/eltwise_binary_no_bcast.cpp</code>. Note <code>is_sfpu</code>: the same op can be compiled to an FPU kernel (A06) or an SFPU kernel (A07) depending on dtypes and options. For a bfloat16 add it chose the FPU.</p>
+  <div class="callout key">An op call is a program-cache lookup. The first call with a new combination of shapes, dtypes, layouts and memory configs builds (and maybe compiles) a program; later identical calls reuse it and only patch addresses. Keep shapes stable and the expensive part happens once.</div>
+
+  <h2 id="model">From a torch model to ttnn calls</h2>
+  <p>Porting a model is mostly a translation exercise, plus deciding the choices from this chapter once per tensor. Take a two-layer MLP:</p>
+<pre><code>mlp = torch.nn.Sequential(torch.nn.Linear(256, 512), torch.nn.GELU(), torch.nn.Linear(512, 256))</code></pre>
+  <p>The translation, as run on ttsim (<code>a18_progcfg.py</code>, second half):</p>
+<pre><code>W1 = ttnn.from_torch(mlp[0].weight.T.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+b1 = ttnn.from_torch(mlp[0].bias.reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+W2 = ttnn.from_torch(mlp[2].weight.T.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+b2 = ttnn.from_torch(mlp[2].bias.reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+h   = ttnn.linear(tx, W1, bias=b1, activation="gelu")
+out = ttnn.linear(h, W2, bias=b2)</code></pre>
+<pre><code>MLP 128x256 -> 512 -> 256 (bfp8 weights)  PCC 0.999934</code></pre>
+  <p>Each line carries one of the decisions:</p>
+  <table>
+    <tr><th>PyTorch</th><th>TT-NN</th><th>Why</th></tr>
+    <tr><td><code>nn.Linear.weight</code> is [out, in]</td><td>transpose once, at load time</td><td><code>ttnn.linear</code> computes <code>x @ W</code> with W as [in, out]; TT-NN's own helper does the same (<code>ttnn/ttnn/model_preprocessing.py:25-28</code>)</td></tr>
+    <tr><td>bias of shape [out]</td><td><code>reshape(1, -1)</code>, TILE</td><td>a 2D row that broadcasts down the rows; padded to 32 rows like everything else</td></tr>
+    <tr><td>fp32 parameters</td><td>weights <code>bfloat8_b</code>, bias and activations <code>bfloat16</code></td><td>the ladder above: weight bytes halve at almost no cost</td></tr>
+    <tr><td><code>GELU</code> module</td><td><code>activation="gelu"</code></td><td>one argument; with no core grid, as here, TT-NN runs it as a separate unary op after the matmul (<code>ttnn/cpp/ttnn/operations/matmul/matmul.cpp:323-329</code>). To fuse it into the matmul kernel, use a program config's <code>fused_activation</code> field</td></tr>
+    <tr><td>tensors between layers</td><td>stay on the device, TILE</td><td>no host round trips or re-tilizing between ops; only the input is converted and only the output is read back</td></tr>
+  </table>
+  <p>Real models add the remaining choices: activations sharded in L1 for decode, program configs for the large matmuls, and a compute kernel config per op. They also follow an accuracy discipline. The LLM tech report recommends testing each submodule against the reference model (PCC about 0.999) before whole layers and the full model (about 0.99), which is the check we just ran at toy scale. <a href="a22-llm-capstone.html">A22</a> does it for a transformer, and <a href="a19-op-anatomy-compilers.html">A19</a> shows how a compiler can make these translations for you.</p>
+  <div class="callout gpu">On a GPU, porting this MLP needs no code: it already runs on CUDA. The closest analogy to the TT-NN port is preparing a model for a TensorRT-style engine: weights are converted and laid out once, precision is chosen per layer, and activations are fused into the GEMM epilogue. The difference is that in TT-NN you make those choices in Python, op by op.</div>
+
+  <h2 id="sim">Running it in the simulator</h2>
+  <div class="callout warn">ttsim is a functional, bit-exact model, not a timing model. The bracketed clock counts in its log are not silicon performance, and the wall-clock times on this page measure the simulator on this orb's CPU.</div>
+  <p>Every script on this page is in the workbench's <code>py/</code> directory as <code>a18_*.py</code> and runs with the workbench from <a href="../sim-labs/b00-workbench.html">B00</a> and the Python environment of the tt-metal build:</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # env.sh cds away, so use absolute paths
+export LAB_HOME=$HOME/ttlab/a18
+source $W/env.sh wh                  # or bh
+source $TT_METAL_HOME/python_env/bin/activate
+export TT_METAL_INSPECTOR=0          # avoid a port clash when several runs share the orb
+python $W/py/a18_ops.py              # also a18_pad, a18_ladder, a18_shard, a18_progcfg, a18_fid, a18_devtilize, a18_shard_edge
+export TT_METAL_CACHE=$LAB_HOME/jit &amp;&amp; rm -rf $TT_METAL_CACHE   # a18_addpath wants an empty kernel cache
+python $W/py/a18_addpath.py</code></pre>
+  <p>Every script whose output depends on random inputs seeds torch's generator, so they print the numbers on this page; only the wall times in <code>a18_addpath.py</code> change from run to run. The opening script is short enough to reproduce whole:</p>
+  <div class="filename">sim-labs/workbench/py/a18_pad.py (docstring trimmed)</div>
+<pre><code>import torch, ttnn
+device = ttnn.open_device(device_id=0)
+x = (torch.arange(3*40, dtype=torch.float32).reshape(3, 40) + 1).to(torch.bfloat16)   # values 1..120
+t = ttnn.from_torch(x, dtype=ttnn.bfloat16)                     # default layout: ROW_MAJOR, on host
+print("from_torch    :", t.layout, t.shape, "padded", t.padded_shape)
+tt = ttnn.to_layout(t, ttnn.TILE_LAYOUT)                        # tilize (host)
+print("to_layout TILE:", tt.layout, t.shape, "padded", tt.padded_shape, "tile", tt.tile)
+d = ttnn.to_device(tt, device)                                  # copy to DRAM
+print("on device     :", d.memory_config().buffer_type, d.memory_config().memory_layout)
+print("pages", d.buffer_num_pages(), "x", d.buffer_page_size(), "bytes")
+p = ttnn.from_device(d).to_torch_with_padded_shape()            # read back, keep the padding
+print("padded view   :", tuple(p.shape), " nonzero:", int((p != 0).sum()), "of", p.numel())
+print("row 0, cols 36..43:", p[0, 36:44].tolist())
+print("row 3, cols 0..3  :", p[3, 0:4].tolist())
+y = ttnn.to_torch(d)
+print("to_torch      :", tuple(y.shape), "bit-identical:", torch.equal(x, y))
+ttnn.close_device(device)</code></pre>
+  <p>What worked and what did not, on ttsim v1.15.0 with tt-metal 7aad8aac:</p>
+  <table>
+    <tr><th>Feature</th><th>Result</th></tr>
+    <tr><td>from_torch / to_layout / to_device / from_device / to_torch, host and device tilize</td><td>works, WH and BH</td></tr>
+    <tr><td>add, matmul, softmax, linear with a GELU activation (run as a separate op, see above)</td><td>works; PCC 0.9997–0.999998</td></tr>
+    <tr><td>bfloat8_b and bfloat4_b tensors and matmuls</td><td>works</td></tr>
+    <tr><td>MathFidelity LoFi / HiFi2 / HiFi3 / HiFi4, packer_l1_acc</td><td>works, measurably different results</td></tr>
+    <tr><td><code>fp32_dest_acc_en=True</code> on matmul</td><td><b>fails</b>: <code>UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code></td></tr>
+    <tr><td>L1 interleaved; height, width and block sharding; add on sharded tensors</td><td>works, WH and BH</td></tr>
+    <tr><td>Matmul with <code>MatmulMultiCoreReuseMultiCastProgramConfig</code> on 2×2 cores</td><td>works</td></tr>
+  </table>
+  <p>Each script runs in 3 to 13 seconds of wall time, most of it device start-up and simulation. The dispatch mode is slow dispatch (A17), so trace is not available here.</p>
+  <div class="callout sim">Go further in <a href="../sim-labs/b11-ttnn-on-sim.html">B11, TT-NN on the simulator</a>: dump the allocator's memory state to see where each tensor landed, walk the full format ladder, and sweep matmul program configs, all under ttsim.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>TT-NN is the operator library on top of TT-Metalium. Each op builds, caches and enqueues a Metalium program; you stop writing kernels but keep choosing layout, dtype, memory placement and math settings.</li>
+    <li>A <code>ttnn.Tensor</code> has a logical <code>shape</code> and a stored <code>padded_shape</code>. In TILE layout the last two dimensions are rounded up to multiples of 32 and one page is one 2048-byte bfloat16 tile with four 16×16 faces inside. Our 3×40 tensor became 32×64: 2 pages, 5.9% useful.</li>
+    <li><code>from_torch</code> defaults to ROW_MAJOR (TILE for block floats) and DRAM interleaved; for a single device it tilizes on the host. <code>to_layout</code> on a device tensor tilizes on the cores.</li>
+    <li>bfloat8_b tiles are 1088 B and bfloat4_b tiles 576 B. bfp8 weights cost little accuracy; bfp4 loses it at storage time, which no fidelity recovers.</li>
+    <li>A <code>MemoryConfig</code> is buffer type (DRAM or L1) times memory layout (interleaved, height, width or block sharded). Shards must be whole tiles and must divide the tensor. All of them run on ttsim.</li>
+    <li>Compute kernel configs set fidelity, approximation and accumulation; program configs set the core split. Passing a matmul program config without a compute config silently drops the fidelity from HiFi2 to LoFi.</li>
+    <li><code>ttnn.add</code> becomes <code>binary_ng</code>, a program-cache lookup, and on a miss three kernels on five RISC-V cores. A19 opens that machinery.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>A tensor of shape [2, 7, 50] in TILE layout, bfloat16. How many pages does it occupy and how big is each?</summary>
+  <p>Padding applies to the last two dimensions of each slice, before the outer dimensions are folded into the height. So 7 rounds up to 32 and 50 to 64, giving <code>padded_shape [2, 32, 64]</code>, which is stored as a 64×64 2D buffer: 2×2 = 4 tiles, 4 pages of 2048 B. Only 700 of 4096 stored values are data. On ttsim: <code>Shape([2, 7, 50]) Shape([2, 32, 64]) 4 2048</code>. A tempting wrong answer is to fold first (14 rows → 32), giving 2 pages; padding is per slice.</p></details>
+  <details class="quiz"><summary>You pass <code>program_config=pc</code> to a bfloat16 matmul and its PCC drops from 0.99998 to 0.99989. You did not touch fidelity. What happened, and what is the fix?</summary>
+  <p>In <code>matmul_device_operation.cpp</code> the default fidelity is HiFi2 only if there is no program config, no core grid and not two block-float inputs; otherwise LoFi. Your program config lowered the fidelity. Pass a <code>compute_kernel_config</code> with the fidelity (and <code>packer_l1_acc</code>) you want. Our run went from 0.3181 to 0.1079 mean error with HiFi2.</p></details>
+  <details class="quiz"><summary>Why does bfloat4_b give the same matmul result at LoFi and HiFi2, while bfloat8_b does not?</summary>
+  <p>In a matmul, in1 (the weights) is unpacked into SrcA, whose multiplier input is 5 bits per phase (A06, A15). A bfp4 value has at most 3 significant bits, so phase 0 already sees all of it; HiFi2's second phase multiplies SrcA's low slice, which is zero. A bfp8 value has up to 7 significant bits, so phase 0 drops the bottom two and LoFi's error is roughly doubled.</p></details>
+  <details class="quiz"><summary>A 128×128 tensor is block-sharded on a 2×2 grid with ROW_MAJOR orientation. Which core holds tile 6 (row 1, column 2 of the 4×4 tiles)?</summary>
+  <p>The shard is 64×64 = 2×2 tiles. Tile row 1 is in block row 0; tile column 2 is in block column 1. Block (r=0, c=1) goes to core (x=1, y=0), which is <code>[0-0 - 1-1]</code>'s top-right core.</p></details>
+  <details class="quiz"><summary>The second identical <code>ttnn.add</code> took 0.01 s instead of 1.13 s. Which steps were skipped, and what would make the next call slow again?</summary>
+  <p>The program-cache lookup hit, so the program factory (kernel selection, CB sizing, work split) and the JIT build were skipped; only runtime arguments such as buffer addresses were patched before the program was enqueued. Changing anything that enters the cache key, such as a shape, dtype, layout or memory config, gives a new key and a new program. A new kernel binary would only be compiled if the kernel cache did not already hold one for those compile-time arguments.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/index.html">TT-NN documentation</a>: the official user guide and API reference.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html">TT-NN: Tensor</a>: the official description of shape, layout, dtype and storage.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/converting_torch_model_to_ttnn.html">Converting a PyTorch model to TT-NN</a>: the official porting walkthrough, with parameter preprocessing.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_layouts/tensor_layouts.md">Tensor and memory layouts</a>: tech report on pages, tiles, faces and interleaving.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_sharding/tensor_sharding.md">Tensor sharding</a>: tech report on height, width, block and ND sharding, with code.</li>
+    <li><a href="https://supermina999.github.io/sharding-visual/">Sharding visualizer</a>: an interactive tool that draws any shard spec over a core grid.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/data_formats/data_formats.md">Data formats</a>: tech report on bfloat16, bfloat8_b and bfloat4_b, including rounding.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/matrix_engine/matrix_engine.md">Matrix engine</a>: tech report on fidelity phases and Dst accumulation.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">LLMs on Tenstorrent</a>: tech report covering sharded activations, program configs, precision choices and PCC targets in real models.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md">Advanced performance optimizations for models</a>: tech report on metal trace and multiple command queues, the next steps after this chapter.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/ttnn/tutorials/basic_python/ttnn_add_tensors.py">ttnn_add_tensors.py</a>: the minimal official TT-NN tutorial script.</li>
+  </ul>
+
+  <div class="pager"><a href="a17-dispatch-host.html">&larr; 17 Dispatch, command queues and the host</a><a class="next" href="a19-op-anatomy-compilers.html">19 How an op is built, and the compiler stack &rarr;</a></div>
+</main>
+</body>
+</html>
