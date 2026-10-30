@@ -1,0 +1,23 @@
+diff -ru -x _out -x .git -x __pycache__ a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tile.cpp	2026-10-30 08:45:38.399526883 +0000
+@@ -2031,6 +2031,19 @@
+                 eth_set_busy(&g_e_tiles[remote_tile_id]);
+                 memcpy(&g_e_tiles[remote_tile_id].sram[dest_addr], &p_tile->sram[start_addr], size_bytes);
+                 ttsim_select_chip(saved_chip_id);
++                { // A21 instrumentation: log Ethernet packet sends
++                    static uint64_t n_pkts[2], n_bytes[2];
++                    static struct Summary { ~Summary() { for (int c = 0; c < 2; c++)
++                        ttsim_printf("ETH summary: chip%d sent %llu packets, %llu bytes\n", c,
++                            (unsigned long long)n_pkts[c], (unsigned long long)n_bytes[c]); } } s_summary;
++                    (void)s_summary;
++                    n_pkts[saved_chip_id & 1]++; n_bytes[saved_chip_id & 1] += size_bytes;
++                    uint64_t n = n_pkts[saved_chip_id & 1];
++                    if (n <= 3 || (n & (n - 1)) == 0)
++                        ttsim_printf("ETH chip%u eth%u -> chip%u eth%u: %u B L1 0x%x -> 0x%x  [pkt #%llu from chip%u, %llu B total]\n",
++                            saved_chip_id, tile_id, remote_chip_id, remote_tile_id, size_bytes, start_addr, dest_addr,
++                            (unsigned long long)n, saved_chip_id, (unsigned long long)n_bytes[saved_chip_id & 1]);
++                }
+                 p_tile->eth_txq_cmd[queue_id] = 0;
+             } else if (data == 4) {
+ #if TT_ARCH_VERSION == 0

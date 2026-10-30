@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A21 · Many chips: Ethernet, meshes and TT-Fabric · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a20-performance.html">&larr; Prev</a>
+  <a href="a22-llm-capstone.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 21</span><span class="tag">Prerequisites: A08, A09, A10, A17, A18</span>
+  <h1><span class="num">21.</span> Many chips: Ethernet, meshes and TT-Fabric</h1>
+  <p class="subtitle">By the end you will know how chips that share no memory cooperate. Each chip has Ethernet cores that push bytes from one chip's SRAM into another's. A fabric routes those pushes across a mesh, and a handful of collective operations, costed in bytes per link, let one model run on 2, 8 or 32 chips.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#why">Why scale out at all</a></li>
+      <li><a href="#eth">The only way off the chip: Ethernet cores</a></li>
+      <li><a href="#systems">From two chips to thirty-two</a></li>
+      <li><a href="#packet">One packet's trip across the link</a></li>
+      <li><a href="#fabric">TT-Fabric: a network stack made of RISC-V cores</a></li>
+      <li><a href="#mesh">MeshDevice, MeshBuffer, MeshWorkload</a></li>
+      <li><a href="#run1">Run it: one buffer on two simulated chips</a></li>
+      <li><a href="#ttnn">Distributed tensors in TT-NN</a></li>
+      <li><a href="#ccl">Collectives: all-gather, reduce-scatter, all-reduce</a></li>
+      <li><a href="#run2">Run it: one step further, and where it stops</a></li>
+      <li><a href="#parallel">Data, tensor and pipeline parallelism on a mesh</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>A Wormhole Galaxy holds 32 chips. No chip can load a byte from another chip's memory. There is no shared address space, no coherent cache and no switch. Tenstorrent's Ethernet guide puts it bluntly: "In a multichip system, there is no concept of shared memory or global addressability across chips for Wormhole or Blackhole" (<code>tech_reports/EthernetMultichip/BasicEthernetGuide.md:188</code>). Yet a 70-billion-parameter model runs across those 32 chips as if they were one device.</p>
+  <p><b>How do 32 chips with no shared memory act as one?</b></p>
+  <p>Inside one chip you have met this problem before. In <a href="a08-noc.html">A08</a> and <a href="a16-multicast-sync.html">A16</a>, Tensix cores had no shared variables either. They cooperated by <i>pushing</i> data into each other's L1 over the NoC and bumping semaphores to say "it's there". Multichip Tenstorrent extends the same idea by one level. A few special cores on each chip push bytes over Ethernet cables into another chip's SRAM. Firmware on those cores forwards packets hop by hop, and a small vocabulary of collective operations turns all of that into "the same tensor, split across 32 chips". This chapter climbs that ladder one rung at a time: wire, packet, fabric, mesh, tensor, collective and parallel model.</p>
+
+  <h2 id="why">Why scale out at all</h2>
+  <p>Start with capacity. A model with 70 billion parameters stored in BF16 needs 70&times;10<sup>9</sup> &times; 2 B = 140 GB just for its weights. An n150 card has 12 GB of GDDR6 (<a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole specifications</a>), so you would need at least twelve chips before computing anything. A Wormhole Galaxy's 32 chips hold 384 GB (<a href="https://tenstorrent.com/hardware/galaxy">Galaxy page</a>).</p>
+  <p>Then speed. <a href="a22-llm-capstone.html">A22</a> shows that generating one token takes roughly as long as reading every weight once from DRAM. If the weights are split over 8 chips, each chip reads only an eighth of them, and all eight DRAM systems stream at once. Splitting the model multiplies the memory bandwidth you can use, not just the capacity. It also introduces a cost that did not exist before: the chips must exchange partial results. All the engineering in this chapter exists to make that exchange cheap.</p>
+
+  <div class="callout key">Scaling out buys capacity and aggregate DRAM bandwidth. You pay for it in bytes that must cross chip-to-chip links, and those links are slower than anything inside a chip. Every multichip design decision is about moving fewer bytes across fewer links.</div>
+
+  <h2 id="eth">The only way off the chip: Ethernet cores</h2>
+  <p>Look again at the Wormhole grid from <a href="a03-chip-tour.html">A03</a>. Besides Tensix, DRAM, PCIe and ARC tiles, there are two rows of <b>Ethernet tiles</b>. The guide describes the core type:</p>
+  <ul>
+    <li>Every Wormhole contains <b>16 Ethernet cores</b> on the NoC (<code>BasicEthernetGuide.md:74</code>).</li>
+    <li>Each one has a <b>single RISC-V processor</b> (called the ERISC), <b>256 KB of L1</b> (about 150 KB of it free for kernels) and an Ethernet subsystem. It has no Tensix compute units (<code>:78-99</code>).</li>
+    <li>Each core connects to 0 or 1 links, and each link runs at a theoretical <b>100 Gbps per direction</b>, which is 12.5 GB/s (<code>:101-105</code>; <code>tech_reports/CCLs/CCL_bandwidth.md:17-20</code>).</li>
+    <li>With all 16 links active a chip has 1,600 Gbps per direction, or 400 GB/s counting both directions (<code>:122</code>).</li>
+  </ul>
+  <p>Blackhole changes the numbers but not the shape. The bring-up guide lists 14 Ethernet cores per chip, each with <b>two RISC-V cores and 512 KB of L1</b> (<code>tech_reports/Blackhole/BlackholeBringUpProgrammingGuide.md:55-56</code>). Each link runs at <b>400 Gbps = 50 GB/s per direction</b> (<code>CCL_bandwidth.md:20</code>).</p>
+  <p>Put these numbers next to the chip's memory. A single Wormhole DRAM channel delivers about 43 GB/s and a link 12.5 GB/s, so they are "of the same order" (<code>CCL_bandwidth.md:84-89</code>). A collective, though, gets only the few links on one axis, while a local op gets the whole memory system. Latency is also real: one Ethernet hop takes 530–620 ns (<code>BasicEthernetGuide.md:313</code>), and a fabric hop measures 711 ns on Wormhole and 515 ns on Blackhole (<code>CCL_bandwidth.md:101-104</code>).</p>
+  <p>What can an Ethernet core do? Only one thing crosses the cable: the ERISC copies a block of its <i>own L1</i> into the <i>L1 of the Ethernet core at the other end of its link</i>. The guide's primitive is <code>eth_send_packet(src, dst, words)</code>. It is non-blocking, and the sender cannot tell on its own when the bytes have landed, so any protocol that reuses a buffer has to build its own acknowledgements (<code>BasicEthernetGuide.md:192-201</code>). ttsim models the primitive at exactly that level:</p>
+
+  <div class="filename">ttsim/src/tile.cpp:2028-2033 @b3620244</div>
+<pre><code>// eth_send_packet (ETH_TXQ_CMD_START_DATA): copy local L1 to the peer eth tile's L1
+uint32_t saved_chip_id = g_current_chip_id;
+ttsim_select_chip(remote_chip_id);
+eth_set_busy(&amp;g_e_tiles[remote_tile_id]);
+memcpy(&amp;g_e_tiles[remote_tile_id].sram[dest_addr], &amp;p_tile-&gt;sram[start_addr], size_bytes);
+ttsim_select_chip(saved_chip_id);</code></pre>
+  <p>The simulator switches to the peer chip, marks the peer's Ethernet tile busy and does a <code>memcpy</code> from this tile's SRAM into the peer tile's SRAM. The peer comes from a static table of cables (<code>remote_chip_id</code>, <code>remote_tile_id</code>, from <code>eth_peer()</code>). There is no wire timing and no packet loss, because ttsim is a functional model. On silicon the same command fragments the payload into Ethernet frames of at most 1500 B, each carrying 50+ B of headers, FEC and CRC (<code>BasicEthernetGuide.md:107-118</code>).</p>
+
+  <div class="callout gpu">On NVLink-connected GPUs, one GPU can load from and store to another GPU's memory, and libraries like NCCL build collectives on top of that. Tenstorrent has no remote loads at all. Every byte that crosses chips is <i>pushed</i> by a small RISC-V core sitting at the cable, into a buffer the receiver agreed to provide. It resembles NCCL's ring kernels, except that the "network card" is a programmable core you can put your own kernel on.</div>
+
+  <div class="callout warn"><b>The sources disagree on several link numbers.</b>
+  <ul>
+    <li><b>Wormhole link speed.</b> The tech reports say 100 Gbps (12.5 GB/s) per link per direction (<code>BasicEthernetGuide.md:105, 159</code>; <code>CCL_bandwidth.md:19</code>). The <a href="https://tenstorrent.com/hardware/galaxy">Galaxy product page</a> lists a system interface of "3.2 Tbps Ethernet (16 x 200Gbps)", which reads like 200 Gbps links. That line describes the box's external ports, though, and the same page's "41.6 Tbps Ethernet Internal Connectivity" is exactly 100 Gbps per link: a 4&times;8 mesh has 52 neighbour pairs &times; 4 links = 208 links, &times; 100 Gbps &times; 2 directions = 41.6 Tbps (my arithmetic).</li>
+    <li><b>Galaxy memory.</b> The same page calls Galaxy's memory "globally addressable", while the Ethernet guide says there is "no concept of shared memory or global addressability". I follow the tech reports, which describe the programming model you actually use.</li>
+    <li><b>Blackhole Ethernet count.</b> Hot Chips 2024 says "10x 400 Gbps" (<a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">slides</a>). The bring-up guide lists 14 Ethernet cores, and ttsim marks 12 of them live, with "eth tiles 12,13 harvested" (<code>ttsim/src/tile.cpp:68</code>). A p150 card exposes 4 QSFP-DD 800G ports (<a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole specifications</a>), which is 3.2 Tbps, the equivalent of 8 links at 400 Gbps (my arithmetic).</li>
+    <li><b>Blackhole Galaxy I/O.</b> The TT-Fabric spec says 11.5 TB/s (<code>TT-Fabric-Architecture.md:104</code>) and the Hot Chips slide says 11.2 TB/s.</li>
+  </ul></div>
+
+  <h2 id="systems">From two chips to thirty-two</h2>
+  <p>Chips come wired together in a few standard products. A <b>cluster descriptor</b> YAML file tells the software which chip's Ethernet channel connects to which, and which chips have a PCIe connection to the host (<code>BasicEthernetGuide.md:140-145</code>). The smallest system is the n300 card. Here is its descriptor in full, as UMD ships it for testing:</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml:11-18 @7aad8aac</div>
+<pre><code>ethernet_connections: [
+   [{chip: 0, chan: 8}, {chip: 1, chan: 0}],
+   [{chip: 0, chan: 9}, {chip: 1, chan: 1}],
+]
+
+chips_with_mmio: [
+   0: 0,
+]</code></pre>
+  <p>Two cables connect chip 0's Ethernet channels 8 and 9 to chip 1's channels 0 and 1. Only chip 0 is "MMIO", meaning reachable over PCIe. The guide spells out the consequence: the right-hand chip "is only accessible through ethernet via the first, local chip", and the dispatcher "reserves one of the links for its own use", so user kernels get 100 of the 200 Gbps per direction (<code>BasicEthernetGuide.md:155-159</code>). Wormhole's spec sheet agrees on the 200G internal chip-to-chip connection. Pick a system below.</p>
+
+  <div class="viz" id="fig-sys"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-sys"), C = TT.C;
+    var g = TT.canvas(root, 800, 360), ctx = g.ctx;
+    var bar = document.createElement("div"); bar.className = "controls"; root.appendChild(bar);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    // Layouts. ids: chip numbers as wired; mmio: host-attached chips; links: cables per neighbour pair.
+    var S = {
+      n300: { name: "n300 (Wormhole)", rows: 1, cols: 2, ids: [[0, 1]], mmio: [0], links: 2, torus: false, arch: "WH",
+        text: "<b>n300:</b> one board, 2 Wormhole chips, <b>2 links</b> between them (chip0 ch8,9 &harr; chip1 ch0,1). Only chip 0 is on PCIe. One link is reserved for dispatch to chip 1, leaving 100 Gbps per direction for user kernels (<code>BasicEthernetGuide.md:155-159</code>). ttsim's <code>wh_x2</code> uses the same table (<code>topology.h:17-19</code>)." },
+      t3k: { name: "T3000 / QuietBox (Wormhole)", rows: 2, cols: 4, ids: [[4, 0, 2, 6], [5, 1, 3, 7]], mmio: [0, 1, 2, 3], links: 2, torus: false, arch: "WH",
+        cards: [[0, 4], [1, 5], [2, 6], [3, 7]],
+        text: "<b>T3000:</b> four n300 cards cabled into a <b>2&times;4 mesh</b> (8 chips). Chips 0&ndash;3 (one per card) are on PCIe, and 4&ndash;7 are reached through them. Every neighbour pair has <b>2 links</b>. Chip placement follows ttsim's T3000 peer table (<code>topology.h:20-31</code>). Dashed outlines mark the n300 boards." },
+      whg: { name: "Galaxy (Wormhole)", rows: 4, cols: 8, mmio: "all", links: 4, torus: true, arch: "WH",
+        text: "<b>Wormhole Galaxy:</b> <b>32 chips</b> in a 4&times;8 grid with <b>4 links</b> per neighbour pair, so an interior chip uses all 16 of its links (<code>BasicEthernetGuide.md:173</code>; <code>Programming_Mesh_of_Devices_with_TT-NN.md:84</code>). The guide describes a mesh whose edge chips have spare links that can close it into a torus. ttsim's <code>wh_x32</code> is the 6U variant: an 8&times;4 torus, all chips on PCIe (<code>topology.h:32</code>). Dashed arcs show the torus wrap." },
+      p300: { name: "p300 (Blackhole)", rows: 1, cols: 2, ids: [[0, 1]], mmio: [0, 1], links: 2, torus: false, arch: "BH",
+        text: "<b>p300:</b> 2 Blackhole chips with <b>2 links</b> (chip0 ch2,3 &harr; chip1 ch9,8), each at 400 Gbps per direction. ttsim's <code>bh_x2</code> table (<code>topology.h:100-102</code>) pairs with UMD's <code>blackhole_P300_both_mmio.yaml</code>, where both chips are on PCIe." },
+      bhg: { name: "Galaxy (Blackhole)", rows: 4, cols: 8, mmio: "all", links: 2, torus: true, arch: "BH",
+        text: "<b>Blackhole Galaxy:</b> 32 chips, 4&times;8 (Hot Chips 2024 slide) or 8&times;4 torus (ttsim <code>bh_x32</code>, <code>topology.h:119</code>). There are <b>2 links</b> per neighbour pair at 50 GB/s each per direction. The TT-Fabric spec says Blackhole has 2 links per direction, plus possibly 2 more for a third (Z) dimension (<code>TT-Fabric-Architecture.md:388</code>)." }
+    };
+    var cur = "n300";
+    function draw() {
+      var s = S[cur];
+      TT.clear(ctx, g.W, g.H);
+      var cw = s.cols <= 2 ? 150 : (s.cols <= 4 ? 120 : 70), ch = s.rows <= 2 ? 70 : 46;
+      var gapx = s.cols <= 2 ? 170 : (s.cols <= 4 ? 60 : 22), gapy = s.rows <= 2 ? 70 : 26;
+      var totw = s.cols * cw + (s.cols - 1) * gapx, toth = s.rows * ch + (s.rows - 1) * gapy;
+      var x0 = (800 - totw) / 2, y0 = 40 + (270 - toth) / 2;
+      function pos(r, c) { return { x: x0 + c * (cw + gapx), y: y0 + r * (ch + gapy) }; }
+      function id(r, c) { return s.ids ? s.ids[r][c] : r * s.cols + c; }
+      function isM(n) { return s.mmio === "all" || s.mmio.indexOf(n) >= 0; }
+      TT.text(ctx, s.name + "  ·  " + (s.rows * s.cols) + " chips  ·  " + s.links + " links per neighbour pair  ·  " +
+        (s.arch === "WH" ? "12.5" : "50") + " GB/s per link per direction", 400, 18, { align: "center", color: C.yellow, font: "14px" });
+      // links
+      function link(a, b, horiz) {
+        var n = s.links, sp = horiz ? Math.min(8, ch / (n + 1)) : Math.min(8, cw / (n + 1));
+        for (var k = 0; k < n; k++) {
+          var off = (k - (n - 1) / 2) * sp;
+          ctx.strokeStyle = C.teal; ctx.lineWidth = 1.5; ctx.beginPath();
+          if (horiz) { ctx.moveTo(a.x + cw, a.y + ch / 2 + off); ctx.lineTo(b.x, b.y + ch / 2 + off); }
+          else { ctx.moveTo(a.x + cw / 2 + off, a.y + ch); ctx.lineTo(b.x + cw / 2 + off, b.y); }
+          ctx.stroke();
+        }
+      }
+      for (var r = 0; r < s.rows; r++) for (var c = 0; c < s.cols; c++) {
+        if (c + 1 < s.cols) link(pos(r, c), pos(r, c + 1), true);
+        if (r + 1 < s.rows) link(pos(r, c), pos(r + 1, c), false);
+      }
+      if (s.torus) {
+        ctx.setLineDash([4, 4]); ctx.strokeStyle = C.muted; ctx.lineWidth = 1.2;
+        for (var r2 = 0; r2 < s.rows; r2++) {
+          var a = pos(r2, 0), b = pos(r2, s.cols - 1);
+          ctx.beginPath(); ctx.moveTo(a.x, a.y + ch / 2); ctx.lineTo(a.x - 10, a.y + ch / 2);
+          ctx.moveTo(b.x + cw, b.y + ch / 2); ctx.lineTo(b.x + cw + 10, b.y + ch / 2); ctx.stroke();
+        }
+        for (var c2 = 0; c2 < s.cols; c2++) {
+          var t0 = pos(0, c2), t1 = pos(s.rows - 1, c2);
+          ctx.beginPath(); ctx.moveTo(t0.x + cw / 2, t0.y); ctx.lineTo(t0.x + cw / 2, t0.y - 8);
+          ctx.moveTo(t1.x + cw / 2, t1.y + ch); ctx.lineTo(t1.x + cw / 2, t1.y + ch + 8); ctx.stroke();
+        }
+        ctx.setLineDash([]);
+        TT.text(ctx, "dashed stubs = torus wrap-around links (6U / ttsim variant)", 400, 335, { align: "center", color: C.muted, font: "12px" });
+      }
+      if (s.cards) {
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = C.purple; ctx.lineWidth = 1.2;
+        s.cards.forEach(function (pr) {
+          var pa = null, pb = null;
+          for (var r3 = 0; r3 < s.rows; r3++) for (var c3 = 0; c3 < s.cols; c3++) {
+            if (id(r3, c3) === pr[0]) pa = pos(r3, c3); if (id(r3, c3) === pr[1]) pb = pos(r3, c3);
+          }
+          var lx = Math.min(pa.x, pb.x) - 6, rx = Math.max(pa.x, pb.x) + cw + 6;
+          ctx.beginPath(); ctx.rect(lx, pa.y - 6, rx - lx, ch + 12); ctx.stroke();
+        });
+        ctx.setLineDash([]);
+        TT.text(ctx, "purple dashed = one n300 board (internal 2-link connection)", 400, 335, { align: "center", color: C.purple, font: "12px" });
+      }
+      for (var r4 = 0; r4 < s.rows; r4++) for (var c4 = 0; c4 < s.cols; c4++) {
+        var p = pos(r4, c4), n = id(r4, c4), m = isM(n);
+        TT.box(ctx, p.x, p.y, cw, ch, { fill: s.arch === "WH" ? C.blue : C.orange, alpha: 0.22, stroke: s.arch === "WH" ? C.blue : C.orange,
+          label: (cw > 80 ? "chip " : "") + n, font: cw > 80 ? "15px" : "12px" });
+        if (m && (s.mmio !== "all" || cw > 80)) TT.text(ctx, "PCIe", p.x + cw - 4, p.y + 10, { align: "right", color: C.yellow, font: "11px" });
+      }
+      if (s.mmio === "all" && s.rows > 2) TT.text(ctx, "every chip host-attached in this variant", 400, 352, { align: "center", color: C.yellow, font: "12px" });
+      if (cur === "n300") TT.text(ctx, "1 of the 2 links reserved for dispatch to chip 1", 400, 300, { align: "center", color: C.muted, font: "13px" });
+      narr.innerHTML = s.text;
+      Array.prototype.forEach.call(bar.children, function (b) { b.classList.toggle("on", b.dataset.k === cur); });
+    }
+    Object.keys(S).forEach(function (k) {
+      var b = document.createElement("button"); b.textContent = S[k].name; b.dataset.k = k;
+      b.onclick = function () { cur = k; draw(); }; bar.appendChild(b);
+    });
+    draw();
+  })();
+  </script>
+
+  <p>Read the figure as a set of rules that the rest of the chapter relies on:</p>
+  <ul>
+    <li><b>Links come in bundles.</b> Neighbouring chips are joined by 2 (n300, T3000, Blackhole) or 4 (Wormhole Galaxy) parallel links. A transfer can use one link or spread over several.</li>
+    <li><b>Not every chip sees the host.</b> On n300 and T3000, half the chips are reached only by tunnelling through a PCIe-attached chip's Ethernet cores. That tunnel costs a link: "every device on the tunnel (the host-attached one included) reserves one routing plane per direction for dispatch. Where every device is host-attached, nothing is reserved" (<code>CCL_bandwidth.md:52</code>).</li>
+    <li><b>Topology is a choice of cabling.</b> The same Wormhole chips form a line, a ring, a 2D mesh or a torus depending on how the cables are plugged (<code>BasicEthernetGuide.md:134-138</code>).</li>
+  </ul>
+
+  <div class="callout warn"><b>"Channel" means three different things in this chapter.</b> An <i>Ethernet channel</i> is the index of an Ethernet core on a chip (<code>chan: 8</code> above). An <i>EDM or fabric channel</i> is a ring of buffer slots in an Ethernet core's L1 (next section). A <i>host channel</i>, in the fast-dispatch error you will meet later, is a region of host memory used by a command queue. In the same spirit, a <i>link</i> is one cable lane between two Ethernet cores, while a <i>routing plane</i> is the set of links with the same index across all chips.</div>
+
+  <h2 id="packet">One packet's trip across the link</h2>
+  <p>Suppose a Tensix core on chip A wants to write 4 KB into a core on chip C, two hops away. It cannot reach C's NoC. It also cannot use the Ethernet hardware directly, because only an ERISC can send. So the worker hands the data to a <b>forwarding service</b> that runs on the Ethernet cores. tt-metal calls that service the <b>Erisc Data Mover (EDM)</b>, and it is the building block of TT-Fabric. The comment at the top of the router kernel describes it:</p>
+
+  <div class="filename">tt-metal/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp:61-82 @7aad8aac (trimmed)</div>
+<pre><code>The fabric Erisc Data Mover (EDM) is a component that can be used to build *very* simple linear topology fabrics.
+One of these EDMs can be instantiated on each ethernet link. ...
+There are two sender channels and one receiver channel. "Sender" and "receiver" are relative to the Ethernet link,
+not the chip. Sender sends over the link and receiver receives from the link.
+- Sender channel 0 : Accepts packets from a workers on the local chip
+- Sender channel 1: accepts packets from an upstream EDM (i.e. an upstream
+  EDM receiver channel on the same chip but different core)
+The receiver channel accepts packets from the Ethernet link and can do one (or both) of:
+- Write the packet to local chip if it is the intended destination (unicast or mcast)
+- Forward the packet to the next chip in the line if:
+  - Unicast and not the target chip
+  - Multicast and this chip is in the multicast target range</code></pre>
+  <p>So each ERISC is a tiny store-and-forward switch with three queues in its L1. One queue holds traffic from local workers, one holds pass-through traffic from the neighbouring EDM, and one receives from the cable. The TT-Fabric spec draws the 1D version with <b>8 slots per sender channel and 16 in the receiver channel</b> (<code>TT-Fabric-Architecture.md:674-700</code>). Slot counts actually depend on L1 and on the configured packet size (<code>CCL_bandwidth.md:42</code>), so treat 8 and 16 as an example. Step through one packet's trip:</p>
+
+  <div class="viz" id="fig-eth"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-eth"), C = TT.C;
+    var g = TT.canvas(root, 800, 400), ctx = g.ctx;
+    // Geometry: three chips; Ethernet cores at the facing edges.
+    var chips = [{ x: 15, n: "chip A" }, { x: 285, n: "chip B" }, { x: 555, n: "chip C" }], CW = 230, CY = 40, CH = 290;
+    var EW = 74, EH = 150, EY = 95;
+    // Ethernet core boxes: A-east, B-west, B-east, C-west
+    var E = { Ae: { x: 15 + CW - EW - 4, lab: "ERISC (A, east)" }, Bw: { x: 285 + 4, lab: "ERISC (B, west)" },
+              Be: { x: 285 + CW - EW - 4, lab: "ERISC (B, east)" }, Cw: { x: 555 + 4, lab: "ERISC (C, west)" } };
+    var W = { x: 40, y: 200 }, D = { x: 680, y: 200 };
+    function slot(core, ch, k) { // ch: "s0","s1","rx"
+      var e = E[core], sx = e.x + 5, sw = 8;
+      if (ch === "s0") return { x: sx + k * sw, y: EY + 26, w: sw - 1, h: 12 };
+      if (ch === "s1") return { x: sx + k * sw, y: EY + 58, w: sw - 1, h: 12 };
+      var row = Math.floor(k / 8); return { x: sx + (k % 8) * sw, y: EY + 92 + row * 16, w: sw - 1, h: 12 };
+    }
+    function drawCore(key, occ) {
+      var e = E[key];
+      TT.box(ctx, e.x, EY, EW, EH, { fill: C.teal, alpha: 0.12, stroke: C.teal });
+      TT.text(ctx, e.lab, e.x + EW / 2, EY - 9, { align: "center", font: "11px", color: C.teal });
+      TT.text(ctx, "sender ch 0", e.x + 5, EY + 17, { font: "10px", color: C.muted });
+      TT.text(ctx, "sender ch 1", e.x + 5, EY + 49, { font: "10px", color: C.muted });
+      TT.text(ctx, "receiver ch", e.x + 5, EY + 83, { font: "10px", color: C.muted });
+      for (var k = 0; k < 8; k++) { var a = slot(key, "s0", k), b = slot(key, "s1", k); ctx.strokeStyle = C.border; ctx.strokeRect(a.x, a.y, a.w, a.h); ctx.strokeRect(b.x, b.y, b.w, b.h); }
+      for (var j = 0; j < 16; j++) { var r = slot(key, "rx", j); ctx.strokeStyle = C.border; ctx.strokeRect(r.x, r.y, r.w, r.h); }
+      (occ[key] || []).forEach(function (o) { var s = slot(key, o[0], o[1]); ctx.fillStyle = C.yellow; ctx.fillRect(s.x, s.y, s.w, s.h); });
+    }
+    function pkt(x, y, lbl) {
+      ctx.fillStyle = C.orange; ctx.fillRect(x - 15, y - 7, 6, 14);
+      ctx.fillStyle = C.blue; ctx.fillRect(x - 9, y - 7, 24, 14);
+      if (lbl) TT.text(ctx, lbl, x, y - 16, { align: "center", font: "11px", color: C.fg });
+    }
+    function centre(s) { return { x: s.x + s.w / 2, y: s.y + s.h / 2 }; }
+    function path(pts, t) { // piecewise-linear interpolation
+      var L = [], tot = 0; for (var i = 1; i < pts.length; i++) { var d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y); L.push(d); tot += d; }
+      var want = t * tot; for (var k = 0; k < L.length; k++) { if (want <= L[k] || k === L.length - 1) { var u = L[k] ? Math.min(1, want / L[k]) : 1; return { x: TT.lerp(pts[k].x, pts[k + 1].x, u), y: TT.lerp(pts[k].y, pts[k + 1].y, u) }; } want -= L[k]; }
+      return pts[pts.length - 1];
+    }
+    var pW = { x: W.x + 40, y: W.y - 14 }, pD = { x: D.x + 40, y: D.y - 14 };
+    var sA0 = centre(slot("Ae", "s0", 0)), rB = centre(slot("Bw", "rx", 0)), sB1 = centre(slot("Be", "s1", 0)), rC = centre(slot("Cw", "rx", 0));
+    var NOCY = 280;
+    // Per step: packet path, slot occupancy after step, credit arrows
+    var steps = [
+      { dur: 1.0, text: "<b>Setup.</b> Chips A, B and C sit in a line, joined by Ethernet cables between the facing ERISC cores. Worker <b>W</b> on chip A wants to write 4,352 bytes (four bfloat8_b tiles, the default fabric payload) into the L1 of core <b>D</b> on chip C. W's NoC ends at chip A's edge.",
+        path: [pW], occ: {} },
+      { dur: 1.6, text: "<b>1. Worker &rarr; local EDM, over the NoC.</b> W builds a packet: a 48-byte fabric header (1D routing: hop count, destination address in D's L1) in front of the payload (<code>CCL_bandwidth.md:28</code>). It checks that a slot is free in sender channel 0, then NoC-writes the packet into that slot of A's east ERISC and bumps the EDM's write pointer. This is ordinary on-chip NoC traffic, as in A08.",
+        path: [pW, { x: pW.x, y: NOCY }, { x: sA0.x, y: NOCY }, sA0], occ: { Ae: [["s0", 0]] } },
+      { dur: 1.8, text: "<b>2. Across the cable.</b> A's ERISC calls <code>eth_send_packet</code>, and the slot's bytes appear in a receiver-channel slot in B's west ERISC L1. On silicon, 4,400 B become 3 Ethernet frames (at most 1500 B each, about 50 B of overhead per frame). That is 4,352 / (4,400 + 150) &asymp; <b>96% efficiency</b>, about 0.36 &micro;s of wire time at 12.5 GB/s. In TT-link mode the Ethernet controller also adds a 16-byte header and retransmits lost frames (go-back-N). In ttsim, this whole step is the <code>memcpy</code> shown earlier.",
+        path: [sA0, { x: sA0.x + 40, y: sA0.y }, { x: rB.x - 40, y: rB.y }, rB], occ: { Bw: [["rx", 0]] } },
+      { dur: 1.8, text: "<b>3. Not for me: pass it through.</b> B's west ERISC reads the header. The destination is further down the line, so it NoC-writes the packet into <b>sender channel 1</b> of B's east ERISC (the pass-through queue). It then frees its receiver slot and returns a <b>credit</b> to A (green), so A may reuse that slot. Without credits, a fast sender would overwrite a slot the receiver had not drained yet.",
+        path: [rB, { x: rB.x, y: NOCY }, { x: sB1.x, y: NOCY }, sB1], occ: { Be: [["s1", 0]] }, credit: ["Bw", "Ae"] },
+      { dur: 1.8, text: "<b>4. Second hop.</b> B's east ERISC round-robins between its two sender channels: local traffic (ch 0) and pass-through (ch 1). It sends our packet over the second cable into C's west ERISC receiver channel. Each hop adds roughly 0.7 &micro;s of latency on Wormhole (711 ns measured, <code>CCL_bandwidth.md:103</code>).",
+        path: [sB1, { x: sB1.x + 40, y: sB1.y }, { x: rC.x - 40, y: rC.y }, rC], occ: { Cw: [["rx", 0]] } },
+      { dur: 1.8, text: "<b>5. Delivered.</b> C's ERISC sees that the packet is for its own chip. The header's NoC command says where: it NoC-writes the payload into D's L1 at the address carried in the header. If the packet asked for one, it also increments a semaphore at D so D's kernel knows the data arrived. The receiver slot is freed and a credit goes back to B.",
+        path: [rC, { x: rC.x, y: NOCY }, { x: pD.x, y: NOCY }, pD], occ: {}, credit: ["Cw", "Be"], sem: true },
+      { dur: 1.0, text: "<b>What just happened.</b> No chip ever <i>read</i> another chip's memory. The bytes were pushed five times, L1 to L1: W&rarr;A's ERISC over the NoC, across a cable, B west&rarr;B east over the NoC, across a cable, then C's ERISC&rarr;D over the NoC. Each push needs a free slot, and freed slots flow back as credits. This is the same producer/consumer handshake as a circular buffer (A11), stretched across chips.",
+        path: [pD], occ: {}, sem: true }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        chips.forEach(function (c) { TT.box(ctx, c.x, CY, CW, CH, { stroke: C.border, fill: C.bg2, alpha: 0.6 }); TT.text(ctx, c.n, c.x + 8, CY + 14, { color: C.muted, font: "12px" }); });
+        // cables
+        [["Ae", "Bw"], ["Be", "Cw"]].forEach(function (p) { var a = E[p[0]], b = E[p[1]]; ctx.strokeStyle = C.yellow; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(a.x + EW, EY + EH / 2); ctx.lineTo(b.x, EY + EH / 2); ctx.stroke();
+          TT.text(ctx, "Ethernet", (a.x + EW + b.x) / 2, EY + EH / 2 + 14, { align: "center", font: "10px", color: C.yellow }); });
+        // NoC lines
+        chips.forEach(function (c) { ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(c.x + 10, NOCY); ctx.lineTo(c.x + CW - 10, NOCY); ctx.stroke(); ctx.setLineDash([]);
+          TT.text(ctx, "NoC", c.x + 12, NOCY + 12, { font: "10px", color: C.muted }); });
+        TT.box(ctx, W.x, W.y, 80, 40, { fill: C.blue, alpha: 0.2, stroke: C.blue, label: "worker W", font: "12px" });
+        TT.box(ctx, D.x, D.y, 80, 40, { fill: C.green, alpha: 0.2, stroke: C.green, label: "core D", font: "12px" });
+        var st = steps[i], occ = t >= 1 ? st.occ : (i > 0 ? steps[i - 1].occ : {});
+        Object.keys(E).forEach(function (k) { drawCore(k, occ); });
+        var p = path(st.path.length > 1 ? st.path : [st.path[0], st.path[0]], t);
+        pkt(p.x, p.y, i === 0 ? "48 B hdr + 4,352 B" : "");
+        if (st.credit && t > 0.5) { var a = E[st.credit[0]], b = E[st.credit[1]]; var u = (t - 0.5) * 2;
+          var cx = TT.lerp(a.x, b.x + EW, u), cy = EY + EH + 12; ctx.fillStyle = C.green; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7); ctx.fill();
+          TT.text(ctx, "credit", cx, cy + 14, { align: "center", font: "10px", color: C.green }); }
+        if (st.sem && t >= 1) TT.text(ctx, "semaphore +1", D.x + 40, D.y + 54, { align: "center", font: "12px", color: C.green });
+        // legend
+        ctx.fillStyle = C.orange; ctx.fillRect(20, 368, 10, 12); TT.text(ctx, "fabric header", 36, 374, { font: "12px", color: C.muted });
+        ctx.fillStyle = C.blue; ctx.fillRect(140, 368, 10, 12); TT.text(ctx, "payload", 156, 374, { font: "12px", color: C.muted });
+        ctx.fillStyle = C.yellow; ctx.fillRect(230, 368, 10, 12); TT.text(ctx, "occupied slot (8 per sender ch, 16 in receiver ch, as drawn in the TT-Fabric spec)", 246, 374, { font: "12px", color: C.muted });
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout key">An Ethernet core is a store-and-forward switch built from a RISC-V core and some L1. Workers hand it packets over the NoC, it pushes them L1&rarr;L1 across a cable, and credits flowing back keep every buffer from overflowing. Multi-hop traffic is just this, repeated.</div>
+
+  <h2 id="fabric">TT-Fabric: a network stack made of RISC-V cores</h2>
+  <p>Point-to-point EDMs were enough for the first collectives, but each operation had to set up its own routes and handshakes, which is fragile. The guide lists the traps: kernels on two chips start at different times, so the far side may still be reading a buffer from the previous op (<code>BasicEthernetGuide.md:357-375</code>). <b>TT-Fabric</b> generalises the EDM into a persistent, layered network. The spec maps it onto the OSI picture (<code>TT-Fabric-Architecture.md:169-416</code>):</p>
+  <table>
+    <tr><th>Layer</th><th>What TT-Fabric does there</th></tr>
+    <tr><td>1–2 (hardware)</td><td>Ethernet MAC/PHY. In <b>TT-link mode</b> the controller adds a 16-byte header, delivers straight into the receiver's L1 at an address from that header, and runs <b>go-back-N</b> retransmission, so upper layers "never see data loss due to ethernet frame CRC errors" (<code>:183-196</code>).</td></tr>
+    <tr><td>3 TT-routing</td><td>Devices are addressed by (MeshId, DeviceId). <b>Within a mesh, packets are source-routed</b>: the sender embeds the hop-by-hop route in the header. The design supports up to 1024 meshes of 256 devices (<code>:207-220</code>). Routes are dimension-ordered to avoid deadlock (<code>:878-907</code>).</td></tr>
+    <tr><td>4 TT-transport</td><td>Virtual channels made of sender/receiver buffers. Ring and torus topologies use <b>bubble flow control</b> to avoid cyclic deadlock, and a separate control VC carries control messages (<code>:394-410</code>).</td></tr>
+    <tr><td>5 TT-session</td><td>The API kernels call. A packet carries "the complete destination memory address where the data must be written"; flow-controlled sockets are built on top (<code>:412-416</code>).</td></tr>
+  </table>
+  <p>Two structural ideas matter for performance.</p>
+  <p><b>Routing planes.</b> Wormhole has 4 Ethernet links in each of the east, west, north and south directions, and Blackhole has 2. TT-Fabric maps them one to one: "the first ethernet port on any edge only routes over first ethernet port of the other edges". This yields 4 (Wormhole) or 2 (Blackhole) independent copies of the network, called routing planes. Traffic stays deterministic, and a collective can use several planes in parallel (<code>TT-Fabric-Architecture.md:386-392</code>). The <code>num_links</code> knob you will meet in older CCL code "selects routing planes per direction", and "the weakest hop sets it for the whole collective" (<code>CCL_bandwidth.md:50</code>).</p>
+  <p><b>Data plane vs control plane.</b> The NoC plus Ethernet carry the data. PCIe is the control plane that launches routers, configures routing tables and collects status such as link-down events and dropped packets (<code>TT-Fabric-Architecture.md:127-157</code>). On Wormhole the single ERISC runs the whole router. On Blackhole the router's work is split across the Ethernet core's two RISC-V cores (<code>:422</code>).</p>
+  <p>There is also an older, smaller network underneath. Every Wormhole ERISC boots with <b>base routing firmware</b> from the board's SPI flash. Its job is to let the <i>host</i> reach chips that are not on PCIe, and it is "used by the 'Slow Dispatch' dispatcher path and is further used to bootstrap more higher level components, such as Fast Dispatch" (<code>BasicEthernetGuide.md:180-182</code>). Keep that in mind: it is exactly the path our simulator runs use to reach the second chip, and also where the all-gather attempt breaks.</p>
+
+  <h2 id="mesh">MeshDevice, MeshBuffer, MeshWorkload</h2>
+  <p>Now go up to the host API. Since <a href="a10-first-program.html">A10</a> you have used <code>MeshDevice::create_unit_mesh(0)</code>, a 1&times;1 mesh. The "mesh" was never decoration. At this commit TT-Metalium <i>only</i> has the mesh API, and a single chip is the degenerate case. TT-Distributed's design document states the goal: present a multi-device system as "1) a large virtual device that has, 2) a distributed shared memory space, and 3) a set of programmable Tensix cores" (<code>tech_reports/TT-Distributed/TT-Distributed-Architecture-1219.md:70</code>). The "shared memory space" here is a host-side abstraction. Moving data between chips still requires the Ethernet pushes described above.</p>
+  <p>Three objects carry the idea:</p>
+  <ul>
+    <li><b>MeshDevice</b>: a logical 2D grid of chips, such as <code>MeshShape(2, 4)</code>, with one command queue that "coordinate[s] execution across all devices, ensuring lock-step parallel execution" (<code>Programming_Mesh_of_Devices_with_TT-NN.md:46, 62</code>).</li>
+    <li><b>MeshBuffer</b>: one allocation across every chip. The allocator lives at mesh scope and does <b>lock-step allocation</b>, so a buffer has the <i>same address on every chip</i> (<code>TT-Distributed-Architecture-1219.md:184</code>). It is either <b>replicated</b> (each chip gets a full copy) or <b>sharded</b> (each chip gets a piece).</li>
+    <li><b>MeshWorkload</b>: a set of Programs, each bound to a range of mesh coordinates. The same program can run everywhere (SPMD), or different programs can run on different sub-grids.</li>
+  </ul>
+  <p>Lock-step allocation sounds like a minor convenience, but collectives depend on it. If the output buffer sits at address X on every chip, a kernel on chip 3 can write "to address X on my neighbour" without ever asking the neighbour. The all-gather kernel you will see below relies on exactly this. Launching a program on a whole mesh looks like single-chip code with one extra object:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/distributed/1_distributed_program_dispatch/distributed_program_dispatch.cpp:36-45 @7aad8aac</div>
+<pre><code>// Instantiate a MeshWorkload and attach the example program. We'll broadcast
+// this program by enqueueing it across all devices in our 2x4 mesh.
+auto mesh_workload = MeshWorkload();
+auto target_devices = MeshCoordinateRange(mesh_device-&gt;shape());
+
+mesh_workload.add_program(target_devices, std::move(example_program));
+EnqueueMeshWorkload(cq, mesh_workload, false /* blocking */);
+
+// Synchronize the mesh command queue to ensure the workload has completed.
+Finish(cq);</code></pre>
+  <p><code>MeshCoordinateRange(mesh_device-&gt;shape())</code> means "every chip". A smaller range would target a sub-mesh, and a second <code>add_program</code> call could put a different program on the rest. A sharded MeshBuffer is described by a global shape and a shard shape:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/mesh_buffer.hpp:51-64 @7aad8aac (trimmed)</div>
+<pre><code>// Specifies sharded MeshBuffer.
+// Write APIs for sharded buffers will split the data so that each device in the virtual mesh will only get a fraction
+// of the data.
+struct ShardedBufferConfig {
+    // Global buffer size. Each device will get a fraction of this size.
+    DeviceAddr global_size = 0;
+    // Global shape of the buffer; at metal-level, we expect the shape to be aligned with the mesh shape.
+    Shape2D global_buffer_shape = {0, 0};
+    // Shard shape, sent to each device.
+    Shape2D shard_shape = {0, 0};</code></pre>
+
+  <h2 id="run1">Run it: one buffer on two simulated chips</h2>
+  <p>ttsim ships multichip builds: <code>wh_x2</code> (n300), <code>wh_x8</code> (T3000), <code>wh_x32</code> (Wormhole Galaxy), <code>bh_x2</code>, <code>bh_x4</code> and <code>bh_x32</code>. Its README warns that "UMD changes for full support are not yet fully merged for platforms beyond <code>wh_x2</code>" and that a separate tt-metal branch was used to validate the others (<code>ttsim/README.md:243-249</code>). In this orb only <code>wh_x2</code> with a 2&times;1 mesh works. The stock distributed examples ask for a 2&times;4 mesh, so they fail on two chips. First give the <code>wh_x2</code> build its own directory, as <a href="../sim-labs/b00-workbench.html#soc">B00</a> does for <code>wh</code> (the <code>make.py :build</code> step there already built it):</p>
+<pre><code>mkdir -p ~/sim/wh_x2
+cp ~/ttsim/src/_out/release_wh_x2/libttsim.so ~/sim/wh_x2/libttsim_wh_x2.so
+cp ~/tt-metal/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml ~/sim/wh_x2/soc_descriptor.yaml
+
+export LAB_HOME=$HOME/ttlab/a21
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench
+SIM=$HOME/sim/wh_x2/libttsim_wh_x2.so source $W/env.sh wh
+export TT_METAL_MOCK_CLUSTER_DESC_PATH=$TT_METAL_HOME/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml
+$EX/distributed/distributed_buffer_rw</code></pre>
+<pre><code>... Using auto discovery to generate mesh graph. (metal_env.cpp:537)
+... TT_FATAL: Requested mesh shape MeshShape([2, 4]) requires 8 devices, but only 2 devices are available in the system mesh MeshShape([2, 1]). (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'      (exit 134)</code></pre>
+  <p>Note that the auto-discovered system mesh is <code>[2, 1]</code>, not the <code>1x2</code> shape the TT-NN guide uses for n300 (<code>Programming_Mesh_of_Devices_with_TT-NN.md:72</code>). The 8-chip build gets no further in this orb. With <code>wh_x8</code> and UMD's <code>t3k_cluster_desc.yaml</code>, the same binary stops at 17 simulated clocks with <code>ERROR: UndefinedBehavior: e_tile_mmio_wr32: eth base fw reported error code 1 on eth tile 15</code>.</p>
+  <p>The workbench copy <code>host/dbrw.cpp</code> is the stock <code>distributed_buffer_rw.cpp</code> with exactly two changes. It uses <code>MeshShape(2, 1)</code> and prints the comparison instead of an <code>assert</code>, which compiles away under <code>-DNDEBUG</code>. It allocates a 32 MiB sharded L1 MeshBuffer, writes random data and reads it back:</p>
+<pre><code>cp $W/host/dbrw.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/dbrw.cpp
+$LAB_HOME/dbrw</code></pre>
+<pre><code>... UMD | Creating Simulation device (cluster.cpp:308)
+... EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0x401e (tt_sim_tt_device.cpp:163)
+... Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:599)
+devices=2 match=true bytes=33554432
+[372773] 8.1 seconds (46.2 KHz)</code></pre>
+  <p>Two devices, and the 33,554,432 bytes came back intact. Look at what is missing from the log: UMD created only <b>one</b> PCIe device, <code>chip_id=0</code>. Chip 1 has no PCIe in the n300 descriptor (<code>chips_with_mmio: [0]</code>), so its 16 MiB half of the buffer must have gone through chip 0's Ethernet cores. To see it, I built an instrumented ttsim with a counter added right after the <code>memcpy</code> excerpt above. The patch is <code>sim-labs/patches/a21-ethlog.patch</code>:</p>
+<pre><code>$W/build_ttsim.sh ethlog wh_x2                      # copy pristine ttsim to $LAB_HOME/ttsim-ethlog, build
+(cd $LAB_HOME/ttsim-ethlog &amp;&amp; patch -p1 &lt; $W/../patches/a21-ethlog.patch)
+$W/build_ttsim.sh ethlog wh_x2                      # rebuild into $LAB_HOME/sim-ethlog-wh_x2-release/</code></pre>
+  <div class="filename">sim-labs/patches/a21-ethlog.patch (against ttsim/src/tile.cpp @b3620244; one context line trimmed)</div>
+<pre><code>--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -2031,6 +2031,19 @@
+                 memcpy(&amp;g_e_tiles[remote_tile_id].sram[dest_addr], &amp;p_tile-&gt;sram[start_addr], size_bytes);
+                 ttsim_select_chip(saved_chip_id);
++                { // A21 instrumentation: log Ethernet packet sends
++                    static uint64_t n_pkts[2], n_bytes[2];
++                    static struct Summary { ~Summary() { for (int c = 0; c &lt; 2; c++)
++                        ttsim_printf("ETH summary: chip%d sent %llu packets, %llu bytes\n", c,
++                            (unsigned long long)n_pkts[c], (unsigned long long)n_bytes[c]); } } s_summary;
++                    (void)s_summary;
++                    n_pkts[saved_chip_id &amp; 1]++; n_bytes[saved_chip_id &amp; 1] += size_bytes;
++                    uint64_t n = n_pkts[saved_chip_id &amp; 1];
++                    if (n &lt;= 3 || (n &amp; (n - 1)) == 0)
++                        ttsim_printf("ETH chip%u eth%u -&gt; chip%u eth%u: %u B L1 0x%x -&gt; 0x%x  [pkt #%llu from chip%u, %llu B total]\n",
++                            saved_chip_id, tile_id, remote_chip_id, remote_tile_id, size_bytes, start_addr, dest_addr,
++                            (unsigned long long)n, saved_chip_id, (unsigned long long)n_bytes[saved_chip_id &amp; 1]);
++                }</code></pre>
+<pre><code>SIM=$LAB_HOME/sim-ethlog-wh_x2-release/libttsim.so source $W/env.sh wh
+$LAB_HOME/dbrw</code></pre>
+<pre><code>[15] ETH chip0 eth9 -&gt; chip1 eth1: 32 B L1 0x14b00 -&gt; 0x14900  [pkt #1 from chip0, 32 B total]
+[19] ETH chip0 eth8 -&gt; chip1 eth0: 32 B L1 0x14b00 -&gt; 0x14900  [pkt #2 from chip0, 64 B total]
+[26] ETH chip1 eth1 -&gt; chip0 eth9: 32 B L1 0x14b00 -&gt; 0x14a00  [pkt #1 from chip1, 32 B total]
+[29] ETH chip1 eth0 -&gt; chip0 eth8: 32 B L1 0x14b00 -&gt; 0x14a00  [pkt #2 from chip1, 64 B total]
+...
+[161204] ETH chip0 eth9 -&gt; chip1 eth1: 32 B L1 0x14b00 -&gt; 0x14900  [pkt #8192 from chip0, 13588976 B total]
+[255380] ETH chip1 eth1 -&gt; chip0 eth9: 4096 B L1 0x15600 -&gt; 0x15600  [pkt #8192 from chip1, 5772928 B total]
+devices=2 match=true bytes=33554432
+[372773] 7.7 seconds (48.1 KHz)
+[372773] ETH summary: chip0 sent 14138 packets, 17213360 bytes
+[372773] ETH summary: chip1 sent 13831 packets, 17088736 bytes</code></pre>
+  <p>Every packet uses exactly the cables from the descriptor: chip 0's channels 8 and 9 to chip 1's channels 0 and 1. Chip 0 pushed 17.2 MB across, which is chip 1's 16 MiB (16,777,216 B) of write data plus about 436 KB of commands. Chip 1 pushed back 17.1 MB, its 16 MiB of read-back data plus replies. The simulated clock count is identical to the uninstrumented run (372,773), so the counter only observed. This traffic is the host-to-remote-chip tunnel of the base routing firmware. ttsim emulates that firmware with its own mock, which describes the mechanism: "Legacy remote-queue the host (UMD) uses to reach a remote chip: it writes a command into this eth core's L1 and bumps the request write pointer; the base fw drains it" (<code>ttsim/fw/eth/eth_fw.c:57-58</code>).</p>
+
+  <div class="callout sim">This chapter uses only two runs. The hands-on version is lab <a href="../sim-labs/b10-two-chips.html">B10 · Two chips</a>. It covers setting up <code>wh_x2</code> with the N300 cluster descriptor, writing your own two-device programs, and a full list of what multichip support exists in ttsim and what does not.</div>
+
+  <h2 id="ttnn">Distributed tensors in TT-NN</h2>
+  <p>At the TT-NN level (<a href="a18-ttnn-user.html">A18</a>), a tensor on a mesh is one Python object whose storage is a MeshBuffer. When you move a torch tensor to the mesh, a <b>mapper</b> decides what each chip gets, and when you bring it back, a <b>composer</b> decides how to put the pieces together:</p>
+  <ul>
+    <li><code>ShardTensorToMesh(mesh, dim)</code> splits the tensor along <code>dim</code>, one piece per chip.</li>
+    <li><code>ReplicateTensorToMesh(mesh)</code> gives every chip a full copy.</li>
+    <li><code>ConcatMeshToTensor(mesh, dim)</code> concatenates the per-chip pieces back along <code>dim</code>.</li>
+  </ul>
+  <p>At this commit these three names are thin, deprecated wrappers:</p>
+  <div class="filename">tt-metal/ttnn/ttnn/distributed/distributed.py:724-737 @7aad8aac</div>
+<pre><code># Deprecated. Use `ttnn.replicate_tensor_to_mesh_mapper` directly.
+def ReplicateTensorToMesh(mesh_device: MeshDevice):
+    mapper = ttnn.replicate_tensor_to_mesh_mapper(mesh_device)
+    return ReplicateTensorToMeshWrapper(mapper)
+
+# Deprecated. Use `ttnn.shard_tensor_to_mesh_mapper` directly.
+def ShardTensorToMesh(mesh_device: MeshDevice, dim: int):
+    return ttnn.shard_tensor_to_mesh_mapper(mesh_device, dim)
+
+# Deprecated. Use `ttnn.concat_mesh_to_tensor_composer` directly.
+def ConcatMeshToTensor(mesh_device: MeshDevice, dim: int):
+    return ttnn.concat_mesh_to_tensor_composer(mesh_device, dim)</code></pre>
+  <p>For 2D meshes, <code>ttnn.create_mesh_mapper</code> takes one placement per mesh axis, for example "shard dim 3 across rows, replicate across columns". Once a tensor is distributed, ops are SPMD: <code>ttnn.add(a, b)</code> on two sharded tensors launches the same program on every chip, and each chip adds its own shards. If the shards line up, <b>no byte crosses a chip boundary</b>. Bytes cross only when an op needs data another chip holds, and that requires a collective.</p>
+
+  <h2 id="ccl">Collectives: all-gather, reduce-scatter, all-reduce</h2>
+  <p>Three collectives cover almost every multichip model:</p>
+  <ul>
+    <li><b>All-gather</b>: each of N chips holds a shard, and afterwards every chip holds all N shards, concatenated.</li>
+    <li><b>Reduce-scatter</b>: each chip holds a full-size <i>partial sum</i>. Afterwards chip i holds the i-th slice of the <i>total</i> sum.</li>
+    <li><b>All-reduce</b>: every chip ends with the full total. It is a reduce-scatter followed by an all-gather (<code>CCL_bandwidth.md:62</code>).</li>
+  </ul>
+  <p>The naive all-gather is "everyone sends their shard to everyone". On a ring of N chips, though, a shard bound for a chip three hops away crosses three links, so the links nearest the busiest chips carry far more traffic than others. The classic trick is to pass data around the ring in N&minus;1 steps. At every step, every chip sends exactly one chunk to its neighbour, so all links are busy at once and none is busier than another. Step through it. T is the size of the full tensor, so each chunk is T/N.</p>
+
+  <div class="viz" id="fig-ring"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-ring"), C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls"; root.appendChild(bar);
+    var inner = document.createElement("div"); root.appendChild(inner);
+    var mode = "AG", N = 4, T = 8e6, BW = 12.5e9;
+    var cols = [C.blue, C.orange, C.green, C.pink, C.yellow, C.purple, C.teal, C.red];
+    var NAMES = { AG: "All-gather", RS: "Reduce-scatter", AR: "All-reduce (RS then AG)" };
+    function mb(x) { return (x / 1e6).toFixed(x % 1e6 ? 2 : 0) + " MB"; }
+    function us(bytes) { return Math.round(bytes / BW * 1e6) + " \u00b5s"; }
+    function nsteps() { return mode === "AR" ? 2 * (N - 1) : N - 1; }
+    function phaseOf(s) { if (mode === "AG") return ["AG", s]; if (mode === "RS") return ["RS", s]; return s < N - 1 ? ["RS", s] : ["AG", s - (N - 1)]; }
+    function sends(s) { var ph = phaseOf(s), out = [];
+      for (var i = 0; i < N; i++) { var c = ph[0] === "AG" ? ((i - ph[1]) % N + N) % N : ((i - ph[1] - 1) % N + N) % N; out.push({ from: i, to: (i + 1) % N, c: c, ph: ph[0] }); }
+      return out; }
+    function initState() { var v = []; for (var i = 0; i < N; i++) { v.push([]); for (var c = 0; c < N; c++) v[i].push(mode === "AG" ? (c === i ? N : 0) : 1); } return v; }
+    function stateAfter(k) { var v = initState();
+      for (var s = 0; s < k; s++) { var nv = v.map(function (r) { return r.slice(); });
+        sends(s).forEach(function (m) { nv[m.to][m.c] = m.ph === "RS" ? v[m.to][m.c] + v[m.from][m.c] : v[m.from][m.c]; });
+        v = nv; }
+      return v; }
+    function stepText(s) {
+      var ph = phaseOf(s), chunk = T / N;
+      var what = ph[0] === "AG" ? "forwards one complete chunk it holds (the one it most recently received; at the first step its own)" :
+        "sends its running partial sum of one chunk, and the receiver <b>adds its own partial</b> for that chunk before forwarding it next step";
+      var head = mode === "AR" ? (ph[0] === "RS" ? "Reduce-scatter phase, step " + (ph[1] + 1) + " of " + (N - 1) : "All-gather phase, step " + (ph[1] + 1) + " of " + (N - 1)) : "Step " + (s + 1) + " of " + (N - 1);
+      return "<b>" + head + ".</b> Every device " + what + ". All " + N + " links carry " + mb(chunk) + " at the same time, " + us(chunk) + " at 12.5 GB/s. Running total per link: <b>" + mb(chunk * (s + 1)) + "</b>.";
+    }
+    function build() {
+      inner.innerHTML = "";
+      var g = TT.canvas(inner, 800, 470), ctx = g.ctx, n = nsteps(), chunk = T / N;
+      var steps = [{ dur: 0.8, text: mode === "AG" ?
+          "<b>Start.</b> " + N + " devices in a ring. The full tensor is T = 8 MB. Device <i>i</i> holds only chunk <i>i</i> (" + mb(chunk) + "). Goal: every device holds all " + N + " chunks." :
+          "<b>Start.</b> " + N + " devices in a ring. Each holds a full-size <i>partial</i> tensor (8 MB), for example the output of a row-parallel matmul. Every chunk on every device has a fill of 1/" + N + ": one device's contribution. Goal: device <i>i</i> ends with the <b>fully summed</b> chunk <i>i</i>" + (mode === "AR" ? ", and then every device gets every summed chunk." : ".") }];
+      for (var s = 0; s < n; s++) steps.push({ dur: 1.6, text: stepText(s) });
+      var per = chunk * n;
+      steps.push({ dur: 0.8, text: "<b>Done.</b> Each link carried <b>" + n + " &times; T/N = " + mb(per) + "</b> in one direction" + (mode === "AR" ? " = 2(N&minus;1)/N &middot; T" : " = (N&minus;1)/N &middot; T") +
+        ", taking an ideal " + us(per) + " at 12.5 GB/s (Wormhole), or " + Math.round(per / 50e9 * 1e6) + " &micro;s at 50 GB/s (Blackhole), plus about 0.7 &micro;s of latency per step. Doubling N barely changes the bytes per link; it doubles the number of steps, so per-hop latency starts to matter for small tensors." +
+        " A bidirectional ring, which is what TT-NN does, splits the work in two directions and halves the bytes per direction." });
+      var cx = 400, cy = N === 4 ? 250 : 238, R = N === 4 ? 150 : 160, Rx = N === 4 ? 150 : 270, bw = N === 4 ? 150 : 104, bh = 46;
+      function dpos(i) { var a = -Math.PI / 2 + i * 2 * Math.PI / N; return { x: cx + Rx * Math.cos(a), y: cy + R * Math.sin(a) }; }
+      function drawDev(i, v, final) {
+        var p = dpos(i), x = p.x - bw / 2, y = p.y - bh / 2;
+        TT.box(ctx, x, y, bw, bh, { fill: C.bg2, stroke: C.muted });
+        TT.text(ctx, "dev " + i, p.x, p.y > cy + 1 ? y + bh + 11 : y - 8, { align: "center", font: "11px", color: C.muted });
+        var sw = (bw - 8) / N;
+        for (var c = 0; c < N; c++) {
+          var sx = x + 4 + c * sw, sy = y + 6, sh = bh - 12, f = v[i][c] / N;
+          ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.strokeRect(sx + 1, sy, sw - 2, sh);
+          if (f > 0) { ctx.globalAlpha = 0.85; ctx.fillStyle = cols[c]; ctx.fillRect(sx + 1, sy + sh * (1 - f), sw - 2, sh * f); ctx.globalAlpha = 1; }
+          if (final && v[i][c] === N && mode === "RS" && c === i) { ctx.strokeStyle = C.fg; ctx.lineWidth = 2; ctx.strokeRect(sx, sy - 1, sw, sh + 2); }
+        }
+      }
+      function linkMid(i) { var a = dpos(i), b = dpos((i + 1) % N); return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+      TT.stepper({ root: inner, steps: steps, draw: function (k, t) {
+        TT.clear(ctx, g.W, g.H);
+        TT.text(ctx, NAMES[mode] + "  ·  N = " + N + "  ·  T = 8 MB  ·  chunk T/N = " + mb(chunk), 400, 18, { align: "center", color: C.yellow, font: "14px" });
+        var done = k === 0 ? 0 : Math.min(n, (k <= n ? (t >= 1 ? k : k - 1) : n));
+        var v = stateAfter(done);
+        // links
+        for (var i = 0; i < N; i++) { var a = dpos(i), b = dpos((i + 1) % N), ang = Math.atan2(b.y - a.y, b.x - a.x);
+          var ox = Math.cos(ang) * (bw / 2 + 6) * Math.abs(Math.cos(ang)) + Math.sin(ang) * 0, oy = Math.sin(ang) * (bh / 2 + 6);
+          TT.arrow(ctx, a.x + ox * 0.9, a.y + oy, b.x - ox * 0.9, b.y - oy, { color: C.teal, lw: 1.5 });
+          var m = linkMid(i), nx = m.x - cx, ny = m.y - cy, nl = Math.hypot(nx, ny) || 1;
+          TT.text(ctx, mb(chunk * done), m.x + nx / nl * 30, m.y + ny / nl * 22, { align: "center", font: "12px", color: C.teal }); }
+        for (var d = 0; d < N; d++) drawDev(d, v, done === n);
+        // flying chunks
+        if (k >= 1 && k <= n && t < 1) {
+          sends(k - 1).forEach(function (m) { var a = dpos(m.from), b = dpos(m.to), u = t;
+            var x = TT.lerp(a.x, b.x, u), y = TT.lerp(a.y, b.y, u), f = v[m.from][m.c] / N;
+            ctx.fillStyle = cols[m.c]; ctx.globalAlpha = 0.95; ctx.fillRect(x - 9, y - 9, 18, 18); ctx.globalAlpha = 1;
+            ctx.strokeStyle = C.fg; ctx.lineWidth = 1; ctx.strokeRect(x - 9, y - 9, 18, 18);
+            if (m.ph === "RS") TT.text(ctx, Math.round(f * N) + "/" + N, x, y + 18, { align: "center", font: "10px" }); });
+        }
+        var tot = chunk * done;
+        TT.text(ctx, "bytes per link so far: " + mb(tot) + "   ·   ideal time so far @12.5 GB/s: " + us(tot), 400, 448, { align: "center", font: "13px", color: C.fg });
+        TT.text(ctx, "slot = chunk index (colour)   ·   fill height = how many devices' contributions are summed in it", 400, 466, { align: "center", font: "11px", color: C.muted });
+      } });
+    }
+    function btn(label, on) { var b = document.createElement("button"); b.textContent = label; b.onclick = on; bar.appendChild(b); return b; }
+    var bAG = btn("All-gather", function () { mode = "AG"; sync(); }), bRS = btn("Reduce-scatter", function () { mode = "RS"; sync(); }),
+        bAR = btn("All-reduce", function () { mode = "AR"; sync(); });
+    var sp = document.createElement("span"); sp.style.width = "1rem"; bar.appendChild(sp);
+    var b4 = btn("N = 4", function () { N = 4; sync(); }), b8 = btn("N = 8", function () { N = 8; sync(); });
+    function sync() { bAG.classList.toggle("on", mode === "AG"); bRS.classList.toggle("on", mode === "RS"); bAR.classList.toggle("on", mode === "AR");
+      b4.classList.toggle("on", N === 4); b8.classList.toggle("on", N === 8); build(); }
+    sync();
+  })();
+  </script>
+
+  <p>Count the bytes. For an all-gather, each link carries N&minus;1 chunks of T/N, which is <b>(N&minus;1)/N &middot; T</b>. That is almost T no matter how many chips there are. A reduce-scatter has the same count with an addition at each hop, and an all-reduce costs twice that. These are exactly the "bottleneck bytes" in Tenstorrent's CCL report (<code>CCL_bandwidth.md:66-71</code>):</p>
+  <table>
+    <tr><th>Collective</th><th>Bytes through the bottleneck link</th><th>T = 8 MB, N = 8, Wormhole (12.5 GB/s)</th></tr>
+    <tr><td>all_gather</td><td>(N&minus;1)/N &times; T</td><td>7 MB &rarr; 560 &micro;s</td></tr>
+    <tr><td>reduce_scatter</td><td>(N&minus;1)/N &times; T</td><td>7 MB &rarr; 560 &micro;s</td></tr>
+    <tr><td>all_reduce</td><td>2(N&minus;1)/N &times; T</td><td>14 MB &rarr; 1,120 &micro;s</td></tr>
+  </table>
+  <p>Three refinements bring the cartoon closer to the code.</p>
+  <p><b>Line or ring.</b> On a line, an end chip has one link, and everything it lacks must come through it. On a ring, every chip has two links on the axis, so traffic splits into two halves that flow in opposite directions. That halves the bytes per direction and cuts the diameter from N&minus;1 hops to N/2 (<code>CCL_bandwidth.md:58-60</code>). A ring needs deadlock avoidance, though. Bubble flow control and extra acknowledgements "cost every packet", so each ring link runs somewhat slower (<code>:75-80</code>).</p>
+  <p><b>TT-NN's unicast all-gather is the ring algorithm, literally.</b> Its program factory says so:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_factory.cpp:17-24 @7aad8aac</div>
+<pre><code>// Store-and-forward AllGather (line/ring over a single mesh axis; for Fabric 1D and 2D)
+//
+// Every device relays stripes to its neighbor one hop at a time; a shard reaches far devices by being
+// re-forwarded at each hop. Forward and backward directions run on separate cores. Per direction: the reader
+// (CB producer, no fabric) reads iteration 0 from local input and later iterations from what upstream relayed
+// into our output; the writer (CB consumer) unicasts each stripe one hop to the neighbor's output (same
+// address on every device). Direction/topology are runtime args, so both kernels compile once and run on all
+// cores. Two semaphores: barrier_sem (init handshake) and data_valid_sem (relay gate + completion).</code></pre>
+  <p>Every idea from this chapter appears in that comment. The algorithm relays one hop at a time, as in the animation, and runs both ring directions at once on separate cores. It writes to "the neighbor's output (same address on every device)", which works only because MeshBuffer allocation is lock-step. A semaphore gates the relay, so a chunk is forwarded only after it has arrived; that is the cross-chip version of A16's semaphores. There is also a <i>multicast</i> variant that sends each shard once as a fabric multicast that every router on the line both consumes and forwards, and it is often the one you get. <code>select_program_factory</code> picks between them (<code>all_gather_device_operation.cpp:217-271</code>). On Wormhole it chooses unicast only on a ring or torus axis with at least 64 pages per device shard (20 if pages are 4 KB or larger), so a line gets multicast. On Blackhole it chooses multicast only for small per-link volumes with large pages. The ring reduce-scatter kernels likewise split each slice into even and odd chunks, one per direction, and run <code>ring_size/2 + 1</code> iterations (<code>experimental/ccl/reduce_scatter_minimal_async/device/kernels/ring_reduction.cpp:55-57</code>).</p>
+  <p><b>Fixed costs.</b> A collective also pays per-call setup: launching kernels, opening fabric connections, an entry barrier so that no chip writes into a neighbour that has not started, and an exit wait. On Wormhole the barrier and the exit wait each cost about 0.7 &micro;s plus 0.95 &micro;s per hop (<code>CCL_bandwidth.md:108-120</code>). For small tensors, such as one decode token's activations, these microseconds dominate the bytes.</p>
+  <p>In Python, the current calls are short. The <code>num_links</code> and <code>topology</code> arguments that older docs pass are now "Deprecated and ignored" (<code>all_gather_nanobind.cpp:51-56</code>), and the fabric configuration decides the topology instead:</p>
+<pre><code>ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)     # before opening the mesh
+mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 8))
+g = ttnn.all_gather(t, dim=3)                           # optional: cluster_axis=0|1 on a 2D mesh
+r = ttnn.reduce_scatter(partials, dim=3)</code></pre>
+
+  <div class="callout key">A collective's cost is bytes per link divided by link bandwidth, plus a few microseconds per hop. All-gather and reduce-scatter move about T per link and all-reduce about 2T, almost independent of the number of chips. Adding chips does not make collectives cheaper per link. It makes the <i>other</i> work, compute and weight reads, cheaper.</div>
+
+  <h2 id="run2">Run it: one step further, and where it stops</h2>
+  <p>Back to the simulator, now one level up, in TT-NN. The script below opens the two-chip mesh, shards two 64&times;32 bf16 tensors by rows (32 rows per chip), adds them and composes the result back. Optionally it then attempts an all-gather:</p>
+  <div class="filename">sim-labs/workbench/py/a21_mesh.py</div>
+<pre><code># usage: python a21_mesh.py add | gather | fabric-gather
+import sys, torch, ttnn
+mode = sys.argv[1]
+if mode == "fabric-gather":
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)   # must precede open_mesh_device
+mesh = ttnn.open_mesh_device(ttnn.MeshShape(2, 1))
+print("mesh:", mesh.shape, "devices:", mesh.get_num_devices())
+torch.manual_seed(0)
+a = torch.rand((1, 1, 64, 32), dtype=torch.bfloat16)
+b = torch.rand((1, 1, 64, 32), dtype=torch.bfloat16)
+shard = ttnn.ShardTensorToMesh(mesh, dim=2)               # rows 0-31 -&gt; device 0, rows 32-63 -&gt; device 1
+ta = ttnn.from_torch(a, layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=shard)
+tb = ttnn.from_torch(b, layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=shard)
+print("per-device shape:", ta.shape)
+tc = ttnn.add(ta, tb)                                      # one call, runs on both chips
+c = ttnn.to_torch(tc, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=2))
+ref = a + b
+pcc = torch.corrcoef(torch.stack([c.flatten().float(), ref.flatten().float()]))[0, 1].item()
+print("composed shape:", tuple(c.shape), f"PCC {pcc:.6f}", "max|diff|", (c.float() - ref.float()).abs().max().item())
+if mode != "add":
+    g = ttnn.all_gather(tc, dim=2)                         # every device should end with all 64 rows
+    print("all_gather per-device shape:", g.shape)
+ttnn.close_mesh_device(mesh)</code></pre>
+<pre><code>source $TT_METAL_HOME/python_env/bin/activate
+SIM=$HOME/sim/wh_x2/libttsim_wh_x2.so source $W/env.sh wh
+export TT_METAL_MOCK_CLUSTER_DESC_PATH=$TT_METAL_HOME/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml
+python $W/py/a21_mesh.py add</code></pre>
+<pre><code>mesh: MeshShape([2, 1]) devices: 2
+per-device shape: Shape([1, 1, 32, 32])
+composed shape: (1, 1, 64, 32) PCC 0.999982 max|diff| 0.0078125
+[83240] 4.8 seconds (17.2 KHz)</code></pre>
+  <p><b>Sharding plus an elementwise op works.</b> Each chip holds a 32&times;32 shard (one tile), one <code>ttnn.add</code> call ran on both, and the composed 64&times;32 result matches torch to PCC 0.99998. The largest difference is 0.0078, one bf16 ulp near 1.0. This is the same rounding effect reported in the single-chip <code>ttnn.add</code> run, so the result is not bit-identical to torch. Now the next step, the all-gather. First try it without a fabric:</p>
+<pre><code>python $W/py/a21_mesh.py gather</code></pre>
+<pre><code>... warning | Op | Failed to discover available ethernet links; falling back to 1 link (moe_utils.cpp:126)
+... critical | Always | TT_FATAL: Trying to get un-initialized fabric context (assert.hpp:104)
+composed shape: (1, 1, 64, 32) PCC 0.999982 max|diff| 0.0078125
+RuntimeError: TT_FATAL @ .../tt_metal/fabric/control_plane.cpp:3084: this-&gt;fabric_context_ != nullptr
+ --- tt::tt_fabric::get_tt_fabric_max_payload_size_bytes()
+ --- ttnn::operations::ccl::all_gather_build_operation_args(...)</code></pre>
+  <p>This failure is by design. Today's CCLs are fabric clients: the all-gather sizes its packets from the fabric's maximum payload, and no fabric was configured. With <code>FABRIC_1D</code> set before opening the mesh:</p>
+<pre><code>python $W/py/a21_mesh.py fabric-gather</code></pre>
+<pre><code>... Metal | Initializing Fabric (fabric_firmware_initializer.cpp:319)
+... Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:466)
+... Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:336)
+mesh: MeshShape([2, 1]) devices: 2
+Traceback (most recent call last):
+  File ".../sim-labs/workbench/py/a21_mesh.py", line 12, in &lt;module&gt;
+    ta = ttnn.from_torch(a, layout=ttnn.TILE_LAYOUT, device=mesh, mesh_mapper=shard)
+RuntimeError: Timeout waiting for Ethernet core service remote IO request flush.
+ 1. tt::umd::RemoteCommunicationLegacyFirmware::wait_for_non_mmio_flush(...)
+ 2. tt::Cluster::write_core(...)
+ 3. tt::Cluster::write_dram_vec(...)
+ 4. tt::tt_metal::slow_dispatch::WriteToDeviceDRAMChannel(...)
+ ...
+[1636224] 26.0 seconds (62.9 KHz)</code></pre>
+  <p>The fabric comes up on both chips, but the very next host write to chip 1 (uploading a shard) times out in UMD's <code>RemoteCommunicationLegacyFirmware</code>, the base-firmware tunnel that carried the dbrw traffic. (The final clock count varies between runs, because UMD's timeout is measured in wall-clock time; a rerun stopped at 1,567,277.) Running the same script on the instrumented simulator (<code>SIM=$LAB_HOME/sim-ethlog-wh_x2-release/libttsim.so</code>) shows a change in the traffic after <code>Initializing Fabric</code>. Chip 0 sends a stream of 16-byte packets from L1 <code>0x18010</code> to <code>0x18000</code> on both channels 8 and 9 (117,984 packets in total, almost all of them this kind; I did not decode their contents). Chip 1 sends only 1,818 packets for the whole run, and the host's remote-IO requests are no longer drained.</p>
+  <p>Why? On an n300, chip 1 is reachable only through channels 8 and 9. Once fabric routers run on those Ethernet cores, the base firmware gets to serve the host's tunnel only when a router <i>yields</i> to it. On silicon, one routing plane stays reserved for the tunnel (<code>CCL_bandwidth.md:52</code>), and tt-metal pins UMD's remote transfers to that dispatch link. That pinning is skipped in the simulator. <code>Cluster::configure_ethernet_cores_for_remote_transfers</code> returns early unless the target is Wormhole silicon (<code>tt_metal/llrt/tt_cluster.cpp:1404</code>), and its caller is already gated on <code>!is_mock_or_emulated()</code> (<code>tt_metal/impl/context/metal_context.cpp:282-295</code>). Lab <a href="../sim-labs/b10-two-chips.html#cross">B10</a> traced the rest in ttsim. Host requests also land on the 9&harr;1 link, whose routers are built with the default yield interval of 10,000 idle passes (<code>erisc_datamover_builder.hpp:355</code>), while the dispatch link's routers use 16. In B10's run, the 9&harr;1 routers stopped yielding once the fabric reported ready, and the host's requests on that link were never drained. B10 shows that a kernel overlay capping the interval at 16 lets <code>FABRIC_1D</code> and <code>ttnn.all_gather</code> run on <code>wh_x2</code>. That overlay is a simulator workaround, not a production fix. Fast dispatch fails even earlier, while the mesh opens, with <code>RuntimeError: Querying size for a host channel that does not exist</code> from UMD's <code>simulation_chip.cpp:183</code>.</p>
+  <table>
+    <tr><th>Attempt (wh_x2, N300 descriptor)</th><th>Outcome</th></tr>
+    <tr><td>Stock <code>distributed_buffer_rw</code> (2&times;4 mesh)</td><td>TT_FATAL: needs 8 devices</td></tr>
+    <tr><td><code>dbrw</code>: 32 MiB sharded MeshBuffer on 2&times;1</td><td><b>works</b>; about 17 MB crosses the Ethernet links each way</td></tr>
+    <tr><td>TT-NN <code>ShardTensorToMesh</code> + <code>ttnn.add</code> + <code>ConcatMeshToTensor</code></td><td><b>works</b>; PCC 0.999982</td></tr>
+    <tr><td><code>ttnn.all_gather</code> without fabric</td><td>TT_FATAL: un-initialized fabric context (expected)</td></tr>
+    <tr><td><code>ttnn.all_gather</code> with <code>FABRIC_1D</code>, slow dispatch</td><td>fabric initializes, then host&rarr;chip 1 writes time out (stock router; <a href="../sim-labs/b10-two-chips.html#cross">B10</a>'s yield-interval overlay makes it work)</td></tr>
+    <tr><td>Same, fast dispatch</td><td>fails opening the mesh: host channel does not exist</td></tr>
+    <tr><td>Stock example on <code>wh_x8</code> + <code>t3k_cluster_desc.yaml</code></td><td>ttsim error: eth base fw error code 1 on eth tile 15</td></tr>
+  </table>
+  <p>So in this orb you can see chips, meshes, mesh buffers, sharded tensors and SPMD ops working on two simulated chips. With stock tt-metal no collective runs. <a href="../sim-labs/b10-two-chips.html#cross">B10</a> gets a two-chip <code>ttnn.all_gather</code> through with a kernel overlay. Beyond that, everything about collectives in this chapter (rings, reduce-scatter, bandwidth) is taken from the code and the tech reports, not from a simulator run.</p>
+
+  <h2 id="parallel">Data, tensor and pipeline parallelism on a mesh</h2>
+  <p>With bytes-per-link costs in hand, the question becomes: how should a model be cut so that it needs the fewest, smallest collectives? Take one matmul, Y[M,N] = X[M,K] &middot; W[K,N], on 4 chips. There are three basic ways to split it, and one clever pairing. The TT-NN LLM report defines them (<code>tech_reports/LLMs/llms.md:1242-1248, 1363-1395</code>):</p>
+  <ul>
+    <li><b>Data parallel</b>: every chip has the <i>whole</i> W and a different slice of the batch (rows of X). There is no communication in the forward pass, but every chip pays the full weight memory.</li>
+    <li><b>Tensor parallel, column</b>: W is split by output columns (N). Each chip needs the <i>whole</i> X and produces a column slice of Y. If the next op needs the full Y, all-gather it.</li>
+    <li><b>Tensor parallel, row</b>: W is split by input rows (K), and X must be split the same way along K. Each chip produces a <i>full-size partial</i> Y. Sum the partials with a reduce-scatter (or all-reduce).</li>
+    <li><b>Column then row</b>: the MLP pattern. Column-parallel FF1 leaves its output split along exactly the dimension that row-parallel FF2 needs split, so the two matmuls run back to back with no communication. One all-reduce at the end is all it costs.</li>
+  </ul>
+  <p>The figure uses the Llama-3-70B MLP shapes from the LLM report: X is [32, 8192] (32 users, one token each), FF1 is [8192, 28672] and FF2 is [28672, 8192], all in bf16, on 4 chips. Blocks are not drawn to scale.</p>
+
+  <div class="viz" id="fig-par"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-par"), C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls"; root.appendChild(bar);
+    var inner = document.createElement("div"); root.appendChild(inner);
+    var DEV = [C.blue, C.orange, C.green, C.pink], mode = "COL";
+    // Matrix descriptors: split = none | rows | cols | partial ; rep = replicated
+    var M = {
+      DP: { name: "Data parallel", mats: [[{ n: "X", w: 50, h: 70, s: "rows", lab: "X [128, 8192]" }, { n: "W1", w: 110, h: 50, s: "none", lab: "W1 [8192, 28672]" }, { n: "Y", w: 110, h: 70, s: "rows", lab: "Y [128, 28672]" }]],
+        mem: "W1 per chip: 448 MiB (full copy)", ccl: "Forward pass: no CCL at all. (Training would all-reduce gradients.)",
+        texts: ["<b>Data parallel.</b> Four independent batches of 32 users: X is [128, 8192] in total. The weights W1 [8192, 28672] are 448 MiB in bf16.",
+                "<b>Placement.</b> Rows of X are sharded (<code>ShardTensorToMesh(dim=2)</code>, 32 users per chip). W1 is <b>replicated</b> (<code>ReplicateTensorToMesh</code>): every chip stores all 448 MiB and reads all of it per step.",
+                "<b>Local compute.</b> Each chip computes its own 32 rows of Y. Nothing depends on another chip.",
+                "<b>Communication: none.</b> Data parallelism multiplies throughput (4 batches at once) but not per-token latency. Each chip still reads the full 448 MiB of weights per step, so the chip count is no help on DRAM-bound decode."] },
+      COL: { name: "Tensor parallel: column", mats: [[{ n: "X", w: 70, h: 30, s: "none", lab: "X [32, 8192]" }, { n: "W1", w: 120, h: 70, s: "cols", lab: "W1 [8192, 28672]" }, { n: "Y", w: 120, h: 30, s: "cols", lab: "Y [32, 28672]" }]],
+        mem: "W1 per chip: 112 MiB (one column slice)", ccl: "all_gather(Y) if the next op needs it whole: 0.75 \u00d7 1.835 MB = 1.38 MB per link \u2192 \u2248 110 \u00b5s @12.5 GB/s",
+        texts: ["<b>Column-parallel.</b> One batch of 32 users. Y = X &middot; W1 with X [32, 8192] and W1 [8192, 28672].",
+                "<b>Placement.</b> W1 is split by <b>output columns</b>: each chip holds [8192, 7168], 112 MiB. X must be <b>whole</b> on every chip (replicated or all-gathered beforehand).",
+                "<b>Local compute.</b> Each chip produces its own 7,168 columns of Y: Y is now <b>width-sharded</b> across the mesh. No partial sums, no communication yet.",
+                "<b>Communication.</b> If the next op needs all of Y on every chip, <code>all_gather(dim=3)</code>. Y is 32 &times; 28,672 &times; 2 B = 1.835 MB, so each link carries (N&minus;1)/N &times; T = 1.38 MB, about 110 &micro;s at 12.5 GB/s. Often the next op can use the shards directly: see Column &rarr; Row."] },
+      ROW: { name: "Tensor parallel: row", mats: [[{ n: "X", w: 120, h: 30, s: "cols", lab: "X [32, 28672]" }, { n: "W2", w: 70, h: 110, s: "rows", lab: "W2 [28672, 8192]" }, { n: "Y", w: 70, h: 30, s: "partial", lab: "Y [32, 8192]" }]],
+        mem: "W2 per chip: 112 MiB (one row slice)", ccl: "reduce_scatter: 0.75 \u00d7 0.524 MB = 0.39 MB per link (\u224831 \u00b5s); all_reduce: 0.79 MB (\u224863 \u00b5s)",
+        texts: ["<b>Row-parallel.</b> Y = X &middot; W2 with X [32, 28672] and W2 [28672, 8192].",
+                "<b>Placement.</b> W2 is split by <b>input rows</b> (the K dimension): [7168, 8192] per chip. X must be split along K the <b>same way</b>: each chip holds 7,168 of X's 28,672 columns.",
+                "<b>Local compute.</b> Each chip multiplies its K-slice and gets a <b>full-size [32, 8192] partial sum</b> (drawn faded with &Sigma;). None of the four is the answer: the answer is their sum.",
+                "<b>Communication.</b> <code>reduce_scatter</code> sums the partials and leaves each chip a quarter of Y: 0.75 &times; 524 KB = 393 KB per link, about 31 &micro;s. Adding an all-gather gives an all-reduce, so every chip has all of Y: 786 KB per link, about 63 &micro;s."] },
+      MLP: { name: "Column \u2192 Row (MLP)", mats: [[{ n: "X", w: 50, h: 26, s: "none", lab: "X" }, { n: "W1", w: 80, h: 50, s: "cols", lab: "W1" }, { n: "H", w: 80, h: 26, s: "cols", lab: "H" }],
+                                                 [{ n: "H", w: 80, h: 26, s: "cols", lab: "H" }, { n: "W2", w: 50, h: 80, s: "rows", lab: "W2" }, { n: "Y", w: 50, h: 26, s: "partial", lab: "Y" }]],
+        mem: "per chip: W1 slice 112 MiB + W2 slice 112 MiB", ccl: "one all_reduce of Y [32, 8192]: 0.79 MB per link (\u224863 \u00b5s), vs 3.15 MB if you gather after each matmul",
+        texts: ["<b>Column then row: the MLP.</b> H = X &middot; W1 (expand 8192 &rarr; 28672), then Y = H &middot; W2 (shrink back to 8192). This expand-then-shrink shape is why the trick pays off.",
+                "<b>Placement.</b> W1 is column-split and W2 is row-split <b>along the same 28,672-wide dimension</b>: chip <i>d</i> holds W1's columns <i>d</i> and W2's rows <i>d</i>. X is whole on every chip.",
+                "<b>Local compute, twice, with no communication in between.</b> FF1 leaves H width-sharded, and chip <i>d</i> holds exactly the columns of H that its rows of W2 need. FF2 runs immediately and yields full-size partials of Y.",
+                "<b>Communication: one all-reduce</b> of Y [32, 8192] = 524 KB: 2 &times; 0.75 &times; 524 KB = 786 KB per link, about 63 &micro;s. The alternative, all-gathering H after FF1 and FF3 (1.38 MB each) and Y after FF2 (0.39 MB), moves 3.15 MB per link, four times more (<code>llms.md:1382-1384</code>)."] }
+    };
+    function drawMat(ctx, x, y, m, dev, showSplit, alpha) { // dev: null = global view; else chip index
+      var w = m.w, h = m.h;
+      if (dev == null) {
+        ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+        for (var d = 0; d < 4; d++) {
+          var col = showSplit ? DEV[d] : C.muted, a = showSplit ? 0.45 : 0.15;
+          ctx.globalAlpha = a; ctx.fillStyle = col;
+          if (!showSplit || m.s === "none") { if (d === 0) { ctx.fillStyle = showSplit ? C.muted : C.muted; ctx.globalAlpha = showSplit ? 0.35 : 0.15; ctx.fillRect(x, y, w, h); } }
+          else if (m.s === "rows") ctx.fillRect(x, y + d * h / 4, w, h / 4);
+          else if (m.s === "cols") ctx.fillRect(x + d * w / 4, y, w / 4, h);
+          else if (m.s === "partial") { ctx.globalAlpha = 0.18; ctx.fillRect(x + d * 3, y + d * 3, w, h); }
+          ctx.globalAlpha = 1;
+        }
+        if (showSplit && m.s !== "none" && m.s !== "partial") { ctx.strokeStyle = C.bg; ctx.lineWidth = 1;
+          for (var k = 1; k < 4; k++) { ctx.beginPath(); if (m.s === "rows") { ctx.moveTo(x, y + k * h / 4); ctx.lineTo(x + w, y + k * h / 4); } else { ctx.moveTo(x + k * w / 4, y); ctx.lineTo(x + k * w / 4, y + h); } ctx.stroke(); } }
+        if (showSplit && m.s === "partial") TT.text(ctx, "\u03a3 of 4 partials", x + w / 2, y + h + 22, { align: "center", font: "10px", color: C.muted });
+        if (showSplit && m.s === "none") TT.text(ctx, "replicated", x + w / 2, y + h / 2, { align: "center", font: "10px", color: C.fg });
+        return;
+      }
+      // per-chip piece
+      var px = x, py = y, pw = w, ph = h, col = DEV[dev];
+      if (m.s === "rows") ph = h / 4; else if (m.s === "cols") pw = w / 4;
+      ctx.globalAlpha = (m.s === "partial" ? 0.35 : 0.75) * (alpha == null ? 1 : alpha); ctx.fillStyle = m.s === "none" ? C.muted : col; ctx.fillRect(px, py, pw, ph); ctx.globalAlpha = 1;
+      ctx.strokeStyle = m.s === "none" ? C.muted : col; ctx.lineWidth = 1; ctx.strokeRect(px, py, pw, ph);
+      TT.text(ctx, m.n + (m.s === "partial" ? " \u03a3" : ""), px + pw / 2, py + ph / 2, { align: "center", font: "10px", color: C.fg });
+      return { w: pw, h: ph };
+    }
+    function build() {
+      inner.innerHTML = "";
+      var g = TT.canvas(inner, 800, 450), ctx = g.ctx, md = M[mode];
+      var steps = md.texts.map(function (tx, i) { return { dur: 1.0, text: tx }; });
+      TT.stepper({ root: inner, steps: steps, draw: function (k, t) {
+        TT.clear(ctx, g.W, g.H);
+        TT.text(ctx, md.name + "  ·  1\u00d74 mesh  ·  bf16", 400, 16, { align: "center", color: C.yellow, font: "14px" });
+        // global view
+        var rows = md.mats.length, gy0 = 40;
+        md.mats.forEach(function (row, r) {
+          var widths = row.reduce(function (a, m) { return a + m.w; }, 0) + 2 * 50, x = 400 - widths / 2, y = gy0 + r * 82;
+          var maxh = Math.max.apply(null, row.map(function (m) { return m.h; }));
+          if (rows > 1) maxh = 80;
+          row.forEach(function (m, j) {
+            var show = k >= 1 && (j < 2 || k >= 2);
+            if (j === 2 && k < 2) { ctx.setLineDash([3, 3]); ctx.strokeStyle = C.border; ctx.strokeRect(x, y, m.w, m.h); ctx.setLineDash([]); }
+            else drawMat(ctx, x, y, m, null, show);
+            if (rows === 1) TT.text(ctx, m.lab, x + m.w / 2, y + m.h + 10, { align: "center", font: "11px", color: C.muted });
+            else TT.text(ctx, m.lab, x + m.w / 2, y - 6, { align: "center", font: "10px", color: C.muted });
+            x += m.w;
+            if (j < 2) TT.text(ctx, j === 0 ? "\u00b7" : "=", x + 25, y + 14, { align: "center", font: "20px" });
+            x += j < 2 ? 50 : 0;
+          });
+        });
+        // chip panels
+        var py = rows === 1 ? 190 : 215, ph = rows === 1 ? 175 : 150;
+        for (var d = 0; d < 4; d++) {
+          var px = 18 + d * 195;
+          TT.box(ctx, px, py, 180, ph, { stroke: DEV[d], fill: C.bg2, alpha: 0.7 });
+          TT.text(ctx, "chip " + d, px + 8, py + 12, { font: "12px", color: DEV[d] });
+          if (k < 1) { TT.text(ctx, "(empty)", px + 90, py + ph / 2, { align: "center", font: "12px", color: C.muted }); continue; }
+          md.mats.forEach(function (row, r) {
+            var x = px + 10, y = py + 26 + r * 62, sc = 0.45;
+            row.forEach(function (m, j) {
+              if (j === 2 && k < 2) return;
+              var mm = { n: m.n, w: m.w * sc, h: m.h * sc, s: m.s };
+              var a = (j === 2 && k === 2) ? Math.min(1, t * 1.5) : 1;
+              var sz = drawMat(ctx, x, y, mm, d, true, a);
+              x += mm.w + 10;
+            });
+          });
+          if (k >= 3 && (mode === "ROW" || mode === "MLP")) TT.text(ctx, "after CCL: Y" + (mode === "ROW" ? ": \u00bc (RS) or all (AR)" : " whole"), px + 90, py + ph - 28, { align: "center", font: "10px", color: C.green });
+          if (k >= 3 && mode === "COL") TT.text(ctx, "after all_gather: whole Y", px + 90, py + ph - 28, { align: "center", font: "10px", color: C.green });
+        }
+        TT.text(ctx, md.mem, 400, py + ph + 18, { align: "center", font: "12px", color: C.fg });
+        // CCL arrows
+        if (k >= 3 && mode !== "DP") {
+          var u = t;
+          for (var e = 0; e < 3; e++) { var x1 = 18 + e * 195 + 180, x2 = 18 + (e + 1) * 195, yy = py + ph / 2;
+            TT.arrow(ctx, x1, yy - 6, x2, yy - 6, { color: C.teal, lw: 2, head: 6 }); TT.arrow(ctx, x2, yy + 6, x1, yy + 6, { color: C.teal, lw: 2, head: 6 }); }
+          TT.text(ctx, md.ccl, 400, 432, { align: "center", font: "12px", color: C.teal });
+        } else if (k >= 3) TT.text(ctx, md.ccl, 400, 432, { align: "center", font: "12px", color: C.teal });
+      } });
+    }
+    Object.keys(M).forEach(function (key) { var b = document.createElement("button"); b.textContent = M[key].name; b.dataset.k = key;
+      b.onclick = function () { mode = key; Array.prototype.forEach.call(bar.children, function (x) { x.classList.toggle("on", x.dataset.k === mode); }); build(); };
+      bar.appendChild(b); });
+    Array.prototype.forEach.call(bar.children, function (x) { x.classList.toggle("on", x.dataset.k === mode); });
+    build();
+  })();
+  </script>
+
+  <p>The arithmetic behind the numbers in the figure (bf16, N = 4, 1 MB = 10<sup>6</sup> B):</p>
+  <ul>
+    <li>W1 = 8,192 &times; 28,672 &times; 2 B = 469,762,048 B = 448 MiB. One quarter is 112 MiB.</li>
+    <li>FF1's output H = 32 &times; 28,672 &times; 2 B = 1,835,008 B. All-gathering it costs 0.75 &times; that = 1,376,256 B per link, which is 110 &micro;s at 12.5 GB/s.</li>
+    <li>FF2's output Y = 32 &times; 8,192 &times; 2 B = 524,288 B. A reduce-scatter costs 393,216 B per link (31 &micro;s), and an all-reduce 786,432 B (63 &micro;s).</li>
+    <li>Gathering after every matmul (FF1, FF3 and FF2) costs 2 &times; 1,376,256 + 393,216 = 3,145,728 B per link. Column&rarr;row needs only the one all-reduce: 786,432 B, a quarter of that.</li>
+  </ul>
+  <p>The rule the LLM report draws: work out the data movement for each scheme, then pick the one with "the lowest overall data movement" (<code>llms.md:1397-1399</code>). The report's table of constraints (<code>:1401-1407</code>) is the bookkeeping. Column-parallel needs its input gathered in K and produces output fractured along N (the table writes "Fractured in K", meaning the next matmul's K). Row-parallel needs its input fractured in K and produces full-size partials.</p>
+  <p><b>Two dimensions.</b> On a Galaxy's 8&times;4 mesh, weights are split along both axes. For W [K, N] the report gives a per-chip block of [K/4, N/8]. Activations are sharded along one cluster axis and replicated along the other, and collectives run along one axis at a time, for example a reduce over <code>cluster_axis=1</code> followed by a gather over <code>cluster_axis=0</code> (<code>llms.md:771, 1388-1393</code>). This is why <code>ttnn.all_gather</code> takes a <code>cluster_axis</code>: each row (or column) of the mesh runs its own independent ring. Data parallelism composes with all of this. For example, a 32-chip Galaxy could run four independent 8-chip tensor-parallel replicas of a model.</p>
+  <p><b>Pipeline parallelism</b> cuts the model by <i>layers</i> instead: chips 0&ndash;7 run layers 1&ndash;20, chips 8&ndash;15 run layers 21&ndash;40, and so on, and activations are passed point to point between stages. Each boundary moves one activation tensor rather than a collective, but the stages must be kept busy with a stream of micro-batches. In tt-metal this lives at the multi-mesh level: "Each rank manages an independent mesh, enabling pipeline parallelism", with one <code>mesh_id</code> per stage (<code>Programming_Mesh_of_Devices_with_TT-NN.md:347-356</code>). The TT-Distributed notes say such workloads "often necessitate MPMD execution models" (<code>TT-Distributed/MultiHostMeshRuntime.md:22</code>), so it is a different programming style from the SPMD tensor parallelism above.</p>
+
+  <div class="callout gpu">These are the Megatron-LM ideas (column-parallel then row-parallel, with one all-reduce per MLP), applied to a mesh. The difference is the interconnect. A DGX's NVSwitch gives every GPU pair the same bandwidth, so the "ring" is a software choice. On a Tenstorrent mesh the ring <i>is</i> the cabling, which makes <code>cluster_axis</code> and topology first-class parameters of every collective.</div>
+
+  <div class="callout warn"><b>Two things the cartoon hides.</b> First, the bytes-per-link formulas assume the collective's links are its own. On n300 and T3000, one routing plane goes to dispatch, and the weakest hop sets the usable plane count for the whole axis. Second, small collectives are latency-bound: a decode-step all-reduce of a few hundred KB pays several microseconds of fixed cost (barriers, connection setup, about 0.7 &micro;s per hop) next to tens of microseconds of wire time. <a href="a22-llm-capstone.html">A22</a> shows why decode lives in exactly that regime.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>Chips share no memory. The only way across is an <b>Ethernet core</b> pushing its L1 into the L1 of the Ethernet core at the other end of a cable. Wormhole has 16 such cores (1 RISC-V, 256 KB, 100 Gbps = 12.5 GB/s each way). Blackhole has 14 (2 RISC-V, 512 KB, 400 Gbps = 50 GB/s). The sources disagree on some counts and speeds, as listed above.</li>
+    <li>Systems are cabled meshes. n300 is 2 chips with 2 links, one of them reserved for dispatch to the non-PCIe chip. T3000 is 2&times;4 with 2 links per pair. Galaxy is 32 chips (4&times;8, or an 8&times;4 torus) with 4 links per pair on Wormhole and 2 on Blackhole.</li>
+    <li>The <b>EDM</b> turns an Ethernet core into a store-and-forward switch: two sender channels (local and pass-through), one receiver channel, and credits flowing back. <b>TT-Fabric</b> layers routing (source-routed, dimension-ordered), transport (VCs, bubble flow control) and session APIs on top, replicated across 4 (Wormhole) or 2 (Blackhole) <b>routing planes</b>. PCIe is the control plane.</li>
+    <li><b>MeshDevice</b>, <b>MeshBuffer</b> (lock-step: same address on every chip) and <b>MeshWorkload</b> make the mesh one SPMD device. TT-NN's mappers <code>ShardTensorToMesh</code>, <code>ReplicateTensorToMesh</code> and <code>ConcatMeshToTensor</code> decide who holds what.</li>
+    <li>Collectives cost bytes per link: about (N&minus;1)/N&middot;T for all-gather and reduce-scatter, and twice that for all-reduce, plus fixed per-hop latency. TT-NN's unicast all-gather is a bidirectional, store-and-forward ring relay. A heuristic picks it or a multicast variant.</li>
+    <li>Cut models to minimise those bytes. Column&rarr;row tensor parallelism costs one all-reduce per MLP. Data parallelism costs no communication but replicates weights. Pipeline parallelism passes activations between per-stage meshes.</li>
+    <li>In ttsim (<code>wh_x2</code>, 2&times;1), mesh buffers and sharded TT-NN ops work, and the host's traffic to chip 1 visibly crosses Ethernet channels 8/9 &harr; 0/1. With stock tt-metal, collectives do not run. They need the fabric, and with the fabric up the host's tunnel to chip 1 starves, because the remote-transfer pinning to the dispatch link is silicon-only (<code>tt_cluster.cpp:1404</code>). B10's yield-interval overlay works around this.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>On an n300, chip 0 sends chip 1 a 1 MB shard and receives chip 1's 1 MB shard (an all-gather with N = 2). How many bytes cross the link in each direction, and what is the ideal wire time on the one link left for user kernels?</summary>
+  <p>(N&minus;1)/N &middot; T with T = 2 MB and N = 2 gives 1 MB in each direction. The two directions are independent, so they overlap. At 12.5 GB/s per direction that is 80 &micro;s, or about 83 &micro;s at the roughly 12.0 GB/s payload ceiling after framing (<code>CCL_bandwidth.md:36</code>), plus a few microseconds of fixed setup. Only one of the two links is available because the other is reserved for dispatch to the non-PCIe chip.</p></details>
+  <details class="quiz"><summary>Why does <code>ttnn.add</code> on two tensors sharded with the same <code>ShardTensorToMesh(dim=2)</code> move zero bytes between chips, while <code>ttnn.all_gather</code> must move about T per link?</summary>
+  <p>An elementwise op on identically sharded inputs needs, on each chip, only the shards that chip already holds, so the SPMD program runs locally everywhere. An all-gather's output on each chip includes shards that live on other chips. Those bytes must be pushed through Ethernet cores, and on a ring every link ends up carrying N&minus;1 chunks of T/N.</p></details>
+  <details class="quiz"><summary>The MLP uses column-parallel FF1 followed by row-parallel FF2. Why not row-parallel FF1 followed by column-parallel FF2?</summary>
+  <p>Row-parallel FF1 would produce full-size partials of H [32, 28672], which must be reduced (about 0.75 &times; 1.835 MB per link for a reduce-scatter) before FF2 can use them. Then column-parallel FF2 needs its input H whole on every chip, so another gather would follow. Column-parallel FF1 instead leaves H split along exactly the dimension that row-parallel FF2 splits K on, so no communication is needed between the two. The only collective is one all-reduce of the narrow output Y [32, 8192]. This works because the MLP expands and then shrinks, putting the collective on the smaller tensor.</p></details>
+  <details class="quiz"><summary>An all-reduce is a reduce-scatter followed by an all-gather. Why is that better than a "reduce to chip 0, then broadcast" scheme on a ring?</summary>
+  <p>Reduce-to-root funnels the whole tensor T into one chip through at most two links, and the broadcast pushes T back out the same way, so the links next to the root carry most of the traffic while the rest sit idle. RS+AG keeps all N links busy at every step with chunks of T/N, for a total of 2(N&minus;1)/N &middot; T per link, which is nearly the minimum: every chip must receive about T of information it did not have and send about the same. The cost is 2(N&minus;1) latency steps instead of about 2&middot;N/2 hops, which matters only for tiny tensors.</p></details>
+  <details class="quiz"><summary>The fabric-enabled all-gather run failed while uploading a shard, before the all-gather started. What in the dbrw ETH log tells you which path that upload uses, and why could enabling the fabric affect it?</summary>
+  <p>The log shows the host's writes to chip 1 crossing chip 0's Ethernet channels 8 and 9, the only cables to chip 1, because chip 1 has no PCIe (<code>chips_with_mmio: [0]</code>). That is the base-firmware remote-IO tunnel running on those Ethernet cores. Fabric initialization puts router kernels on the same cores. On silicon, tt-metal pins UMD's remote transfers to the dispatch link, whose routers yield often. In the simulator that pinning is skipped (<code>tt_cluster.cpp:1404</code>), so requests also land on the 9&harr;1 link. Its routers yield only after 10,000 idle passes, and after start-up B10 saw them stop yielding. The host's requests there are never drained, and UMD times out with "Timeout waiting for Ethernet core service remote IO request flush". The instrumented run fits this: after fabric init, chip 1 goes nearly silent. <a href="../sim-labs/b10-two-chips.html#cross">B10</a> traces it and works around it.</p></details>
+  <details class="quiz"><summary>A ring halves the bytes per direction compared with a line. Why does the CCL report measure line collectives on a line fabric rather than on a ring fabric?</summary>
+  <p>A ring fabric needs deadlock avoidance on every router: bubble flow control (inject only with at least two free slots) and first-level acknowledgements that double credit traffic. Those cost every packet, so even traffic that never wraps around runs slower on a ring-configured fabric (<code>CCL_bandwidth.md:75-80</code>). Measuring a line on a line fabric avoids paying for deadlock avoidance it does not need.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/EthernetMultichip/BasicEthernetGuide.md">Ethernet and Multichip Basics</a>: Ethernet cores, link specs, n300/T3000/Galaxy, flow control, latency microbenchmarks.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/TT-Fabric/TT-Fabric-Architecture.md">TT-Fabric Architecture Specification</a>: the layered stack, routing planes, router channels and deadlock avoidance.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/CCLs/CCL_bandwidth.md">Collective Communication Bandwidth</a>: bytes-per-link formulas, framing overhead, per-hop latency and measured results.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Programming_Mesh_of_Devices/Programming_Mesh_of_Devices_with_TT-NN.md">Programming Mesh of Devices with TT-NN</a>: MeshDevice, mappers, SPMD execution and multi-host launch.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/TT-Distributed/TT-Distributed-Architecture-1219.md">TT-Metalium Distributed</a>: the design of MeshDevice, MeshBuffer, lock-step allocation and MeshWorkload.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">LLMs in TT-NN</a>: section 3.3 on multi-device: column/row/2D weight sharding and CCL choices for real models.</li>
+    <li><a href="https://arxiv.org/abs/1909.08053">Megatron-LM (Shoeybi et al., 2019)</a>: the paper that popularised column-then-row tensor parallelism for transformers.</li>
+    <li><a href="https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/">Bringing HPC Techniques to Deep Learning (Gibiansky)</a>: the classic illustrated explanation of ring all-reduce.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Tenstorrent at Hot Chips 2024</a>: Wormhole and Blackhole Ethernet, Blackhole Galaxy as a "scale-out Lego block".</li>
+    <li><a href="https://tenstorrent.com/hardware/galaxy">Tenstorrent Galaxy</a> and <a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole card specifications</a>: product-level numbers (note the conflicts flagged above).</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the README's multichip status and the <code>wh_x2</code>&hellip;<code>bh_x32</code> builds.</li>
+  </ul>
+
+  <div class="pager"><a href="a20-performance.html">&larr; 20 Thinking like a performance engineer</a><a class="next" href="a22-llm-capstone.html">22 Capstone: running an LLM &rarr;</a></div>
+</main>
+</body>
+</html>
