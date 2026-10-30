@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B04 · Following Tensix instructions · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border: 1px solid var(--orange); background: var(--bg2); border-radius: 8px; padding: .7rem 1rem; margin: 1rem 0 1.5rem; }
+  .honesty b { color: var(--orange); }
+  .out { border-color: #3a4a2a; }
+  .provenance { font-size: 13px; color: var(--muted); margin: -.3rem 0 .8rem; }
+  .modebar { display: flex; flex-wrap: wrap; gap: .5rem; padding: .6rem .8rem; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .modebar span { color: var(--muted); align-self: center; margin-right: .3rem; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a14-one-tiles-journey.html">&larr; Prev</a>
+  <a href="../chapters/a15-matmul-one-to-many.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B04</span><span class="tag">Prerequisites: A04, A12, A13, B00</span>
+  <h1><span class="num">B04.</span> Following Tensix instructions</h1>
+  <p class="subtitle">Teach the simulator to print every instruction one Tensix core executes, then use that trace to watch MOPs expand, the three threads take turns, and each thread stop and wait for another.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <em>functional, bit-exact</em> simulator: it computes the same bits silicon would. It is <em>not a timing model</em>. The clock counts and "rounds" in this lab say <em>in what order</em> ttsim ran things and <em>which</em> instruction waited for which. They do not say how many nanoseconds anything takes on a real chip. Treat every number below as an ordering or a count, never as performance.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">Setup</a></li>
+      <li><a href="#trace">Step 1: An opcode trace for one tile</a></li>
+      <li><a href="#stream">Step 2: One tile, three instruction streams</a></li>
+      <li><a href="#mop">Step 3: Watching MOPs expand</a></li>
+      <li><a href="#stalls">Step 4: Stalls, and who is waiting for whom</a></li>
+      <li><a href="#hist">Step 5: Eltwise add vs matmul, by opcode</a></li>
+      <li><a href="#exercises">Step 6: Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="../chapters/a04-inside-tensix.html">A04</a> you counted the instructions each TRISC pushed into the Tensix coprocessor for <code>add_2_integers_in_compute</code>, which adds two bf16 tiles on core (0,0). TRISC1, the MATH core, pushed 37 instructions (34 with <code>.ttinsn</code>, 3 with <code>sw</code>). None of them was an <code>ELWADD</code>, and yet 8 <code>ELWADD</code>s came out of its expanders. In <a href="../chapters/a12-compute-kernels.html">A12</a> you saw the source: one call, <code>add_tiles(cb_in0, cb_in1, 0, 0, 0)</code>, compiled three times. <a href="../chapters/a13-llk-mops-jit.html">A13</a> explained the machinery in between: the LLK library, MOP templates and the replay buffer.</p>
+  <p>Counts tell you <em>how many</em>. They don't tell you <em>when</em>. Here is the question for this lab:</p>
+  <p><b>If you could print every Tensix instruction as it leaves its thread's FIFO and runs, on all three threads of one core, what would you see? In what order do <code>UNPACR</code>, <code>ELWADD</code> and <code>PACR</code> actually run, and where does each thread sit and wait?</b></p>
+  <p>ttsim can't print that out of the box. But its source is a few C++ files that rebuild in four seconds, and the print we need is a few dozen lines, so we'll add it ourselves. By the end you'll have a trace format, a small Python post-processor that names opcodes using ttsim's own ISA table, and real traces of an eltwise add and a small matmul. Every output block on this page was produced in this orb with ttsim <code>b3620244</code> (Wormhole) and tt-metal <code>7aad8aac</code>.</p>
+
+  <h2 id="setup">Setup</h2>
+  <p>We use a lab directory of our own and an editable copy of ttsim (<a href="b00-workbench.html">B00</a> explains the scripts):</p>
+<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+export LAB_HOME=$HOME/ttlab/b04
+source $W/env.sh wh
+$W/build_ttsim.sh trace wh</code></pre>
+<pre class="out"><code>ttsim lab env: ARCH=wh SIM=/home/user/sim/wh/libttsim_wh.so cwd=/home/user/ttlab/b04/run
+copied ttsim source to /home/user/ttlab/b04/ttsim-trace (edit files in /home/user/ttlab/b04/ttsim-trace/src/)
+export TT_METAL_SIMULATOR=/home/user/ttlab/b04/sim-trace-wh-release/libttsim.so</code></pre>
+  <p>The edits go in <code>$LAB_HOME/ttsim-trace/src/</code>. Three patches are saved next to this page: <a href="patches/b04-trace.patch"><code>patches/b04-trace.patch</code></a> (step 1), <a href="patches/b04-mop.patch"><code>patches/b04-mop.patch</code></a> (step 3, applied on top of the first) and <a href="patches/b04-mm-small.patch"><code>patches/b04-mm-small.patch</code></a> (step 4, a smaller matmul host program). Apply them with <code>patch -p1</code> from the root of the ttsim copy (from <code>$LAB_HOME</code> for the third). We checked that applying the first two to pristine <code>b3620244</code> sources gives exactly the files we built.</p>
+
+  <h2 id="trace">Step 1: An opcode trace for one tile</h2>
+  <h3>Where does an instruction "execute"?</h3>
+  <p>To log executed instructions, we need the one place in ttsim where an instruction leaves the FIFO. It's in the clock loop. Each clock, ttsim visits every busy Tensix tile. For each of the three threads (ttsim calls them <em>pipes</em>) it hands the instruction at the head of the FIFO to <code>tensix_decode_and_execute</code>:</p>
+  <div class="filename">ttsim/src/libttsim.cpp:250-283 @b3620244 (trimmed)</div>
+<pre><code>for (uint32_t tile_id = next_busy_t_tile(0); tile_id &lt; NUM_T_TILES; tile_id = next_busy_t_tile(tile_id + 1)) {
+    TensixTile *p_tile = &amp;g_t_tiles[tile_id];
+    // Hack: for simulator perf, we clock a tile repeatedly as long as it successfully executes at least one Tensix instruction
+    for (;;) {
+        for (...) rv32_step(&amp;p_tile-&gt;rv32[rv32_index]);                 // each of the 5 baby RISC-Vs: one step
+        ...
+            tensix_frontend_step(p_tensix, pipe);                       // MOP/replay expanders refill the FIFO
+        ...
+        for (uint32_t pipe_mask = p_tensix-&gt;inst_pipes_active; ...) {   // pipes in order T0, T1, T2
+            uint32_t pipe = __builtin_ctz(pipe_mask);
+            ...
+                uint32_t inst = p_tensix-&gt;inst[pipe][inst_rd_ptr];
+                if (tensix_decode_and_execute(p_tensix, pipe, inst)) {  // true: executed, pop it
+                    any_tensix = true;
+                    inst_rd_ptr = (inst_rd_ptr + 1) % TENSIX_INST_FIFO_SIZE;
+                    ...
+        }
+        if (!any_tensix) {
+            break; // no Tensix instructions executed, bail out
+        }
+    }</code></pre>
+  <p>Three facts in that loop shape everything we'll see:</p>
+  <ul>
+    <li><b>Returning <code>false</code> means "stall".</b> The instruction stays at the head of its FIFO and is tried again next time. Every wait in this lab (an <code>UNPACR</code> with no free Src bank, an <code>ELWADD</code> with no valid operands, a <code>SEMWAIT</code> on a zero semaphore) is an execute function that returns <code>false</code>.</li>
+    <li><b>Pipes go in order T0, T1, T2 within one pass.</b> If T1 frees something, T0 can only see it on the next pass, but T2 sees it in the same pass. This turns out to explain one of our stalls exactly.</li>
+    <li><b>One clock can contain many passes.</b> The "hack" comment says it: as long as some Tensix instruction succeeds, ttsim keeps re-running the tile <em>within the same clock</em>. So <code>g_clock</code> is far too coarse to order instructions: the whole <code>add_tiles</code> body ran at clock 4531. We'll count passes instead and call each one a <b>round</b>. One round gives each RISC-V one step and each pipe one chance to execute.</li>
+  </ul>
+  <div class="callout warn">A round is not a cycle. On silicon, a RISC-V step, an expander step and a backend issue have different latencies, and an <code>MVMUL</code> has a pipeline. ttsim gives each of them one slot per round because it's a functional model. Rounds are good for <em>order</em> and for <em>how many times something was retried</em>. They are not good for durations.</div>
+
+  <h3>The patch</h3>
+  <p><code>tensix_decode_and_execute</code> is a five-line wrapper that releases a latched wait if the block mask allows it and then calls the decoder:</p>
+  <div class="filename">ttsim/src/tensix.cpp:5771-5776 @b3620244</div>
+<pre><code>bool tensix_decode_and_execute(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+    if (p_tensix-&gt;wait_block[pipe] &amp;&amp; block_mask_holds(p_tensix-&gt;wait_block[pipe], inst)) {
+        p_tensix-&gt;wait_block[pipe] = 0;
+    }
+    return tensix_execute_inst(p_tensix, pipe, inst);
+}</code></pre>
+  <p>We wrap the return value. A failed attempt bumps a per-pipe counter. A successful one writes a line with the clock, the round, the pipe, the raw 32-bit instruction and the number of failed attempts before it. We print the raw word, not a name, because ttsim already has a better name table than anything we'd type: <code>data/wh/tensix_isa.json</code>, the file its decoder is generated from (<code>tensix_gen_decode.py</code> reads it and writes <code>_out/wh/tensix_decode.h</code>). Gating keeps the log small. Nothing is written unless <code>B04_OUT</code> is set, and then only for one tile (<code>B04_TILE</code>, default 0, the tile that runs core (0,0) here) and a mask of pipes (<code>B04_PIPES</code>, default 7).</p>
+  <div class="filename">sim-labs/patches/b04-trace.patch (tensix.cpp part)</div>
+<pre><code>+// B04 lab: trace the Tensix instructions of ONE tile, gated by environment variables.
++//   B04_OUT=file   enables the trace;  B04_TILE=n (default 0);  B04_PIPES=mask of threads T0/T1/T2 (default 7)
++struct B04Trace {
++    FILE *f = nullptr;
++    uint32_t tile = 0, pipes = 7;
++    uint64_t first_try[TENSIX_INST_PIPES] = {}; // clock of the first failed attempt of the head instruction
++    uint64_t tries[TENSIX_INST_PIPES] = {};     // failed attempts so far
++    B04Trace() {
++        if (const char *p = getenv("B04_OUT")) f = fopen(p, "w");
++        if (f) setvbuf(f, nullptr, _IOLBF, 0); // line-buffered: ttsim errors end the process without flushing
++        if (const char *p = getenv("B04_TILE")) tile = atoi(p);
++        if (const char *p = getenv("B04_PIPES")) pipes = strtoul(p, nullptr, 0);
++    }
++    ~B04Trace() { if (f) fclose(f); }
++    bool on(const TensixState *p_tensix, uint32_t pipe) const {
++        return f &amp;&amp; (p_tensix-&gt;tile_id == tile) &amp;&amp; ((pipes &gt;&gt; pipe) &amp; 1);
++    }
++};
++static B04Trace s_b04;
++uint64_t g_b04_round;            // issue rounds of the traced tile (libttsim.cpp clocks a tile several rounds per clock)
++uint32_t b04_trace_tile() { return s_b04.tile; }
+ ...
+@@ -5772,5 +5795,17 @@
+     if (p_tensix-&gt;wait_block[pipe] &amp;&amp; block_mask_holds(p_tensix-&gt;wait_block[pipe], inst)) {
+         p_tensix-&gt;wait_block[pipe] = 0;
+     }
+-    return tensix_execute_inst(p_tensix, pipe, inst);
++    bool done = tensix_execute_inst(p_tensix, pipe, inst);
++    if (s_b04.on(p_tensix, pipe)) {
++        if (!done) {
++            if (!s_b04.tries[pipe]++) s_b04.first_try[pipe] = g_clock; // stalled: the FIFO head retries later
++        } else {
++            // X &lt;clock&gt; &lt;round&gt; T&lt;pipe&gt; &lt;instruction&gt; &lt;failed tries&gt; &lt;clocks spent stalled&gt;
++            uint64_t stall_clks = s_b04.tries[pipe] ? g_clock - s_b04.first_try[pipe] : 0;
++            fprintf(s_b04.f, "X %llu %llu T%u %08x %llu %llu\n", (unsigned long long)g_clock, (unsigned long long)g_b04_round, pipe, inst,
++                    (unsigned long long)s_b04.tries[pipe], (unsigned long long)stall_clks);
++            s_b04.tries[pipe] = 0;
++        }
++    }
++    return done;
+ }</code></pre>
+  <p>The round counter lives in the clock loop, so the same patch adds two lines to <code>libttsim.cpp</code>:</p>
+  <div class="filename">sim-labs/patches/b04-trace.patch (libttsim.cpp part)</div>
+<pre><code>+extern uint64_t g_b04_round; // B04 lab trace (tensix.cpp)
++uint32_t b04_trace_tile();
+ static void clock_current_chip() {
+ ...
+         for (;;) {
++            if (tile_id == b04_trace_tile()) g_b04_round++;
+             for (uint32_t rv32_mask = p_tile-&gt;rv32_cores_active; rv32_mask; rv32_mask &amp;= rv32_mask - 1) {</code></pre>
+  <p>The <code>setvbuf</code> line was added after a lesson. When ttsim hits an error it ends the process, and our first version lost the trace lines still sitting in stdio's buffer, which are exactly the lines you want when debugging a crash (Exercise 6). Line buffering fixes that. Because "failed attempt" is counted per round, the <code>tries</code> field is exactly the number of rounds the instruction sat at the head of its FIFO, refused to execute.</p>
+
+  <h3>Naming opcodes with tensix_isa.json</h3>
+  <p>Opcodes are the top byte of the instruction (<code>TT_OP(opcode, params) ((opcode &lt;&lt; 24) + params)</code> in <code>ckernel_ops.h</code>). The ISA file maps each name to an opcode and its fields as <code>"hi:lo"</code> bit ranges:</p>
+  <div class="filename">ttsim/data/wh/tensix_isa.json @b3620244 (three of its 128 entries, reformatted)</div>
+<pre><code>"ELWADD":    {"opcode": 40,  "args": {"dst": "9:0", "addr_mode": "16:15", "instr_mod19": "20:19", "dest_accum_en": "21:21", "clear_dvalid": "23:22"}},
+"SEMWAIT":   {"opcode": 166, "args": {"wait_sem_cond": "1:0", "sem_sel": "9:2", "stall_res": "23:15"}},
+"STALLWAIT": {"opcode": 162, "args": {"wait_res": "14:0", "stall_res": "23:15"}},</code></pre>
+  <p>The post-processor, <a href="workbench/py/b04_trace.py"><code>sim-labs/workbench/py/b04_trace.py</code></a>, loads that file and turns <code>a6008009</code> into "SEMWAIT MATH_PACK while==0". It decodes a few fields where they help: the semaphore names come from <code>ckernel_structs.h:15-24</code>, and the <code>STALLWAIT</code> condition bits C0–C14 from the ISA documentation's <code>STALLWAIT.md</code>. One caveat: the JSON has placeholder bit ranges for <code>MOP</code> and <code>REPLAY</code>, because ttsim decodes those four frontend opcodes by hand, so the script decodes them the way <code>mop_ingest</code> and <code>replay_expander</code> do. It has five subcommands: <code>stream</code>, <code>stalls</code>, <code>mops</code>, <code>hist</code> and <code>js</code>.</p>
+  <div class="callout gpu">This is the moral equivalent of running a GPU kernel under an instruction-level tracer (think SASS-level tracing in a simulator such as GPGPU-Sim, or binary instrumentation with NVBit) and post-processing with the ISA tables. The difference is how small it is. The whole Tensix frontend and backend of ttsim fit in one 6000-line file, and our hook is one function.</div>
+
+  <h2 id="stream">Step 2: One tile, three instruction streams</h2>
+<pre><code>$W/build_ttsim.sh trace wh
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-trace-wh-release/libttsim.so
+export TTSIM_HOME=~/ttsim            # where b04_trace.py finds data/wh/tensix_isa.json
+B04_OUT=$LAB_HOME/add.trace $EX/metal_example_add_2_integers_in_compute
+wc -l $LAB_HOME/add.trace
+python3 $W/py/b04_trace.py stream $LAB_HOME/add.trace</code></pre>
+<pre class="out"><code>Success: Result matches expected value!
+[4682] 0.2 seconds (25.6 KHz)
+151 /home/user/ttlab/b04/add.trace</code></pre>
+  <p>The program still passes, at the same 4682 clocks as stock ttsim in A04. The trace changes nothing it observes. With the trace on, the whole run took 0.36 s of wall-clock time. 151 instructions executed on tile 0. Here is the stream, cut into the pieces worth reading. The columns are clock, round, thread, raw word, name and decoded fields.</p>
+  <h3>Boot: BRISC initialises the coprocessor</h3>
+<pre class="out"><code>X     2088   1840 T0 10180000 ZEROACC
+X     2090   1843 T0 8a00300a SFPENCC
+X     2094   1848 T0 7100bf80 SFPLOADI
+X     2096   1851 T0 910000b0 SFPCONFIG
+X     2112   1868 T0 a3100008 SEMINIT    MATH_PACK init=0 max=1
+X     2113   1870 T0 a3100010 SEMINIT    UNPACK_TO_DEST init=0 max=1
+X     2114   1872 T0 a3100200 SEMINIT    MATH_DONE init=0 max=1
+X     2115   1874 T0 a3100040 SEMINIT    PACK_DONE init=0 max=1</code></pre>
+  <p>These eight came long before any kernel, and TRISC0 didn't push them. Step 3's push log shows they were pushed by BRISC with <code>bypass_mop_expander</code> set, which is the path that enters thread T0 after its MOP expander (A04). BRISC actually pushed nine: the ninth was a <code>NOP</code>, which <code>tensix_push_inst_fifo</code> drops on entry (<code>tensix.cpp:49-52</code>). They match BRISC's firmware <code>device_setup()</code> line by line: clear Dst, enable the SFPU condition-code stack, load SFPU constants, then <code>initialize_tensix_semaphores</code>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisc.cc:248-255,262 @7aad8aac and hw/inc/internal/tt-1xx/wormhole/c_tensix_core.h:276-279</div>
+<pre><code>    // Clear destination registers
+    core.ex_zeroacc(instrn_buf[0]);
+    // Enable CC stack
+    core.ex_encc(instrn_buf[0]);
+    // Set default sfpu constant register state
+    core.ex_load_const(instrn_buf[0]);
+    ...
+    core.initialize_tensix_semaphores(instrn_buf[0]);
+...
+    ex_sem_init(ckernel::semaphore::MATH_PACK, 1, 0, instrn_buf);
+    ex_sem_init(ckernel::semaphore::UNPACK_TO_DEST, 1, 0, instrn_buf);
+    ex_sem_init(ckernel::semaphore::MATH_DONE, 1, 0, instrn_buf);
+    ex_sem_init(ckernel::semaphore::PACK_DONE, 1, 0, instrn_buf);</code></pre>
+  <p>That answers a loose end from A04, which noted that BRISC pushed 9 instructions on each of 72 tiles but didn't trace which ones.</p>
+
+  <h3>Configuration: most instructions are not math</h3>
+  <p>Next, between clocks 4263 and 4519, the three TRISCs run <code>compute_kernel_hw_startup</code> and <code>add_init</code>. This is the bulk of the trace: <code>SETC16</code>, <code>RMWCIB0..3</code>, <code>WRCFG</code>, <code>SETGPR</code> and <code>REG2FLOP</code> writes that program data formats, address counters and the MOP templates. A few lines from MATH (T1):</p>
+<pre class="out"><code>X     4272   4036 T1 a3200008 SEMINIT    MATH_PACK init=0 max=2
+X     4273   4038 T1 b2010000 SETC16
+X     4273   4039 T1 a2404080 STALLWAIT  until MATH+SFPU block=0x080
+...
+X     4309   4097 T1 3700000f SETRWC
+X     4318   4107 T1 a6a1000a SEMWAIT    MATH_PACK while==max
+X     4325   4115 T1 b2010000 SETC16</code></pre>
+  <p>Two of those set up the handshake you know from A12. MATH re-initialises <code>MATH_PACK</code> with max=2: the boot value of 1 becomes 2, which allows half-sync double buffering of Dst. Then <code>tile_regs_acquire()</code> becomes a <code>SEMWAIT MATH_PACK while==max</code>: "don't start math while both halves of Dst are full". The semaphore is 0, so it passes at once.</p>
+
+  <h3>The tile itself</h3>
+  <p>Now the interesting part. Everything below happened inside a single ttsim clock, 4531, in 33 consecutive rounds:</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py stream $LAB_HOME/add.trace --from 4383 --to 4415
+X     4531   4383 T0 a2042000 STALLWAIT  until TRISC_CFG block=0x008
+X     4531   4384 T0 420080c1 UNPACR     SrcA
+X     4531   4385 T0 428080c1 UNPACR     SrcB
+X     4531   4385 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0   &lt;- stalled 269 rounds, 206 clocks
+X     4531   4386 T0 420080c1 UNPACR     SrcA
+X     4531   4386 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4387 T0 428080c1 UNPACR     SrcB
+X     4531   4387 T1 37cc0003 SETRWC
+X     4531   4388 T0 420080c1 UNPACR     SrcA
+X     4531   4388 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4389 T0 428080c1 UNPACR     SrcB
+X     4531   4389 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4390 T1 37cc0003 SETRWC
+X     4531   4391 T0 420080c1 UNPACR     SrcA   &lt;- stalled 1 rounds, 0 clocks
+X     4531   4391 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4392 T0 428080c1 UNPACR     SrcB
+X     4531   4392 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4393 T0 a5000080 SEMGET     UNPACK_SYNC
+X     4531   4393 T1 37cc0003 SETRWC
+X     4531   4394 T0 b2270101 SETC16
+X     4531   4394 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4395 T1 28000000 ELWADD     dst=0 addr_mode=0 clear_dvalid=0
+X     4531   4396 T1 37cc0003 SETRWC
+X     4531   4397 T1 37000004 SETRWC
+X     4531   4398 T0 45000108 SETGPR
+X     4531   4398 T1 a2014080 STALLWAIT  until MATH+SFPU block=0x002
+X     4531   4399 T0 a2100006 STALLWAIT  until UNPACK0+UNPACK1 block=0x020
+X     4531   4399 T1 a4000008 SEMPOST    MATH_PACK
+X     4531   4399 T2 a6008009 SEMWAIT    MATH_PACK while==0   &lt;- stalled 72 rounds, 55 clocks
+X     4531   4400 T0 67110003 STOREREG
+X     4531   4400 T1 a2404080 STALLWAIT  until MATH+SFPU block=0x080
+X     4531   4400 T2 508c0000 SETADC
+X     4531   4401 T1 b2010200 SETC16
+X     4531   4401 T2 451ae518 SETGPR
+X     4531   4402 T2 45800019 SETGPR
+X     4531   4403 T2 4840014c REG2FLOP
+X     4531   4404 T2 41010f02 PACR
+X     4531   4405 T2 45000019 SETGPR
+X     4531   4406 T2 41008f11 PACR
+X     4531   4407 T2 a2200078 STALLWAIT  until PACK0+PACK1+PACK2+PACK3 block=0x040
+X     4531   4408 T2 10108000 ZEROACC
+X     4531   4409 T2 a5000008 SEMGET     MATH_PACK
+...</code></pre>
+  <p>Read it as three columns, not one list. That's what the animation below does: it replays this exact trace, trimmed to the rounds shown, with each thread on its own lane. The orange bands are rounds the head instruction spent refusing to execute. The animation continues into two windows of the matmul trace from step 4.</p>
+
+  <div class="viz" id="fig-lanes"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-lanes");
+    var g = TT.canvas(root, 900, 380), ctx = g.ctx, C = TT.C;
+    // Real trace data from b04_trace.py js: [round, pipe, opcode, failed tries before it executed]
+    var DS = {
+      add: { title: "add_2_integers_in_compute, tile 0, rounds 4380-4416 (all at clock 4531)", w: [4380, 4416],
+        ev: [[4383,0,"STALLWAIT",0],[4384,0,"UNPACR",0],[4385,0,"UNPACR",0],[4385,1,"ELWADD",269],[4386,0,"UNPACR",0],[4386,1,"ELWADD",0],[4387,0,"UNPACR",0],[4387,1,"SETRWC",0],[4388,0,"UNPACR",0],[4388,1,"ELWADD",0],[4389,0,"UNPACR",0],[4389,1,"ELWADD",0],[4390,1,"SETRWC",0],[4391,0,"UNPACR",1],[4391,1,"ELWADD",0],[4392,0,"UNPACR",0],[4392,1,"ELWADD",0],[4393,0,"SEMGET",0],[4393,1,"SETRWC",0],[4394,0,"SETC16",0],[4394,1,"ELWADD",0],[4395,1,"ELWADD",0],[4396,1,"SETRWC",0],[4397,1,"SETRWC",0],[4398,0,"SETGPR",0],[4398,1,"STALLWAIT",0],[4399,0,"STALLWAIT",0],[4399,1,"SEMPOST",0],[4399,2,"SEMWAIT",72],[4400,0,"STOREREG",0],[4400,1,"STALLWAIT",0],[4400,2,"SETADC",0],[4401,1,"SETC16",0],[4401,2,"SETGPR",0],[4402,2,"SETGPR",0],[4403,2,"REG2FLOP",0],[4404,2,"PACR",0],[4405,2,"SETGPR",0],[4406,2,"PACR",0],[4407,2,"STALLWAIT",0],[4408,2,"ZEROACC",0],[4409,2,"SEMGET",0],[4410,2,"WRCFG",0],[4411,2,"DMANOP",0],[4412,2,"DMANOP",0],[4413,2,"SETGPR",0],[4414,2,"STALLWAIT",0],[4415,2,"STOREREG",0]] },
+      mm1: { title: "64x64 matmul (HiFi4), tile 0, rounds 4440-4477: the first MVMULs", w: [4440, 4477],
+        ev: [[4442,0,"STALLWAIT",0],[4443,0,"UNPACR",0],[4444,0,"UNPACR",0],[4444,1,"MVMUL",300],[4445,0,"RDCFG",0],[4445,1,"MVMUL",0],[4446,0,"ADDGPR",0],[4446,1,"MVMUL",0],[4447,0,"REG2FLOP",0],[4447,1,"MVMUL",0],[4448,0,"SEMGET",0],[4448,1,"MVMUL",0],[4449,0,"SETC16",0],[4449,1,"MVMUL",0],[4450,1,"MVMUL",0],[4451,1,"MVMUL",0],[4452,1,"MVMUL",0],[4453,0,"SETGPR",0],[4453,1,"MVMUL",0],[4454,0,"STALLWAIT",0],[4454,1,"MVMUL",0],[4455,0,"STOREREG",0],[4455,1,"MVMUL",0],[4456,1,"MVMUL",0],[4457,1,"MVMUL",0],[4458,1,"MVMUL",0],[4459,1,"MVMUL",0],[4460,1,"MVMUL",0],[4461,1,"MVMUL",0],[4462,1,"MVMUL",0],[4463,1,"MVMUL",0],[4464,1,"MVMUL",0],[4465,1,"MVMUL",0],[4466,1,"MVMUL",0],[4467,0,"SETGPR",0],[4467,1,"MVMUL",0],[4468,0,"STALLWAIT",0],[4468,1,"MVMUL",0],[4469,0,"STOREREG",0],[4469,1,"MVMUL",0],[4470,1,"MVMUL",0],[4471,1,"MVMUL",0],[4472,1,"MVMUL",0],[4473,1,"MVMUL",0],[4474,1,"MVMUL",0],[4475,1,"MVMUL",0],[4476,1,"MVMUL",0],[4477,1,"MVMUL",0]] },
+      mm2: { title: "64x64 matmul (HiFi4), tile 0, rounds 4596-4636: first output tile handed to PACK", w: [4596, 4636],
+        ev: [[4596,1,"MVMUL",0],[4597,1,"MVMUL",0],[4598,1,"MVMUL",0],[4599,1,"MVMUL",0],[4600,1,"MVMUL",0],[4601,1,"MVMUL",0],[4602,1,"MVMUL",0],[4603,1,"MVMUL",0],[4604,1,"MVMUL",0],[4605,1,"MVMUL",0],[4606,1,"MVMUL",0],[4607,1,"MVMUL",0],[4608,1,"MVMUL",0],[4609,1,"MVMUL",0],[4610,1,"MVMUL",0],[4611,1,"MVMUL",0],[4612,1,"MVMUL",0],[4613,1,"MVMUL",0],[4614,1,"MVMUL",0],[4615,1,"MVMUL",0],[4616,1,"SETRWC",0],[4617,1,"SETRWC",0],[4618,1,"STALLWAIT",0],[4619,1,"SEMPOST",0],[4619,2,"SEMWAIT",256],[4620,1,"STALLWAIT",0],[4620,2,"SETADC",0],[4621,1,"SETC16",0],[4621,2,"SETGPR",0],[4622,1,"SEMWAIT",0],[4622,2,"SETGPR",0],[4623,1,"SETC16",0],[4623,2,"REG2FLOP",0],[4624,2,"PACR",0],[4625,2,"SETGPR",0],[4626,2,"PACR",0],[4627,2,"SETGPR",0],[4628,2,"STALLWAIT",0],[4629,2,"STOREREG",0],[4630,2,"STALLWAIT",0],[4631,2,"ZEROACC",0],[4632,2,"SEMGET",0],[4633,2,"WRCFG",0],[4634,2,"DMANOP",0],[4635,2,"DMANOP",0]] }
+    };
+    function col(n) {
+      if (n === "UNPACR") return C.blue;
+      if (n === "ELWADD" || n === "MVMUL") return C.yellow;
+      if (n === "PACR") return C.green;
+      if (/^SEM|STALLWAIT/.test(n)) return C.red;
+      if (/^SETRWC|^SETADC|^ZEROACC/.test(n)) return C.purple;
+      return C.muted;
+    }
+    var steps = [
+      { ds: "add", r: [4380, 4383], text: "<b>The add, one tile.</b> Three lanes, one per Tensix thread. Each block is one instruction that executed in that round. T1's <code>ELWADD</code> is already at the head of its FIFO, refusing to run: the orange band reaches back past the left edge because it started at round 4116, the round the MOP was ingested." },
+      { ds: "add", r: [4383, 4386], text: "<b>Unpack, then math.</b> T0 passes a <code>STALLWAIT</code>, then unpacks a face into SrcA (round 4384) and SrcB (4385). In round 4385, after T0 has run, both operand banks are valid, so T1's <code>ELWADD</code> finally executes, after 269 failed tries. No semaphore was needed: the Src valid bits are the hand-off." },
+      { ds: "add", r: [4386, 4392], text: "<b>The rhythm.</b> UNPACR A, UNPACR B on T0; ELWADD, ELWADD, SETRWC on T1. Each <code>SETRWC</code> (clear_ab_vld=3) hands both Src banks back to the unpacker. At round 4391 an <code>UNPACR SrcA</code> shows a one-round stall: in round 4390 its bank was still valid, because T1's <code>SETRWC</code> runs <em>after</em> T0 in the same round." },
+      { ds: "add", r: [4392, 4399], text: "<b>MATH signals PACK.</b> After the 8th <code>ELWADD</code> and the 4th <code>SETRWC</code>, T1 runs <code>STALLWAIT</code> (until MATH+SFPU) and <code>SEMPOST MATH_PACK</code>. T2 runs after T1 within the round, so its <code>SEMWAIT MATH_PACK while==0</code>, stuck for 72 rounds, passes in the same round 4399." },
+      { ds: "add", r: [4399, 4416], text: "<b>PACK drains Dst.</b> T2 programs the packer, issues two <code>PACR</code>s, waits for the packers (<code>STALLWAIT</code> PACK0..3), clears its half of Dst (<code>ZEROACC</code>) and returns the Dst half with <code>SEMGET MATH_PACK</code>. That is <code>tile_regs_wait / pack_tile / tile_regs_release</code> from A12, instruction by instruction." },
+      { ds: "mm1", r: [4440, 4444], text: "<b>Matmul: operands in the other order.</b> In the 2&times;2-tile matmul, T0 unpacks <b>SrcB first</b> (in0, the left matrix, goes to SrcB) and then SrcA. T1's <code>MVMUL</code> has been waiting 300 rounds for both banks to become valid, and runs in round 4444, right after the SrcA unpack." },
+      { ds: "mm1", r: [4444, 4477], text: "<b>An MVMUL every round.</b> These come from the replay buffer: one <code>REPLAY</code> plays back 16 recorded <code>MVMUL</code>s, and at HiFi4 the MOP plays it 4 times. T0 is meanwhile doing address bookkeeping (<code>RDCFG</code>, <code>ADDGPR</code>, <code>STOREREG</code>). The FPU lane never waits once it has started." },
+      { ds: "mm2", r: [4596, 4619], text: "<b>End of one output tile.</b> Kt = 2, so the output tile needs two <code>matmul_tiles</code> calls: 128 MVMULs. Then T1 resets counters (<code>SETRWC</code>), waits for the FPU (<code>STALLWAIT</code>) and posts <code>MATH_PACK</code>. T2's <code>SEMWAIT</code> has waited 256 rounds and passes in the same round." },
+      { ds: "mm2", r: [4619, 4636], text: "<b>Overlap via half-sync.</b> While T2 packs, T1 already passes its next <code>SEMWAIT MATH_PACK while==max</code> (round 4622): the semaphore is 1 and its max is 2, so MATH may start filling the other half of Dst. That double buffering is why MATH_PACK was re-initialised with max=2." }
+    ];
+    var PX0 = 110, PX1 = 885, LY = [78, 178, 278], LH = 78;
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        var s = steps[i], d = DS[s.ds];
+        var cur = TT.lerp(s.r[0], s.r[1] + 0.999, t);
+        TT.clear(ctx, g.W, g.H);
+        var n = d.w[1] - d.w[0] + 1, pw = (PX1 - PX0) / n;
+        function X(r) { return PX0 + (r - d.w[0]) * pw; }
+        TT.text(ctx, d.title, 14, 16, { font: "bold 14px" });
+        var names = ["T0  UNPACK", "T1  MATH", "T2  PACK"];
+        for (var p = 0; p < 3; p++) {
+          TT.box(ctx, PX0, LY[p], PX1 - PX0, LH, { fill: C.bg2, r: 4 });
+          TT.text(ctx, names[p], 12, LY[p] + LH / 2, { font: "bold 13px", color: [C.blue, C.yellow, C.green][p] });
+        }
+        // round axis
+        for (var r = d.w[0]; r <= d.w[1]; r++) {
+          if ((r - d.w[0]) % 5 === 0) {
+            TT.text(ctx, String(r), X(r) + 1, 362, { font: "11px", color: C.muted, mono: true });
+            ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(r), 60); ctx.lineTo(X(r), 352); ctx.stroke();
+          }
+        }
+        TT.text(ctx, "round \u2192", 12, 362, { font: "11px", color: C.muted });
+        d.ev.forEach(function (e) {
+          var y = LY[e[1]];
+          if (e[3] > 0) {   // stall band: the rounds before execution
+            var s0 = e[0] - e[3], a = Math.max(s0, d.w[0]), b = Math.min(e[0], cur);
+            if (b > a) {
+              ctx.globalAlpha = 0.35; ctx.fillStyle = C.orange; ctx.fillRect(X(a), y + 4, X(b) - X(a), LH - 8); ctx.globalAlpha = 1;
+              var lab = "waits " + e[3] + (e[3] === 1 ? " round" : " rounds") + (s0 < d.w[0] ? " (since " + s0 + ")" : "");
+              TT.text(ctx, lab, X(a) + 4, y - 8, { font: "bold 11px", color: C.orange });
+              if (s0 < d.w[0]) TT.text(ctx, "\u25C0", X(a) + 1, y + 12, { font: "11px", color: C.orange });
+            }
+          }
+          if (e[0] > cur) return;
+          var x = X(e[0]) + 1, w = Math.max(2, pw - 2), c = col(e[2]);
+          TT.box(ctx, x, y + 3, w, LH - 6, { fill: c, alpha: 0.85, r: 3 });
+          ctx.save(); ctx.translate(x + w / 2, y + LH - 7); ctx.rotate(-Math.PI / 2);
+          TT.text(ctx, e[2], 0, 0, { font: "10px", color: "#000", base: "middle" }); ctx.restore();
+        });
+        // playhead
+        var xp = X(Math.min(cur, d.w[1] + 0.999));
+        ctx.strokeStyle = C.fg; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(xp, 62); ctx.lineTo(xp, 354); ctx.stroke();
+        TT.text(ctx, "round " + Math.floor(cur), Math.min(xp, PX1 - 40), 54, { font: "bold 11px", align: "center", mono: true });
+        // legend
+        var L = [["unpack", C.blue], ["FPU", C.yellow], ["pack", C.green], ["sync", C.red], ["counters/Dst", C.purple], ["config", C.muted], ["stalled", C.orange]];
+        var lx = PX1;
+        ctx.font = "11px Inter, sans-serif";
+        L.slice().reverse().forEach(function (l) { var tw = ctx.measureText(l[0]).width; lx -= tw + 30; TT.box(ctx, lx, 30, 10, 10, { fill: l[1], r: 2 }); TT.text(ctx, l[0], lx + 14, 35, { font: "11px", color: C.muted }); ctx.font = "11px Inter, sans-serif"; });
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout key">Unpack → math is synchronised by hardware: an FPU instruction simply refuses to execute until both Src banks are valid. Math → pack is synchronised by software: a <code>SEMPOST</code> on one thread releases a <code>SEMWAIT</code> on the other. The trace shows both mechanisms firing, in the round you'd predict.</div>
+
+  <h2 id="mop">Step 3: Watching MOPs expand</h2>
+  <p>The X lines show what executed. To see where it came from, we log three more places on the frontend path. A push enters <code>tensix_push_inst</code>, which sends a <code>MOP</code> to the MOP expander and everything else to the replay expander:</p>
+  <div class="filename">ttsim/src/tensix.cpp:295-308 @b3620244</div>
+<pre><code>void tensix_push_inst(TensixState *p_tensix, uint32_t pipe, uint32_t inst, bool bypass_mop_expander) {
+    if (bypass_mop_expander) {
+        replay_expander(p_tensix, pipe, inst);
+        tensix_frontend_step(p_tensix, pipe);
+        return;
+    }
+    uint32_t opcode = bits&lt;31,24&gt;(inst);
+    switch (opcode) {
+        case TENSIX_OPCODE_MOP: mop_ingest(p_tensix, pipe, inst); break;
+        case TENSIX_OPCODE_MOP_CFG: mop_cfg(p_tensix, pipe, inst); break;
+        default: replay_expander(p_tensix, pipe, inst); break; // everything else is just passthrough
+    }
+    tensix_frontend_step(p_tensix, pipe);
+}</code></pre>
+  <p><code>mop_ingest</code> (<code>tensix.cpp:125-157</code>) snapshots the thread's nine MOP config words. <code>mop_next</code> then walks <code>mop_step_inst</code> (<code>161-218</code>) one emitted instruction at a time, whenever the FIFO has room, and each emitted instruction goes through <code>replay_expander</code> (<code>63-116</code>), which may record it, or turn a <code>REPLAY</code> into a playback. The second patch adds a line at each of those points: <code>P</code> for a push, <code>M</code> for an ingested MOP with its config words, <code>E</code> for each emitted instruction, <code>D</code> when an expansion ends with its count, <code>R</code> for a <code>REPLAY</code>, and <code>Y</code> for each instruction played back from the replay buffer.</p>
+  <div class="filename">sim-labs/patches/b04-mop.patch (excerpt)</div>
+<pre><code>+// One trace line: &lt;kind&gt; &lt;clock&gt; &lt;round&gt; T&lt;pipe&gt; &lt;instruction&gt; [extra]
++static void b04_ev(char kind, const TensixState *p_tensix, uint32_t pipe, uint32_t inst, const char *extra = "") {
++    if (s_b04.on(p_tensix, pipe)) {
++        fprintf(s_b04.f, "%c %llu %llu T%u %08x%s\n", kind, (unsigned long long)g_clock, (unsigned long long)g_b04_round,
++                pipe, inst, extra);
++    }
++}
+ ...                                                     (in mop_ingest, after the config is copied)
++    snprintf(cfgs, sizeof(cfgs), " %x %x %08x %08x %08x %08x %08x %08x %08x", cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
++             cfg[6], cfg[7], cfg[8]);
++    b04_ev('M', p_tensix, pipe, inst, cfgs);
+ ...                                                     (in mop_next)
+         if (step == MOP_STEP_EMIT) {
++            b04_ev('E', p_tensix, pipe, *p_inst);
++            s_b04.emitted[pipe]++;
+             return true;
+ ...
++    b04_ev('D', p_tensix, pipe, p_mop-&gt;inst, n);
+     p_mop-&gt;busy = false;
+ ...                                                     (in tensix_frontend_step, replay playback)
++            b04_ev('Y', p_tensix, pipe, p_tensix-&gt;replay_buf[pipe][p_tensix-&gt;replay_play_index[pipe]]);
+ ...                                                     (in tensix_push_inst)
++    b04_ev('P', p_tensix, pipe, inst, bypass_mop_expander ? " 1" : " 0");</code></pre>
+  <p>Rebuild, rerun (the result and the 4682 clocks are unchanged), and ask for the MOPs:</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py mops $LAB_HOME/add.trace
+T1 clock 4325 round 4116: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=4 inner=2
+      start=NOP end0=SETRWC end1=NOP loop=ELWADD loop1=NOP last0=ELWADD last1=ELWADD
+      -&gt; 12 emitted: ELWADD x8, SETRWC x4
+T2 clock 4506 round 4357: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=1 inner=1
+      start=NOP end0=NOP end1=NOP loop=PACR loop1=NOP last0=PACR last1=PACR
+      -&gt; 1 emitted: PACR x1
+T0 clock 4531 round 4384: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=2 inner=2
+      start=NOP end0=NOP end1=NOP loop=UNPACR loop1=UNPACR last0=UNPACR last1=UNPACR
+      -&gt; 8 emitted: UNPACR x8</code></pre>
+  <p>So <code>add_tiles</code> is three MOPs, one per thread. The math MOP is a double loop: 4 outer iterations (one per 16×16 face), each running the inner op twice (each <code>ELWADD</code> handles 8 rows, and a face has 16) and then the end op <code>SETRWC</code>, which resets the row counters and releases the Src banks. That is 4 × (2 + 1) = 12. The LLK code that programmed it says the same thing in C++:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_binary.h:125,131,143,150 @7aad8aac</div>
+<pre><code>    const std::uint8_t innerloop = tensor_shape.face_r_dim &gt; MAX_FPU_ROWS ? (tensor_shape.face_r_dim &gt;&gt; MAX_FPU_ROWS_LOG2) : 1;
+    const std::uint32_t outerloop = (bcast_type == BroadcastType::COL) ? num_faces_c_dim : num_faces;
+        ckernel_template tmp(outerloop, innerloop, eltwise_binary_func&lt;eltwise_binary_type&gt;(0 /*clr_src*/, acc_to_dest, broadcast_type, addr_mod));
+        tmp.set_end_op(TT_OP_SETRWC(CLR_SRC, p_setrwc::CR_AB, 0, 0, 0, p_setrwc::SET_AB));</code></pre>
+  <p>With <code>face_r_dim</code> = 16 and <code>MAX_FPU_ROWS</code> = 8, <code>innerloop</code> = 2, and <code>num_faces</code> = 4. The unpack MOP uses <em>two</em> inner ops, <code>UNPACR SrcA</code> and <code>UNPACR SrcB</code>. In that case ttsim doubles the inner count and alternates the two (<code>loop_op_flip</code> in <code>mop_step_inst</code>), giving A B A B per outer iteration and 8 in total. That's <code>ckernel_template tmp(num_faces_r_dim, num_faces_c_dim, unpack_srca, unpack_srcb)</code> at <code>llk_unpack_AB.h:130</code>, with 2 × 2 faces. Step through the expander below. It runs the same rules as ttsim's <code>mop_step_inst</code> on the config words captured above.</p>
+
+  <div class="viz" id="fig-mop"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-mop"), C = TT.C;
+    // Captured MOP configs (M lines). "loop1" NOP means a single inner op.
+    var CFG = {
+      t1add: { label: "add, T1 MATH", outer: 4, inner: 2, start: "NOP", loop: "ELWADD", loop1: "NOP", end0: "SETRWC", end1: "NOP", last0: "ELWADD", last1: "ELWADD",
+               src: "ckernel_template(outerloop=4 faces, innerloop=2, ELWADD) + set_end_op(SETRWC)" },
+      t0add: { label: "add, T0 UNPACK", outer: 2, inner: 2, start: "NOP", loop: "UNPACR A", loop1: "UNPACR B", end0: "NOP", end1: "NOP", last0: "UNPACR B", last1: "UNPACR B",
+               src: "ckernel_template(num_faces_r_dim=2, num_faces_c_dim=2, unpack_srca, unpack_srcb)" },
+      t1mm: { label: "matmul HiFi4, T1 MATH", outer: 1, inner: 4, start: "NOP", loop: "REPLAY", loop1: "NOP", end0: "SETRWC", end1: "NOP", last0: "REPLAY", last1: "REPLAY",
+               src: "ckernel_template(1, inner_loops = 4 (HiFi4), replay_insn(offset, 16))" }
+    };
+    // Port of tensix.cpp mop_step_inst for mop_type 1.
+    function expand(c) {
+      var out = [], inner = c.inner * (c.loop1 !== "NOP" ? 2 : 1);
+      for (var it = 0; it < c.outer; it++) {
+        for (var step = 0; ; step++) {
+          var name = null, why = "";
+          if (step === 0) { if (c.start === "NOP") continue; name = c.start; why = "start_op"; }
+          else if (step <= inner) {
+            var j = step - 1;
+            if (j + 1 < inner) { name = (c.loop1 !== "NOP" && (j & 1)) ? c.loop1 : c.loop; why = (c.loop1 !== "NOP" && (j & 1)) ? "inner loop, odd slot: loop_op1" : "inner loop: loop_op"; }
+            else if (it + 1 < c.outer) { name = c.last1; why = "last inner slot, not last outer iteration: loop1_last_instr (cfg[8])"; }
+            else { name = c.last0; why = "last inner slot of the last outer iteration: loop0_last_instr (cfg[7])"; }
+          } else if (step === inner + 1) { if (c.end0 === "NOP") continue; name = c.end0; why = "end_op0"; }
+          else if (step === inner + 2) { if (c.end0 === "NOP" || c.end1 === "NOP") continue; name = c.end1; why = "end_op1"; }
+          else break;
+          out.push({ it: it, step: step, name: name, why: why });
+        }
+      }
+      return out;
+    }
+    var mode = "t1add";
+    function build() {
+      root.innerHTML = "";
+      var bar = document.createElement("div"); bar.className = "modebar";
+      bar.innerHTML = "<span>MOP:</span>";
+      Object.keys(CFG).forEach(function (k) {
+        var b = document.createElement("button"); b.className = "tt" + (k === mode ? " on" : ""); b.textContent = CFG[k].label;
+        b.style.cssText = k === mode ? "background:var(--blue);color:#000" : "";
+        b.onclick = function () { mode = k; build(); }; bar.appendChild(b);
+      });
+      root.appendChild(bar);
+      var g = TT.canvas(root, 900, 400), ctx = g.ctx;
+      root.insertBefore(bar, root.firstChild);
+      var c = CFG[mode], em = expand(c), isMM = mode === "t1mm";
+      var fifoTotal = 0; em.forEach(function (e) { fifoTotal += e.name === "REPLAY" ? 16 : 1; });
+      var steps = [{ dur: 1, text: "<b>" + c.label + ".</b> The TRISC pushed one 32-bit <code>MOP</code> word. The expander copied this thread's MOP config (left) when it ingested it. LLK side: <code>" + c.src + "</code>. Press Step to emit instructions one at a time." }];
+      em.forEach(function (e, k) {
+        var t = "<b>Emit #" + (k + 1) + ": " + e.name + "</b> (outer iteration " + e.it + ", step " + e.step + ": " + e.why + ").";
+        if (e.name === "REPLAY") t += " The replay expander turns it into a playback of 16 recorded <code>MVMUL</code>s (buffer entries 16-31), so 16 instructions enter the FIFO.";
+        steps.push({ dur: 0.5, text: t });
+      });
+      steps.push({ dur: 1, text: "<b>Done:</b> 1 pushed instruction became " + em.length + " emitted" + (isMM ? ", which became " + fifoTotal + " FIFO entries after replay (4 &times; 16 MVMUL + 1 SETRWC). At LoFi the inner count is 1, giving 16 MVMULs per tile." : ". This matches the trace's <code>D</code> line.") });
+      TT.stepper({
+        root: root, steps: steps,
+        draw: function (i, t) {
+          TT.clear(ctx, g.W, g.H);
+          var shown = Math.max(0, Math.min(em.length, i)), curE = (i >= 1 && i <= em.length) ? em[i - 1] : null;
+          // config panel
+          TT.text(ctx, "MOP config (captured)", 20, 22, { font: "bold 13px" });
+          var rows = [["outer_loop_len", c.outer], ["inner_loop_len", c.inner], ["start_op", c.start], ["loop_op", c.loop], ["loop_op1", c.loop1], ["end_op0", c.end0], ["end_op1", c.end1], ["loop0_last", c.last0], ["loop1_last", c.last1]];
+          rows.forEach(function (r, k) {
+            var y = 40 + k * 30, hot = false;
+            if (curE) {
+              if (/inner loop: loop_op$/.test(curE.why) && r[0] === "loop_op") hot = true;
+              if (/loop_op1$/.test(curE.why) && r[0] === "loop_op1") hot = true;
+              if (/cfg\[8\]/.test(curE.why) && r[0] === "loop1_last") hot = true;
+              if (/cfg\[7\]/.test(curE.why) && r[0] === "loop0_last") hot = true;
+              if (curE.why === "end_op0" && r[0] === "end_op0") hot = true;
+            }
+            TT.box(ctx, 20, y, 230, 24, { fill: hot ? C.yellow : C.bg2, alpha: hot ? 0.8 : 1, stroke: C.border, r: 4 });
+            TT.text(ctx, r[0], 28, y + 12, { font: "12px", mono: true, color: hot ? "#000" : C.muted });
+            TT.text(ctx, String(r[1]), 242, y + 12, { font: "bold 12px", mono: true, align: "right", color: hot ? "#000" : (r[1] === "NOP" ? C.muted : C.fg) });
+          });
+          // loop nest
+          TT.text(ctx, "Loop nest", 280, 22, { font: "bold 13px" });
+          var code = ["for outer in 0.." + (c.outer - 1) + ":", "  " + (c.start === "NOP" ? "(start_op NOP: skipped)" : c.start), "  for slot in 1.." + (c.inner * (c.loop1 !== "NOP" ? 2 : 1)) + ":", "    " + (c.loop1 !== "NOP" ? c.loop + " / " + c.loop1 + " alternate" : c.loop), "    (last slot: loop0/loop1_last)", "  " + (c.end0 === "NOP" ? "(end_op0 NOP: skipped)" : c.end0)];
+          code.forEach(function (s, k) { TT.text(ctx, s, 280, 48 + k * 22, { font: "12px", mono: true, color: C.fg }); });
+          if (curE) {
+            TT.text(ctx, "outer = " + curE.it + ", step = " + curE.step, 280, 200, { font: "bold 13px", mono: true, color: C.yellow });
+            for (var o = 0; o < c.outer; o++) TT.box(ctx, 280 + o * 34, 220, 28, 16, { fill: o < curE.it ? C.green : (o === curE.it ? C.yellow : C.bg3), r: 3 });
+            TT.text(ctx, "outer iterations", 280, 250, { font: "11px", color: C.muted });
+          }
+          // FIFO
+          TT.text(ctx, "Into the thread's FIFO", 560, 22, { font: "bold 13px" });
+          var colr = function (n) { return /UNPACR/.test(n) ? C.blue : /ELWADD|MVMUL/.test(n) ? C.yellow : /SETRWC/.test(n) ? C.purple : C.teal; };
+          var fy = 40, cnt = 0;
+          for (var k = 0; k < shown; k++) {
+            var e = em[k], a = (k === shown - 1 && i === shown) ? t : 1;
+            if (isMM && e.name === "REPLAY") {
+              ctx.globalAlpha = a;
+              TT.text(ctx, "REPLAY #" + (k + 1) + " \u2192", 560, fy + 8, { font: "11px", mono: true, color: C.teal });
+              for (var m = 0; m < 16; m++) TT.box(ctx, 650 + m * 14, fy, 12, 16, { fill: C.yellow, r: 2 });
+              ctx.globalAlpha = 1; fy += 24; cnt += 16;
+            } else {
+              var col = cnt % 3, row = Math.floor(cnt / 3);
+              var x = 560 + (isMM ? 0 : col * 108), y = isMM ? fy : 40 + row * 30;
+              ctx.globalAlpha = a;
+              TT.box(ctx, x, y, 100, 24, { fill: colr(e.name), alpha: 0.85 * a, r: 4, label: e.name, color: "#000", font: "bold 12px", mono: true });
+              ctx.globalAlpha = 1;
+              if (isMM) fy += 30;
+              cnt++;
+            }
+          }
+          TT.text(ctx, "emitted " + shown + " / " + em.length + (isMM ? "   FIFO entries " + cnt : ""), 560, 385, { font: "12px", mono: true, color: C.muted });
+        }
+      });
+    }
+    build();
+  })();
+  </script>
+
+  <h3>How much did the expanders multiply?</h3>
+  <p>Counting push lines against executed lines per thread (a one-line <code>awk</code> over the trace) gives the whole frontend's accounting for the add:</p>
+  <table>
+    <tr><th>Thread</th><th class="num">pushed by its TRISC</th><th class="num">pushed by BRISC</th><th class="num">MOPs</th><th class="num">MOP emitted</th><th class="num">NOPs dropped</th><th class="num">executed</th></tr>
+    <tr><td>T0 UNPACK</td><td class="num">27</td><td class="num">9</td><td class="num">1</td><td class="num">8</td><td class="num">1</td><td class="num">42</td></tr>
+    <tr><td>T1 MATH</td><td class="num">37</td><td class="num">0</td><td class="num">1</td><td class="num">12</td><td class="num">0</td><td class="num">48</td></tr>
+    <tr><td>T2 PACK</td><td class="num">63</td><td class="num">0</td><td class="num">1</td><td class="num">1</td><td class="num">2</td><td class="num">61</td></tr>
+  </table>
+  <p>It balances: T0 is 27 − 1 MOP + 8 emitted + 9 from BRISC − 1 NOP = 42. T1 is 37 − 1 + 12 = 48, and T2 is 63 − 1 + 1 − 2 NOPs = 61. The TRISC push counts (27/37/63) and BRISC's 9 match A04's independent counters exactly. For an eltwise add the expanders barely matter: 37 instructions in, 48 out on MATH. The next section shows where they do matter.</p>
+
+  <h3>The matmul: MOP → REPLAY → MVMUL</h3>
+  <p>To see a case where expansion dominates, we trace a matmul. The series' <code>mm_fid.cpp</code> multiplies 640×640 matrices, which is 8000 tile products, far too many to read. The third patch shrinks it to 64×64 (2×2 tiles, so 8 tile products):</p>
+  <div class="filename">sim-labs/patches/b04-mm-small.patch</div>
+<pre><code>--- a/host/mm_fid.cpp
++++ b/host/mm_small.cpp
+@@ -197,9 +197,9 @@
+         // parameters for the matrix multiplication
+-        constexpr uint32_t M = 640;  // user-defined
+-        constexpr uint32_t N = 640;  // user-defined
+-        constexpr uint32_t K = 640;  // user-defined
++        constexpr uint32_t M = 64;  // B04: 2x2 tiles, so the trace stays small
++        constexpr uint32_t N = 64;  // B04: 2x2 tiles, so the trace stays small
++        constexpr uint32_t K = 64;  // B04: 2x2 tiles, so the trace stays small</code></pre>
+<pre><code>cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; (cd $LAB_HOME &amp;&amp; patch -p1 -o mm_small.cpp mm_fid.cpp &lt; .../patches/b04-mm-small.patch)
+$W/build_host.sh $LAB_HOME/mm_small.cpp
+MM_FIDELITY=4 MM_SEED=42 B04_OUT=$LAB_HOME/mm4.trace $LAB_HOME/mm_small
+MM_FIDELITY=0 MM_SEED=42 B04_OUT=$LAB_HOME/mm0.trace $LAB_HOME/mm_small</code></pre>
+<pre class="out"><code>math_fidelity = 4
+Metalium vs Golden -- PCC = 0.9992891
+mean_abs_err = 0.045578 max_abs_err = 0.250000 result_hash = f1eb0e5e837bc383
+[5039] 0.2 seconds (22.1 KHz)
+math_fidelity = 0
+Metalium vs Golden -- PCC = 0.99948364
+mean_abs_err = 0.320908 max_abs_err = 0.500000 result_hash = 587b6985ef13c383
+[5371] 0.3 seconds (20.9 KHz)</code></pre>
+  <p>(LoFi's error is about 7× larger, as <a href="../chapters/a06-matrix-engine.html">A06</a> predicts. Its higher PCC on this tiny 64×64 problem is not meaningful. And LoFi needs <em>more</em> clocks, which is the "clocks are not performance" effect from B01.) The math thread's MOPs and replays:</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py stream $LAB_HOME/mm4.trace --kinds R --pipe 1 --limit 2
+R     4287   4081 T1 04040101 REPLAY     load start=16 len=16
+R     4347   4144 T1 04040100 REPLAY     play start=16 len=16
+$ python3 $W/py/b04_trace.py mops $LAB_HOME/mm4.trace | head -3
+T1 clock 4347 round 4144: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=1 inner=4
+      start=NOP end0=SETRWC end1=NOP loop=REPLAY loop1=NOP last0=REPLAY last1=REPLAY
+      -&gt; 5 emitted: REPLAY x4, SETRWC x1</code></pre>
+  <p>The story in three lines:</p>
+  <ol>
+    <li>During <code>matmul_init</code>, TRISC1 pushes a <code>REPLAY</code> in <em>load</em> mode (start 16, length 16), followed by 16 <code>MVMUL</code>s. The replay expander records them into buffer entries 16–31 instead of passing them on. Execute-while-loading is off, so none of them runs yet. This is <code>lltt::record(ckernel::math::replay_buf_offset, replay_buf_len)</code> with <code>replay_buf_len</code> = 16 for full 32×32 tiles (<code>llk_math_matmul.h:361-364</code>), the 16-MVMUL sequence A06 drew.</li>
+    <li>Each <code>matmul_tiles</code> pushes one <code>MOP</code> whose inner op is <code>REPLAY play 16,16</code> and whose inner count is the fidelity (<code>inner_loops = high_fidelity ? math_fidelity : 1</code>, <code>llk_math_matmul.h:469-470</code>). At HiFi4 it emits 4 REPLAYs and one <code>SETRWC</code>.</li>
+    <li>Each REPLAY plays back 16 MVMULs. So one 32-bit push becomes 4 × 16 = 64 MVMULs, and 8 tile products give <b>512</b>. At LoFi: 8 × 16 = <b>128</b>. We also ran HiFi2: <b>256</b>. Those are A06's "16/32/48/64 MVMULs per tile" at 1, 2 and 4 phases, counted from the instruction stream itself.</li>
+  </ol>
+  <p>The push and execute totals for the matmul:</p>
+<pre class="out"><code>== mm4  (HiFi4)
+push T0 118 (+9 from BRISC)   exec T0 139   mops=8 emitted=8  replayed=40
+push T1 96                    exec T1 591   mops=8 emitted=40 replayed=512
+push T2 114                   exec T2 112   mops=4 emitted=4  replayed=0
+== mm0  (LoFi)
+push T1 96                    exec T1 199   mops=8 emitted=8  replayed=128</code></pre>
+  <p>MATH pushed 96 instructions and executed 591. Here the expanders do most of the work. The 96 pushes are identical at both fidelities: fidelity lives in the MOP config, not in the code TRISC1 runs. That's why TRISC1 can get away with a ½ KiB instruction cache (A04). The unpack thread uses replay too: its MOPs are of the other type (<code>mop_type 0</code>, the "unpack template"), and each emits a single <code>REPLAY play 0,5</code> that replays <code>UNPACR SrcA, RDCFG, ADDGPR, REG2FLOP, NOP</code>.</p>
+  <div class="callout sim">This is the instruction-level view of <a href="../chapters/a13-llk-mops-jit.html">A13</a>'s zoom from <code>add_tiles</code> to an expanded stream, and of the MVMUL ordering in <a href="../chapters/a06-matrix-engine.html">A06</a>. <a href="b07-matmul-fidelity.html">B07</a> goes one level deeper and dumps one MVMUL's operands.</div>
+
+  <h2 id="stalls">Step 4: Stalls, and who is waiting for whom</h2>
+  <p>Every stall is an execute function returning <code>false</code>. The <code>stalls</code> subcommand totals the failed attempts by instruction:</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py stalls $LAB_HOME/add.trace
+thread  instruction                                   stalled  rounds  max
+T0      UNPACR SrcA                                         1       1    1
+T1      ELWADD dst=0 addr_mode=0 clear_dvalid=0             1     269  269
+T2      SEMWAIT MATH_PACK while==0                          1      72   72
+$ python3 $W/py/b04_trace.py stalls $LAB_HOME/mm4.trace
+thread  instruction                                   stalled  rounds  max
+T1      MVMUL dst=0 addr_mode=0 clear_dvalid=0              8     629  300
+T2      SEMWAIT MATH_PACK while==0                          4     910  256</code></pre>
+  <p>Three kinds of wait, each with its own source line.</p>
+
+  <h3>(a) UNPACR waits for a free Src bank</h3>
+  <div class="filename">ttsim/src/tensix.cpp:3168-3172 @b3620244 (TENSIX_EXECUTE_UNPACR)</div>
+<pre><code>    uint32_t src_bank = unpack_block_selection ? p_tensix-&gt;src_b_unpack_bank : p_tensix-&gt;src_a_unpack_bank;
+    uint32_t src_valid = unpack_block_selection ? p_tensix-&gt;src_b_valid : p_tensix-&gt;src_a_valid;
+    if (src_valid &amp; (1 &lt;&lt; src_bank)) {
+        return false; // stall until not valid
+    }</code></pre>
+  <p>An unpacker writes into the bank it's pointing at, and refuses while that bank still holds data the FPU hasn't released. After a successful unpack it flips to the other bank (<code>src_a_unpack_bank ^= 1</code>, <code>tensix.cpp:3588</code>). Look at round 4390 in the add. T0 had filled SrcA bank 0 (round 4384) and bank 1 (4386), and bank 0 again (4388) after T1's first <code>SETRWC</code> released it at 4387. Its next target was bank 1, which the FPU was still reading. T1's second <code>SETRWC</code> (clear_ab_vld = 3, releasing both operands) ran at round 4390, but T1 runs after T0 within a round. So T0 failed once in round 4390 and succeeded in 4391. It's a one-round stall, and its exact cause is ttsim's pipe order. <code>metal_example_eltwise_binary</code>, which adds 64 tiles, shows the same pattern once per tile: 64 stalls of exactly 1 round each.</p>
+
+  <h3>(b) MVMUL and ELWADD wait for valid banks</h3>
+  <div class="filename">ttsim/src/tensix.cpp:1763-1767 @b3620244 (tensix_matmul_op, used by MVMUL; tensix_elw_op at 1957-1961 is identical)</div>
+<pre><code>    uint32_t src_a_bank = p_tensix-&gt;src_a_matrix_bank;
+    uint32_t src_b_bank = p_tensix-&gt;src_b_matrix_bank;
+    if (!(p_tensix-&gt;src_a_valid &amp; (1 &lt;&lt; src_a_bank)) || !(p_tensix-&gt;src_b_valid &amp; (1 &lt;&lt; src_b_bank))) {
+        return false; // stall until both valid
+    }</code></pre>
+  <p>This is the opposite condition, and it's the hardware rule that makes the unpack → math hand-off need no semaphore (the ISA documentation says FPU instructions that read Src "automatically wait for this condition", <code>STALLWAIT.md</code>, notes on C10/C11). In the matmul, the first <code>MVMUL</code> of each <code>matmul_tiles</code> waits. The longest wait, 300 rounds, is the very first. The MATH thread had pushed its MOP long before and the MVMUL sat at the FIFO head the whole time, while T0 executed nothing. Most likely TRISC0 was still waiting in <code>cb_wait_front</code> for the reader kernel to bring the first tiles from DRAM. That is an inference: our trace records Tensix instructions, not RISC-V code.</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py stream $LAB_HOME/mm4.trace --from 4442 --to 4446
+X     4582   4442 T0 a2042000 STALLWAIT  until TRISC_CFG block=0x008
+X     4582   4443 T0 428000c1 UNPACR     SrcB
+X     4582   4444 T0 420000c1 UNPACR     SrcA
+X     4582   4444 T1 26000000 MVMUL      dst=0 addr_mode=0 clear_dvalid=0   &lt;- stalled 300 rounds, 235 clocks
+X     4582   4445 T0 b10c0040 RDCFG
+X     4582   4445 T1 26008000 MVMUL      dst=0 addr_mode=1 clear_dvalid=0
+X     4582   4446 T0 5800c324 ADDGPR
+X     4582   4446 T1 26000000 MVMUL      dst=0 addr_mode=0 clear_dvalid=0</code></pre>
+  <p>Note the order: SrcB first (in0), then SrcA (in1). <code>llk_math_matmul.h:343-344</code> says so ("in0 - loaded to SrcB, in1 - loaded to SrcA"). The MVMUL fires in the round the second operand lands, because T1 runs after T0. All 8 MVMUL stalls in the trace are on the first MVMUL of a tile product (each waits for a fresh pair of tiles). The other 504 never wait.</p>
+
+  <h3>(c) SEMWAIT on MATH_PACK</h3>
+  <div class="filename">ttsim/src/tensix.cpp:5570-5582 @b3620244 (TENSIX_EXECUTE_SEMWAIT)</div>
+<pre><code>    for (uint32_t sems = sem_sel; sems; sems &amp;= sems - 1) {
+        uint32_t sem_index = __builtin_ctz(sems);
+        ...
+        if (wait_sem_cond == 2) { // wait while max
+            if (p_tensix-&gt;sem[sem_index] &gt;= p_tensix-&gt;sem_max[sem_index]) {
+                return false;
+            }
+        } else { // wait while zero
+            if (!p_tensix-&gt;sem[sem_index]) {
+                return false;
+            }
+        }
+    }</code></pre>
+  <p>PACK's <code>tile_regs_wait()</code> is <code>SEMWAIT MATH_PACK while==0</code> (<code>_llk_packer_wait_for_math_done_</code>, <code>llk_pack_common.h:26-29</code>). The packer thread reaches it early, because TRISC2 has nothing else to do, and it sits there until MATH's <code>SEMPOST</code>. In the add that took 72 rounds. In the matmul it happened four times, once per output tile, for 256, 214, 226 and 214 rounds: each output tile takes two whole <code>matmul_tiles</code> of 64 MVMULs. In every case the SEMWAIT passes in <em>the same round</em> as the SEMPOST, because T1 runs before T2.</p>
+  <div class="callout warn">Don't read "PACK waited 256 rounds" as "the packer is idle 256 cycles per tile on silicon". On a real chip, MVMUL has a 5-cycle latency, unpackers take many cycles per face, and the packer has to wait for a <code>STALLWAIT</code> on MATH to drain the FPU pipeline. ttsim models none of those timings. What carries over is the <b>dependency structure</b>: which instruction waits on which condition, and which thread releases it. Those are properties of the program, and a missing one is a bug on any timing.</div>
+  <div class="callout gpu">On a GPU, the closest analogue of these stalls is warp-scheduler stall reasons ("waiting on a barrier", "long scoreboard"), which profilers sample statistically. Here we can list every stall exactly, with the condition that caused it. In exchange, the simulator has no timing to tell you whether a stall would actually <em>cost</em> anything.</div>
+
+  <h2 id="hist">Step 5: Eltwise add vs matmul, by opcode</h2>
+  <p>Finally, the shape of the work. <code>hist</code> counts executed opcodes per thread, with one column per trace:</p>
+<pre class="out"><code>$ python3 $W/py/b04_trace.py hist add.trace mm4.trace mm0.trace     (trimmed)
+thread opcode           add.trace   mm4.trace   mm0.trace
+T0     STALLWAIT                3          24          24
+T0     SETGPR                   4          19          19
+T0     UNPACR                   8          16          16
+T0     STOREREG                 2          16          16
+...
+T1     MVMUL                    0         512         128
+T1     SETC16                  19          35          35
+T1     SETRWC                   6          17           9
+T1     STALLWAIT                4          10          10
+...
+T1     ELWADD                   8           0           0
+...
+T2     SETGPR                  22          34          34
+T2     PACR                     2           8           8
+...
+total                         151         842         450</code></pre>
+  <p>Explore the full table below. Pick a thread, and switch to a log scale to see the small counts next to the 512 MVMULs.</p>
+
+  <div class="viz" id="fig-hist"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-hist"), C = TT.C;
+    // [thread, opcode, add (1 tile), matmul 64x64 HiFi4, matmul 64x64 LoFi], from b04_trace.py hist
+    var ROWS = [[0,"ZEROACC",1,1,1],[0,"ZEROSRC",1,1,1],[0,"UNPACR",8,16,16],[0,"SETGPR",4,19,19],[0,"REG2FLOP",0,8,8],[0,"SETADCXY",1,1,1],[0,"SETADCZW",2,2,2],[0,"ADDGPR",0,8,8],[0,"SETADCXX",1,2,2],[0,"STOREREG",2,16,16],[0,"SFPLOADI",1,1,1],[0,"SFPENCC",1,1,1],[0,"SFPCONFIG",1,1,1],[0,"ATGETM",1,1,1],[0,"ATRELM",1,1,1],[0,"STALLWAIT",3,24,24],[0,"SEMINIT",4,4,4],[0,"SEMGET",1,8,8],[0,"RDCFG",0,8,8],[0,"SETC16",3,10,10],[0,"RMWCIB0",1,1,1],[0,"RMWCIB1",3,3,3],[0,"RMWCIB2",2,2,2],[1,"ZEROACC",1,1,1],[1,"MVMUL",0,512,128],[1,"ELWADD",8,0,0],[1,"SETRWC",6,17,9],[1,"STALLWAIT",4,10,10],[1,"SEMINIT",1,1,1],[1,"SEMPOST",1,4,4],[1,"SEMWAIT",1,4,4],[1,"SETC16",19,35,35],[1,"RMWCIB0",2,2,2],[1,"RMWCIB1",1,1,1],[1,"RMWCIB2",1,1,1],[1,"RMWCIB3",3,3,3],[2,"ZEROACC",1,4,4],[2,"PACR",2,8,8],[2,"SETGPR",22,34,34],[2,"REG2FLOP",7,10,10],[2,"SETADC",1,4,4],[2,"SETADCXY",1,1,1],[2,"SETADCZW",1,1,1],[2,"SETADCXX",1,1,1],[2,"DMANOP",4,10,10],[2,"STOREREG",1,4,4],[2,"ATGETM",1,1,1],[2,"ATRELM",1,1,1],[2,"STALLWAIT",4,10,10],[2,"SEMGET",1,4,4],[2,"SEMWAIT",1,4,4],[2,"WRCFG",4,7,7],[2,"SETC16",3,3,3],[2,"RMWCIB0",1,1,1],[2,"RMWCIB1",2,2,2],[2,"RMWCIB2",1,1,1],[2,"RMWCIB3",1,1,1]];
+    var SER = [["eltwise add, 1 tile", C.blue], ["matmul 2x2 tiles, HiFi4", C.yellow], ["matmul 2x2 tiles, LoFi", C.orange]];
+    var thread = -1, logs = false, grow = 1;
+    var bar = document.createElement("div"); bar.className = "modebar";
+    root.appendChild(bar);
+    var g = TT.canvas(root, 900, 540), ctx = g.ctx;
+    root.insertBefore(bar, root.firstChild);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    var TEXT = {
+      "-1": "<b>All threads.</b> The add executes 151 Tensix instructions for one tile, and only 8 of them (ELWADD) are arithmetic. The matmul executes 842, of which 512 are MVMUL at HiFi4 and 128 at LoFi. Everything else is configuration and synchronisation, and it is nearly identical between the two fidelities.",
+      "0": "<b>T0, UNPACK.</b> The add unpacks 8 faces (4 into SrcA, 4 into SrcB). The matmul executes 16 UNPACRs (one SrcB and one SrcA per tile product, 8 tile products), plus per-tile address bookkeeping: RDCFG, ADDGPR and REG2FLOP, 8 each, and 16 STOREREGs.",
+      "1": "<b>T1, MATH.</b> 8 ELWADDs for the add, against 512 MVMULs at HiFi4 and 128 at LoFi: 4 vs 1 fidelity phases &times; 16 MVMULs &times; 8 tile products. SETRWC differs too: 17 vs 9. Each HiFi4 MOP has a SETRWC end op (bit_mask 0xF, which also resets the fidelity phase), and the LoFi MOP has none. The 35 SETC16s are setup and do not scale with the work.",
+      "2": "<b>T2, PACK.</b> Packing is the same per output tile in both programs: two PACRs per tile (8 for the matmul's 4 output tiles), preceded by GPR and register setup and followed by STALLWAIT, ZEROACC and SEMGET. Fidelity changes nothing on this thread."
+    };
+    function mk(label, on, fn) { var b = document.createElement("button"); b.className = "tt"; b.textContent = label; if (on) b.style.cssText = "background:var(--blue);color:#000"; b.onclick = fn; return b; }
+    function controls() {
+      bar.innerHTML = "<span>Thread:</span>";
+      [[-1, "All"], [0, "T0 UNPACK"], [1, "T1 MATH"], [2, "T2 PACK"]].forEach(function (p) { bar.appendChild(mk(p[1], thread === p[0], function () { thread = p[0]; animate(); })); });
+      var s = document.createElement("span"); s.textContent = "Scale:"; s.style.marginLeft = "1rem"; bar.appendChild(s);
+      bar.appendChild(mk("linear", !logs, function () { logs = false; animate(); }));
+      bar.appendChild(mk("log", logs, function () { logs = true; animate(); }));
+    }
+    function data() {
+      var m = {};
+      ROWS.forEach(function (r) { if (thread >= 0 && r[0] !== thread) return; var k = r[1]; m[k] = m[k] || [0, 0, 0]; for (var j = 0; j < 3; j++) m[k][j] += r[2 + j]; });
+      var arr = Object.keys(m).map(function (k) { return [k, m[k]]; });
+      arr.sort(function (a, b) { return Math.max.apply(null, b[1]) - Math.max.apply(null, a[1]) || (b[1][0] - a[1][0]); });
+      var top = arr.slice(0, 14);
+      if (arr.length > 14) { var o = [0, 0, 0]; arr.slice(14).forEach(function (a) { for (var j = 0; j < 3; j++) o[j] += a[1][j]; }); top.push(["(" + (arr.length - 14) + " others)", o]); }
+      return top;
+    }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var d = data(), max = 1, tot = [0, 0, 0];
+      ROWS.forEach(function (r) { if (thread < 0 || r[0] === thread) for (var j = 0; j < 3; j++) tot[j] += r[2 + j]; });
+      d.forEach(function (r) { max = Math.max(max, r[1][0], r[1][1], r[1][2]); });
+      var X0 = 150, XW = 650, Y0 = 46, RH = Math.min(32, (g.H - Y0 - 20) / d.length);
+      function w(v) { if (v <= 0) return 0; return logs ? XW * Math.log10(v + 1) / Math.log10(max + 1) : XW * v / max; }
+      SER.forEach(function (s, j) { TT.box(ctx, 150 + j * 230, 14, 12, 12, { fill: s[1], r: 2 }); TT.text(ctx, s[0] + " (" + tot[j] + ")", 168 + j * 230, 20, { font: "12px", color: C.muted }); });
+      d.forEach(function (r, k) {
+        var y = Y0 + k * RH;
+        TT.text(ctx, r[0], X0 - 8, y + RH / 2 - 1, { font: "12px", mono: true, align: "right" });
+        for (var j = 0; j < 3; j++) {
+          var bh = (RH - 6) / 3, yy = y + j * bh, ww = w(r[1][j]) * grow;
+          if (ww > 0) TT.box(ctx, X0, yy, Math.max(2, ww), bh - 1, { fill: SER[j][1], alpha: 0.9, r: 1 });
+          if (grow >= 1) TT.text(ctx, String(r[1][j]), X0 + Math.max(2, ww) + 4, yy + bh / 2, { font: "10px", mono: true, color: r[1][j] ? C.fg : C.muted });
+        }
+      });
+      TT.text(ctx, logs ? "log scale (log10(count+1))" : "linear scale", g.W - 10, g.H - 10, { font: "11px", color: C.muted, align: "right" });
+      narr.innerHTML = TEXT[String(thread)];
+    }
+    function animate() {
+      controls(); grow = 0; var t0 = performance.now();
+      function f(now) { grow = TT.smooth((now - t0) / 600); draw(); if (grow < 1) requestAnimationFrame(f); }
+      requestAnimationFrame(f);
+    }
+    controls(); draw();
+  })();
+  </script>
+
+  <p>Three observations, each of which you could have predicted from the earlier chapters and can now confirm:</p>
+  <ul>
+    <li><b>Most Tensix instructions are not math.</b> For one tile of eltwise add, 8 of 151 executed instructions are <code>ELWADD</code>. The rest set data formats, address counters, MOP templates and packer registers, or synchronise. Setup is a fixed cost per kernel launch, which is one reason real workloads keep many tiles flowing through one kernel launch (A15).</li>
+    <li><b>The matmul is dominated by one opcode, and fidelity is a pure multiplier on it.</b> Going from LoFi to HiFi4 adds exactly 384 MVMULs (and 8 SETRWCs). Not one other instruction on any thread changes. Fidelity costs FPU instructions and nothing else, which is why A06 can reduce matmul throughput to "16 × phases MVMULs per tile".</li>
+    <li><b>The per-tile thread costs are lopsided.</b> Per output tile, MATH executes 128 MVMULs at HiFi4 against PACK's 2 PACRs. In a real kernel the FPU lane is the one that has to stay busy. Anything that makes it wait (an unpacker starved by the NoC, or a packer that hasn't released Dst) shows up as the stall bands in the first animation.</li>
+  </ul>
+  <p>For one more data point, we also ran a 96×96 matmul (3×3×3 = 27 tile products): 1728 MVMULs = 27 × 64, 54 UNPACRs = 27 × 2, and 18 PACRs = 9 output tiles × 2. The formula holds.</p>
+
+  <h2 id="exercises">Step 6: Exercises, with answers</h2>
+  <details class="quiz"><summary>Exercise 1. Trace only the MATH thread of the add. How many X lines do you get, and how do you ask for it?</summary>
+  <p><code>B04_OUT=$LAB_HOME/t1.trace B04_PIPES=2 $EX/metal_example_add_2_integers_in_compute</code>. The mask is per thread (bit 0 = T0, bit 1 = T1, bit 2 = T2), so <code>2</code> selects T1 only. We got 48 X lines (and 37 P, 1 M, 12 E, 1 D), which matches T1's column in the full trace. The run still prints <code>Success</code> at [4682]: the gate only filters what is written.</p></details>
+  <details class="quiz"><summary>Exercise 2. Predict, then measure: how many MVMULs does the 64×64 matmul execute at HiFi2? What else changes?</summary>
+  <p>The inner loop count is the fidelity value, 2, so each <code>matmul_tiles</code> MOP plays the 16-MVMUL replay twice: 8 × 2 × 16 = <b>256</b>. Measured with <code>MM_FIDELITY=2 MM_SEED=42</code>: <code>T1 MVMUL 256</code>, total 586 executed instructions, PCC 0.9992975. Only MVMUL and SETRWC counts depend on fidelity, and nothing on T0 or T2 changes.</p></details>
+  <details class="quiz"><summary>Exercise 3. The UNPACR stall in the add lasted exactly one round. What change to ttsim's clock loop would make it disappear, and why would that not be a hardware insight?</summary>
+  <p>Visit the pipes in the order T1, T0, T2. Then T1's <code>SETRWC</code> would release the SrcA bank earlier in round 4390, and T0's <code>UNPACR</code> would succeed in the same round. (This is a prediction we did not run. The new order would also shift the rest of the schedule, for example by making each <code>ELWADD</code> see a fresh unpack one round later, so a one-round stall could reappear on T1 instead.) The stall exists because ttsim processes pipes in a fixed order within a round (<code>libttsim.cpp</code>, the <code>pipe_mask</code> loop). On silicon all three threads and the backend units run concurrently, with real latencies, and the question "did the release arrive before the unpack this cycle?" has a hardware answer that ttsim doesn't model. The robust fact is the <em>condition</em>: an UNPACR into a bank the FPU still owns must wait.</p></details>
+  <details class="quiz"><summary>Exercise 4. Find the four SEMWAIT stalls on T2 in the matmul trace and explain why each is roughly the same length.</summary>
+  <p><code>python3 b04_trace.py stream mm4.trace | grep stalled</code> lists them: 256, 214, 226 and 214 rounds. Each output tile is Kt = 2 tile products, each 64 MVMULs (HiFi4) plus a stall on the first MVMUL while T0 unpacks the next pair, and MATH only posts <code>MATH_PACK</code> after both. PACK finishes its previous tile long before that, so it parks on the SEMWAIT for about one output tile's worth of MATH rounds. The four values differ by a few dozen rounds; we did not track down exactly which unpack or reader delays account for each difference.</p></details>
+  <details class="quiz"><summary>Exercise 5. Decode 0xa2014080 by hand using tensix_isa.json, then check it against the trace.</summary>
+  <p>Top byte 0xa2 = 162 = <code>STALLWAIT</code>. Its args are <code>wait_res</code> = bits 14:0 = 0x4080, and <code>stall_res</code> = bits 23:15 = 0x014080 &gt;&gt; 15 = 0x002. 0x4080 has bits 7 and 14 set: C7 (an instruction of this thread is in the FPU pipeline) and C14 (one is in the SFPU pipeline). Block mask 0x002 = B1, which blocks Sync-unit instructions. So: "don't let a semaphore instruction through until MATH and SFPU are idle". It is the first half of <code>t6_semaphore_post&lt;MATH | WAIT_SFPU&gt;(MATH_PACK)</code>, and the trace shows it immediately before <code>SEMPOST MATH_PACK</code> (round 4398 → 4399). The script prints exactly "STALLWAIT until MATH+SFPU block=0x002".</p></details>
+  <details class="quiz"><summary>Exercise 6. Use the overlay to comment out tile_regs_wait() in add_2_tiles.cpp (as in A04) and trace the failing run. What does PACK do, and what never happens?</summary>
+  <p>We ran it (overlay at <code>$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp</code>). ttsim stops with <code>[4499] ERROR: NonContractualBehavior: tensix_semget: sem=0 sem_max=2</code>, and the trace ends like this:</p>
+<pre class="out"><code>X     4498   4352 T2 4840014c REG2FLOP
+X     4498   4353 T2 41010f02 PACR
+X     4499   4355 T2 45000019 SETGPR
+X     4499   4356 T2 41008f11 PACR
+X     4499   4357 T2 a2200078 STALLWAIT  until PACK0+PACK1+PACK2+PACK3 block=0x040
+X     4499   4358 T2 10108000 ZEROACC</code></pre>
+  <p>The next T2 instruction, <code>SEMGET MATH_PACK</code>, is the one that failed, so it was never logged. <code>hist</code> on this trace shows 2 PACRs and <b>zero</b> UNPACR, ELWADD or SEMPOST. Without its wait, PACK packed Dst and cleared it before a single operand had even been unpacked. This is the run where line buffering matters: our first, fully buffered version of the patch lost everything after clock 4408.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>Every Tensix instruction in ttsim executes in one place, <code>tensix_decode_and_execute</code>, called from the clock loop for the head of each thread's FIFO. A <code>false</code> return is a stall. Wrapping it with a gated <code>fprintf</code> gives a complete per-thread trace for one tile, and naming opcodes with <code>data/wh/tensix_isa.json</code> keeps the names identical to ttsim's decoder.</li>
+    <li>ttsim runs a busy tile for many rounds per clock and visits the pipes in the order T0, T1, T2. Rounds give an order and retry counts, not durations.</li>
+    <li>For one tile of <code>add_2_integers_in_compute</code>: BRISC's boot pushes (ZEROACC, SFPU setup, 4 SEMINITs), then about 100 configuration instructions, then the work: 8 UNPACR on T0, 8 ELWADD + 4 SETRWC on T1, 2 PACR on T2, joined by STALLWAITs and the MATH_PACK SEMPOST/SEMWAIT/SEMGET.</li>
+    <li>Each <code>add_tiles</code> thread body is one MOP: unpack = 2 × (A B A B) = 8, math = 4 × (ELWADD ELWADD SETRWC) = 12, pack = 1. Matmul nests MOP → REPLAY → MVMUL: one push becomes 16 × fidelity MVMULs (512 vs 128 for 8 tile products at HiFi4 vs LoFi). MATH pushed 96 instructions and executed 591.</li>
+    <li>The three stalls: UNPACR waits for its target bank to be released, FPU ops wait for both banks to be valid (hardware hand-off, no semaphore), and PACK's SEMWAIT waits for MATH's SEMPOST (software hand-off). Each released in the round its condition became true.</li>
+    <li>Fidelity changes only MVMUL (and a few SETRWC) counts. Most instructions are setup and synchronisation.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Why can't we use ttsim's clock number to order the instructions of add_tiles?</summary>
+  <p>Because ttsim keeps clocking a tile repeatedly within one clock while it keeps executing Tensix instructions (the "hack" in <code>clock_current_chip</code>). All 33 rounds of the tile's work happened at clock 4531. A per-tile round counter, incremented on every pass, recovers the order. Neither number is a hardware cycle.</p></details>
+  <details class="quiz"><summary>TRISC1 pushed zero ELWADDs, yet 8 executed. Where exactly were they created, and what decides how many?</summary>
+  <p>In the MOP expander: <code>mop_next</code> walking <code>mop_step_inst</code> over the config words captured at <code>mop_ingest</code>. The count comes from the template the LLK programmed: outer = 4 (faces), inner = 2 (16 rows per face ÷ 8 rows per ELWADD), plus one SETRWC end op per face, giving 8 ELWADD + 4 SETRWC. The trace's M line shows <code>outer=4 inner=2 end0=SETRWC</code>.</p></details>
+  <details class="quiz"><summary>The add needed a semaphore between MATH and PACK but none between UNPACK and MATH. What evidence of that is in the trace?</summary>
+  <p>T1's first ELWADD stalled 269 rounds and executed in the round SrcA and SrcB became valid, with no Sync-unit instruction on T0 or T1 in between: the FPU's own valid-bit check is the hand-off. On the other side, T2's SEMWAIT MATH_PACK stalled 72 rounds and was released only by T1's SEMPOST in round 4399. Dst has no valid bits, so software provides them.</p></details>
+  <details class="quiz"><summary>You switch a matmul from HiFi4 to LoFi. Which threads' instruction streams change?</summary>
+  <p>Only T1's, and only in MVMUL (512 → 128 for our 8 tile products) and SETRWC (17 → 9). T0 and T2 execute identical counts of every opcode, and TRISC1 pushes the same 96 instructions. Fidelity is the inner loop count inside the MOP config (<code>inner_loops = math_fidelity</code>, <code>llk_math_matmul.h:469</code>).</p></details>
+  <details class="quiz"><summary>The trace shows PACK waiting about 220 rounds per matmul output tile. Can you conclude the packer is a bottleneck-free unit on silicon?</summary>
+  <p>No. ttsim isn't a timing model: rounds give each instruction one slot regardless of real latency, and MVMUL pipelining, unpacker throughput and packer write bandwidth aren't modelled. What you can conclude is the dependency structure: PACK can't start a tile until MATH posts MATH_PACK, and per output tile MATH executes 64× as many MVMULs (128) as PACK executes PACRs (2). Performance questions need silicon or a timing model.</p></details>
+  <details class="quiz"><summary>Why does the post-processor decode MOP and REPLAY by hand instead of using their tensix_isa.json field ranges?</summary>
+  <p>Because the JSON's ranges for those four frontend opcodes (MOP, NOP, MOP_CFG, REPLAY) are placeholders such as <code>"len": "4:4"</code>. ttsim's generator skips them ("skip for now" in <code>tensix_gen_decode.py</code>), and the expanders decode them by hand: <code>mop_ingest</code> uses bits 15:0, 22:16 and 23, and <code>replay_expander</code> uses bits 0, 1, 13:4 and 23:14. Using the JSON would have reported every REPLAY length as 0 or 1.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MOPExpander.md">MOP Expander</a>: the ISA's functional model of both MOP templates, which ttsim's <code>mop_step_inst</code> implements.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/REPLAY.md">REPLAY</a>: recording and playing back up to 32 instructions per thread.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/WaitGate.md">Wait Gate</a>: everything that can hold an instruction at the head of a thread, including Src ownership.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/STALLWAIT.md">STALLWAIT</a>: the block-mask and condition-mask bit tables used to decode the trace.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SEMWAIT.md">SEMWAIT</a>: semaphore waits, and how they differ from STALLWAIT when a wait is already latched.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md">SrcA and SrcB</a>: the two-bank, AllowedClient hand-off behind stalls (a) and (b).</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md">MVMUL</a>: the instruction that dominates the matmul histogram.</li>
+    <li><a href="https://github.com/tenstorrent/tt-llk">tt-llk</a>: the low-level kernel library whose <code>ckernel_template</code> calls programmed every MOP in this lab.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator; <code>src/tensix.cpp</code> and <code>data/wh/tensix_isa.json</code> are the files patched and read here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/compute/compute.html">TT-Metalium compute kernel APIs</a>: the official reference for <code>add_tiles</code>, <code>matmul_tiles</code> and the tile-register calls traced above.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a14-one-tiles-journey.html">&larr; 14 One tile's journey</a><a class="next" href="../chapters/a15-matmul-one-to-many.html">15 Matmul on one core, then many &rarr;</a></div>
+</main>
+</body>
+</html>

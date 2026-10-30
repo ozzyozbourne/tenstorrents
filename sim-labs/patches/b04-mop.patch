@@ -1,0 +1,75 @@
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -19,6 +19,7 @@
+     uint32_t tile = 0, pipes = 7;
+     uint64_t first_try[TENSIX_INST_PIPES] = {}; // clock of the first failed attempt of the head instruction
+     uint64_t tries[TENSIX_INST_PIPES] = {};     // failed attempts so far
++    uint32_t emitted[TENSIX_INST_PIPES] = {};   // instructions emitted by the current MOP expansion
+     B04Trace() {
+         if (const char *p = getenv("B04_OUT")) f = fopen(p, "w");
+         if (f) setvbuf(f, nullptr, _IOLBF, 0); // line-buffered: ttsim errors end the process without flushing
+@@ -33,6 +34,13 @@
+ static B04Trace s_b04;
+ uint64_t g_b04_round;            // issue rounds of the traced tile (libttsim.cpp clocks a tile several rounds per clock)
+ uint32_t b04_trace_tile() { return s_b04.tile; }
++// One trace line: <kind> <clock> <round> T<pipe> <instruction> [extra]
++static void b04_ev(char kind, const TensixState *p_tensix, uint32_t pipe, uint32_t inst, const char *extra = "") {
++    if (s_b04.on(p_tensix, pipe)) {
++        fprintf(s_b04.f, "%c %llu %llu T%u %08x%s\n", kind, (unsigned long long)g_clock, (unsigned long long)g_b04_round,
++                pipe, inst, extra);
++    }
++}
+ 
+ #define IS_TENSIX_NOP(inst) (bits<31,24>(inst) == TENSIX_OPCODE_NOP)
+ 
+@@ -96,6 +104,7 @@
+             tensix_push_inst_fifo(p_tensix, pipe, inst);
+         }
+     } else if (bits<31,24>(inst) == TENSIX_OPCODE_REPLAY) {
++        b04_ev('R', p_tensix, pipe, inst);
+         TTSIM_VERIFY(!(inst & 0xF83C0C), NonContractualBehavior, "REPLAY inst=0x%x", inst); // unused bits in encoding
+         uint32_t load_mode = bits<0,0>(inst);
+         uint32_t execute_while_loading = bits<1,1>(inst);
+@@ -176,6 +185,11 @@
+     std::copy(cfg, cfg + 9, p_mop->cfg);
+     p_mop->iter = 0;
+     p_mop->step = 0;
++    char cfgs[128];
++    snprintf(cfgs, sizeof(cfgs), " %x %x %08x %08x %08x %08x %08x %08x %08x", cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
++             cfg[6], cfg[7], cfg[8]);
++    b04_ev('M', p_tensix, pipe, inst, cfgs);
++    s_b04.emitted[pipe] = 0;
+ }
+ 
+ enum MopStep { MOP_STEP_END, MOP_STEP_EMIT, MOP_STEP_SKIP };
+@@ -254,9 +268,14 @@
+         }
+         p_mop->step++;
+         if (step == MOP_STEP_EMIT) {
++            b04_ev('E', p_tensix, pipe, *p_inst);
++            s_b04.emitted[pipe]++;
+             return true;
+         }
+     }
++    char n[16];
++    snprintf(n, sizeof(n), " %u", s_b04.emitted[pipe]);
++    b04_ev('D', p_tensix, pipe, p_mop->inst, n);
+     p_mop->busy = false;
+     return false;
+ }
+@@ -273,6 +292,7 @@
+ void tensix_frontend_step(TensixState *p_tensix, uint32_t pipe) {
+     while (inst_fifo_used(p_tensix, pipe) < TENSIX_INST_FIFO_SIZE - 1) { // the FIFO keeps one entry empty
+         if (p_tensix->replay_play_left[pipe]) {
++            b04_ev('Y', p_tensix, pipe, p_tensix->replay_buf[pipe][p_tensix->replay_play_index[pipe]]);
+             tensix_push_inst_fifo(p_tensix, pipe, p_tensix->replay_buf[pipe][p_tensix->replay_play_index[pipe]]);
+             p_tensix->replay_play_index[pipe]++;
+             p_tensix->replay_play_left[pipe]--;
+@@ -317,6 +337,7 @@
+ }
+ 
+ void tensix_push_inst(TensixState *p_tensix, uint32_t pipe, uint32_t inst, bool bypass_mop_expander) {
++    b04_ev('P', p_tensix, pipe, inst, bypass_mop_expander ? " 1" : " 0");
+     if (bypass_mop_expander) {
+         replay_expander(p_tensix, pipe, inst);
+         tensix_frontend_step(p_tensix, pipe);

@@ -1,0 +1,71 @@
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -9,6 +9,30 @@
+ #include "sim.h"
+ #include "tensix_decode.h" // generated
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++
++// B04 lab: trace the Tensix instructions of ONE tile, gated by environment variables.
++//   B04_OUT=file   enables the trace;  B04_TILE=n (default 0);  B04_PIPES=mask of threads T0/T1/T2 (default 7)
++struct B04Trace {
++    FILE *f = nullptr;
++    uint32_t tile = 0, pipes = 7;
++    uint64_t first_try[TENSIX_INST_PIPES] = {}; // clock of the first failed attempt of the head instruction
++    uint64_t tries[TENSIX_INST_PIPES] = {};     // failed attempts so far
++    B04Trace() {
++        if (const char *p = getenv("B04_OUT")) f = fopen(p, "w");
++        if (f) setvbuf(f, nullptr, _IOLBF, 0); // line-buffered: ttsim errors end the process without flushing
++        if (const char *p = getenv("B04_TILE")) tile = atoi(p);
++        if (const char *p = getenv("B04_PIPES")) pipes = strtoul(p, nullptr, 0);
++    }
++    ~B04Trace() { if (f) fclose(f); }
++    bool on(const TensixState *p_tensix, uint32_t pipe) const {
++        return f && (p_tensix->tile_id == tile) && ((pipes >> pipe) & 1);
++    }
++};
++static B04Trace s_b04;
++uint64_t g_b04_round;            // issue rounds of the traced tile (libttsim.cpp clocks a tile several rounds per clock)
++uint32_t b04_trace_tile() { return s_b04.tile; }
+ 
+ #define IS_TENSIX_NOP(inst) (bits<31,24>(inst) == TENSIX_OPCODE_NOP)
+ 
+@@ -5772,5 +5796,17 @@
+     if (p_tensix->wait_block[pipe] && block_mask_holds(p_tensix->wait_block[pipe], inst)) {
+         p_tensix->wait_block[pipe] = 0;
+     }
+-    return tensix_execute_inst(p_tensix, pipe, inst);
++    bool done = tensix_execute_inst(p_tensix, pipe, inst);
++    if (s_b04.on(p_tensix, pipe)) {
++        if (!done) {
++            if (!s_b04.tries[pipe]++) s_b04.first_try[pipe] = g_clock; // stalled: the FIFO head retries later
++        } else {
++            // X <clock> <round> T<pipe> <instruction> <failed tries> <clocks spent stalled>
++            uint64_t stall_clks = s_b04.tries[pipe] ? g_clock - s_b04.first_try[pipe] : 0;
++            fprintf(s_b04.f, "X %llu %llu T%u %08x %llu %llu\n", (unsigned long long)g_clock, (unsigned long long)g_b04_round, pipe, inst,
++                    (unsigned long long)s_b04.tries[pipe], (unsigned long long)stall_clks);
++            s_b04.tries[pipe] = 0;
++        }
++    }
++    return done;
+ }
+--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
+@@ -241,6 +241,8 @@
+     g_chip->t_tile_cores_paused = false;
+ }
+ 
++extern uint64_t g_b04_round; // B04 lab trace (tensix.cpp)
++uint32_t b04_trace_tile();
+ static void clock_current_chip() {
+     if (g_chip->t_tile_cores_paused && !(g_clock % PAUSE_CLOCKS)) {
+         resume_paused_cores();
+@@ -251,6 +253,7 @@
+         TensixTile *p_tile = &g_t_tiles[tile_id];
+         // Hack: for simulator perf, we clock a tile repeatedly as long as it successfully executes at least one Tensix instruction
+         for (;;) {
++            if (tile_id == b04_trace_tile()) g_b04_round++;
+             for (uint32_t rv32_mask = p_tile->rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
+                 uint32_t rv32_index = __builtin_ctz(rv32_mask);
+                 rv32_step(&p_tile->rv32[rv32_index]);

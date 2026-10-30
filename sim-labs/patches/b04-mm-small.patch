@@ -1,0 +1,15 @@
+--- a/host/mm_fid.cpp
++++ b/host/mm_small.cpp
+@@ -197,9 +197,9 @@
+         std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
+ 
+         // parameters for the matrix multiplication
+-        constexpr uint32_t M = 640;  // user-defined
+-        constexpr uint32_t N = 640;  // user-defined
+-        constexpr uint32_t K = 640;  // user-defined
++        constexpr uint32_t M = 64;  // B04: 2x2 tiles, so the trace stays small
++        constexpr uint32_t N = 64;  // B04: 2x2 tiles, so the trace stays small
++        constexpr uint32_t K = 64;  // B04: 2x2 tiles, so the trace stays small
+ 
+         static_assert(M % TILE_HEIGHT == 0, "M must be divisible by TILE_HEIGHT");
+         static_assert(N % TILE_WIDTH == 0, "N must be divisible by TILE_WIDTH");
