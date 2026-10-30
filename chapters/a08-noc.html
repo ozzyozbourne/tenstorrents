@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A08 · The Network-on-Chip · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  table.t td.n { text-align: right; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a07-vector-engine.html">&larr; Prev</a>
+  <a href="a09-memory.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 08</span><span class="tag">Prerequisites: A03, A04</span>
+  <h1><span class="num">08.</span> The Network-on-Chip</h1>
+  <p class="subtitle">Why every Tenstorrent chip has two one-way networks running in opposite directions, how a packet finds its way across them, and what a RISC-V core actually does when it says &ldquo;send this&rdquo;.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#why-network">Why a network at all?</a></li>
+      <li><a href="#one-way">One-way streets on a doughnut</a></li>
+      <li><a href="#routing">Dimension-order routing, and why the second NoC helps</a></li>
+      <li><a href="#flits">Flits, packets, hops and bandwidth</a></li>
+      <li><a href="#transactions">What you can send: reads, writes, atomics, multicast</a></li>
+      <li><a href="#deadlock">Virtual channels and the dateline</a></li>
+      <li><a href="#ordering">Weak ordering, counters and barriers</a></li>
+      <li><a href="#coords">Three kinds of coordinates</a></li>
+      <li><a href="#niu">Programming the NIU: one store starts a transfer</a></li>
+      <li><a href="#sim">Watching real transfers in ttsim</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <!-- ===================================================================== -->
+  <h2 id="question">The question</h2>
+  <p>A Wormhole chip is a grid of 10 &times; 12 = 120 positions. Eighty of them are Tensix cores, and the rest are DRAM controllers, Ethernet ports, a PCIe port, the ARC management CPU, and a few empty spots (you met this map in <a href="a03-chip-tour.html">A03</a>). No Tensix core sits behind a shared cache hierarchy (each RISC-V core has only a tiny instruction cache), and none can load a byte from another core's memory with an ordinary load instruction. Every byte that moves between two positions travels as a packet over a <b>Network-on-Chip</b>, or NoC.</p>
+  <p>Look at the chip a little longer and you find something odd. There is not one network but two, and they are <em>physically separate</em>. Each is a one-way street: on NoC&nbsp;0 data can only move right or down, and on NoC&nbsp;1 it can only move left or up. So:</p>
+  <div class="callout key">Why would anyone build two networks that run in opposite directions, instead of one network where data can go either way?</div>
+  <p>By the end of this chapter you will be able to answer that with numbers. You will also know how a packet is routed, how big it is, what kinds of request exist, why the network will happily reorder your writes, and how a single 32-bit store from a tiny RISC-V core starts a 2 KiB DMA. Along the way we use the simulator ttsim as executable documentation, and we look at real transfers it logged.</p>
+
+  <!-- ===================================================================== -->
+  <h2 id="why-network">Why a network at all?</h2>
+  <p>Start with the simplest thing that could work: a <b>bus</b>, one shared set of wires that every tile can drive. A bus is cheap, and with four tiles it is fine. But only one tile can talk at a time. With 120 tiles, each one gets on average 1/120 of the bus, and the wires have to stretch across the whole die, so they are long, slow and power-hungry.</p>
+  <p>The opposite extreme is a <b>crossbar</b>: a switch that can connect any input to any output at the same time. Now all 120 tiles can talk at once, but a full crossbar needs 120 &times; 120 = 14,400 crosspoints, and every input wire must still reach every output, all the way across the chip.</p>
+  <p>A <b>mesh</b> takes a third path. Each tile gets a small router that only talks to its immediate neighbours. A packet going far just takes several short hops. Every wire is one tile long, every router is the same small circuit, and when you add tiles you add links in proportion, so total bandwidth grows with the chip. The price is latency proportional to distance, and the possibility that two packets want the same link at the same moment (congestion).</p>
+  <p>Drag the slider to grow the chip and watch how the three designs scale.</p>
+
+  <div class="viz" id="fig0"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig0");
+    var g = TT.canvas(root, 860, 365), ctx = g.ctx, C = TT.C;
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    ctrl.innerHTML = '<label>tiles per side k <input type="range" min="2" max="12" value="4" id="f0k"></label><span id="f0v" style="color:#9aa4b2"></span>';
+    root.appendChild(ctrl);
+    var cap = document.createElement("div"); cap.className = "caption";
+    cap.innerHTML = "Counts are exact for N = k&times;k tiles. &ldquo;Simultaneous transfers&rdquo; is how many one-hop link transfers can happen in one cycle: a bus allows 1; a crossbar allows N (one per output); a unidirectional 2D torus has one X-out and one Y-out link per router, so 2N links per network.";
+    root.appendChild(cap);
+    var slider = ctrl.querySelector("#f0k"), lab = ctrl.querySelector("#f0v");
+    function draw() {
+      var k = +slider.value, N = k * k;
+      lab.textContent = "N = " + N + " tiles";
+      TT.clear(ctx, g.W, g.H);
+      var panels = [{ x: 20, t: "Bus" }, { x: 305, t: "Crossbar" }, { x: 590, t: "2D torus (one NoC)" }];
+      panels.forEach(function (p) { TT.text(ctx, p.t, p.x + 125, 20, { align: "center", font: "bold 15px", color: C.yellow }); });
+      // Bus
+      var bx = 30, by = 120, bw = 230;
+      ctx.strokeStyle = C.blue; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + bw, by); ctx.stroke();
+      var shown = Math.min(N, 24);
+      for (var i = 0; i < shown; i++) {
+        var x = bx + (i + 0.5) * bw / shown, up = i % 2 === 0;
+        ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, by); ctx.lineTo(x, up ? by - 30 : by + 30); ctx.stroke();
+        TT.box(ctx, x - 5, (up ? by - 42 : by + 30), 10, 12, { fill: C.orange, alpha: 0.8, r: 2 });
+      }
+      if (N > shown) TT.text(ctx, "(showing 24 of " + N + ")", bx + bw / 2, by + 62, { align: "center", color: C.muted, font: "12px" });
+      // Crossbar
+      var cx0 = 330, cy0 = 45, cs = 150;
+      var lines = Math.min(N, 48);
+      ctx.strokeStyle = "rgba(88,196,221,0.55)"; ctx.lineWidth = 1;
+      for (i = 0; i < lines; i++) {
+        var o = (i + 0.5) * cs / lines;
+        ctx.beginPath(); ctx.moveTo(cx0, cy0 + o); ctx.lineTo(cx0 + cs, cy0 + o); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(cx0 + o, cy0); ctx.lineTo(cx0 + o, cy0 + cs); ctx.stroke();
+      }
+      if (N > lines) TT.text(ctx, "(" + lines + " of " + N + " lines drawn)", cx0 + cs / 2, cy0 + cs + 14, { align: "center", color: C.muted, font: "12px" });
+      // Torus
+      var tx0 = 640, ty0 = 50, ts = 140, step = ts / k;
+      for (var yy = 0; yy < k; yy++) for (var xx = 0; xx < k; xx++) {
+        var px = tx0 + xx * step + step / 2, py = ty0 + yy * step + step / 2;
+        ctx.strokeStyle = C.blue; ctx.lineWidth = 1.2;
+        if (xx < k - 1) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + step, py); ctx.stroke(); }
+        if (yy < k - 1) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, py + step); ctx.stroke(); }
+        TT.box(ctx, px - Math.min(5, step * 0.25), py - Math.min(5, step * 0.25), Math.min(10, step * 0.5), Math.min(10, step * 0.5), { fill: C.orange, r: 2 });
+      }
+      ctx.setLineDash([3, 3]); ctx.strokeStyle = C.purple;
+      for (i = 0; i < k; i++) {
+        var p = ty0 + i * step + step / 2, q = tx0 + i * step + step / 2;
+        ctx.beginPath(); ctx.moveTo(tx0 + ts - step / 2, p); ctx.lineTo(tx0 + ts + 8, p); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(tx0 - 8, p); ctx.lineTo(tx0 + step / 2, p); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(q, ty0 + ts - step / 2); ctx.lineTo(q, ty0 + ts + 8); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(q, ty0 - 8); ctx.lineTo(q, ty0 + step / 2); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      // numbers
+      var rows = [
+        ["simultaneous transfers", "1", String(N), String(2 * N)],
+        ["switch points", "N taps", (N * N).toLocaleString() + " crosspoints", N + " small routers"],
+        ["longest wire", "whole chip", "whole chip", "1 tile (+ wrap links)"]
+      ];
+      rows.forEach(function (r, j) {
+        var y = 232 + j * 42;
+        TT.text(ctx, r[0], 430, y, { align: "center", color: C.muted, font: "12px" });
+        TT.text(ctx, r[1], 145, y + 18, { align: "center", font: "14px", color: j === 0 ? C.red : C.fg });
+        TT.text(ctx, r[2], 405, y + 18, { align: "center", font: "14px", color: j === 1 ? C.red : C.fg });
+        TT.text(ctx, r[3], 710, y + 18, { align: "center", font: "14px", color: C.green });
+      });
+    }
+    slider.addEventListener("input", draw);
+    draw();
+  })();
+  </script>
+
+  <p>Tenstorrent chips use the mesh idea with one twist: the edges wrap around. The right edge of each row connects back to the left edge, and the bottom of each column connects back to the top. A grid whose edges wrap like this is a <b>2D torus</b>: roll the grid into a tube and bend the tube into a ring, and you get a doughnut. On a plain mesh a corner tile is far from everything; on a torus no tile is special, because every tile sees the same neighbourhood.</p>
+  <p>The ISA documentation says it directly: &ldquo;Each NoC is a 2D torus of NoC routers and NIUs (NoC interface units). Packets initiate at an NIU, and terminate at an NIU, with routers moving packets between NIUs&rdquo; (<code>tt-isa-documentation/WormholeB0/NoC/README.md:5</code>). Every grid position has a router and an NIU, even the empty ones, which &ldquo;still contain a router and an NIU&rdquo; (README.md:21).</p>
+  <div class="callout warn">The dashed wraparound links in the figure are drawn long because the picture is flat. Real torus chips often <em>fold</em> the ring in the physical layout so that every wire stays short. The Tenstorrent ISA documentation gives one uniform router-to-router latency (9 cycles) and does not describe the physical layout, so this page doesn't say how the wrap links are wired.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="one-way">One-way streets on a doughnut</h2>
+  <p>Here is the first surprise. A textbook mesh router has links in both directions. Tenstorrent's routers don't. From <code>RoutingPaths.md:11</code>: &ldquo;All data flow between NoC #0 routers is rightwards and downwards, with the left/right and top/bottom edges connected to each other.&rdquo; And for the other network (<code>RoutingPaths.md:35</code>): &ldquo;All data flow between NoC #1 routers is leftwards and upwards.&rdquo;</p>
+  <p>Picture a city whose streets are all one-way, and which happens to be built on a doughnut. On NoC&nbsp;0 you can only drive east or south. To reach the building just <em>west</em> of you, you have to drive east all the way around the doughnut: on a 10-wide grid that is 9 blocks to move 1. Each row is a one-way ring and each column is a one-way ring.</p>
+  <p>Why build it that way? The METALIUM_GUIDE gives Tenstorrent's reason: &ldquo;the unidirectional design optimizes power consumption and silicon area utilization&rdquo; (<code>tt-metal/METALIUM_GUIDE.md:58</code>). A one-way router has one output per axis instead of two, so it is smaller. The wrap is what makes a one-way network usable at all: without it, a packet could never travel left on NoC&nbsp;0.</p>
+  <p>Then add the second doughnut with every street reversed, and the westward trip is one block again. The guide puts it this way: &ldquo;The opposing directional flow of the two NoCs naturally provides efficient return paths for data, regardless of the originating location&rdquo; (METALIUM_GUIDE.md:58). Try it below.</p>
+
+  <!-- ====== FIG 1: the aha ====== -->
+  <div class="viz" id="fig1"></div>
+  <script>
+  /* Shared Wormhole grid helpers (NoC 0 coordinates: x 0..9 left->right, y 0..11 top->bottom). */
+  window.A08 = (function () {
+    var C = TT.C, W = 10, H = 12;
+    function type(x, y) {
+      if (x === 5) return "D";
+      if (x === 0) {
+        if ([0, 1, 5, 6, 7, 11].indexOf(y) >= 0) return "D";
+        if (y === 3) return "P";
+        if (y === 10) return "A";
+        return "-";
+      }
+      if (y === 0 || y === 6) return "E";
+      return "T";
+    }
+    var col = { T: C.orange, D: C.teal, E: C.blue, P: C.pink, A: C.yellow, "-": "#555" };
+    function geom(GX, GY, CS) {
+      return {
+        GX: GX, GY: GY, CS: CS,
+        cx: function (x) { return GX + x * CS + CS / 2; },
+        cy: function (y) { return GY + y * CS + CS / 2; }
+      };
+    }
+    function drawGrid(ctx, gm, opts) {
+      opts = opts || {};
+      for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+        var t = type(x, y), a = opts.dim ? 0.13 : 0.22;
+        if (opts.alpha) a = opts.alpha(x, y, a);
+        TT.box(ctx, gm.GX + x * gm.CS + 3, gm.GY + y * gm.CS + 3, gm.CS - 6, gm.CS - 6,
+          { fill: col[t], alpha: a, stroke: col[t], lw: 0.6, r: 4 });
+        TT.text(ctx, t === "-" ? "" : t, gm.cx(x), gm.cy(y), { align: "center", color: "rgba(230,230,230,0.55)", font: "11px" });
+      }
+      for (x = 0; x < W; x++) TT.text(ctx, String(x), gm.cx(x), gm.GY - 9, { align: "center", color: C.muted, font: "11px" });
+      for (y = 0; y < H; y++) TT.text(ctx, String(y), gm.GX - 10, gm.cy(y), { align: "center", color: C.muted, font: "11px" });
+    }
+    function hit(canvas, W0, ev, gm) {
+      var r = canvas.getBoundingClientRect(), s = W0 / r.width;
+      var px = (ev.clientX - r.left) * s, py = (ev.clientY - r.top) * s;
+      var x = Math.floor((px - gm.GX) / gm.CS), y = Math.floor((py - gm.GY) / gm.CS);
+      if (x < 0 || x >= W || y < 0 || y >= H) return null;
+      return [x, y];
+    }
+    /* Unicast routes. NoC0: right (x+1) as needed, then down (y+1). NoC1: up (y-1) as needed, then left (x-1). */
+    function route(noc, s, d) {
+      var p = [[s[0], s[1]]], x = s[0], y = s[1];
+      if (noc === 0) {
+        while (x !== d[0]) { x = (x + 1) % W; p.push([x, y]); }
+        while (y !== d[1]) { y = (y + 1) % H; p.push([x, y]); }
+      } else {
+        while (y !== d[1]) { y = (y - 1 + H) % H; p.push([x, y]); }
+        while (x !== d[0]) { x = (x - 1 + W) % W; p.push([x, y]); }
+      }
+      return p;
+    }
+    /* Draw one hop a->b, splitting wraparound hops into two edge stubs. */
+    function hop(ctx, gm, a, b, color, lw, partial) {
+      var ax = gm.cx(a[0]), ay = gm.cy(a[1]), bx = gm.cx(b[0]), by = gm.cy(b[1]);
+      var f = partial == null ? 1 : partial;
+      ctx.strokeStyle = color; ctx.lineWidth = lw || 3; ctx.lineCap = "round";
+      var wrap = Math.abs(a[0] - b[0]) > 1 || Math.abs(a[1] - b[1]) > 1;
+      if (!wrap) {
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(TT.lerp(ax, bx, f), TT.lerp(ay, by, f)); ctx.stroke();
+        return [TT.lerp(ax, bx, f), TT.lerp(ay, by, f)];
+      }
+      var dx = 0, dy = 0;
+      if (a[1] === b[1]) dx = (b[0] === 0 && a[0] === W - 1) ? 1 : -1; else dy = (b[1] === 0 && a[1] === H - 1) ? 1 : -1;
+      var ex = ax + dx * gm.CS * 0.62, ey = ay + dy * gm.CS * 0.62;   // leave through the edge
+      var sx = bx - dx * gm.CS * 0.62, sy = by - dy * gm.CS * 0.62;   // re-enter through the opposite edge
+      ctx.setLineDash([4, 4]);
+      if (f <= 0.5) {
+        var g1 = f / 0.5;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(TT.lerp(ax, ex, g1), TT.lerp(ay, ey, g1)); ctx.stroke();
+        ctx.setLineDash([]);
+        return [TT.lerp(ax, ex, g1), TT.lerp(ay, ey, g1)];
+      }
+      var g2 = (f - 0.5) / 0.5;
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(TT.lerp(sx, bx, g2), TT.lerp(sy, by, g2)); ctx.stroke();
+      ctx.setLineDash([]);
+      return [TT.lerp(sx, bx, g2), TT.lerp(sy, by, g2)];
+    }
+    function ring(ctx, gm, p, color, label) {
+      ctx.strokeStyle = color; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(gm.cx(p[0]), gm.cy(p[1]), gm.CS * 0.42, 0, Math.PI * 2); ctx.stroke();
+      if (label) TT.text(ctx, label, gm.cx(p[0]), gm.cy(p[1]) - gm.CS * 0.55, { align: "center", color: color, font: "bold 11px" });
+    }
+    return { W: W, H: H, type: type, col: col, geom: geom, drawGrid: drawGrid, hit: hit, route: route, hop: hop, ring: ring };
+  })();
+
+  (function () {
+    var root = document.getElementById("fig1");
+    var g = TT.canvas(root, 860, 580), ctx = g.ctx, C = TT.C, A = A08;
+    var gm = A.geom(40, 40, 42);
+    var src = [1, 1], dst = [0, 11];
+    var presets = {
+      loop: [[1, 1], [0, 11], "Real loopback transfer: Tensix (1,1) &harr; DRAM (0,11)"],
+      left: [[4, 3], [3, 3], "One step to the left"],
+      down: [[6, 2], [6, 3], "One step down"],
+      diag: [[2, 2], [8, 9], "Far corner, no wrap on NoC 0"],
+      mid: [[1, 1], [6, 7], "Halfway across"]
+    };
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>preset <select id="f1p"><option value="loop">T(1,1) → D(0,11) (loopback)</option><option value="left">one step left</option><option value="down">one step down</option><option value="diag">(2,2) → (8,9)</option><option value="mid">(1,1) → (6,7)</option></select></label>' +
+      '<span style="color:#9aa4b2">or click the grid: <b id="f1m" style="color:#ffd866">next click sets the source</b></span>';
+    root.appendChild(bar);
+    var mode = 0; // 0: next click sets source, 1: sets destination
+    var p0, p1;
+    function recompute() {
+      p0 = A.route(0, src, dst); p1 = A.route(1, src, dst);
+      steps[1].dur = Math.max(1.5, (p0.length - 1) * 0.28);
+      steps[2].dur = Math.max(1.5, (p1.length - 1) * 0.28);
+      var n0 = p0.length - 1, n1 = p1.length - 1;
+      var s = "(" + src + ") &rarr; (" + dst + ")";
+      steps[0].text = "<b>Step 1.</b> Source " + s + ". Click the grid to choose other tiles, or pick a preset. Yellow ring = source, green ring = destination.";
+      steps[1].text = "<b>NoC 0</b> moves only right, then down (X first, then Y), wrapping at the edges: <b>" + n0 + " hops</b>.";
+      steps[2].text = "<b>NoC 1</b> moves only up, then left (Y first, then X), wrapping at the edges: <b>" + n1 + " hops</b>.";
+      steps[3].text = "<b>Compare.</b> " + n0 + " + " + n1 + " = " + (n0 + n1) + ". Whenever source and destination differ in both x and y, the two hop counts add up to 10 + 12 = 22 (the width plus the height): what one NoC saves, the other pays. NoC 1's route from A to B uses the same tiles as NoC 0's route from B to A, in reverse.";
+    }
+    var steps = [{ dur: 1.0, text: "" }, { dur: 2, text: "" }, { dur: 2, text: "" }, { dur: 1.2, text: "" }];
+    function panel(i, t) {
+      var x0 = 510, n0 = p0.length - 1, n1 = p1.length - 1;
+      TT.text(ctx, "Hop counter", x0, 50, { font: "bold 16px", color: C.yellow });
+      TT.text(ctx, "source (" + src + ") " + A.type(src[0], src[1]) + "   →   dest (" + dst + ") " + A.type(dst[0], dst[1]), x0, 80, { font: "14px", mono: true });
+      var h0 = i === 1 ? Math.floor(t * n0 + 1e-6) : (i > 1 ? n0 : 0);
+      var h1 = i === 2 ? Math.floor(t * n1 + 1e-6) : (i > 2 ? n1 : 0);
+      function rowAt(y, name, color, h, n, show) {
+        TT.text(ctx, name, x0, y, { font: "bold 15px", color: color });
+        TT.text(ctx, show ? ("hop " + h + " / " + n) : "–", x0 + 90, y, { font: "15px", mono: true });
+        var bw = 300, w = n ? bw * h / 22 : 0;
+        TT.box(ctx, x0, y + 14, bw, 12, { stroke: C.border, r: 3 });
+        if (show && w > 0) TT.box(ctx, x0, y + 14, w, 12, { fill: color, r: 3 });
+        if (show) TT.text(ctx, "head-flit latency ≈ 5 + 9×" + n + " + 5 = " + (10 + 9 * n) + " cycles", x0, y + 42, { font: "12px", color: C.muted });
+      }
+      rowAt(130, "NoC 0", C.blue, h0, n0, i >= 1);
+      rowAt(210, "NoC 1", C.pink, h1, n1, i >= 2);
+      TT.text(ctx, "bar scale: 22 hops", x0 + 300, 300, { align: "right", font: "11px", color: C.muted });
+      if (i === 3) {
+        TT.text(ctx, "NoC 0 + NoC 1 = " + n0 + " + " + n1 + " = " + (n0 + n1), x0, 330, { font: "bold 16px", color: C.green });
+        var best = n0 <= n1 ? "NoC 0" : "NoC 1";
+        TT.text(ctx, "shorter: " + best + " (" + Math.min(n0, n1) + " hops)", x0, 360, { font: "15px" });
+        TT.text(ctx, "A read's request and response travel on the", x0, 400, { font: "13px", color: C.muted });
+        TT.text(ctx, "same NoC, so a round trip on one NoC is", x0, 420, { font: "13px", color: C.muted });
+        TT.text(ctx, n0 + " + " + n1 + " hops whichever NoC you pick.", x0, 440, { font: "13px", color: C.muted });
+        TT.text(ctx, "What the choice changes is which leg carries", x0, 466, { font: "13px", color: C.muted });
+        TT.text(ctx, "the data. (See the next section.)", x0, 486, { font: "13px", color: C.muted });
+      }
+      TT.text(ctx, "Latency per ISA table: ~5 NIU→router, 9 per hop,", x0, 530, { font: "11px", color: C.muted });
+      TT.text(ctx, "~5 router→NIU; no congestion; data flits follow.", x0, 546, { font: "11px", color: C.muted });
+    }
+    function drawPath(p, color, upto) {
+      var n = p.length - 1, f = upto * n, k = Math.floor(f), head = null;
+      for (var j = 0; j < n; j++) {
+        if (j < k) A.hop(ctx, gm, p[j], p[j + 1], color, 3);
+        else if (j === k) { head = A.hop(ctx, gm, p[j], p[j + 1], color, 3, f - k); break; }
+      }
+      if (n === 0) return;
+      if (upto >= 1) head = [gm.cx(p[n][0]), gm.cy(p[n][1])];
+      if (head) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(head[0], head[1], 6, 0, Math.PI * 2); ctx.fill(); }
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      A.drawGrid(ctx, gm);
+      if (i === 1) drawPath(p0, C.blue, t);
+      if (i === 2) { drawPath(p1, C.pink, t); }
+      if (i === 3) { ctx.globalAlpha = 0.9; drawPath(p0, C.blue, 1); drawPath(p1, C.pink, 1); ctx.globalAlpha = 1; }
+      A.ring(ctx, gm, src, C.yellow, "src");
+      A.ring(ctx, gm, dst, C.green, "dst");
+      TT.text(ctx, "NoC 0 coordinates (x right, y down). T Tensix · D DRAM · E Ethernet · P PCIe · A ARC", 40, 568, { font: "12px", color: C.muted });
+      panel(i, t);
+    }
+    recompute();
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    bar.querySelector("#f1p").addEventListener("change", function (e) {
+      var p = presets[e.target.value]; src = p[0].slice(); dst = p[1].slice(); recompute(); st.render();
+    });
+    var mlab = bar.querySelector("#f1m");
+    g.canvas.style.cursor = "crosshair";
+    g.canvas.addEventListener("click", function (ev) {
+      var c = A.hit(g.canvas, g.W, ev, gm); if (!c) return;
+      if (mode === 0) { src = c; mlab.textContent = "next click sets the destination"; }
+      else { dst = c; mlab.textContent = "next click sets the source"; }
+      mode = 1 - mode; recompute(); st.render();
+    });
+  })();
+  </script>
+
+  <p>Play with a few pairs. One step left costs 9 hops on NoC&nbsp;0 and 1 hop on NoC&nbsp;1. One step down costs 1 hop on NoC&nbsp;0 and 11 on NoC&nbsp;1. The loopback preset is a real transfer the simulator logged later in this chapter: Tensix (1,1) talking to the DRAM tile at (0,11). On NoC&nbsp;0 that is 9 hops right (wrapping past column 9) plus 10 hops down, 19 in all. On NoC&nbsp;1 it is 2 hops up (wrapping past row 0) plus 1 hop left, just 3.</p>
+
+  <!-- ===================================================================== -->
+  <h2 id="routing">Dimension-order routing, and why the second NoC helps</h2>
+  <p>Notice that each route turns at most once. That is no accident. The ISA spec (<code>RoutingPaths.md:17</code>) says unicast packets on NoC&nbsp;0 &ldquo;will travel rightwards as necessary, turn at most once, and then travel downwards as necessary&rdquo;. On NoC&nbsp;1 they &ldquo;travel upwards as necessary, turn at most once, and then travel leftwards as necessary&rdquo; (RoutingPaths.md:41). This scheme is called <b>dimension-order routing</b>: finish moving in one dimension, then move in the other. Each NIU's <code>NOC_NODE_ID</code> register has a bit recording which order its NoC uses. That bit is &ldquo;in practice always <code>true</code> [X first] at all NoC #0 NIUs and <code>false</code> [Y first] at all NoC #1 NIUs&rdquo; (MemoryMap.md:189).</p>
+  <p>Dimension-order routing is <b>deterministic</b>: the route is fixed by the source, the destination and the NoC (RoutingPaths.md:3-8), with no adaptive detours around traffic. That makes it cheap to build and easy to reason about. If two of your transfers collide on a link, they will collide every time.</p>
+  <p>Now look again at the hop counts. On one ring of length L, going forward d steps costs d hops, and going the other way round costs L&minus;d. So for any pair that differs in both x and y:</p>
+  <pre><code>hops(NoC 0) + hops(NoC 1) = (10 - dx) + dx + (12 - dy) + dy = 10 + 12 = 22   (Wormhole)</code></pre>
+  <p>So whichever NoC is longer, the other is shorter, and the better of the two is never more than 11 hops. With only NoC&nbsp;0, a transfer could need up to 9&nbsp;+&nbsp;11&nbsp;=&nbsp;20 hops.</p>
+
+  <h3>The twist: a read is a round trip</h3>
+  <p>Here is where it gets subtle, and where the full answer to our question lies. A <b>read</b> sends a small request to the remote tile, and the remote tile sends the data back. The ISA spec says &ldquo;unicast request packets, along with all types of response / acknowledgement packets&rdquo; follow the same routing rule on a given NoC (RoutingPaths.md:17), so the response returns on the same NoC as the request. On a one-way torus, going A&rarr;B and then B&rarr;A on the same NoC is a full loop in each ring. The round trip is <em>always</em> 22 hops on Wormhole (when x and y both differ), whichever NoC you choose.</p>
+  <p>So for a read, the second NoC doesn't shorten the round trip. What it changes is <em>which leg carries the data</em>. The request is a single header flit, and the response carries up to 256 data flits. Take the loopback read of DRAM (0,11) by core (1,1):</p>
+  <table class="t">
+    <tr><th>Issued on</th><th>Request (1 flit) (1,1)&rarr;(0,11)</th><th>Response (65 flits for 2 KiB) (0,11)&rarr;(1,1)</th><th>Link-cycles occupied by data</th></tr>
+    <tr><td>NoC 0</td><td class="n">19 hops</td><td class="n">3 hops</td><td class="n">&asymp; 3 &times; 65 = 195</td></tr>
+    <tr><td>NoC 1</td><td class="n">3 hops</td><td class="n">19 hops</td><td class="n">&asymp; 19 &times; 65 = 1235</td></tr>
+  </table>
+  <p>Both rows have the same round-trip hop count, but the NoC&nbsp;1 version drags 2 KiB of data across 19 links instead of 3. Every link it occupies is a link some other core can't use in that cycle. On a busy chip, that is the difference between a quiet network and a congested one. (These are derived counts, assuming the 65 flits of a 2 KiB packet, one header plus 64 data flits, each hold one link for one cycle.)</p>
+  <p>A <b>write</b> is the reverse: the data travels on the request leg, and only a 1-flit acknowledgement comes back, or nothing at all if the write is posted. For writes, pick the NoC whose forward path is short.</p>
+  <div class="callout key">Two opposite one-way tori give every pair of tiles both a short path and a long path, at the cost of building one-way routers twice. Put the heavy data on the short leg. As a bonus, the two networks are physically separate, so they double the bandwidth into and out of every tile.</div>
+  <p>The second reason matters just as much in practice. Each tile has two NIUs, one per NoC (MemoryMap.md:3), and each can inject one flit per cycle. The METALIUM_GUIDE describes the usual division of labour: &ldquo;NoC 0 reads data from DRAM (or accept data from other Tensixes) &hellip; NoC 1 sends the result to DRAM (or other Tensixes)&rdquo; (METALIUM_GUIDE.md:49-53). A reader kernel on one data-movement core uses NoC&nbsp;0 while a writer kernel on the other uses NoC&nbsp;1 (METALIUM_GUIDE.md:71), so input and output traffic never compete for the same links. It is &ldquo;just one possible configuration&rdquo;: some operators &ldquo;intentionally utilize both NoCs for the same data movement simultaneously, doubling the effective bandwidth&rdquo; (METALIUM_GUIDE.md:62).</p>
+  <div class="callout gpu">A GPU hides its on-chip interconnect behind the cache hierarchy: an SM issues a load, and a crossbar or mesh to the L2 slices does the rest, out of the programmer's sight. On Tenstorrent the network is part of the programming model. Your data-movement kernel picks the NoC, the destination coordinates and the transfer size, and so it also chooses which links its data occupies.</div>
+  <div class="callout warn">Routes are fixed, so placement is a performance decision. The DRAM-bandwidth tech report found that placing 12 DRAM readers on the top two rows made &ldquo;the routes for DRAM bank 2 and bank 10 are overlapped and cause congestion&rdquo;. Its fix was to put each reader next to its bank, so the response route &ldquo;just has one hop&rdquo; (<code>tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md:26-31</code>). That is the heavy-leg rule above, applied to the whole chip.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="flits">Flits, packets, hops and bandwidth</h2>
+  <p>What actually moves over a link? A NoC transaction &ldquo;consists of one or more packets. Each packet consists of one or more flits (exactly one header flit, followed by up to 256 data flits)&rdquo; (README.md:3). A <b>flit</b> (flow-control unit) is what a link carries in one cycle: the width of the wire bundle between two routers.</p>
+  <table class="t">
+    <tr><th></th><th>Wormhole B0</th><th>Blackhole A0</th><th>Source</th></tr>
+    <tr><td>Flit size</td><td class="n">256 bit = 32 B</td><td class="n">512 bit = 64 B</td><td>WH README.md:3; BH README.md:3</td></tr>
+    <tr><td>Max data per packet (256 flits)</td><td class="n">8,192 B</td><td class="n">16,384 B</td><td>WH Counters.md:169; BH README.md:70; ttsim <code>config.h</code> <code>NOC_MAX_PACKET_SIZE</code></td></tr>
+    <tr><td>NIU &rarr; router</td><td colspan="2">1 flit/cycle, ~5 cycles</td><td>README.md performance table</td></tr>
+    <tr><td>Router &rarr; router</td><td colspan="2">1 flit/cycle per axis, 9 cycles</td><td>README.md performance table</td></tr>
+    <tr><td>NoC clock</td><td class="n">1 GHz</td><td class="n">1.35 GHz</td><td>BH README.md:44 (&ldquo;1 GHz &rarr; 1.35 GHz&rdquo;)</td></tr>
+    <tr><td><i>Link bandwidth (derived)</i></td><td class="n">32 B &times; 1 GHz = 32 GB/s</td><td class="n">64 B &times; 1.35 GHz = 86.4 GB/s</td><td>flit &times; clock, per link, per direction of travel</td></tr>
+  </table>
+  <p>A cross-check: Tenstorrent's Hot Chips 2024 slides list the Blackhole &ldquo;NoC link width 64 Bytes&rdquo; and &ldquo;NoC link BW 83 GB/s&rdquo;, slightly below the 86.4 GB/s derived from the 1.35 GHz clock in the ISA docs. The two sources disagree by about 4%, probably because the slides assume a lower clock (83 GB/s &divide; 64 B &asymp; 1.3 GHz), but neither says so. Treat both as peak figures, not something you will measure.</p>
+  <p>Routers work in <b>cut-through</b> mode: &ldquo;a router can start forwarding (the flits of) a packet <em>before</em> it has finished receiving the entire packet. This is sometimes called Wormhole switching&rdquo; (RoutingPaths.md:61-63). (The term predates the chip; the shared name is a coincidence.) Picture a train: the header flit is the locomotive, it sets the route, and the data flits follow nose to tail, spread across several routers at once. So the latency of a whole packet is roughly the header's travel time <em>plus</em> one cycle per data flit, not hops &times; packet length.</p>
+  <p>Let's put small numbers on it. Sending one 32&times;32 bfloat16 tile (2,048 B) over 3 hops on Wormhole:</p>
+  <ul>
+    <li>Data flits: 2048 / 32 = 64, plus 1 header = 65 flits.</li>
+    <li>Header arrives after &asymp; 5 + 3&times;9 + 5 = 37 cycles. The last flit arrives about 64 cycles later, so &asymp; 101 cycles &asymp; 0.1 &micro;s with no congestion.</li>
+    <li>Useful fraction of the link: 64/65 &asymp; 98.5%. A maximum packet is 8192 / (8192 + 32) &asymp; 99.6%. A 4-byte write is one header flit carrying 4 bytes of payload, so the link is mostly overhead. The spec makes this point: &ldquo;the amount of <em>useful</em> throughput depends on the ratio of header flits to data flits&rdquo; (README.md:68).</li>
+  </ul>
+  <p>Now compare the scales. One Wormhole link moves 32 GB/s; the whole Wormhole DRAM system is specified at 288 GB/s at 12 GT/s, and a microbenchmark reached 267 GB/s (Saturating_DRAM_bandwidth.md:64-67). So a single core reading over a single NoC can't come close to saturating DRAM, and it shouldn't try. That is why the tech report used &ldquo;one DRAM reader per bank&rdquo; across 12 cores (Saturating_DRAM_bandwidth.md:24).</p>
+  <div class="callout warn">These latencies are derived from the ISA performance table with zero congestion. They are not measurements, and ttsim, where a transfer completes the moment it is issued, will not reproduce them (see <a href="#sim">below</a>).</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="transactions">What you can send: reads, writes, atomics, multicast</h2>
+  <p>The NIU understands three request types, chosen by the 2-bit field at the bottom of <code>NOC_CTRL</code>: <code>NOC_CMD_RD</code> (0), <code>NOC_CMD_AT</code> (1) and <code>NOC_CMD_WR</code> (2) (MemoryMap.md:55). Flag bits refine them. The two address registers have a naming quirk worth learning once. <code>NOC_TARG_ADDR</code> is the &ldquo;target&rdquo; and <code>NOC_RET_ADDR</code> is the &ldquo;return&rdquo; address, but which one is the source of the data depends on the request type (MemoryMap.md:86-91):</p>
+  <table class="t">
+    <tr><th>Request</th><th>Data comes from</th><th>Data goes to</th><th>Reply</th></tr>
+    <tr><td><b>Read</b></td><td>TARG (remote, e.g. DRAM)</td><td>RET (usually your own L1)</td><td>the response <em>is</em> the data; always sent</td></tr>
+    <tr><td><b>Write</b></td><td>TARG (your own L1)</td><td>RET (remote)</td><td>1-flit ack if <code>RESP_MARKED</code>; none if <b>posted</b></td></tr>
+    <tr><td><b>Inline write</b> (<code>WR_INLINE</code>)</td><td>32-bit immediate in <code>NOC_AT_DATA</code></td><td>TARG</td><td>ack if non-posted</td></tr>
+    <tr><td><b>Atomic</b></td><td>immediate operand</td><td>an aligned 16-byte line in remote L1 (TARG)</td><td>old value written to RET, if non-posted</td></tr>
+    <tr><td><b>Multicast</b> (<code>BRCST_PACKET</code>)</td><td>your L1</td><td>every Tensix in a rectangle</td><td>one ack <em>per receiver</em> if non-posted</td></tr>
+  </table>
+  <ul>
+    <li><b>Posted vs non-posted.</b> A posted write saves the ack packet, but then the sender can never find out when the write has landed. &ldquo;Optionally posted (i.e. receiver does <em>not</em> send an acknowledgement packet in response once the write completes)&rdquo; (README.md:31).</li>
+    <li><b>Atomics</b> act on L1 only, never DRAM or MMIO (Atomics.md:3). The menu is increment (on the low <i>n</i> bits of a word), compare-and-swap, and two swap variants (Atomics.md). Metalium's <code>noc_semaphore_inc</code> is an atomic increment.</li>
+    <li><b>Inline writes</b> carry their data in the header, so they cost a single flit. Blackhole has &ldquo;an unfortunate regression [so] that <code>NOC_CMD_WR_INLINE</code> can no longer safely be used to write to L1 addresses&rdquo; (BH README.md:44). ttsim enforces this: on Blackhole an inline write to L1 is <code>UndefinedBehavior</code> (<code>ttsim/src/tile.cpp:1558-1559</code>).</li>
+    <li><b>Multicast</b> (the spec calls it broadcast) sends one packet that the routers <em>copy</em> into a tree, so each link carries the data once even though many tiles receive it. Only Tensix tiles receive; other tiles inside the rectangle &ldquo;opt out&rdquo; (README.md:33; RoutingPaths.md:23). Reads cannot be multicast (MemoryMap.md:59). Blackhole adds a <code>NOC_BRCST_EXCLUDE</code> register &ldquo;allowing for non-rectangular broadcasts&rdquo; (BH MemoryMap.md:56).</li>
+  </ul>
+  <p>How does one packet reach a whole rectangle? With X as the major axis (the default), &ldquo;packets will travel along the major axis as necessary, then along the minor axis as necessary, and finally on the major axis again as necessary&rdquo; (RoutingPaths.md:23). In the figure below, the packet goes right to the rectangle's first column, travels down that column, and at every row it forks rightwards.</p>
+
+  <!-- ====== FIG 2: multicast ====== -->
+  <div class="viz" id="fig2"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig2");
+    var g = TT.canvas(root, 860, 580), ctx = g.ctx, C = TT.C, A = A08;
+    var gm = A.geom(40, 40, 42);
+    var presets = {
+      isa: { s: [2, 2], x0: 3, x1: 7, y0: 5, y1: 9, ym: false, note: "The example from RoutingPaths.md (NoC 0, X major)" },
+      isay: { s: [2, 2], x0: 3, x1: 7, y0: 5, y1: 9, ym: true, note: "Same rectangle with NOC_CMD_BRCST_XY set (Y major)" },
+      real: { s: [1, 1], x0: 2, x1: 9, y0: 1, y1: 1, ym: false, note: "Logged by ttsim in matmul_multicore_reuse_mcast: core (1,1) → row 1, x 2..9" }
+    };
+    var cur = presets.isa;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>example <select id="f2p"><option value="isa">ISA example, X major</option><option value="isay">ISA example, Y major</option><option value="real">real mcast from ttsim log</option></select></label>';
+    root.appendChild(bar);
+    var legs, recv, opted, uniHops, treeLinks;
+    function walk(from, axis, to, out) {   // NoC0: x increases (right), y increases (down), with wrap
+      var p = from.slice(), segs = [];
+      while ((axis === 0 ? p[0] : p[1]) !== to) {
+        var q = p.slice();
+        if (axis === 0) q[0] = (q[0] + 1) % A.W; else q[1] = (q[1] + 1) % A.H;
+        segs.push([p, q]); p = q;
+      }
+      out.push(segs); return p;
+    }
+    function build() {
+      var c = cur; legs = [[], [], []];
+      var tmp = [];
+      if (!c.ym) {
+        var a = walk(c.s, 0, c.x0, tmp); legs[0] = tmp.pop();
+        var b = walk(a, 1, c.y0, tmp); var seg = tmp.pop(); var b2 = walk(b, 1, c.y1, tmp); legs[1] = seg.concat(tmp.pop());
+        for (var y = c.y0; ; y = (y + 1) % A.H) { walk([c.x0, y], 0, c.x1, tmp); legs[2] = legs[2].concat(tmp.pop()); if (y === c.y1) break; }
+      } else {
+        var a2 = walk(c.s, 1, c.y0, tmp); legs[0] = tmp.pop();
+        var bb = walk(a2, 0, c.x0, tmp); var sg = tmp.pop(); walk(bb, 0, c.x1, tmp); legs[1] = sg.concat(tmp.pop());
+        for (var x = c.x0; ; x = (x + 1) % A.W) { walk([x, c.y0], 1, c.y1, tmp); legs[2] = legs[2].concat(tmp.pop()); if (x === c.x1) break; }
+      }
+      recv = []; opted = []; uniHops = 0;
+      for (var yy = c.y0; yy <= c.y1; yy++) for (var xx = c.x0; xx <= c.x1; xx++) {
+        if (xx === c.s[0] && yy === c.s[1]) continue;
+        if (A.type(xx, yy) === "T") { recv.push([xx, yy]); uniHops += A.route(0, c.s, [xx, yy]).length - 1; }
+        else opted.push([xx, yy]);
+      }
+      treeLinks = legs[0].length + legs[1].length + legs[2].length;
+      steps[0].text = "<b>Setup.</b> " + c.note + ". Source (" + c.s + "), rectangle x " + c.x0 + ".." + c.x1 + ", y " + c.y0 + ".." + c.y1 + ". One packet leaves the source NIU.";
+      steps[1].text = "<b>Major axis first.</b> " + (c.ym ? "Down (Y)" : "Right (X)") + " from the source, " + legs[0].length + " hop(s), to reach the rectangle's first " + (c.ym ? "row" : "column") + ".";
+      steps[2].text = "<b>Then the minor axis.</b> " + (c.ym ? "Right along the first row" : "Down the first column") + ", into and through every " + (c.ym ? "column" : "row") + " of the rectangle (" + legs[1].length + " hops).";
+      steps[3].text = "<b>Major axis again, as a tree.</b> At each " + (c.ym ? "column" : "row") + " the routers copy the flits " + (c.ym ? "downwards" : "rightwards") + " (" + legs[2].length + " hops). Every link in the tree carries the data exactly once.";
+      steps[4].text = "<b>Delivered.</b> " + recv.length + " Tensix tiles receive the data. Non-Tensix tiles in the rectangle (marked ×) opt out. The tree used " + treeLinks + " link traversals; " + recv.length + " separate unicasts on NoC 0 would use " + uniHops + ". If the write is non-posted, the sender receives " + recv.length + " acks.";
+    }
+    var steps = [{ dur: 1, text: "" }, { dur: 1.2, text: "" }, { dur: 1.6, text: "" }, { dur: 1.8, text: "" }, { dur: 1, text: "" }];
+    function drawLeg(segs, t, color) {
+      var n = segs.length; if (!n) return;
+      var f = t * n;
+      for (var j = 0; j < n; j++) {
+        if (j < Math.floor(f)) A.hop(ctx, gm, segs[j][0], segs[j][1], color, 3);
+        else if (j === Math.floor(f)) { A.hop(ctx, gm, segs[j][0], segs[j][1], color, 3, f - j); break; }
+      }
+    }
+    function drawBranches(t) {   // grow every branch in parallel
+      var c = cur, groups = {};
+      legs[2].forEach(function (s) { var k = c.ym ? s[0][0] : s[0][1]; (groups[k] = groups[k] || []).push(s); });
+      Object.keys(groups).forEach(function (k) { drawLeg(groups[k], t, C.purple); });
+    }
+    function draw(i, t) {
+      var c = cur;
+      TT.clear(ctx, g.W, g.H);
+      A.drawGrid(ctx, gm, { dim: true });
+      // rectangle
+      ctx.strokeStyle = C.yellow; ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5;
+      ctx.strokeRect(gm.GX + c.x0 * gm.CS + 1, gm.GY + c.y0 * gm.CS + 1, (c.x1 - c.x0 + 1) * gm.CS - 2, (c.y1 - c.y0 + 1) * gm.CS - 2);
+      ctx.setLineDash([]);
+      if (i >= 4) recv.forEach(function (p) { TT.box(ctx, gm.GX + p[0] * gm.CS + 4, gm.GY + p[1] * gm.CS + 4, gm.CS - 8, gm.CS - 8, { fill: C.green, alpha: 0.3 + 0.35 * t, r: 4 }); });
+      if (i >= 1) drawLeg(legs[0], i === 1 ? t : 1, C.purple);
+      if (i >= 2) drawLeg(legs[1], i === 2 ? t : 1, C.purple);
+      if (i >= 3) drawBranches(i === 3 ? t : 1);
+      if (i >= 4) opted.forEach(function (p) { TT.text(ctx, "×", gm.cx(p[0]) + 10, gm.cy(p[1]) - 10, { color: C.red, font: "bold 16px", align: "center" }); });
+      A.ring(ctx, gm, c.s, C.yellow, "src");
+      // panel
+      var x0 = 510;
+      TT.text(ctx, "Rectangle multicast (NoC 0)", x0, 50, { font: "bold 16px", color: C.yellow });
+      TT.text(ctx, (c.ym ? "Y" : "X") + " is the major axis" + (c.ym ? "  (NOC_CMD_BRCST_XY = 1)" : "  (NOC_CMD_BRCST_XY = 0)"), x0, 78, { font: "13px", mono: true });
+      TT.text(ctx, "start (" + c.x0 + "," + c.y0 + ")   end (" + c.x1 + "," + c.y1 + ")", x0, 100, { font: "13px", mono: true });
+      var lines = [
+        ["packets injected", "1"],
+        ["link traversals so far", String(i === 0 ? 0 : (i === 1 ? Math.floor(t * legs[0].length) : legs[0].length) + (i === 2 ? Math.floor(t * legs[1].length) : (i > 2 ? legs[1].length : 0)) + (i === 3 ? "+" : (i > 3 ? legs[2].length : 0)))],
+        ["Tensix receivers", i >= 4 ? String(recv.length) : "–"],
+        ["traversals if sent as unicasts", i >= 4 ? String(uniHops) : "–"]
+      ];
+      if (i >= 4) lines[1][1] = String(treeLinks);
+      lines.forEach(function (l, j) {
+        TT.text(ctx, l[0], x0, 150 + j * 30, { font: "14px", color: C.muted });
+        TT.text(ctx, l[1], x0 + 330, 150 + j * 30, { font: "15px", align: "right", mono: true, color: j === 3 ? C.red : C.green });
+      });
+      TT.text(ctx, "Receivers must be Tensix: firmware opts", x0, 300, { font: "12px", color: C.muted });
+      TT.text(ctx, "every other NIU out (MemoryMap.md:114).", x0, 318, { font: "12px", color: C.muted });
+      TT.text(ctx, "The source itself is excluded unless", x0, 344, { font: "12px", color: C.muted });
+      TT.text(ctx, "NOC_CMD_BRCST_SRC_INCLUDE is set.", x0, 362, { font: "12px", color: C.muted });
+    }
+    build();
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    bar.querySelector("#f2p").addEventListener("change", function (e) { cur = presets[e.target.value]; build(); st.render(); });
+  })();
+  </script>
+
+  <p>Multicast is the NoC's answer to a question that comes up constantly in matmul: 64 cores need the same row of A, so must it be read 64 times? No. One core reads it and multicasts it, and the routers copy the flits at each fork. In the ISA example above, one packet reaches 16 Tensix tiles and uses 28 link traversals; 16 separate unicasts from the same source would need 132. <a href="a16-multicast-sync.html">A16</a> builds a full multicast matmul on this idea.</p>
+  <div class="callout warn">Multicast has a deadlock hazard of its own. Two broadcasts whose trees share links can each grab part of the other's path. The hardware offers <code>NOC_CMD_PATH_RESERVE</code>: &ldquo;all routers along the path need to reserve virtual channel numbers for the transaction before any data leaves the initiating NIU&rdquo; (MemoryMap.md:62). Without it, &ldquo;software is responsible for ensuring that its traffic patterns do not cause deadlocks&rdquo;. ttsim on Wormhole refuses multicasts without path reservation (<code>tile.cpp:1421-1423</code>), so the multicast matmul passing in ttsim tells us tt-metal sets the flag.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="deadlock">Virtual channels and the dateline</h2>
+  <p>A cut-through network has a classic failure mode. A packet's flits are spread across several routers, and each router holds buffer space for them. If packet P1 holds a buffer that P2 needs, P2 holds one that P3 needs, and so on around a loop back to P1, nobody can move again. That is <b>deadlock</b>. A ring is the perfect place for such a loop, and a torus is made of rings.</p>
+  <p>The standard cure is the <b>virtual channel</b> (VC): several independent sets of buffers multiplexed over each physical link, so that a packet waiting in one VC doesn't block packets in another. Add a <b>dateline</b>, a fixed point on each ring. Every packet starts on the &ldquo;before the dateline&rdquo; VC and switches to the &ldquo;after the dateline&rdquo; VC when it crosses that point. A packet never goes all the way round a ring, so it never crosses the dateline twice. Buffers before the line can wait on buffers after the line, but never the other way round, and the cycle of waiting is broken.</p>
+
+  <div class="viz" id="fig4"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig4");
+    var g = TT.canvas(root, 860, 250), ctx = g.ctx, C = TT.C;
+    var steps = [
+      { dur: 1.2, text: "<b>One VC.</b> A one-way ring of 4 routers. Each packet holds a buffer and needs the next router's buffer, which another packet holds. The waits form a cycle (red), so no packet can ever move: deadlock." },
+      { dur: 1.5, text: "<b>Add a dateline</b> on the wrap link (between router 3 and router 0). Packets that cross it move to a second set of buffers (VC hi). Packet D, crossing the line, waits on a <i>free</i> VC-hi buffer, not on A. The chain of waits ends, D moves, and everything drains." }
+    ];
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var xs = [130, 330, 530, 730], y = 95;
+      for (var r = 0; r < 4; r++) {
+        TT.box(ctx, xs[r] - 45, y - 30, 90, 60, { stroke: C.muted, label: "", r: 8 });
+        TT.text(ctx, "router " + r, xs[r], y - 42, { align: "center", font: "12px", color: C.muted });
+        TT.box(ctx, xs[r] - 35, y - 22, 70, 20, { fill: C.blue, alpha: 0.7, r: 4, label: "VC lo: " + "ABCD"[r], font: "12px", color: "#000" });
+        if (i === 1) TT.box(ctx, xs[r] - 35, y + 4, 70, 20, { fill: C.purple, alpha: r === 0 ? 0.25 + 0.6 * t : 0.25, r: 4, label: r === 0 ? (t > 0.5 ? "VC hi: D" : "VC hi: free") : "VC hi: free", font: "12px", color: (r === 0 && t > 0.5) ? "#000" : C.fg });
+        if (r < 3) TT.arrow(ctx, xs[r] + 45, y, xs[r + 1] - 45, y, { color: C.muted });
+      }
+      // wrap link
+      ctx.strokeStyle = C.muted; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(xs[3] + 45, y); ctx.lineTo(xs[3] + 80, y); ctx.lineTo(xs[3] + 80, 190); ctx.lineTo(xs[0] - 80, 190); ctx.lineTo(xs[0] - 80, y); ctx.stroke();
+      ctx.setLineDash([]);
+      TT.arrow(ctx, xs[0] - 80, y, xs[0] - 46, y, { color: C.muted });
+      TT.text(ctx, "wraparound link", 250, 205, { align: "center", font: "12px", color: C.muted });
+      if (i === 0) {
+        ctx.strokeStyle = C.red; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.ellipse(430, 120, 360, 50 + 10 * t, 0, 0, Math.PI * 2); ctx.stroke();
+        TT.text(ctx, "A waits for B, B for C, C for D, D for A", 430, 232, { align: "center", color: C.red, font: "bold 14px" });
+      } else {
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(430, 178); ctx.lineTo(430, 202); ctx.stroke();
+        TT.text(ctx, "dateline", 445, 172, { color: C.yellow, font: "bold 13px" });
+        TT.text(ctx, "D crosses the dateline → VC hi (free) → the cycle is broken", 430, 232, { align: "center", color: C.green, font: "bold 14px" });
+      }
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>Tenstorrent's version, at the level the ISA describes it: each hop assigns a packet a 4-bit <b>virtual channel number</b> made of &ldquo;one dateline bit, two class bits, and one buddy bit&rdquo; (README.md:46). The <b>dateline bit</b> &ldquo;always flips at certain statically predetermined points along the packet's route&rdquo;. Each router's <code>NOC_NODE_ID</code> says whether the dateline bit can flip on its outbound X or Y port (MemoryMap.md:187-188). The <b>class bits</b> separate traffic kinds: <code>00</code> and <code>01</code> for unicast requests, <code>10</code> for broadcast requests, <code>11</code> for responses. Keeping responses in their own class matters: a request can't complete until its response gets through, so responses must never get stuck behind requests. The <b>buddy bit</b> gives each class two lanes, and routers may flip it at each hop to dodge congestion.</p>
+  <p>On the software side, tt-metal's ordering page says there are &ldquo;6 <code>VC</code> (numbered 0-5)&rdquo; per NoC, with unicast writes on VC&nbsp;1 and multicast writes on VC&nbsp;4 (<code>docs/.../data_movement/ordering.rst:15-16</code>; <code>dataflow_api_common.h:62-64</code>). The two descriptions agree once you decode them. The 3-bit static VC field in <code>NOC_CTRL</code> is the buddy bit (bit 13) plus the two class bits (bits 14-15) (MemoryMap.md:65-66). The three request classes &times; 2 buddies give 6 values: VC&nbsp;1 = class 00, buddy 1; VC&nbsp;4 = class 10 (broadcast), buddy 0. The dateline bit is not chosen by software, and response VCs aren't selectable.</p>
+  <div class="callout key">For ordinary unicast traffic the hardware guarantees deadlock freedom. Software takes on part of that job only when it uses multi-packet linked transactions (<code>VC_LINKED</code>), broadcasts without path reservation, or non-zero arbitration priority (README.md:39-42).</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="ordering">Weak ordering, counters and barriers</h2>
+  <p>Suppose a writer core sends a 2 KiB tile to a reader core, then writes a &ldquo;ready&rdquo; flag into the reader's L1. On a CPU with a simple memory model you would expect the flag to arrive last. On the NoC, maybe not.</p>
+  <p>The rule from the ISA spec (Ordering.md:13): two packets are guaranteed to stay in order only where they share a route <em>and</em> &ldquo;at every hop along that route, both are assigned the same virtual channel number&rdquo;. Change any of that and they can overtake each other. tt-metal's ordering page summarises it for writes (ordering.rst:24-28):</p>
+  <ul>
+    <li>&ldquo;If writes are on different NoCs, there is no ordering guarantees.&rdquo;</li>
+    <li>&ldquo;If writes are on the same NoC but different VCs, there's also no ordering guarantees.&rdquo;</li>
+    <li>&ldquo;If writes are on the same NoC and same VC, they will be ordered based on program order.&rdquo;</li>
+  </ul>
+  <p>Responses have it worse: &ldquo;Software has no way of controlling virtual channel number assignment for response / acknowledgement packets &hellip; so these types of packets can always get reordered or interleaved&rdquo; (Ordering.md:18). Even inside one packet, writes into L1 are broken into 16-byte units that &ldquo;could happen in any order&rdquo; (Ordering.md:5).</p>
+
+  <!-- ====== FIG 3: ordering ====== -->
+  <div class="viz" id="fig3"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig3");
+    var g = TT.canvas(root, 860, 340), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>writer code <select id="f3m"><option value="0">write data; write flag (no barrier)</option><option value="1">write data; noc_async_write_barrier(); write flag</option></select></label>';
+    root.appendChild(bar);
+    var mode = 0;
+    var steps = [{ dur: 1.4 }, { dur: 1.8 }, { dur: 1.6 }, { dur: 1.6 }];
+    var texts = [
+      ["<b>Issue the data.</b> The writer issues a 2 KiB write (65 flits) on VC&nbsp;a. A link on its route is busy with other traffic on the same VC, so the data train stalls behind it.",
+       "<b>Issue the flag at once.</b> The writer's next instruction sends a 1-flit flag write. It travels on a different VC (or a different NoC), so the router interleaves it past the stalled data.",
+       "<b>The flag lands first.</b> The reader sees ready = 1 and reads its buffer, which still holds the <i>old</i> contents. Wrong answer.",
+       "<b>The data arrives, too late.</b> Nothing was lost; the two packets were simply reordered, which the NoC is allowed to do."],
+      ["<b>Issue the data</b> (non-posted). The issue counter becomes 1, while <code>NIU_MST_WR_ACK_RECEIVED</code> is still 0. The data stalls behind other traffic, just as before.",
+       "<b>Barrier.</b> <code>noc_async_write_barrier()</code> spins until the hardware ack counter equals the number of acks expected. The data finally drains into the reader's L1.",
+       "<b>Ack returns.</b> The receiving NIU sends a 1-flit ack once the writes to L1 complete. The ack counter becomes 1 = expected, and the barrier exits.",
+       "<b>Now the flag.</b> By the time the flag is issued the data is already in the reader's L1, so whatever VC or NoC the flag uses, the reader sees the new tile. Correct, at the cost of one round-trip of waiting."]
+    ];
+    function setTexts() { for (var k = 0; k < 4; k++) steps[k].text = texts[mode][k]; }
+    setTexts();
+    var xs = [150, 300, 450, 600, 710], y = 130;
+    function router(k) { TT.box(ctx, xs[k] - 16, y - 16, 32, 32, { stroke: C.muted, r: 16, label: "R", font: "11px", color: C.muted }); }
+    function train(x0, len, color, label, yy) {
+      TT.box(ctx, x0 - len, yy - 9, len, 18, { fill: color, alpha: 0.85, r: 4, label: label, font: "12px", color: "#000" });
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.box(ctx, 20, y - 45, 90, 90, { stroke: C.yellow, label: "", r: 8 });
+      TT.text(ctx, "writer", 65, y - 20, { align: "center", color: C.yellow, font: "bold 14px" });
+      TT.box(ctx, 750, y - 45, 95, 90, { stroke: C.green, r: 8 });
+      TT.text(ctx, "reader L1", 797, y - 25, { align: "center", color: C.green, font: "bold 14px" });
+      ctx.strokeStyle = C.border; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(110, y); ctx.lineTo(750, y); ctx.stroke();
+      for (var k = 0; k < 4; k++) router(k);
+      // congestion: grey train on the link between router 1 and 2
+      var congest = mode === 0 ? (i <= 2 ? 1 : 1 - t) : (i === 0 ? 1 : (i === 1 ? 1 - t : 0));
+      if (congest > 0) { ctx.globalAlpha = congest; train(430, 90, "#888", "other traffic", y - 22); ctx.globalAlpha = 1; }
+      var dataX, flagX = null, buf = "old", ack = 0, expect = 1, flagShown = false, ackX = null;
+      if (mode === 0) {
+        if (i === 0) dataX = TT.lerp(110, 300, t);
+        else if (i <= 2) dataX = 300;
+        else dataX = TT.lerp(300, 790, t);
+        if (i === 1) { flagX = TT.lerp(110, 600, t); flagShown = true; }
+        if (i >= 2) { flagX = i === 2 ? TT.lerp(600, 790, t) : 790; flagShown = true; }
+        if (i === 3 && t > 0.85) buf = "new";
+      } else {
+        if (i === 0) dataX = TT.lerp(110, 300, t);
+        else if (i === 1) dataX = TT.lerp(300, 790, t);
+        else dataX = 790;
+        if (i >= 1 && (i > 1 || t > 0.9)) buf = "new";
+        if (i === 2) { ackX = TT.lerp(740, 110, t); if (t > 0.95) ack = 1; }
+        if (i === 3) { ack = 1; flagX = TT.lerp(110, 790, t); flagShown = true; }
+      }
+      // data train clipped at reader
+      ctx.save(); ctx.beginPath(); ctx.rect(110, 0, 640, g.H); ctx.clip();
+      if (dataX < 790) train(dataX, 190, C.blue, "DATA 2 KiB (65 flits) · VC a", y);
+      if (flagShown && flagX !== null) train(flagX, 34, C.orange, "flag", mode === 0 ? y + 24 : y);
+      if (ackX !== null) train(ackX + 30, 30, C.purple, "ack", y + 24);
+      ctx.restore();
+      if (mode === 0 && (i === 1 || (i === 2 && t < 0.9))) TT.text(ctx, "flag on VC b", 600, y + 46, { color: C.orange, font: "12px", align: "center" });
+      var code = mode === 0 ? ["write(tile → reader)", "write(flag → reader)"] : ["write(tile → reader)", "noc_async_write_barrier()", "write(flag → reader)"];
+      TT.text(ctx, "writer program:", 20, 22, { font: "bold 13px", color: C.yellow });
+      code.forEach(function (c, j) {
+        var active = mode === 0 ? (j === Math.min(i, 1)) : (j === (i === 0 ? 0 : (i <= 2 ? 1 : 2)));
+        TT.text(ctx, (active ? "▶ " : "  ") + c, 150 + j * 230, 22, { font: "13px", mono: true, color: active ? C.fg : C.muted });
+      });
+      // reader contents
+      var ok = buf === "new";
+      var flagSet = (mode === 0 && i >= 2 && (i > 2 || t > 0.9)) || (mode === 1 && i === 3 && t > 0.95);
+      TT.text(ctx, "ready = " + (flagSet ? 1 : 0), 797, y + 2, { align: "center", font: "13px", mono: true });
+      TT.box(ctx, 765, y + 14, 64, 22, { fill: ok ? C.green : C.red, alpha: 0.75, r: 4, label: ok ? "tile: new" : "tile: old", font: "12px", color: "#000" });
+      if (mode === 0 && i === 3 && ok) TT.text(ctx, "(too late)", 797, y + 52, { align: "center", font: "12px", color: C.red });
+      var verdict = "";
+      if (mode === 0 && i === 2 && t > 0.9) verdict = "reader sees ready=1 but the tile is OLD → wrong";
+      if (mode === 0 && i === 3) verdict = "data arrives after the reader already used the buffer";
+      if (mode === 1 && i === 3 && t > 0.95) verdict = "reader sees ready=1 and the NEW tile → correct";
+      if (verdict) TT.text(ctx, verdict, 430, 230, { align: "center", font: "bold 15px", color: verdict.indexOf("correct") >= 0 && verdict.indexOf("→ wrong") < 0 && mode === 1 ? C.green : C.red });
+      // counters
+      TT.text(ctx, "writer NIU counters (NoC " + (mode === 0 ? "0/1" : "0") + ")", 20, 270, { font: "bold 13px", color: C.yellow });
+      var issued = mode === 1 ? (i >= 0 ? 1 : 0) : 0;
+      TT.text(ctx, mode === 1 ? ("non-posted writes issued (software) = " + issued + "     NIU_MST_WR_ACK_RECEIVED (hardware) = " + ack) : "no barrier: nobody looks at the counters", 20, 295, { font: "13px", mono: true });
+      if (mode === 1) TT.text(ctx, (i === 1 || (i === 2 && ack === 0)) ? "barrier spinning: " + ack + " != " + expect : (i >= 2 ? "barrier passed" : ""), 20, 320, { font: "13px", mono: true, color: (i === 1 || (i === 2 && ack === 0)) ? C.red : C.green });
+    }
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    bar.querySelector("#f3m").addEventListener("change", function (e) { mode = +e.target.value; setTexts(); st.render(); });
+  })();
+  </script>
+
+  <p>So how does a core know a transfer has finished? Not by watching the network, but by watching <b>counters</b>. Each NIU keeps a bank of them at <code>NIU_BASE + 0x200</code> (Counters.md:3-9). The two you'll meet constantly are <code>NIU_MST_RD_RESP_RECEIVED</code> (counter 2), which increments when a read response has been written into your L1, and <code>NIU_MST_WR_ACK_RECEIVED</code> (counter 1), which increments when a write acknowledgement arrives. The NIU has no &ldquo;wait&rdquo; instruction. tt-metal's firmware keeps its own software count of how many requests it issued, and a <b>barrier</b> is just a loop comparing the two:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc_nonblocking_api.h:604-606 @7aad8aac</div>
+<pre><code>inline __attribute__((always_inline)) bool ncrisc_noc_nonposted_writes_flushed(uint32_t noc) {
+    return (NOC_STATUS_READ_REG(noc, NIU_MST_WR_ACK_RECEIVED) == noc_nonposted_writes_acked[noc]);
+}</code></pre>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1949-1963 @7aad8aac</div>
+<pre><code>void noc_async_write_barrier(uint8_t noc = noc_index) {
+    RECORD_NOC_EVENT(NocEventType::WRITE_BARRIER_START, false, noc);
+
+    WAYPOINT("NWBW");
+    if constexpr (noc_mode == DM_DYNAMIC_NOC) {
+        do {
+            invalidate_l1_cache();
+        } while (!ncrisc_dynamic_noc_nonposted_writes_flushed(noc));
+    } else {
+        while (!ncrisc_noc_nonposted_writes_flushed(noc));
+    }
+    invalidate_l1_cache();
+    WAYPOINT("NWBD");
+    ...</code></pre>
+  <p>Line by line: <code>NOC_STATUS_READ_REG</code> is an MMIO load of the hardware ack counter. <code>noc_nonposted_writes_acked[noc]</code> is a plain variable the firmware incremented each time it issued a non-posted write, by the number of destinations for a multicast (<code>noc_nonblocking_api.h:513-519</code>). The <code>while</code> spins until they match. <code>WAYPOINT("NWBW")</code> and <code>"NWBD"</code> are breadcrumbs for the Watcher debug tool: &ldquo;write barrier wait&rdquo; and &ldquo;done&rdquo;. <code>noc_async_read_barrier</code> is the same idea against <code>NIU_MST_RD_RESP_RECEIVED</code> (<code>dataflow_api.h:1919-1933</code>).</p>
+  <div class="callout key">The NoC is weakly ordered by design, because reordering is what lets it use free bandwidth. A barrier doesn't stop the network; it makes <em>your core</em> wait until a counter proves the data has landed. This is also &ldquo;the only approach if software needs ordering between requests which travel on different NoCs&rdquo; (Ordering.md:32).</div>
+  <div class="callout warn">Posted writes produce no acks, so <code>noc_async_write_barrier</code> cannot wait for them. And a <em>missing</em> barrier will not show up in ttsim (<a href="#sim">see below</a>); real silicon will find the race.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="coords">Three kinds of coordinates</h2>
+  <p>So far every coordinate on this page has been a <b>NoC&nbsp;0 coordinate</b>: (0,0) at the top-left, x growing to the right and y growing downwards, the direction NoC&nbsp;0's data flows (Coordinates.md:7). That is the coordinate system used throughout this page. But there are others.</p>
+  <ol>
+    <li><b>NoC&nbsp;1 coordinates</b> put (0,0) at the <em>bottom-right</em> and also count in the direction of data flow, leftwards and upwards (Coordinates.md:13). On Wormhole, x<sub>1</sub> = 9 &minus; x<sub>0</sub> and y<sub>1</sub> = 11 &minus; y<sub>0</sub>. tt-metal has macros for exactly this: <code>NOC_0_X_PHYS_COORD(noc_index, noc_size_x, x)</code> returns <code>noc_size_x - 1 - x</code> on NoC&nbsp;1 (<code>noc_nonblocking_api.h:30-31</code>).</li>
+    <li><b>Translated coordinates.</b> The NIU can translate coordinates as the command is issued, &ldquo;which happens as software writes to <code>NOC_CMD_CTRL</code>&rdquo; (Coordinates.md:19). Firmware programs the tables so that the same numbers mean the same tile on both NoCs, similar tiles get contiguous ranges, and harvested (fused-off) rows move to the end. On Wormhole, x 16-25 and y 16-27 are translated, and 0-15 pass through unchanged. For example, X&nbsp;18 &rarr; NoC&nbsp;0 x&nbsp;1, NoC&nbsp;1 x&nbsp;8 (the leftmost Tensix column), and Y&nbsp;18 &rarr; NoC&nbsp;0 y&nbsp;1 (the topmost Tensix row) (Coordinates.md:27-58).</li>
+    <li><b>Logical coordinates</b> are what a Metalium host program uses: <code>CoreCoord{0,0}</code> means &ldquo;the first worker core&rdquo;, wherever it physically is. The host turns these into NoC addresses for your kernels. <a href="a09-memory.html">A09</a> and <a href="a10-first-program.html">A10</a> use them.</li>
+  </ol>
+  <p>Translation has one catch: &ldquo;when performing broadcasts, StartX &harr; EndX need to be swapped by software, and likewise StartY &harr; EndY &hellip; because coordinate translation does not change the direction of data flow&rdquo; (Coordinates.md:25). A rectangle walked in NoC&nbsp;1's direction has its corners the other way round. Blackhole goes further: its translation is &ldquo;combined&rdquo; across X and Y rather than separable (BH Coordinates.md:26), with translated Tensix columns at x 1-7 and 10-16 and DRAM at x 17-18.</p>
+  <p>The ttsim log below shows all three raw forms in use at once. The <code>[asked …]</code> field is what the kernel wrote into the register; the coordinate before it is the NoC&nbsp;0 position ttsim resolved it to.</p>
+
+  <!-- ===================================================================== -->
+  <h2 id="niu">Programming the NIU: one store starts a transfer</h2>
+  <p>We have treated &ldquo;send a packet&rdquo; as a single action. From the RISC-V core's side it is a handful of 32-bit stores into memory-mapped registers. Each NIU has <b>four request initiators</b> (tt-metal calls them <em>command buffers</em>), each a block of registers at <code>NIU_BASE + i&times;0x400</code>, with <code>NIU_BASE</code> = <code>0xFFB2_0000</code> for NoC&nbsp;0 and <code>0xFFB3_0000</code> for NoC&nbsp;1 on Wormhole (MemoryMap.md:3-9, 30-41). tt-metal dedicates them by purpose: buffer 0 for writes, 1 for reads, 2 for small register-sized writes, 3 for atomics (<code>noc_nonblocking_api.h:48-56</code>).</p>
+  <p>This is the core of <code>noc_async_write</code>, after inlining:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc_nonblocking_api.h:496-510 @7aad8aac</div>
+<pre><code>    uint32_t noc_cmd_field =
+        NOC_CMD_CPY | NOC_CMD_WR | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(vc) | (linked ? NOC_CMD_VC_LINKED : 0x0) |
+        (mcast ? ((multicast_path_reserve ? NOC_CMD_PATH_RESERVE : 0) | NOC_CMD_BRCST_PACKET) : 0x0) |
+        (posted ? 0 : NOC_CMD_RESP_MARKED);
+    ...
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_CTRL, noc_cmd_field);
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_TARG_ADDR_LO, src_addr);
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_RET_ADDR_LO, (uint32_t)dest_addr);
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_RET_ADDR_COORDINATE, (uint32_t)(dest_addr &gt;&gt; NOC_ADDR_COORD_SHIFT));
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_AT_LEN_BE, len_bytes);
+    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_CMD_CTRL, NOC_CTRL_SEND_REQ);</code></pre>
+  <ul>
+    <li><code>noc_cmd_field</code> assembles the <code>NOC_CTRL</code> bits we've met: request type <code>WR</code>, a static VC, the multicast and path-reserve flags, and <code>RESP_MARKED</code> (non-posted) unless the write is posted.</li>
+    <li><code>NOC_TARG_ADDR_LO</code> = the local L1 source address (for a write, TARG is the source).</li>
+    <li><code>NOC_RET_ADDR_LO</code> / <code>_COORDINATE</code> = the remote destination: the low 32 address bits, then the upper bits with x and y packed above bit 36 on Wormhole (MemoryMap.md:95-99).</li>
+    <li><code>NOC_AT_LEN_BE</code> = the length in bytes.</li>
+    <li>The last store, <code>1</code> into <code>NOC_CMD_CTRL</code>, is the trigger. The NIU queues the request, assigns a VC and sends it, then clears the bit. Software must not touch the initiator until that bit reads 0 again (MemoryMap.md:150-156). The RISC-V core moves on immediately; the transfer proceeds &ldquo;asynchronously to RISCV execution&rdquo; (README.md:56).</li>
+  </ul>
+
+  <h3>ttsim's <code>noc_cmd_ctrl</code>: the same story as executable code</h3>
+  <p>In ttsim, a RISC-V store to the MMIO address of <code>NOC_CMD_CTRL</code> reaches <code>noc_regs_wr32</code>, which calls the function that models the whole NIU:</p>
+  <div class="filename">ttsim/src/tile.cpp:1708-1717 @b3620244</div>
+<pre><code>        case NOC_REGS_NOC_CMD_CTRL(0):
+        case NOC_REGS_NOC_CMD_CTRL(1):
+        case NOC_REGS_NOC_CMD_CTRL(2):
+        case NOC_REGS_NOC_CMD_CTRL(3):
+            TTSIM_VERIFY(data == 1, UnimplementedFunctionality, "noc_cmd_ctrl[%d] data=0x%x", cmd_buf, data);
+            if constexpr (tile_type == 'E') {
+                eth_set_busy(p_tile);
+            }
+            noc_cmd_ctrl&lt;tile_type&gt;(tile_id, noc_instance, cmd_buf);
+            break;</code></pre>
+  <p><code>noc_cmd_ctrl</code> (tile.cpp:1397-1623) reads like a checklist of this chapter. It decodes <code>NOC_CTRL</code> bit by bit, rejecting features it doesn't model (byte-enable writes, <code>BRCST_XY</code>, arbitration priority) with <code>UnimplementedFunctionality</code>. It checks static-VC classes (&ldquo;class 2&rdquo; only for multicast). It translates coordinates with <code>remap_virtual_coordinate</code>, then branches on the five request kinds: multicast, atomic, inline write, write and read. Here is the plain write:</p>
+  <div class="filename">ttsim/src/tile.cpp:1582-1596 @b3620244 (a range check and a tile-type check elided)</div>
+<pre><code>    } else if (bits&lt;1,1&gt;(noc_ctrl)) { // write -- either L1 -&gt; L1 or L1 -&gt; DRAM, alignment is the same for both cases
+        TTSIM_VERIFY((noc_at_len_be &gt;= 1) &amp;&amp; (noc_at_len_be &lt;= NOC_MAX_PACKET_SIZE), UnsupportedFunctionality, "write: noc_at_len_be=%d", noc_at_len_be);
+        TTSIM_VERIFY(src_tile_type == tile_type, UnimplementedFunctionality, "write: src_tile_type=%c", src_tile_type);
+        TTSIM_VERIFY(src_tile_id == tile_id, UnimplementedFunctionality, "write: src_tile_id=0x%x", src_tile_id); // write must be from current tile
+        ...
+        TTSIM_VERIFY((src_addr &amp; 15) == (dst_addr &amp; 15), UndefinedBehavior, "write: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+            src_addr, dst_addr);
+        tile_wr_bytes(dst_coordinate, dst_addr, &amp;p_tile-&gt;sram[src_addr], noc_at_len_be);
+        if (bits&lt;4,4&gt;(noc_ctrl)) { // nonposted
+            p_tile-&gt;niu_mst_wr_ack_received[noc_instance]++;
+            p_tile-&gt;niu_mst_nonposted_wr_req_sent[noc_instance]++;
+        } else {
+            p_tile-&gt;niu_mst_posted_wr_req_sent[noc_instance]++;
+        }</code></pre>
+  <ul>
+    <li>The length check enforces the packet limit: <code>NOC_MAX_PACKET_SIZE</code> is 8192 on Wormhole and 16384 on Blackhole (<code>config.h:47, 81</code>). ttsim doesn't model the hardware's automatic splitting of larger requests (Counters.md:167-173).</li>
+    <li><code>(src_addr &amp; 15) == (dst_addr &amp; 15)</code> is the ISA's &ldquo;C16&rdquo; rule: source and destination must be congruent mod 16 for L1 data (Alignment.md:17). Break it and you get <code>UndefinedBehavior</code>, which is lab <a href="../sim-labs/b05-noc-and-dram.html">B05</a>'s alignment trap. Reads from DRAM need mod 32 on Wormhole and mod 64 on Blackhole (tile.cpp:1605-1612).</li>
+    <li><code>tile_wr_bytes(...)</code> copies the bytes into the destination tile's memory, <b>right now</b>, inside the store instruction. No packet, no hops, no flits.</li>
+    <li>Then the counters are bumped immediately. For a non-posted write, <code>niu_mst_wr_ack_received</code> goes up in the same call, as though the ack had already come back.</li>
+  </ul>
+  <div class="callout warn"><b>ttsim delivers every NoC transfer instantly.</b> That is the right call for a functional, bit-exact simulator, but it means ttsim can't show you anything on this page that depends on time: hop latency, congestion, VC interleaving, reordering. By the time a kernel reaches <code>noc_async_write_barrier()</code>, the hardware counter already equals the software count, so the barrier always passes at once, and a missing barrier is invisible. ttsim does catch <em>illegal</em> requests: misalignment, oversized packets, multicast to non-Tensix tiles, inline writes to L1 on Blackhole.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="sim">Watching real transfers in ttsim</h2>
+  <p>Let's look at real traffic. Using the workbench's <code>build_ttsim.sh</code>, I made an editable copy of ttsim and added one <code>ttsim_printf</code> to <code>noc_cmd_ctrl</code>, just after coordinate translation (after line 1466 of tile.cpp). It prints the NoC, the tile and command buffer, the request kind, and source and destination in NoC&nbsp;0 coordinates, with the raw coordinates the kernel wrote shown as <code>[asked …]</code>. For multicast it also prints the rectangle. For writes, &ldquo;src&rdquo; is TARG and &ldquo;dst&rdquo; is RET; for reads it is the reverse, matching the data flow.</p>
+  <div class="filename">$LAB_HOME/ttsim-noclog/src/tile.cpp (instrumentation added after line 1466; two more small edits save the raw coordinates before translation and print the multicast rectangle)</div>
+<pre><code>    { // A08 instrumentation: log every NoC command
+        const char *kind = bits&lt;5,5&gt;(noc_ctrl) ? "MCAST_WR" : bits&lt;0,0&gt;(noc_ctrl) ? "ATOMIC" : bits&lt;3,3&gt;(noc_ctrl) ? "INLINE_WR" : bits&lt;1,1&gt;(noc_ctrl) ? "WRITE" : "READ";
+        ttsim_printf("NOC%u %c%u buf%u %-9s %s  src %c(%u,%u)[asked %u,%u]:0x%llx -&gt; dst %c(%u,%u)[asked %u,%u]:0x%llx len=%u\n",
+            noc_instance, tile_type, tile_id, cmd_buf, kind, bits&lt;4,4&gt;(noc_ctrl) ? "ack " : "post",
+            src_tile_type, src_coordinate &amp; 63, src_coordinate &gt;&gt; 6, raw_src &amp; 63, raw_src &gt;&gt; 6, (unsigned long long)src_addr,
+            dst_tile_type, dst_coordinate &amp; 63, dst_coordinate &gt;&gt; 6, raw_dst &amp; 63, raw_dst &gt;&gt; 6, (unsigned long long)dst_addr, noc_at_len_be);
+    }</code></pre>
+<pre><code>export LAB_HOME=$HOME/ttlab/a08
+source sim-labs/workbench/env.sh wh
+sim-labs/workbench/build_ttsim.sh noclog wh      # copy, edit src/tile.cpp, rebuild (~4 s)
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so
+$EX/metal_example_loopback</code></pre>
+  <p>The loopback example's single kernel reads each 2 KiB tile from a DRAM buffer into L1 and writes it back to another DRAM buffer, with a barrier after each (<code>programming_examples/loopback/kernels/loopback_dram_copy.cpp</code>). The run printed 100 NoC commands, 50 reads and 50 writes, then <code>Test Passed</code>. Here are the first eight, trimmed:</p>
+<pre><code>[4373] NOC0 T0 buf1 READ      ack   src D(0,11)[asked 0,11]:0x2d4c40 -&gt; dst T(1,1)[asked 1,1]:0x16d800 len=2048
+[4393] NOC0 T0 buf0 WRITE     ack   src T(1,1)[asked 1,1]:0x16d800 -&gt; dst D(0,11)[asked 0,11]:0x2d7440 len=2048
+[4429] NOC0 T0 buf1 READ      ack   src D(0,1)[asked 0,1]:0x402d4c40 -&gt; dst T(1,1)[asked 1,1]:0x16d800 len=2048
+[4449] NOC0 T0 buf0 WRITE     ack   src T(1,1)[asked 1,1]:0x16d800 -&gt; dst D(0,1)[asked 0,1]:0x402d7440 len=2048
+[4485] NOC0 T0 buf1 READ      ack   src D(0,5)[asked 0,5]:0x2d4c40 -&gt; dst T(1,1)[asked 1,1]:0x16d800 len=2048
+[4505] NOC0 T0 buf0 WRITE     ack   src T(1,1)[asked 1,1]:0x16d800 -&gt; dst D(0,5)[asked 0,5]:0x2d7440 len=2048
+[4541] NOC0 T0 buf1 READ      ack   src D(0,7)[asked 0,7]:0x402d4c40 -&gt; dst T(1,1)[asked 1,1]:0x16d800 len=2048
+[4561] NOC0 T0 buf0 WRITE     ack   src T(1,1)[asked 1,1]:0x16d800 -&gt; dst D(0,7)[asked 0,7]:0x402d7440 len=2048
+...
+[7313] 0.2 seconds (35.1 KHz)</code></pre>
+  <p>What to read from this:</p>
+  <ul>
+    <li><b>Command buffers:</b> reads go through <code>buf1</code> and writes through <code>buf0</code>, exactly tt-metal's assignment (<code>NCRISC_RD_CMD_BUF = 1</code>, <code>NCRISC_WR_CMD_BUF = 0</code>).</li>
+    <li><b>Everything is non-posted</b> (<code>ack</code>), which is what <code>noc_async_write_barrier</code> needs.</li>
+    <li><b>The first read is the hop-counter preset:</b> T(1,1) &larr; D(0,11) on NoC&nbsp;0, a 19-hop request and a 3-hop data response. On real silicon this read's data rides the short leg; the write that follows, also on NoC&nbsp;0, carries its tile the long 19-hop way.</li>
+    <li><b>Successive tiles visit different DRAM tiles</b> (0,11), (0,1), (0,5), (0,7)&hellip;, and addresses alternate between <code>0x2d…</code> and <code>0x402d…</code>. That is page interleaving across banks, the subject of <a href="a09-memory.html">A09</a>.</li>
+    <li><b>The bracketed numbers are ttsim clock ticks</b>, about 20-36 per command here. They count simulator steps, not silicon cycles, and the transfer itself took zero of them.</li>
+  </ul>
+  <p>The multicast matmul (<code>$EX/metal_example_matmul_multicore_reuse_mcast</code>, also <code>Test Passed</code>) is busier: 4,224 commands, including 464 multicasts, 176 atomics and traffic on both NoCs. A few lines show the three coordinate systems side by side:</p>
+<pre><code>[7768] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x19e60 -&gt; dst T(9,1)[asked 25,18]:0x19e60 len=8192
+[7768]       mcast rectangle start (2,1) end (9,1) [asked start 19,18]
+[8216] NOC1 T2 buf1 READ      ack   src D(5,8)[asked 4,3]:0x2ffc40 -&gt; dst T(3,1)[asked 6,10]:0x59e60 len=2048
+[4562] NOC1 T14 buf3 ATOMIC    ack   src T(1,2)[asked 18,19]:0x8b30 -&gt; dst T(8,2)[asked 1,9]:0x4 len=4220</code></pre>
+  <ul>
+    <li><b>Line 1:</b> a full 8 KiB multicast packet from core (1,1) to the rest of row 1 (x 2..9). The kernel asked for translated coordinates (19,18)&ndash;(25,18); the translation table maps X&nbsp;19&rarr;2, X&nbsp;25&rarr;9 and Y&nbsp;18&rarr;1 on NoC&nbsp;0 (Coordinates.md:35-58). This is the &ldquo;real mcast&rdquo; preset in the multicast figure.</li>
+    <li><b>Line 3:</b> a NoC&nbsp;1 read written in <em>raw NoC&nbsp;1 coordinates</em>: the core at NoC&nbsp;0 (3,1) calls itself (6,10) = (9&minus;3, 11&minus;1), and DRAM (5,8) appears as (4,3).</li>
+    <li><b>Line 4:</b> an atomic increment of a semaphore on a remote core. ttsim names the remote end &ldquo;src&rdquo; in its own variables; the atomic happens at T(1,2). The 32-bit &ldquo;len&rdquo; field holds the atomic opcode (<code>0x107C</code>, increment, as ttsim's check at tile.cpp:1528 expects), not a length.</li>
+  </ul>
+  <div class="callout sim">The lab <a href="../sim-labs/b05-noc-and-dram.html">B05: NoC transactions, DRAM and the alignment trap</a> walks through this instrumentation step by step, logs multicasts, deliberately misaligns a read so that both ttsim and Watcher catch it, and shows why a missing barrier passes in ttsim.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A bus doesn't scale and a crossbar costs N&sup2;, so Tenstorrent uses a <b>2D torus</b> of small routers: one router and one NIU per grid position, short links, bandwidth that grows with the chip.</li>
+    <li>There are <b>two physically separate NoCs</b>: NoC&nbsp;0 flows only right and down, NoC&nbsp;1 only left and up, both wrapping at the edges.</li>
+    <li>Routing is <b>dimension-order</b> and deterministic: NoC&nbsp;0 does X then Y, NoC&nbsp;1 does Y then X. For any pair differing in both axes, the two hop counts sum to width + height (22 on Wormhole), so the shorter NoC is never more than 11 hops.</li>
+    <li>A read's round trip on one NoC is always the full loop; the choice of NoC decides <b>which leg carries the data</b>. Using both NoCs also doubles per-tile bandwidth (by convention, readers on NoC&nbsp;0 and writers on NoC&nbsp;1).</li>
+    <li>Packets are a header flit plus up to 256 data flits: <b>32 B / 8 KiB</b> on Wormhole, <b>64 B / 16 KiB</b> on Blackhole. One flit per cycle per link, 9 cycles per hop, cut-through. That gives a derived 32 GB/s (WH) or 86.4 GB/s (BH) per link.</li>
+    <li>Requests: read, write (posted or not, inline), atomics on L1, and rectangle <b>multicast</b> to Tensix tiles, which copies data at tree forks.</li>
+    <li><b>Virtual channels</b> (dateline, class and buddy bits) keep the torus deadlock-free and separate requests from responses.</li>
+    <li>The NoC is <b>weakly ordered</b>. Completion is observed through NIU <b>counters</b>, and barriers spin until a counter matches what software issued.</li>
+    <li>A transfer starts with a few MMIO stores into a <b>command buffer</b>, ending in <code>NOC_CMD_CTRL = 1</code>. ttsim models that store as an <b>instant</b> copy, so it checks legality but not timing or ordering.</li>
+  </ul>
+
+  <!-- ===================================================================== -->
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>On Wormhole, core (7,4) writes 2 KiB to core (6,4). Which NoC should it use, and how many hops is each option?</summary>
+  <p>Same row, one column to the left. NoC&nbsp;0 can only go right, so it goes 7&rarr;8&rarr;9&rarr;0&rarr;&hellip;&rarr;6: 9 hops. NoC&nbsp;1 goes left directly: 1 hop. The data travels on the request leg of a write, so use NoC&nbsp;1. (9 + 1 = 10, the row length, because y is the same.)</p></details>
+  <details class="quiz"><summary>A colleague says &ldquo;my read from DRAM is 19 hops on NoC&nbsp;0, so I'll switch to NoC&nbsp;1 and make it 3 hops&rdquo;. What happens to latency and to link usage?</summary>
+  <p>The round trip stays the same: request plus response is 22 hops on either NoC, because the response returns on the same NoC. What changes is which leg is long. On NoC&nbsp;0 the 1-flit request takes 19 hops and the 65-flit data response takes 3; on NoC&nbsp;1 the data takes 19 hops. Switching makes the read occupy roughly six times as many link-cycles and is likely to congest other traffic.</p></details>
+  <details class="quiz"><summary>Why can a multicast reach 16 cores with far fewer link traversals than unicasting to each one?</summary>
+  <p>The routers copy flits at the forks of the broadcast tree, so each link in the tree carries the data once. Separate unicasts each walk their own full route from the source, re-crossing the shared links. In the ISA example that is 28 traversals for the tree against 132 for 16 unicasts. Only Tensix tiles receive; other tiles in the rectangle opt out.</p></details>
+  <details class="quiz"><summary>A writer sends a tile with <code>noc_async_write</code> on NoC&nbsp;0, then sets a flag in the reader's L1 with a write on NoC&nbsp;1. Without a barrier, is the reader guaranteed to see the new tile when it sees the flag?</summary>
+  <p>No. Packets on different NoCs (or different VCs) have no ordering guarantee. The flag can overtake the data. The writer must call <code>noc_async_write_barrier()</code> (wait until <code>NIU_MST_WR_ACK_RECEIVED</code> matches the issued count) before sending the flag. The ISA calls this request-wait-for-response approach the only way to order requests across NoCs.</p></details>
+  <details class="quiz"><summary>You delete the barrier from that kernel and it still passes in ttsim. Why, and what does that prove?</summary>
+  <p>ttsim's <code>noc_cmd_ctrl</code> copies the bytes and increments the ack counter inside the store that triggers the transfer. Every transfer has already completed when the next instruction runs, so reordering can't happen and every barrier passes immediately. A pass in ttsim proves the kernel is functionally correct <em>if</em> transfers were instant. It says nothing about races on real hardware.</p></details>
+  <details class="quiz"><summary>tt-metal says there are 6 VCs per NoC; the ISA says the VC number is 4 bits. Who is right?</summary>
+  <p>Both. Software chooses a 3-bit static VC (2 class bits + the buddy bit) for requests, and only classes 00, 01 and 10 are for requests: 3 &times; 2 = 6 values, 0-5. The hardware VC number adds the dateline bit, which flips at fixed points on the route and is not chosen by software, and response traffic has its own class 11. 16 combinations in all, matching the &ldquo;12 request + 4 response&rdquo; channels a receiving NIU can process at once (Ordering.md:20).</p></details>
+
+  <!-- ===================================================================== -->
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/README.md">tt-isa-documentation: Wormhole NoC overview</a>: packet and flit structure, request types, virtual channels, the performance table.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/RoutingPaths.md">Wormhole NoC routing paths</a>: diagrams of NoC&nbsp;0 and NoC&nbsp;1 unicast and broadcast routes, congestion and cut-through.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Ordering.md">Wormhole NoC ordering</a>: the exact ordering guarantees for single packets, pairs of packets and the receiving NIU.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Counters.md">Wormhole NIU counters</a>: which counter moves when, for every request type, plus automatic request splitting.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/NoC/README.md">Blackhole NoC overview</a>: the 64-byte flit, 1.35 GHz clock, 64-bit addresses and the inline-write regression.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/ordering.html">TT-Metalium docs: Ordering (NOC, CMD_BUF, VC)</a>: the programmer's summary of command buffers, VCs and write ordering.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE</a>: Tenstorrent's architecture overview, including the two-NoC reader/writer data flow.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md">Tech report: Saturating DRAM bandwidth</a>: how reader placement, routes and VCs got over 92% of Wormhole DRAM bandwidth.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Hot Chips 2024: &ldquo;The Standalone AI Computer and its Programming Model&rdquo;</a>: Blackhole slides, including the two-NoC torus, 64-byte links and per-core NoC bandwidth.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Wormhole_switching">Wormhole switching (Wikipedia)</a>: flits, cut-through forwarding, and why virtual channels are needed to avoid deadlock.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Torus_interconnect">Torus interconnect (Wikipedia)</a>: tori in supercomputers and on chips, with notes on folded layouts.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim on GitHub</a>: the simulator; <code>src/tile.cpp</code> holds <code>noc_cmd_ctrl</code>.</li>
+  </ul>
+
+  <div class="pager"><a href="a07-vector-engine.html">&larr; 07 The vector engine (SFPU)</a><a class="next" href="a09-memory.html">09 Memory: L1, DRAM, interleaving and sharding &rarr;</a></div>
+</main>
+</body>
+</html>
