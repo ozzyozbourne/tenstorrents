@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A05 · Tiles, faces and number formats · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .viz .controls input[type=text] { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .5rem; font-family: var(--mono); width: 13em; }
+  .viz canvas.drag { cursor: ew-resize; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a04-inside-tensix.html">&larr; Prev</a>
+  <a href="a06-matrix-engine.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 05</span><span class="tag">Prerequisites: A04</span>
+  <h1><span class="num">05.</span> Tiles, faces and number formats</h1>
+  <p class="subtitle">Why every tensor on a Tenstorrent chip is chopped into 32&times;32 tiles, what the bits of each number format mean, and how sixteen numbers can share one exponent without falling apart.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#tiles">Why tiles exist</a></li>
+      <li><a href="#faces">Faces, face order and padding</a></li>
+      <li><a href="#floats">Four ways to spell a float</a></li>
+      <li><a href="#registers">Inside the core: 19-bit Src, 32-bit Dst</a></li>
+      <li><a href="#bfp">Block floating point</a></li>
+      <li><a href="#rounding">Rounding and saturation, bit for bit</a></li>
+      <li><a href="#lineage">A family tree: HBFP, MSFP and OCP MX</a></li>
+      <li><a href="#pcc">Measuring correctness: PCC and tolerances</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here are sixteen numbers, the kind you might find in one row of a neural network's activations:</p>
+  <p style="font-family: var(--mono); font-size: 14px;">0.9, 0.82, &minus;0.37, 0.51, 0.093, &minus;0.64, 0.27, 0.011, &minus;0.15, 0.44, 0.021, &minus;0.71, 0.33, 0.058, &minus;0.22, 0.95</p>
+  <p>Stored as BF16, each one carries its own 8-bit exponent: 16 numbers, 16 exponents. A Tenstorrent chip will happily store them a different way, with <em>one</em> exponent for all sixteen and only 8 bits per number for the sign and the digits. That saves almost half the memory and half the DRAM bandwidth, which on a memory-bound workload is close to half the run time.</p>
+  <p>It sounds too good to be true. If one number sets the exponent for everyone, what happens to the others? What if one of the sixteen is 300 instead of 0.9?</p>
+  <div class="callout key">The chapter's question: <b>can 16 numbers share one exponent and stay useful?</b> The answer is "usually yes, and here is exactly when not". To get there we need two things first: why the chip groups numbers at all (tiles and faces), and what the bits of an ordinary float mean.</div>
+  <p>The previous chapter, <a href="a04-inside-tensix.html">A04</a>, showed the Tensix core: unpackers feed the matrix engine's <code>SrcA</code> and <code>SrcB</code> registers, results land in <code>Dst</code>, and packers write them back to L1. This chapter is about the <em>shape</em> and the <em>bits</em> of the data that flows along that path. How the matrix engine multiplies those bits, and what "math fidelity" means, is the subject of <a href="a06-matrix-engine.html">A06</a>.</p>
+
+  <h2 id="tiles">Why tiles exist</h2>
+  <p>Start with how a programmer thinks of a matrix: rows, one after another. A 64&times;64 matrix of BF16 values in row-major order is 64 rows of 64 elements, and each row is 128 bytes. Element <code>(r, c)</code> lives at address <code>r&times;64 + c</code>.</p>
+  <p>Now look at what the matrix engine wants. It does not consume rows. It consumes small square blocks: one instruction multiplies an 8&times;16 block by a 16&times;16 block (details in <a href="a06-matrix-engine.html">A06</a>). The unit that moves through circular buffers, across the NoC and into the unpackers is a 32&times;32 block called a <b>tile</b>. Ask a row-major buffer for the top-left 32&times;32 block and you get 32 separate pieces of 64 bytes each, 128 bytes apart. Every one of those is a separate address to compute and, on the NoC, potentially a separate transaction.</p>
+  <p>The fix is old and simple: store the matrix the way you will read it. In <b>tiled layout</b> the 1,024 elements of a tile sit next to each other in memory, so one tile is one contiguous 2,048-byte page (for BF16). The tt-metal tensor layout report puts it this way:</p>
+  <blockquote>"In a tiled tensor, pages are represented as 2D tiles, with the default tile size being 32x32, rather than being confined to a single row. For example, with a 64x64 tensor, this results in 4 tiles, each of size 32x32." <br><span style="color:var(--muted);font-size:13px">tt-metal/tech_reports/tensor_layouts/tensor_layouts.md:50 @7aad8aac</span></blockquote>
+  <p>An analogy: a road atlas. A huge map printed as one long scroll, line by line, is "row-major": to see one town you unroll many lines and read a small part of each. The atlas cuts the map into pages so that one region is one page. Where the analogy breaks: atlas pages overlap at the edges and tiles do not, and memory has no second dimension at all; "page" here only means a run of consecutive addresses.</p>
+  <p>The animation colours every element of a 64&times;64 tensor by the tile it belongs to (four colours) and the face within the tile (four shades; faces come next). On the right is memory, address 0 at the top left, 128 elements per line. Watch where each tile ends up.</p>
+
+  <div class="viz" id="fig-tiles"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-tiles");
+    var g = TT.canvas(root, 900, 440), ctx = g.ctx, C = TT.C;
+    var cs = 5, TX = 40, TY = 62, MX = 440, MY = 62, MW = 3, MH = 9, PER = 128;
+    var tileCol = [C.blue, C.orange, C.green, C.purple], faceA = [1, 0.72, 0.5, 0.32];
+    function owner(r, c) { return { t: ((r >> 5) << 1) | (c >> 5), f: (((r & 31) >> 4) << 1) | ((c & 31) >> 4) }; }
+    function addrT(r, c) { var o = owner(r, c); return o.t * 1024 + o.f * 256 + (r & 15) * 16 + (c & 15); }
+    var invRM = [], invT = [];
+    for (var r = 0; r < 64; r++) for (var c = 0; c < 64; c++) { invRM[r * 64 + c] = [r, c]; invT[addrT(r, c)] = [r, c]; }
+    function cell(x, y, col, a) { ctx.globalAlpha = a; ctx.fillStyle = col; ctx.fillRect(x, y, cs - 0.7, cs - 0.7); }
+    function labels(mode) {
+      TT.text(ctx, "Tensor, 64\u00d764 elements (logical view)", TX, 26, { font: "bold 14px" });
+      TT.text(ctx, mode === "rm" ? "Memory, row-major: address = row\u00d764 + col" : "Memory, tiled: tile \u2192 face \u2192 row \u2192 col", MX, 26, { font: "bold 14px" });
+      TT.text(ctx, "address 0  (128 elements per line)", MX, 48, { color: C.muted, font: "11px" });
+      TT.text(ctx, "4095", MX + PER * MW, MY + 32 * MH + 12, { color: C.muted, font: "11px", align: "right" });
+      // tile and face grid on the tensor
+      ctx.strokeStyle = C.fg; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.9;
+      ctx.strokeRect(TX - 0.5, TY - 0.5, 320, 320);
+      ctx.beginPath(); ctx.moveTo(TX + 160, TY); ctx.lineTo(TX + 160, TY + 320); ctx.moveTo(TX, TY + 160); ctx.lineTo(TX + 320, TY + 160); ctx.stroke();
+      ctx.lineWidth = 0.6; ctx.globalAlpha = 0.5; ctx.beginPath();
+      [80, 240].forEach(function (p) { ctx.moveTo(TX + p, TY); ctx.lineTo(TX + p, TY + 320); ctx.moveTo(TX, TY + p); ctx.lineTo(TX + 320, TY + p); });
+      ctx.stroke(); ctx.globalAlpha = 1;
+      ["tile 0", "tile 1", "tile 2", "tile 3"].forEach(function (s, i) {
+        var cx = TX + (i & 1) * 160 + 80, cy = TY + (i >> 1) * 160 + 80;
+        TT.box(ctx, cx - 26, cy - 10, 52, 20, { fill: "#000", alpha: 0.75, r: 4 });
+        TT.text(ctx, s, cx, cy, { align: "center", font: "bold 13px", color: C.fg });
+      });
+      if (mode === "tiled") {
+        for (var b = 0; b < 16; b++) TT.text(ctx, "T" + (b >> 2) + " F" + (b & 3), MX + PER * MW + 6, MY + b * 2 * MH + MH, { font: "10px", color: tileCol[b >> 2] });
+      } else {
+        for (var q = 0; q < 32; q += 4) TT.text(ctx, "rows " + (2 * q) + "-" + (2 * q + 1), MX + PER * MW + 6, MY + q * MH + MH / 2, { font: "10px", color: C.muted });
+      }
+    }
+    function drawState(mode, n, hiTile) {
+      var inv = mode === "rm" ? invRM : invT;
+      for (var a = 0; a < 4096; a++) {
+        var rc = inv[a], o = owner(rc[0], rc[1]), filled = a < n;
+        var col = filled ? tileCol[o.t] : C.bg3, al = filled ? faceA[o.f] : 1;
+        if (hiTile != null && o.t !== hiTile) { col = C.bg3; al = 1; }
+        cell(TX + rc[1] * cs, TY + rc[0] * cs, col, al);
+        ctx.globalAlpha = al; ctx.fillStyle = col; ctx.fillRect(MX + (a % PER) * MW, MY + Math.floor(a / PER) * MH, MW - 0.5, MH - 1);
+      }
+      ctx.globalAlpha = 1;
+      if (n > 0 && n < 4096 && hiTile == null) {
+        var p = inv[n - 1];
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 2;
+        ctx.strokeRect(TX + p[1] * cs - 2, TY + p[0] * cs - 2, cs + 3, cs + 3);
+        ctx.strokeRect(MX + ((n - 1) % PER) * MW - 2, MY + Math.floor((n - 1) / PER) * MH - 2, MW + 3, MH + 3);
+        TT.text(ctx, "address " + (n - 1) + "  \u2192  element (row " + p[0] + ", col " + p[1] + ")", TX, 410, { mono: true, color: C.yellow });
+      }
+      labels(mode);
+    }
+    function padding(t) {
+      var s = 10, x0 = TX, y0 = TY;
+      for (var r = 0; r < 32; r++) for (var c = 0; c < 32; c++) {
+        var used = r < 3 && c < 5;
+        ctx.globalAlpha = used ? 1 : TT.lerp(1, 0.55, t);
+        ctx.fillStyle = used ? C.blue : C.bg3; ctx.fillRect(x0 + c * s, y0 + r * s, s - 1, s - 1);
+      }
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = C.fg; ctx.lineWidth = 1.5; ctx.strokeRect(x0 - 0.5, y0 - 0.5, 320, 320);
+      TT.text(ctx, "A 3\u00d75 tensor in TILE layout", TX, 26, { font: "bold 14px" });
+      TT.text(ctx, "3\u00d75 real values", x0 + 56, y0 + 14, { color: C.blue, font: "bold 12px" });
+      TT.text(ctx, "padding (1009 elements)", x0 + 160, y0 + 200, { align: "center", color: C.muted, font: "13px" });
+      var lines = [
+        ["Useful elements:", "15 of 1024  (1.5%)"],
+        ["BF16 bytes stored:", "2048 (one whole tile)"],
+        ["BFP8_b bytes stored:", "1088 (one whole tile)"],
+        ["Next size up, 33\u00d733:", "pads to 64\u00d764 = 4 tiles"],
+      ];
+      lines.forEach(function (L, i) {
+        TT.text(ctx, L[0], MX - 40, TY + 30 + i * 34, { color: C.muted, font: "14px" });
+        TT.text(ctx, L[1], MX + 130, TY + 30 + i * 34, { mono: true, font: "14px", color: C.fg });
+      });
+      TT.text(ctx, "Rule: both of the last two dimensions round up to a multiple of 32.", MX - 40, TY + 190, { font: "13px", color: C.yellow });
+    }
+    var steps = [
+      { dur: 4, text: "<b>Row-major.</b> Address = row\u00d764 + col. The cursor fills memory one full 64-wide tensor row at a time. Each 128-element memory line holds two tensor rows, so tile 0 and tile 1 alternate every 32 elements." },
+      { dur: 1, text: "<b>Where is tile 0?</b> Only tile 0 is coloured now. In row-major memory it is 32 separate runs of 32 elements (64 bytes each for BF16), 128 bytes apart. Reading it takes 32 address calculations and, over the NoC, many small transfers." },
+      { dur: 2.5, text: "<b>Tiled layout, face 0.</b> Memory now starts with the top-left 16\u00d716 face of tile 0, stored row by row: 256 consecutive elements." },
+      { dur: 3, text: "<b>Faces 1, 2, 3.</b> Then the top-right face, the bottom-left face and the bottom-right face. After 1024 addresses, tile 0 is complete." },
+      { dur: 3, text: "<b>Tiles 1, 2, 3.</b> Tiles follow one another, tile rows first. Inside every tile the order is the same: face 0 \u2192 1 \u2192 2 \u2192 3, rows within a face, columns within a row." },
+      { dur: 1, text: "<b>Tile 0 is one page.</b> In tiled layout tile 0 is a single contiguous run of 1024 elements (2048 bytes in BF16): one CB page, one NoC transfer, one unpack." },
+      { dur: 1.5, text: "<b>The price: padding.</b> A tensor whose last two dimensions are not multiples of 32 is padded up. A 3\u00d75 tensor occupies a whole tile; 98.5% of it is padding that still gets moved and, unless an op masks it, computed on." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        if (i === 0) drawState("rm", Math.floor(TT.lerp(0, 4096, t)));
+        else if (i === 1) drawState("rm", 4096, 0);
+        else if (i === 2) drawState("tiled", Math.floor(TT.lerp(0, 256, t)));
+        else if (i === 3) drawState("tiled", Math.floor(TT.lerp(256, 1024, t)));
+        else if (i === 4) drawState("tiled", Math.floor(TT.lerp(1024, 4096, t)));
+        else if (i === 5) drawState("tiled", 4096, 0);
+        else padding(t);
+        if (i === 1) TT.text(ctx, "tile 0 = 32 runs of 64 B", MX, 395, { color: C.blue, font: "bold 14px" });
+        if (i === 5) TT.text(ctx, "tile 0 = 1 run of 2048 B", MX, 395, { color: C.blue, font: "bold 14px" });
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout gpu">On a GPU, tensors usually stay row-major in global memory and the <em>kernel</em> does the tiling: it loads a block into shared memory, then into tensor-core fragments. Tenstorrent moves the tiling into the storage format itself. Every tensor that the compute engines touch is already in tile order before a kernel sees it, so a kernel reads a whole tile as one page and never computes strided addresses inside it.</div>
+
+  <h2 id="faces">Faces, face order and padding</h2>
+  <p>Why is a tile split again into four 16&times;16 <b>faces</b>? Because 16 is the matrix engine's natural width. <code>SrcA</code> and <code>SrcB</code> are 16 columns wide, and one bank holds 64 rows of 16, which is exactly 1,024 values: one tile, four faces of 16 rows each (<code>tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md:3</code>). The layout report says it directly:</p>
+  <blockquote>"Each tile is split into faces ("sub-tiles"). By default, tile size is 32x32, and face size is 16x16 -- 4 faces per tile [...] (i.e., face0->face1->face2->face3 on the picture below). The reason for using faces is that the matrix engine natively multiplies 16x16 matrices, and tile multiplication is decomposed into multiple face multiplications." <br><span style="color:var(--muted);font-size:13px">tt-metal/tech_reports/tensor_layouts/tensor_layouts.md:60-62 @7aad8aac</span></blockquote>
+  <p>The sizes are compile-time constants in the host API:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/constants.hpp:19-24 @7aad8aac</div>
+<pre><code>constexpr uint32_t TILE_HEIGHT = 32;
+constexpr uint32_t TILE_WIDTH = 32;
+constexpr uint32_t TILE_HW = TILE_WIDTH * TILE_HEIGHT;
+constexpr uint32_t FACE_HEIGHT = 16;
+constexpr uint32_t FACE_WIDTH = 16;
+constexpr uint32_t FACE_HW = FACE_WIDTH * FACE_HEIGHT;</code></pre>
+  <p>The face order is easiest to see in code that actually walks a tile. This is the host-side packer that turns a 32&times;32 block into a block-float tile (we will meet block floats shortly). The four nested loops are the face order: tile-row of faces <code>tr</code>, tile-column of faces <code>tc</code>, row <code>i</code> inside the face, column <code>j</code> inside the face row.</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/blockfloat_common.cpp:410-420 @7aad8aac (trimmed; comments added)</div>
+<pre><code>for (int tr = 0; tr &lt; subtiles_in_tile_row; ++tr) {         // face row: 0 = top, 1 = bottom
+    for (int tc = 0; tc &lt; subtiles_in_tile_col; ++tc) {     // face col: 0 = left, 1 = right
+        for (int i = 0; i &lt; subtile_rows; ++i) {            // 16 rows inside the face
+            ...
+            for (int j = 0; j &lt; subtile_cols; ++j) {        // 16 columns inside the row
+                ...
+                if (row_major_input) {
+                    data_index =
+                        (tr * face_H + i) * tile_W + (tc * face_W + j) + (num_float_in_tile * tile_index);</code></pre>
+  <p>So element <code>(r, c)</code> of a tile, with <code>r, c</code> in 0..31, sits at offset <code>face&times;256 + (r mod 16)&times;16 + (c mod 16)</code>, where <code>face = 2&times;(r &ge; 16) + (c &ge; 16)</code>. Face 0 is top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Converting between the two orders is called <b>tilize</b> and <b>untilize</b>; <a href="a15-matmul-one-to-many.html">A15</a> and <a href="a18-ttnn-user.html">A18</a> show where it happens in practice.</p>
+  <div class="callout warn">Two variations exist. With <code>transpose_tile=True</code> the faces are stored in column-major order (0 &rarr; 2 &rarr; 1 &rarr; 3) and the values inside each face are transposed too (<code>tensor_layouts.md:83</code>). And the hardware supports tile shapes of 32&times;32, 16&times;32, 4&times;32, 2&times;32 and 1&times;32, but "currently TT-Metalium only supports 32x32, with limited functionality for 16x32 in some ops such as matmul" (<code>tensor_layouts.md:57</code>). Assume 32&times;32 unless an op says otherwise.</div>
+  <p><b>Padding</b> is the price of a fixed tile. Each of the last two dimensions is rounded up to a multiple of 32. A 3&times;5 tensor in tile layout costs a whole tile: 15 useful values out of 1,024. A 33&times;33 tensor costs four tiles. For the large matrices that dominate AI workloads this overhead is a rounding error. For a batch of small vectors it can dominate, which is why TT-NN also keeps a <code>ROW_MAJOR_LAYOUT</code> (one row per page, <code>tensor_layouts.md:33-34</code>) for data that the matrix engine will not touch.</p>
+
+  <h2 id="floats">Four ways to spell a float</h2>
+  <p>Now the bits inside each element. Every floating-point format here works the same way: a sign bit, an <b>exponent</b> that picks a power of two (the "zoom level"), and a <b>mantissa</b> that picks a point inside that power of two. A normal number is <code>(&minus;1)<sup>s</sup> &times; (1 + m/2<sup>M</sup>) &times; 2<sup>e &minus; bias</sup></code>, where <code>M</code> is the number of mantissa bits. Exponent bits buy <em>range</em>; mantissa bits buy <em>precision</em>. The four formats you will meet trade them differently:</p>
+  <table>
+    <tr><th>Format</th><th>Sign</th><th>Exponent</th><th>Mantissa</th><th>Relative step (2<sup>&minus;M</sup>)</th><th>Where you meet it</th></tr>
+    <tr><td>FP32</td><td>1</td><td>8 (bias 127)</td><td>23</td><td>1.2&times;10<sup>&minus;7</sup></td><td>Host tensors, <code>Dst</code> in 32-bit mode, SFPU registers</td></tr>
+    <tr><td>TF32</td><td>1</td><td>8</td><td>10</td><td>9.8&times;10<sup>&minus;4</sup></td><td>The widest float in <code>SrcA</code>/<code>SrcB</code>; FP32 inputs become this</td></tr>
+    <tr><td>BF16</td><td>1</td><td>8</td><td>7</td><td>7.8&times;10<sup>&minus;3</sup></td><td>The default dtype for activations and weights</td></tr>
+    <tr><td>FP16</td><td>1</td><td>5 (bias 15)</td><td>10</td><td>9.8&times;10<sup>&minus;4</sup></td><td>Supported, rarer; range only up to about 6.5&times;10<sup>4</sup> in IEEE</td></tr>
+  </table>
+  <p>BF16 is FP32 with the bottom 16 bits cut off: same exponent, same range, only 7 mantissa bits. TF32 is FP32 cut to 10 mantissa bits, 19 bits in total. The ISA documentation defines both that way: "starting with IEEE 754 FP32 and then truncating the mantissa down to 10 bits" for TF32 and "down to 7 bits" for BF16 (<code>FloatBitPatterns.md:29,49</code>). FP16 keeps 10 mantissa bits but shrinks the exponent to 5, which is why it overflows at 65,504 while BF16 reaches about 3.4&times;10<sup>38</sup>.</p>
+  <p>Type a number below and watch it become bits. The error column shows what each format loses. Try <code>0.1</code> (no binary format holds it exactly), <code>16777217</code> (FP32 itself runs out of mantissa), <code>70000</code> (FP16 overflows) and <code>1e-6</code> (FP16 goes subnormal).</p>
+
+  <div class="viz" id="fig-bits"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-bits");
+    var g = TT.canvas(root, 900, 420), ctx = g.ctx, C = TT.C;
+    var dv = new DataView(new ArrayBuffer(4));
+    function f32bits(x) { dv.setFloat32(0, x); return dv.getUint32(0); }
+    function bitsf32(u) { dv.setUint32(0, u >>> 0); return dv.getFloat32(0); }
+    function isNaN32(u) { return ((u >>> 23) & 255) === 255 && (u & 0x7fffff) !== 0; }
+    // FP32 bits -> BF16 bits (16) and TF32 bits (19): round-to-nearest-even or truncate.
+    function toBF16(u, trunc) {
+      if (isNaN32(u)) return ((u >>> 16) | 0x40) & 0xffff;
+      if (trunc) return u >>> 16;
+      return Math.floor((u + 0x7fff + ((u >>> 16) & 1)) / 65536) & 0xffff;
+    }
+    function toTF32(u, trunc) {
+      if (isNaN32(u)) return ((u >>> 13) | 0x200) & 0x7ffff;
+      if (trunc) return u >>> 13;
+      return Math.floor((u + 0xfff + ((u >>> 13) & 1)) / 8192) & 0x7ffff;
+    }
+    function rne(v) { var f = Math.floor(v), d = v - f; return d > 0.5 ? f + 1 : d < 0.5 ? f : f + (f % 2); }
+    // IEEE FP16 from a double, round-to-nearest-even, with subnormals and overflow to infinity.
+    function toFP16(x) {
+      if (isNaN(x)) return 0x7e00;
+      var s = (x < 0 || (x === 0 && 1 / x < 0)) ? 0x8000 : 0, a = Math.abs(x);
+      if (a >= 65520) return s | 0x7c00;
+      if (a < Math.pow(2, -14)) return s | rne(a / Math.pow(2, -24));
+      var e = Math.floor(Math.log2(a));
+      while (Math.pow(2, e) > a) e--;
+      while (Math.pow(2, e + 1) <= a) e++;
+      var q = rne((a / Math.pow(2, e) - 1) * 1024);
+      if (q === 1024) { q = 0; e++; }
+      if (e > 15) return s | 0x7c00;
+      return s | ((e + 15) << 10) | q;
+    }
+    function decode(bits, E, M, bias) {
+      var s = (bits >>> (E + M)) & 1, e = (bits >>> M) & ((1 << E) - 1), m = bits & ((1 << M) - 1);
+      var sg = s ? -1 : 1;
+      if (e === (1 << E) - 1) return m ? NaN : sg * Infinity;
+      if (e === 0) return sg * m * Math.pow(2, 1 - bias - M);
+      return sg * (1 + m / Math.pow(2, M)) * Math.pow(2, e - bias);
+    }
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    var inp = document.createElement("input"); inp.type = "text"; inp.value = "0.1";
+    var lab = document.createElement("label"); lab.textContent = "number:"; lab.appendChild(inp);
+    ctrl.appendChild(lab);
+    ["0.1", "3.14159265", "16777217", "70000", "1e-6", "-2.5", "1e-39"].forEach(function (p) {
+      var b = document.createElement("button"); b.textContent = p; b.onclick = function () { inp.value = p; draw(); }; ctrl.appendChild(b);
+    });
+    var tl = document.createElement("label"); var tr = document.createElement("input"); tr.type = "checkbox";
+    tl.appendChild(tr); tl.appendChild(document.createTextNode("truncate BF16/TF32 (as the unpacker does)"));
+    ctrl.appendChild(tl);
+    root.appendChild(ctrl);
+    var cap = document.createElement("div"); cap.className = "caption"; root.appendChild(cap);
+    inp.addEventListener("input", draw); tr.addEventListener("change", draw);
+
+    function fmt(v) {
+      if (v === Infinity) return "+inf"; if (v === -Infinity) return "-inf"; if (isNaN(v)) return "NaN";
+      if (v === 0) return "0";
+      var s = Number(v.toPrecision(10)).toString();
+      return s;
+    }
+    function hex(b, n) { var s = (b >>> 0).toString(16).toUpperCase(); while (s.length < n) s = "0" + s; return "0x" + s; }
+    function row(y, name, layout, bits, E, M, x, v, note) {
+      var nb = 1 + E + M, cw = 21, x0 = 120;
+      TT.text(ctx, name, 14, y + 12, { font: "bold 16px", color: C.yellow });
+      TT.text(ctx, layout, 14, y + 32, { font: "12px", color: C.muted, mono: true });
+      for (var i = 0; i < nb; i++) {
+        var bit = (bits >>> (nb - 1 - i)) & 1;
+        var col = i === 0 ? C.red : i <= E ? C.blue : C.green;
+        var gap = (i >= 1 ? 5 : 0) + (i >= 1 + E ? 5 : 0);
+        var bx = x0 + i * cw + gap;
+        TT.box(ctx, bx, y, cw - 3, 24, { fill: col, alpha: bit ? 0.9 : 0.15, r: 3 });
+        TT.text(ctx, String(bit), bx + (cw - 3) / 2, y + 12, { align: "center", mono: true, color: bit ? "#000" : C.fg, font: "13px" });
+      }
+      var err = v - x, rel = x !== 0 ? Math.abs(err) / Math.abs(x) : (v === 0 ? 0 : Infinity);
+      var errTxt = !isFinite(v) ? "overflow" : (err === 0 ? "exact" : (err > 0 ? "+" : "\u2212") + Math.abs(err).toExponential(3) + "  (relative " + (isFinite(rel) ? rel.toExponential(2) : "inf") + ")");
+      TT.text(ctx, hex(bits, Math.ceil(nb / 4)), 120, y + 42, { mono: true, color: C.muted, font: "12px" });
+      TT.text(ctx, "value = " + fmt(v), 230, y + 42, { mono: true, font: "13px" });
+      TT.text(ctx, "error " + errTxt, 520, y + 42, { mono: true, font: "13px", color: err === 0 ? C.green : (rel < 1e-3 ? C.fg : rel < 1e-2 ? C.yellow : C.red) });
+      if (note) TT.text(ctx, note, 120, y + 60, { font: "12px", color: C.orange });
+    }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var x = Number(inp.value.trim());
+      if (inp.value.trim() === "" || isNaN(x)) { TT.text(ctx, "Type a number (e.g. 0.1, 1e-6, -2.5)", 20, 40, { color: C.red }); return; }
+      var trunc = tr.checked;
+      var u = f32bits(x), v32 = bitsf32(u);
+      var b16 = toBF16(u, trunc), vb = decode(b16, 8, 7, 127);
+      var t19 = toTF32(u, trunc), vt = decode(t19, 8, 10, 127);
+      var h = toFP16(x), vh = decode(h, 5, 10, 15);
+      var e32 = (u >>> 23) & 255, eb = (b16 >>> 7) & 255, eh = (h >>> 10) & 31;
+      var n32 = e32 === 0 && (u & 0x7fffff) ? "FP32 denormal: the Tensix FPU and SFPU read this as zero" : "";
+      var nb = eb === 255 ? "Exp 255: IEEE inf/NaN, but the Tensix FPU reads it as an ordinary huge number" :
+               (eb === 0 && (b16 & 127) ? "BF16 denormal: the Tensix FPU and SFPU read this as zero" : "");
+      var nh = eh === 31 ? "Exp 31: IEEE inf/NaN, but the Tensix FPU reads (1+m/1024)\u00d72^16 = " + fmt((1 + (h & 1023) / 1024) * 65536) + "; no FP16 NaN" :
+               (eh === 0 && (h & 1023) ? "FP16 subnormal: the FPU reads it as zero; precision is lost long before that" : "");
+      row(14, "FP32", "1 \u00b7 8 \u00b7 23", u, 8, 23, x, v32, n32);
+      row(118, "TF32", "1 \u00b7 8 \u00b7 10", t19, 8, 10, x, vt, ((t19 >>> 10) & 255) === 0 && (t19 & 1023) ? "TF32 denormal: the Tensix FPU reads this as zero" : "");
+      row(214, "BF16", "1 \u00b7 8 \u00b7 7", b16, 8, 7, x, vb, nb);
+      row(318, "FP16", "1 \u00b7 5 \u00b7 10", h, 5, 10, x, vh, nh);
+      TT.text(ctx, "sign", 830, 26, { color: C.red, font: "12px" });
+      TT.text(ctx, "exponent", 830, 44, { color: C.blue, font: "12px" });
+      TT.text(ctx, "mantissa", 830, 62, { color: C.green, font: "12px" });
+      cap.innerHTML = "Input parsed as a double: <code>" + x + "</code>. FP32 is the nearest float to it (round-to-nearest-even). " +
+        (trunc ? "BF16 and TF32 are <b>truncated</b> from FP32, as the unpacker does when it reads FP32 into <code>SrcA</code>/<code>SrcB</code>." :
+                 "BF16 and TF32 are <b>rounded to nearest even</b> from FP32, as PyTorch does on the host.") +
+        " FP16 is IEEE round-to-nearest-even from the input. Errors are measured against the typed value.";
+    }
+    draw();
+  })();
+  </script>
+
+  <p>Two things to notice. First, BF16 and TF32 have <em>the same exponent field</em> as FP32, so converting between them never overflows; only the mantissa changes. FP16 has to squeeze the exponent too, which is where its overflow and subnormal behaviour comes from. Second, the checkbox matters: the host rounds FP32 to BF16 to nearest, but the unpacker <em>truncates</em> when it reads FP32 into a source register, as the next section shows. With <code>0.1</code>, rounding gives BF16 <code>0x3DCD</code> = 0.10009765625 (error +9.8&times;10<sup>&minus;5</sup>); tick the box and truncation gives <code>0x3DCC</code> = 0.099609375 (error &minus;3.9&times;10<sup>&minus;4</sup>), four times worse and always toward zero. Truncation errors do not average out the way round-to-nearest errors do, which matters over a long accumulation.</p>
+
+  <h2 id="registers">Inside the core: 19-bit Src, 32-bit Dst</h2>
+  <p>Why does TF32 exist at all? Look at the size of the source registers:</p>
+  <blockquote>"Each of SrcA and SrcB can be viewed as having 2 banks of 64 rows of 16 columns of 19-bit data." <br><span style="color:var(--muted);font-size:13px">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md:3 @be833101</span></blockquote>
+  <p>Nineteen bits is 1 + 8 + 10: exactly one TF32. The multipliers behind those registers are built for that width (and <a href="a06-matrix-engine.html">A06</a> shows they are much narrower still, using several passes). Every float format that enters <code>SrcA</code> or <code>SrcB</code> is fitted into those 19 bits (<code>SrcASrcB.md:55-59</code>):</p>
+  <ul>
+    <li><b>TF32</b> fills them. FP32 from L1 "can be converted to TF32, though the conversion involves throwing away the low 13 bits of mantissa."</li>
+    <li><b>BF16</b> is "overlaid onto TF32, with the three least significant bits of the TF32 mantissa set to zero."</li>
+    <li><b>FP16</b> (1/5/10) uses the same 19 bits with a 5-bit exponent.</li>
+    <li>An integer "8" type, overlaid on FP16, for integer matmuls.</li>
+  </ul>
+  <p>The simulator makes "throwing away" concrete. This is ttsim's unpacker converting an FP32 datum on its way into a source register. There is no rounding: the bits are masked off.</p>
+  <div class="filename">ttsim/src/tensix.cpp:3472-3482 @b3620244</div>
+<pre><code>} else if (out_data_format == 4) { // tf32
+    if (unpack_to_dst) {
+        value = dst_encode_fp32(value);
+    } else {
+        value &amp;= 0xFFFFE000; // drop low 13 bits of mantissa (no rounding)
+    }
+} else if (out_data_format == 5) { // bf16
+    ...
+    value = denormals_as_zeros(value);
+    value &amp;= 0xFFFF0000; // drop low 16 bits of mantissa (no rounding)</code></pre>
+  <p>So a full FP32 multiply never happens in the matrix engine. FP32 survives only where there is room for 32 bits: in <code>Dst</code>, and in the vector engine's registers (<a href="a07-vector-engine.html">A07</a>).</p>
+  <p><code>Dst</code> is the opposite of narrow. It is 1,024 rows &times; 16 columns &times; 16 bits, which can also be viewed as 512 rows of 32-bit values (<code>Dst.md:3</code>). That is 16 BF16 tiles or 8 FP32 tiles. Here is a detail you will only see if you dump raw register contents from an instrumented simulator: <code>Dst</code> does not store BF16 in the usual bit order. Both the ISA spec (<code>Dst.md:105-115</code>) and ttsim define a shuffle that puts the mantissa in the high byte and the exponent in the low byte:</p>
+  <div class="filename">ttsim/src/tensix.cpp:912-922 @b3620244 (comments added)</div>
+<pre><code>static inline uint16_t dst_decode_bf16(uint16_t x) {
+    uint16_t e = x &amp; 255;
+    uint16_t m = (x &gt;&gt; 8) &amp; 127;
+    return (x &amp; 0x8000) | (e &lt;&lt; 7) | m;
+}
+
+static inline uint16_t dst_encode_bf16(uint16_t x) {
+    uint16_t e = (x &gt;&gt; 7) &amp; 255;    // 8-bit exponent from a normal BF16
+    uint16_t m = x &amp; 127;           // 7-bit mantissa
+    return (x &amp; 0x8000) | (m &lt;&lt; 8) | e;   // stored as: sign | mantissa | exponent
+}</code></pre>
+  <p>BF16 <code>1.0</code> is <code>0x3F80</code> in memory and <code>0x007F</code> inside <code>Dst</code>. Every unit that reads or writes <code>Dst</code> applies these helpers, so software never sees the shuffle. The 32-bit form applies the same shuffle to its high half and leaves the low 16 mantissa bits alone (<code>Dst.md:130-135</code>).</p>
+  <div class="callout warn"><b>Tensix floats are not quite IEEE.</b> The ISA spec lists the differences (<code>FloatBitPatterns.md</code>). The matrix unit treats FP32/BF16 denormals as zero and treats exponent 255 as an ordinary large number, not infinity or NaN; it outputs that pattern for values too large to represent. For FP16 there is no NaN at all, and exponent 31 is an ordinary exponent to the FPU. Values from PyTorch that rely on <code>inf</code>/<code>NaN</code> semantics may need pre- or post-processing. The bit explorer above prints a note whenever a value hits one of these cases.</div>
+  <div class="callout gpu">TF32 will look familiar: it is the same 1/8/10 layout that NVIDIA's Ampere tensor cores introduced for "FP32" matmuls. The idea is similar: keep FP32's range, multiply with a narrower mantissa, and accumulate in FP32 (on Tensix, only when <code>Dst</code> is in 32-bit mode). Two differences: even with all four fidelity phases the matrix engine does not use every TF32 mantissa bit from <code>SrcA</code> (<code>SrcASrcB.md:115</code>, more in <a href="a06-matrix-engine.html">A06</a>), and the conversion differs. The Tensix unpacker <em>truncates</em> FP32 to TF32; it does not round.</div>
+
+  <h2 id="bfp">Block floating point</h2>
+  <p>Back to the opening question. Look at the exponents of those sixteen activations. Most of them lie between 2<sup>&minus;4</sup> and 2<sup>0</sup>. Storing sixteen copies of nearly the same 8-bit exponent is wasteful. <b>Block floating point</b> stores the exponent once per group and gives each value only a sign and a fixed-point <b>magnitude</b> relative to that shared exponent.</p>
+  <p>An analogy: a group photo with one exposure setting. The camera meters on the brightest face, and everyone else is recorded relative to it. Faces nearly as bright come out fine; faces in deep shadow come out black. The brightest value sets the shared exponent, values near it keep all their bits, and values far below it lose bits from the bottom until nothing is left. Where the analogy breaks: a camera sensor fades gradually, while BFP loses exactly one bit of precision for every halving below the maximum, and a value goes to exactly zero once it falls 8 binades below the maximum. And each 16-value group has its own exposure, so one bright face only darkens its own row.</p>
+  <h3>The format, exactly</h3>
+  <p>The ISA spec defines the family (<code>FloatBitPatterns.md:89-99</code>):</p>
+  <blockquote>"These consist of either 8 or 4 or 2 bits per datum, where the most significant bit is a sign bit and the remaining bits are a magnitude. Exponents are separate, with each group of 16 datums sharing a common 8-bit exponent (though BFP8a/BFP4a/BFP2a only use the low five bits of the exponent and expect the high three bits to be zero)."</blockquote>
+  <p>For BFP8 a datum is 1 sign bit and a 7-bit magnitude <code>Mag</code>, and its value is <code>Mag/2<sup>6</sup> &times; 2<sup>Exp&minus;127</sup></code>. There is no hidden leading 1: the leading 1 is stored explicitly, which is why tt-metal's data format notes say BFP8 really keeps "6 bits total" of the original mantissa (<code>data_formats.md:12</code>). The value with the largest exponent gets <code>Mag</code> in 64..127, i.e. 1.xxxxxx in binary. A value half as large gets 0.1xxxxx, losing one bit. A value 2<sup>&minus;7</sup> as large gets at most one bit, and anything smaller becomes 0.</p>
+  <p>Tenstorrent names: <code>Bfp8_b</code>, <code>Bfp4_b</code>, <code>Bfp2_b</code> are the 8-bit-exponent formats (the "b" matches BF16's exponent, and these unpack to BF16). <code>Bfp8</code>, <code>Bfp4</code>, <code>Bfp2</code> without the suffix are the "a" variants with a 5-bit exponent that unpack to FP16 (<code>Unpackers/FormatConversion.md:8-9</code>). In TT-NN they appear as <code>ttnn.bfloat8_b</code> and <code>ttnn.bfloat4_b</code>.</p>
+  <h3>Which 16 values share an exponent?</h3>
+  <p>One face row: 16 consecutive values in tile order. A tile has 4 faces &times; 16 rows = 64 groups, so 64 exponent bytes. The host packer stores them at the front of the tile, ahead of all the magnitudes:</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/blockfloat_common.cpp:455-464 @7aad8aac</div>
+<pre><code>// prepend exponents to follow data packing order:
+//  16 exponents for sub-tile 0
+//      exp_row0, exp_row1, … exp_row15
+//  16 exponents for sub-tile 1
+//  16 exponents for sub-tile 2
+//  16 exponents for sub-tile 3
+//  entire sub-tile 0 (RM layout)
+//  entire sub-tile 1 (RM layout)
+//  entire sub-tile 2 (RM layout)
+//  entire sub-tile 3 (RM layout)</code></pre>
+  <p>That gives the tile sizes, which you can read straight off the backend API: 1,024 datums at 8, 4 or 2 bits, plus 64 exponent bytes.</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/tt_backend_api_types.hpp:122-129, 138-140 @7aad8aac (byte-count comments added)</div>
+<pre><code>constexpr static uint32_t tile_size(const DataFormat&amp; format) {
+    switch (format) {
+        case DataFormat::Bfp2:
+        case DataFormat::Bfp2_b: return (64 * 4) + (16 * 4);    //  256 + 64 =  320 bytes
+        case DataFormat::Bfp4:
+        case DataFormat::Bfp4_b: return (128 * 4) + (16 * 4);   //  512 + 64 =  576 bytes
+        case DataFormat::Bfp8:
+        case DataFormat::Bfp8_b: return (256 * 4) + (16 * 4);   // 1024 + 64 = 1088 bytes
+        ...
+        case DataFormat::Float16_b: return (1024 * 2);          // BF16: 2048 bytes
+        case DataFormat::Float32: return (1024 * 4);            // FP32: 4096 bytes</code></pre>
+  <table>
+    <tr><th>Format</th><th>Bits per value</th><th>Bytes per tile</th><th>vs BF16</th><th>Magnitude bits kept for the largest value</th></tr>
+    <tr><td>FP32</td><td>32</td><td>4096</td><td>2&times;</td><td>24 (with hidden bit)</td></tr>
+    <tr><td>BF16</td><td>16</td><td>2048</td><td>1&times;</td><td>8 (with hidden bit)</td></tr>
+    <tr><td>BFP8_b</td><td>8 + 0.5</td><td>1088</td><td>0.53&times;</td><td>7</td></tr>
+    <tr><td>BFP4_b</td><td>4 + 0.5</td><td>576</td><td>0.28&times;</td><td>3</td></tr>
+    <tr><td>BFP2_b</td><td>2 + 0.5</td><td>320</td><td>0.16&times;</td><td>1 (each value is 0 or &plusmn;2<sup>Exp&minus;127</sup>)</td></tr>
+  </table>
+  <h3>The aha: drag the outlier</h3>
+  <p>Below are the sixteen activations from the start of the chapter, forming one face row and therefore one block. Value 0 is the one you control: drag the handle on the axis (or use the slider). Each row shows the magnitude bits that survive. Dim red cells are bits spent on alignment: leading zeros that the value needs because its own exponent is smaller than the shared one. The quantizer is a line-by-line port of the real code. Pick the host converter (what <code>ttnn.from_torch(..., dtype=ttnn.bfloat8_b)</code> runs on the CPU) or the device packer in either of its two configurations, explained in the next section.</p>
+
+  <div class="viz" id="fig-bfp"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-bfp");
+    var g = TT.canvas(root, 900, 580), ctx = g.ctx, C = TT.C;
+    g.canvas.classList.add("drag");
+    var dv = new DataView(new ArrayBuffer(4));
+    function f32bits(x) { dv.setFloat32(0, x); return dv.getUint32(0); }
+    function bitsf32(u) { dv.setUint32(0, u >>> 0); return dv.getFloat32(0); }
+    function toBF16(u) { return Math.floor((u + 0x7fff + ((u >>> 16) & 1)) / 65536) & 0xffff; }   // host RNE, as torch does
+    function bf16val(h) { return bitsf32((h << 16) >>> 0); }
+    // Host converter: port of convert_u32_to_bfp (tt-metal blockfloat_common.cpp:239-334), round to nearest, ties to even.
+    function hostBlock(bf, W) {
+      var us = bf.map(function (h) { return (h << 16) >>> 0; }), E = 0;
+      us.forEach(function (u) { E = Math.max(E, (u >>> 23) & 255); });
+      return { E: E, items: us.map(function (u) {
+        var m = u & 0x7fffff, e = (u >>> 23) & 255, s = u >>> 31;
+        if (e === 0) return { s: 0, mag: 0, shift: E };
+        var mant = (1 << 23) | m, d = E - e;
+        if (d > 0) mant = d >= 32 ? 0 : (mant >>> d);
+        var S = 24 - W, tie = 1 << (S - 1), rv = mant & ((1 << S) - 1);
+        mant = mant >>> S;
+        if (rv > tie || (rv === tie && (mant & 1))) mant++;
+        mant = Math.min(mant, (1 << W) - 1);                 // saturate instead of renormalizing
+        return { s: mant ? s : 0, mag: mant, shift: d };
+      }) };
+    }
+    // Device packer: port of BF16ToBFP8 (tt-isa-documentation Packers/FormatConversion.md:84-113), ties away from zero,
+    // then truncation to BFP4/BFP2. If !precise, the early conversion first rounds BF16 to E8M6 (bfp8_pack_precise=false).
+    function e8m6(h) { return (h & 0x8000) | (((h & 0x7fff) + 1) & 0x7ffe); }
+    function packerBlock(bf, W, precise) {
+      if (!precise) bf = bf.map(e8m6);
+      var E = 0;
+      bf.forEach(function (h) { E = Math.max(E, (h >> 7) & 255); });
+      return { E: E, items: bf.map(function (h) {
+        var s = h >> 15, e = (h >> 7) & 255, man = (h & 127) | (e ? 128 : 0), sh = E - e, mag = 0;
+        if (sh < 8) { mag = (man + (1 << sh)) >> (sh + 1); if (mag === 128) mag = 127; }
+        mag = mag >> (7 - W);
+        return { s: mag ? s : 0, mag: mag, shift: sh };
+      }) };
+    }
+    function val(it, E, W) { return it.mag ? (it.s ? -1 : 1) * it.mag / Math.pow(2, W - 1) * Math.pow(2, E - 127) : 0; }
+    function quant(bf, W, mode) { return mode === "host" ? hostBlock(bf, W) : packerBlock(bf, W, mode === "precise"); }
+    function pcc(a, b) {
+      var n = a.length, ma = 0, mb = 0, i; for (i = 0; i < n; i++) { ma += a[i]; mb += b[i]; } ma /= n; mb /= n;
+      var cv = 0, va = 0, vb = 0; for (i = 0; i < n; i++) { cv += (a[i] - ma) * (b[i] - mb); va += (a[i] - ma) * (a[i] - ma); vb += (b[i] - mb) * (b[i] - mb); }
+      return va && vb ? cv / Math.sqrt(va * vb) : NaN;
+    }
+    // Self-check against outputs recorded from ttsim (see the "Verified in the simulator" section).
+    var probe = [1.0, 1.0078125, 0.5078125, 0.0078125, 0.01, 0.005, -0.75, 0.3, 0.1, -0.1, 0.0625, 0.03, 1.9921875, -1.5, 0.2, 0.001];
+    var probe2 = [1.0, 0.50390625, 0.5078125, 1.9921875, 0.30078125, 0.2001953125, -0.75, 0.0078125, 0, 0, 0, 0, 0, 0, 0, 0];
+    var checks = [
+      [probe, 7, "host", [1, 1, 0.5, 0, 0.015625, 0, -0.75, 0.296875, 0.09375, -0.09375, 0.0625, 0.03125, 1.984375, -1.5, 0.203125, 0]],
+      [probe, 7, "precise", [1, 1.015625, 0.515625, 0.015625, 0.015625, 0, -0.75, 0.296875, 0.09375, -0.09375, 0.0625, 0.03125, 1.984375, -1.5, 0.203125, 0]],
+      [probe, 3, "host", [1, 1, 0.5, 0, 0, 0, -0.75, 0.25, 0, 0, 0, 0, 1.75, -1.5, 0.25, 0]],
+      [probe, 3, "default", [1, 1, 0.5, 0, 0, 0, -0.5, 0, 0, 0, 0, 0, 2, -1.5, 0, 0]],
+      [probe2, 7, "default", [1, 0.5, 0.5, 2, 0.3125, 0.1875, -0.75, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
+    ];
+    var okAll = 0, nAll = 0;
+    checks.forEach(function (c) {
+      var bf = c[0].map(function (x) { return toBF16(f32bits(x)); }), q = quant(bf, c[1], c[2]);
+      q.items.forEach(function (it, i) { nAll++; if (val(it, q.E, c[1]) === c[3][i]) okAll++; });
+    });
+
+    var base = [0.9, 0.82, -0.37, 0.51, 0.093, -0.64, 0.27, 0.011, -0.15, 0.44, 0.021, -0.71, 0.33, 0.058, -0.22, 0.95];
+    var outlier = 0.9, W = 7, mode = "host";
+    var AX0 = 120, AX1 = 860, AY = 44, LMIN = -2, LMAX = 3;
+    function ax(v) { return AX0 + (Math.log10(v) - LMIN) / (LMAX - LMIN) * (AX1 - AX0); }
+
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    var sl = document.createElement("input"); sl.type = "range"; sl.min = -1; sl.max = 3; sl.step = 0.005; sl.value = Math.log10(0.9);
+    var sll = document.createElement("label"); sll.textContent = "outlier:"; sll.appendChild(sl);
+    var fsel = document.createElement("select");
+    [["7", "BFP8_b (1088 B/tile)"], ["3", "BFP4_b (576 B/tile)"], ["1", "BFP2_b (320 B/tile)"]].forEach(function (o) { var op = document.createElement("option"); op.value = o[0]; op.textContent = o[1]; fsel.appendChild(op); });
+    var msel = document.createElement("select");
+    [["host", "host: from_torch (RNE)"], ["precise", "device packer, bfp8_pack_precise=true"], ["default", "device packer, default (E8M6 first)"]].forEach(function (o) { var op = document.createElement("option"); op.value = o[0]; op.textContent = o[1]; msel.appendChild(op); });
+    var bSweep = document.createElement("button"); bSweep.textContent = "Sweep 0.5 \u2192 1000";
+    var bReset = document.createElement("button"); bReset.textContent = "Reset";
+    [sll, fsel, msel, bSweep, bReset].forEach(function (e) { ctrl.appendChild(e); });
+    root.appendChild(ctrl);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    var cap = document.createElement("div"); cap.className = "caption"; root.appendChild(cap);
+    cap.innerHTML = "Quantizer self-check against values recorded from ttsim (Wormhole and Blackhole): <b>" + okAll + " / " + nAll + "</b> match. " +
+      "Inputs are rounded to BF16 first, as they would be in <code>Dst</code>. Value 0 is the outlier; the other fifteen are fixed.";
+
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var xs = base.slice(); xs[0] = outlier;
+      var bf = xs.map(function (x) { return toBF16(f32bits(x)); });
+      var orig = bf.map(bf16val);
+      var q = quant(bf, W, mode), E = q.E;
+      var qs = q.items.map(function (it) { return val(it, E, W); });
+      // Axis
+      TT.text(ctx, "|value|", 14, AY, { color: C.muted, font: "12px" });
+      ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(AX0, AY); ctx.lineTo(AX1, AY); ctx.stroke();
+      for (var d = LMIN; d <= LMAX; d++) {
+        var tx = ax(Math.pow(10, d));
+        ctx.beginPath(); ctx.moveTo(tx, AY - 5); ctx.lineTo(tx, AY + 5); ctx.stroke();
+        TT.text(ctx, String(Math.pow(10, d)), tx, AY + 15, { align: "center", color: C.muted, font: "11px" });
+      }
+      // Shared exponent window: values below 2^(E-127-7) become zero in BFP8
+      var top = Math.pow(2, E - 127 + 1), zeroBelow = Math.pow(2, E - 127 - (W === 7 ? 7 : W));
+      var zx = Math.max(AX0, ax(Math.max(zeroBelow, 1e-2)));
+      ctx.fillStyle = C.red; ctx.globalAlpha = 0.18; ctx.fillRect(AX0, AY - 9, zx - AX0, 18); ctx.globalAlpha = 1;
+      for (var i = 1; i < 16; i++) { var vx = ax(Math.abs(orig[i])); ctx.fillStyle = C.fg; ctx.fillRect(vx - 1, AY - 7, 2, 14); }
+      var hx = ax(Math.abs(orig[0]));
+      ctx.beginPath(); ctx.arc(hx, AY, 9, 0, 2 * Math.PI); ctx.fillStyle = C.yellow; ctx.fill();
+      TT.text(ctx, "drag", hx, AY - 18, { align: "center", color: C.yellow, font: "bold 11px" });
+      TT.text(ctx, "shared exponent byte E = " + E + "  \u2192  block covers [0, " + top + ")", 14, 82, { mono: true, font: "13px", color: C.yellow });
+      TT.text(ctx, (W === 7 ? "red band: values here become 0" : "red band: values here become 0 (approx.)"), AX1, 82, { align: "right", font: "12px", color: C.red });
+      // Table header
+      var y0 = 112, rh = 25, bx0 = 200, cw = 17;
+      TT.text(ctx, "#", 14, y0 - 12, { color: C.muted, font: "12px" });
+      TT.text(ctx, "input (bf16)", 130, y0 - 12, { color: C.muted, font: "12px", align: "right" });
+      TT.text(ctx, "shift", 160, y0 - 12, { color: C.muted, font: "12px" });
+      TT.text(ctx, "magnitude bits", bx0, y0 - 12, { color: C.muted, font: "12px" });
+      TT.text(ctx, "stored value", 455, y0 - 12, { color: C.muted, font: "12px", align: "right" });
+      TT.text(ctx, "relative error", 475, y0 - 12, { color: C.muted, font: "12px" });
+      var zeros = 0;
+      for (i = 0; i < 16; i++) {
+        var y = y0 + i * rh, it = q.items[i], o = orig[i], v = qs[i];
+        var rel = o !== 0 ? Math.abs(v - o) / Math.abs(o) : 0;
+        if (v === 0 && o !== 0) zeros++;
+        if (i === 0) { ctx.fillStyle = C.yellow; ctx.globalAlpha = 0.08; ctx.fillRect(8, y - 2, 884, rh - 2); ctx.globalAlpha = 1; }
+        TT.text(ctx, String(i), 14, y + 10, { mono: true, color: i === 0 ? C.yellow : C.muted, font: "12px" });
+        TT.text(ctx, Number(o.toPrecision(6)).toString(), 130, y + 10, { mono: true, align: "right", font: "13px" });
+        TT.text(ctx, it.shift >= 1 ? "\u2212" + Math.min(it.shift, 99) : "0", 160, y + 10, { mono: true, font: "12px", color: C.muted });
+        for (var b = 0; b < W; b++) {
+          var bit = (it.mag >> (W - 1 - b)) & 1, lost = b < it.shift && !bit;
+          TT.box(ctx, bx0 + b * cw, y, cw - 3, rh - 6, { fill: bit ? C.green : (lost ? C.red : C.bg3), alpha: bit ? 0.9 : (lost ? 0.3 : 1), r: 2 });
+          TT.text(ctx, String(bit), bx0 + b * cw + (cw - 3) / 2, y + (rh - 6) / 2, { align: "center", mono: true, font: "11px", color: bit ? "#000" : C.muted });
+        }
+        TT.text(ctx, it.s ? "\u2212" : "+", bx0 - 12, y + 10, { mono: true, font: "12px", color: C.red });
+        TT.text(ctx, Number(v.toPrecision(6)).toString(), 455, y + 10, { mono: true, align: "right", font: "13px", color: v === 0 && o !== 0 ? C.red : C.fg });
+        var L = rel <= 0 ? 0 : Math.max(0, Math.min(1, (Math.log10(rel) + 4) / 4));
+        var col = rel < 0.01 ? C.green : rel < 0.1 ? C.yellow : C.red;
+        ctx.fillStyle = C.bg3; ctx.fillRect(475, y + 3, 220, rh - 12);
+        ctx.fillStyle = col; ctx.fillRect(475, y + 3, 220 * L, rh - 12);
+        var st = (v === 0 && o !== 0) ? "collapsed to 0" : rel === 0 ? "exact" : (rel * 100).toPrecision(2) + "%";
+        TT.text(ctx, st, 705, y + 10, { font: "12px", color: col, mono: true });
+      }
+      var others = orig.slice(1), qothers = qs.slice(1);
+      var p16 = pcc(orig, qs), p15 = pcc(others, qothers);
+      var sy = y0 + 16 * rh + 18;
+      TT.text(ctx, "zeros: " + zeros + " of 16", 14, sy, { mono: true, font: "14px", color: zeros ? C.red : C.green });
+      TT.text(ctx, "PCC(all 16) = " + (isNaN(p16) ? "undefined" : p16.toFixed(6)), 200, sy, { mono: true, font: "14px" });
+      TT.text(ctx, "PCC(values 1-15) = " + (isNaN(p15) ? "undefined (all 0)" : p15.toFixed(6)), 500, sy, { mono: true, font: "14px", color: (isNaN(p15) || p15 < 0.99) ? C.red : C.fg });
+      var msg;
+      if (zeros >= 8) msg = "<b>Collapse.</b> The outlier owns the exponent. Everything 8 or more binades below it is now exactly zero. Note that PCC over all 16 values still looks excellent: the outlier dominates the statistics.";
+      else if (zeros > 0 && outlier <= 1.0) msg = "<b>Too few bits.</b> No outlier, yet the values furthest below the block maximum have already rounded to zero: " + W + " magnitude bits only reach " + W + " binades down.";
+      else if (zeros > 0) msg = "<b>Losing the small ones.</b> Each doubling of the outlier shifts every other magnitude right by one bit (the red cells). The smallest values have already hit zero.";
+      else if (outlier > 1.0) msg = "<b>Shifting.</b> The outlier has raised the shared exponent. The others still survive, but with fewer significant bits.";
+      else msg = "<b>No outlier.</b> The largest value sets the exponent; values near it keep all " + W + " magnitude bits. Already, the tiny value 0.011 keeps only 1 or 2 bits.";
+      narr.innerHTML = msg;
+    }
+    function setOut(v) { outlier = Math.min(1000, Math.max(0.1, v)); sl.value = Math.log10(outlier); draw(); }
+    sl.addEventListener("input", function () { setOut(Math.pow(10, Number(sl.value))); });
+    fsel.addEventListener("change", function () { W = Number(fsel.value); draw(); });
+    msel.addEventListener("change", function () { mode = msel.value; draw(); });
+    bReset.onclick = function () { setOut(0.9); };
+    var sweeping = false;
+    bSweep.onclick = function () {
+      if (sweeping) return; sweeping = true; var t0 = performance.now();
+      (function step(now) {
+        var t = Math.min(1, (now - t0) / 5000);
+        setOut(Math.pow(10, TT.lerp(Math.log10(0.5), 3, t)));
+        if (t < 1) requestAnimationFrame(step); else sweeping = false;
+      })(t0);
+    };
+    var dragging = false;
+    function logical(e) { var r = g.canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * g.W / r.width, y: (e.clientY - r.top) * g.H / r.height }; }
+    g.canvas.addEventListener("pointerdown", function (e) {
+      var p = logical(e); if (p.y < 70 && p.x >= AX0 - 10 && p.x <= AX1 + 10) { dragging = true; g.canvas.setPointerCapture(e.pointerId); move(p); }
+    });
+    function move(p) { var lv = LMIN + (Math.max(AX0, Math.min(AX1, p.x)) - AX0) / (AX1 - AX0) * (LMAX - LMIN); setOut(Math.pow(10, lv)); }
+    g.canvas.addEventListener("pointermove", function (e) { if (dragging) move(logical(e)); });
+    g.canvas.addEventListener("pointerup", function () { dragging = false; });
+    draw();
+  })();
+  </script>
+
+  <p>Things to try, and what they show:</p>
+  <ul>
+    <li><b>No outlier (0.9).</b> The block's largest value is 0.95, so the shared exponent is that of [0.5, 1). Values near 0.5&ndash;1 keep 6&ndash;7 significant bits. 0.011 is already 6 binades down and keeps a single bit: its stored value is 0.0078, a 29% error. BFP8 is a <em>relative-to-the-block</em> format; values far below the block maximum are always coarse.</li>
+    <li><b>Outlier at 10.</b> The exponent rises by 4 binades and every other magnitude shifts right by 4. The 0.011, 0.021 and 0.058 values vanish.</li>
+    <li><b>Outlier at 300.</b> The shared exponent is now that of [256, 512), and everything below 2 (8 or more binades down) is exactly zero. Fifteen of sixteen values are gone. Yet PCC over all sixteen still prints about 0.99998, because the outlier dominates the variance. Remember this when we get to <a href="#pcc">PCC</a>.</li>
+    <li><b>Switch to BFP4_b.</b> Only 3 magnitude bits, so every stored value is a multiple of 1/8 of the block's top binade. With no outlier the three smallest values collapse; once the outlier reaches 4 (the [4, 8) binade), 10 of the other 15 are zero.</li>
+  </ul>
+  <div class="callout key">BFP works when the 16 values in a face row have similar magnitudes, which is often true of weights and many activations. It fails, locally and silently, when one value is far larger than its 15 neighbours. The damage is confined to that one face row of 16 values; the other 63 groups in the tile have their own exponents.</div>
+  <p>Going back to BF16 is easy. The unpacker converts BFP8 to BF16 without loss, because a 7-bit magnitude, once normalized, has at most 6 bits after its leading 1, and BF16 has room for 7. ttsim implements it exactly as the spec's pseudocode (<code>FloatBitPatterns.md:121-133</code>):</p>
+  <div class="filename">ttsim/src/tensix.cpp:3141-3151 @b3620244 (comments on the mag lines and return added)</div>
+<pre><code>static inline uint16_t bfp8_to_bf16(uint8_t x, uint8_t exp_bits) {
+    uint32_t sign = x &gt;&gt; 7;
+    uint8_t mag = x &lt;&lt; 1;                 // 7-bit magnitude, moved to the top of a byte
+    if (!mag) {
+        return sign ? 0xFF80 : 0; // zero-magnitude encodings map to -inf and +0
+    }
+    uint32_t lz = __builtin_clz(mag) - 24; // perform an 8-bit CLZ
+    mag &lt;&lt;= lz;                           // normalize: leading 1 to the top
+    exp_bits -= lz; // this will often wrap; seems odd, but spec/silicon are consistent here
+    return (sign &lt;&lt; 15) | (uint16_t(exp_bits) &lt;&lt; 7) | (mag &amp; 0x7E);   // drop the leading 1
+}</code></pre>
+  <p>Two details in that function deserve a second look. A sign bit with magnitude 0 (byte <code>0x80</code>) does not mean &minus;0: it decodes to BF16 <code>0xFF80</code>, which is &minus;infinity in IEEE terms ("&minus;2<sup>128</sup> or &minus;Infinity", <code>FloatBitPatterns.md:99</code>). That is why both packers make sure to never write <code>0x80</code>. And the exponent subtraction can wrap if the shared exponent is very small, which the comment notes is how silicon behaves too.</p>
+
+  <h2 id="rounding">Rounding and saturation, bit for bit</h2>
+  <p>To quantize a block, every converter does the same three things: find the largest exponent among the 16 values, shift each mantissa right by its distance from that exponent, and round what falls off the bottom. The sources agree on the first two steps and on one more rule, <b>saturation</b>. They disagree on how to break ties, and there is a configuration that rounds twice.</p>
+  <h3>Saturation: clamp, don't renormalize</h3>
+  <p>If the largest value's mantissa is all ones, rounding up overflows 7 bits (1.1111111 rounds to 10.000000). A correct float conversion would bump the exponent. BFP cannot do that without re-shifting all the other 15 values, so it clamps to the largest magnitude instead. The tt-metal notes say: "If there is an overflow in the mantissa when we round up, we do not recompute the max shared exponent and re-normalize across the 16 numbers. Instead, the mantissa is set to the max value (ie. all 1's)" (<code>data_formats.md:20</code>). The ISA spec has the same rule as <code>if (Mag == 128) Mag = 127;</code>. In practice: BF16 1.9921875 becomes 1.984375 in BFP8_b (on the host, and on the device with <code>bfp8_pack_precise</code>; the default device path differs, as shown below).</p>
+  <h3>Ties: the host and the device packer disagree</h3>
+  <p>The host converter, which runs when you call <code>ttnn.from_torch(..., dtype=ttnn.bfloat8_b)</code>, rounds to nearest with ties to even:</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/blockfloat_common.cpp:305-325 @7aad8aac (trimmed; the two trailing comments are added)</div>
+<pre><code>// Round mantissa to nearest; ties round to even
+...
+uint32_t round_value = mantissa &amp; MANTISSA_ROUND_MASK;   // the 17 bits below the kept 7
+mantissa = mantissa &gt;&gt; MANTISSA_BFP_SHIFT;
+uint32_t guard_bit = mantissa &amp; 0x1;
+
+if (round_value &gt; TIE_VALUE or (round_value == TIE_VALUE and guard_bit == 1)) {
+    // Round up
+    mantissa += 1;
+}
+
+mantissa = std::min(mantissa, MANTISSA_BFP_MAX_VAL);      // saturate at 127</code></pre>
+  <p>The device packer, which runs when a kernel packs <code>Dst</code> into a BFP8_b circular buffer, is specified differently in the ISA documentation: "deterministic round-to-nearest with ties away from zero" (<code>Packers/FormatConversion.md:79</code>). Its reference code works on BF16 input:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/Packers/FormatConversion.md:84-103 @be833101 (the "8 bits incl. hidden 1" comment is added)</div>
+<pre><code>void BF16ToBFP8(const uint16_t Datums[16], uint8_t* SharedExp, uint8_t BFP8[16]) {
+  uint8_t MaxExp = 0;
+  for (unsigned i = 0; i &lt; 16; ++i) {
+    uint8_t Exp = (Datums[i] &gt;&gt; 7) &amp; 0xff;
+    if (Exp &gt; MaxExp) MaxExp = Exp; // NB: Exp == 255 is not special
+  }
+  *SharedExp = MaxExp;
+  for (unsigned i = 0; i &lt; 16; ++i) {
+    uint8_t Sign = Datums[i] &gt;&gt; 15;
+    uint8_t Exp = (Datums[i] &gt;&gt; 7) &amp; 0xff;
+    uint8_t Man = (Datums[i] &amp; 0x7f) | (Exp ? 0x80 : 0);   // 8 bits incl. hidden 1
+    unsigned Shift = MaxExp - Exp;
+    uint8_t Mag = 0;
+    if (Shift &lt; 8) {
+      Mag = (Man + (1u &lt;&lt; Shift)) &gt;&gt; (Shift + 1); // Round to nearest, ties away from zero
+      if (Mag == 128) Mag = 127; // Clamp rather than renormalize
+    }
+    BFP8[i] = Mag ? ((Sign &lt;&lt; 7) | Mag) : 0; // Never 0x80
+  }
+}</code></pre>
+  <p>Read the rounding line slowly. <code>Man</code> has 8 significant bits; the result keeps <code>7 &minus; Shift</code> of them. Adding <code>1 &lt;&lt; Shift</code> adds exactly half of the last kept bit's weight, then the shift drops everything below: round half up, on the magnitude. A value whose exponent is 8 or more below the maximum is zero without any rounding at all. ttsim's packer (<code>src/tensix.cpp:2964-2987</code>) is the same algorithm line for line, so we can test it.</p>
+  <div class="callout warn">The tie rule is a <b>disagreement between sources</b>, not a typo. tt-metal's <code>data_formats.md</code> and its host code say ties go to even; the ISA spec and ttsim say the device packer sends ties away from zero. Both are true, of different code paths. A tensor quantized on the host and the same tensor quantized on device can differ by one unit in the last place on exact ties. The run below confirms it.</div>
+  <h3>Verified in the simulator</h3>
+  <p>To check the quantizer in the figure against the real thing, I built one 32&times;32 BF16 tile whose first face row holds 16 chosen values, including exact ties and a saturating mantissa. I quantized it twice: on the host with <code>ttnn.from_torch(x, dtype=ttnn.bfloat8_b)</code>, and on the simulated device with <code>ttnn.typecast(t, ttnn.bfloat8_b)</code>, which runs a compute kernel whose packer writes BFP8_b. Then I read both back with <code>ttnn.to_torch</code> (BFP8 &rarr; float is lossless).</p>
+  <div class="filename">sim-labs/workbench/py/bfp8_probe.py (core lines; activate <code>$TT_METAL_HOME/python_env</code>, <code>source env.sh wh</code>, then run it with <code>python</code> by absolute path, since <code>env.sh</code> changes directory)</div>
+<pre><code>row = [1.0, 1.0078125, 0.5078125, 0.0078125, 0.01, 0.005, -0.75, 0.3,
+       0.1, -0.1, 0.0625, 0.03, 1.9921875, -1.5, 0.2, 0.001]
+x = torch.zeros((32, 32), dtype=torch.bfloat16)
+x[0, :16] = torch.tensor(row, dtype=torch.bfloat16)          # face 0, row 0 = one BFP block
+host_q = ttnn.to_torch(ttnn.from_torch(x, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT))
+t = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+dev_q = ttnn.to_torch(ttnn.typecast(t, ttnn.bfloat8_b))</code></pre>
+  <p>The output (log lines trimmed). It was identical on Wormhole (<code>env.sh wh</code>) and Blackhole (<code>env.sh bh</code>):</p>
+<pre><code>   input(bf16)  host bfp8_b  device bfp8_b
+             1            1              1
+     1.0078125            1       1.015625   &lt;-- differ
+     0.5078125          0.5       0.515625   &lt;-- differ
+     0.0078125            0       0.015625   &lt;-- differ
+  0.0100097656     0.015625       0.015625
+ 0.00500488281            0              0
+         -0.75        -0.75          -0.75
+    0.30078125     0.296875       0.296875
+   0.100097656      0.09375        0.09375
+  -0.100097656     -0.09375       -0.09375
+        0.0625       0.0625         0.0625
+  0.0300292969      0.03125        0.03125
+     1.9921875     1.984375       1.984375
+          -1.5         -1.5           -1.5
+   0.200195312     0.203125       0.203125
+0.000999450684            0              0
+[4583] 3.3 seconds (1.4 KHz)</code></pre>
+  <p>Every difference is an exact tie. 1.0078125 has <code>Man = 129</code> at <code>Shift = 0</code>: the exact magnitude is 64.5, and ties-to-even picks 64 (1.0) while ties-away picks 65 (1.015625). 0.0078125 = 2<sup>&minus;7</sup> sits exactly 7 binades below the max: the exact magnitude is 0.5, so the host gives 0 and the device gives 1 &times; 2<sup>&minus;6</sup>, doubling the value. 1.9921875 saturates to 1.984375 on both. The figure's quantizer reproduces all 16 values in both modes.</p>
+  <h3>The double rounding you get by default</h3>
+  <p>There is a second packer configuration, and it is the default. Kernels have a <code>bfp8_pack_precise</code> flag that is <code>false</code> unless an op sets it (<code>tt_metal/api/tt-metalium/kernel_types.hpp:111</code>). When it is false, the JIT build picks <code>Bfp8_b</code> as the packer's intermediate format (<code>tt_metal/jit_build/data_format.cpp:329-334</code>), which the ISA describes as an early rounding "To E8M6" (BF16 with 6 mantissa bits) before the BFP conversion (<code>Packers/FormatConversion.md:14,188</code>). <code>typecast</code> to BFP8_b sets the flag to <code>true</code> (<code>ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp:42</code>; only for BFP8_b, not BFP4_b); ordinary ops such as <code>ttnn.add</code> do not. I ran a second probe, <code>sim-labs/workbench/py/bfp8_double.py</code>, that sends the same values through both (output rearranged into columns; identical on <code>wh</code> and <code>bh</code>):</p>
+<pre><code>         input  typecast (precise)  add(x, 0, dtype=bfloat8_b)  (default)
+             1  1                   1
+    0.50390625  0.5                 0.5
+     0.5078125  0.515625            0.5
+     1.9921875  1.98438             2
+    0.30078125  0.296875            0.3125
+  0.2001953125  0.203125            0.1875
+         -0.75  -0.75               -0.75
+     0.0078125  0.015625            0
+[5325] 3.2 seconds (1.7 KHz)</code></pre>
+  <p>The interesting line is 1.9921875. In E8M6 it rounds up to 2.0, which raises the block's shared exponent by one. Every other value in the block then loses a bit, which is why 0.30078125 and 0.2001953125 move further from their true values. Pick "device packer, default" in the figure to reproduce this column. For BFP4_b and BFP2_b the device always rounds to BFP8 first and then truncates (<code>Packers/FormatConversion.md:71</code>). The host instead rounds straight to 3 or 1 bits, so host and device differ much more often for those formats. The figure's self-check includes a BFP4_b run (<code>sim-labs/workbench/py/bfp4_probe.py</code>).</p>
+  <div class="callout sim">Reproduce these runs and go further, with Dst dumps, BF16 and FP32 behaviour, and a custom SFPI kernel, in <a href="../sim-labs/b08-formats-and-sfpu.html">B08: Data formats and SFPU numerics</a>. ttsim is bit-exact for these conversions, so a mismatch between your model and ttsim is a real finding. One limit: ttsim rejects stochastic rounding as out of scope (<code>src/tensix.cpp:598-603</code>), so you cannot simulate that mode.</div>
+
+  <h2 id="lineage">A family tree: HBFP, MSFP and OCP MX</h2>
+  <p>Shared exponents are much older than deep learning. The MSFP paper itself notes that using them to get "a precision approaching floating point while using a fixed-point processor" is "not new in computer architecture". The deep-learning branch of the family tree looks like this:</p>
+  <ul>
+    <li><b>HBFP</b> (Drumond et al., NeurIPS 2018) trained DNNs with "hybrid block floating point": block floating point for the dot products, ordinary floating point for everything else.</li>
+    <li><b>MSFP</b> (Rouhani et al., NeurIPS 2020, Microsoft) is nearly the same format as Tenstorrent's. Its paper defines a "bounding box" of values sharing the <em>maximum</em> exponent, an 8-bit shared exponent, a sign-magnitude mantissa with no implicit leading bit, and a default box size of 16. MSFP<i>N</i> is named by the sum of the sign, mantissa and shared-exponent widths, so MSFP16 (1 + 7 + 8) has the shape of BFP8_b and MSFP12 (1 + 3 + 8) the shape of BFP4_b. The paper reports MSFP16 at "3&times; lower cost compared to Bfloat16".</li>
+    <li><b>OCP Microscaling (MX)</b> (v1.0, September 2023, from AMD, Arm, Intel, Meta, Microsoft, NVIDIA and Qualcomm) standardizes the idea with two changes. The block is 32 elements, with an <code>E8M0</code> scale (a pure 8-bit power of two). And each element can be a tiny float with its own small exponent, not just a fixed-point magnitude: MXFP8 (E4M3 or E5M2), MXFP6 (E2M3 or E3M2), MXFP4 (E2M1), and MXINT8, which is the closest relative of BFP8.</li>
+  </ul>
+  <p>The tt-metal enum already lists MX formats (<code>MxFp8R</code>, <code>MxFp8P</code>, <code>MxFp6R</code>, <code>MxFp6P</code>, <code>MxFp4</code>, <code>MxInt8</code>, <code>MxInt4</code>, <code>MxInt2</code>), each with a tile size of "32 scales (1 per 32-elem block)" plus data, for example 1056 bytes for <code>MxInt8</code> (<code>tt_backend_api_types.hpp:130-137</code>). These are for the next-generation Quasar core: the Quasar LLK packer handles them (<code>tt_metal/tt-llk/tt_llk_quasar/common/inc/cpack_common.h:76-80</code>), while the Blackhole JIT code notes "MX formats are absent from the Blackhole DataFormat enum" (<code>tt_metal/hw/ckernels/blackhole/metal/llk_api/data_format_derive.h:32-33</code>). On Wormhole and Blackhole, the block formats are BFP8/4/2.</p>
+  <div class="callout gpu">GPUs mostly reached narrow formats from the other direction: FP16, then FP8 with a per-tensor scale. The MX paper argues that per-tensor scaling "has been shown to be insufficient [...] for sub-8-bit formats", and that fine-grained per-block scales are what make those formats work. Tenstorrent's BFP formats have had per-16-value scales from the start, and they are a storage format for whole tensors, so they save DRAM bandwidth as well as compute.</div>
+
+  <h2 id="pcc">Measuring correctness: PCC and tolerances</h2>
+  <p>If a BFP8 matmul cannot match an FP32 reference exactly, what should a test check? Tenstorrent's tests overwhelmingly use the <b>Pearson correlation coefficient</b> (PCC) between the device result and a PyTorch "golden":</p>
+  <p style="text-align:center"><code>PCC = &Sigma;(g&minus;&#x1E21;)(c&minus;c&#x0304;) / &radic;( &Sigma;(g&minus;&#x1E21;)&sup2; &middot; &Sigma;(c&minus;c&#x0304;)&sup2; )</code></p>
+  <div class="filename">tt-metal/ttnn/ttnn/comparison.py:137-143, 151 @7aad8aac</div>
+<pre><code>n = golden.numel()
+g_centered = golden - (golden.sum(dtype=torch.float64) / n).to(golden.dtype)
+c_centered = calculated - (calculated.sum(dtype=torch.float64) / n).to(calculated.dtype)
+cov = (g_centered * c_centered).sum(dtype=torch.float64)
+g_sq_sum = g_centered.pow(2).sum(dtype=torch.float64)
+c_sq_sum = c_centered.pow(2).sum(dtype=torch.float64)
+denom = torch.sqrt(g_sq_sum * c_sq_sum)
+...
+cal_pcc = (cov / denom).item()</code></pre>
+  <p>PCC is 1.0 for a perfect match and falls as the error grows relative to the spread of the data. It does not care about the overall scale of the tensor, and it does not need a hand-picked absolute tolerance. That is why one threshold can serve a whole sweep of tensor shapes.</p>
+  <p>Because the error is set by the format, so is the threshold. Real tests say it outright:</p>
+  <div class="filename">tt-metal/tests/ttnn/unit_tests/operations/matmul/test_addmm.py:621 @7aad8aac</div>
+<pre><code>assert_with_pcc(torch_output_tensor, out_tensor, pcc=0.999 if dtype == ttnn.bfloat8_b else 0.9999)</code></pre>
+  <div class="filename">tt-metal/tests/ttnn/unit_tests/operations/eltwise/test_binary_fp32.py:833 @7aad8aac</div>
+<pre><code>@pytest.mark.parametrize("ttnn_dtype, pcc", [(ttnn.bfloat8_b, 0.999), (ttnn.bfloat4_b, 0.97)])</code></pre>
+  <p>The pattern, roughly: BF16 tests expect four nines, BFP8_b three, and BFP4_b somewhere between 0.9 and 0.98, depending on the op. Softmax with BFP8 input relaxes PCC to 0.99 and loosens <code>rtol</code>/<code>atol</code> too (<code>tests/ttnn/unit_tests/operations/fused/test_softmax.py:1178-1180</code>). Even the allclose fallback in <code>comp_pcc</code> scales with the format: for BF16 or FP16 tensors it widens the relative tolerance to 4 units of the format's epsilon, <code>max(rtol, 4 * max(sixteen_bit_eps))</code> (<code>comparison.py:78-83</code>), because "a result one ULP from the golden" would otherwise fail.</p>
+  <p>Even a plain BF16 add is not bit-identical to PyTorch. Running the workbench's 32&times;32 <code>ttnn.add</code> script on the simulated Wormhole gave:</p>
+  <div class="filename">refs/sim-runs/ttnn/ttnn_add.py, run on ttsim (wh), output trimmed</div>
+<pre><code>max abs diff: 0.0078125
+elements differing from torch bf16 add: 120/1024 (bf16 rounding differences, max 1 ulp expected)
+PCC: 0.999983
+PASS</code></pre>
+  <div class="callout warn"><b>PCC is blind to some bugs.</b> It is invariant to scale and offset: a result that is exactly 2&times; the golden, or golden + 5, has PCC 1.0. And as the BFP figure showed, one large value can hold PCC above 0.9999 while fifteen others are zero. Pair PCC with a check that does see magnitude (max absolute error, <code>allclose</code>, or a comparison of norms), and look at regions as well as the whole tensor. A slice of all-zero rows hidden in a large tensor barely moves the global PCC.</div>
+  <p>How do you pick a format, then? A reasonable default: keep activations in BF16, try weights in BFP8_b (half the DRAM traffic, and weights tend to have well-behaved magnitudes within a face row), and measure the model-level metric, not only per-op PCC. BFP4_b is for weights that tolerate it, usually after checking accuracy end to end. <a href="a06-matrix-engine.html">A06</a> adds the other dial, math fidelity: BFP8 operands need only 2 multiplier phases for full precision where BF16 needs 4 (<code>SrcASrcB.md:110-115</code>), so the narrower format is cheaper to compute as well as to move.</p>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A <b>tile</b> is 32&times;32 values stored contiguously, one page in CBs and DRAM. Inside, four <b>16&times;16 faces</b> are stored in order 0 (top-left), 1 (top-right), 2 (bottom-left), 3 (bottom-right), each row-major. Offset = <code>face&times;256 + (r mod 16)&times;16 + (c mod 16)</code>.</li>
+    <li>Faces exist because <code>SrcA</code>/<code>SrcB</code> are 16 wide and one bank of 64&times;16 holds exactly one tile. Tile layout pads both trailing dims to multiples of 32; a 3&times;5 tensor costs a whole tile.</li>
+    <li>FP32 (1/8/23), TF32 (1/8/10), BF16 (1/8/7) and FP16 (1/5/10). Source registers are 19 bits: TF32, BF16 or FP16. The unpacker truncates FP32 to TF32 or BF16. Full FP32 lives only in <code>Dst</code> and the SFPU. <code>Dst</code> stores BF16 with a byte shuffle that software never sees.</li>
+    <li>The FPU is not IEEE at the edges: denormals are zero, exponent 255 is a normal number for FP32/BF16, and FP16 has no NaN.</li>
+    <li><b>BFP8_b/4_b/2_b</b>: 16 values (one face row) share an 8-bit exponent; each value is a sign plus a 7/3/1-bit magnitude with an explicit leading 1. Tiles are 1088/576/320 bytes (64 exponent bytes plus data). Unpacking to BF16 is lossless.</li>
+    <li>Quantizing: take the max exponent, shift, round, and clamp on overflow (no renormalization). The host rounds ties to even; the device packer rounds ties away from zero; with the default <code>bfp8_pack_precise=false</code> it also rounds to E8M6 first. Values 8 or more binades below the block's maximum become 0.</li>
+    <li>The idea runs HBFP &rarr; MSFP (16-value boxes, 8-bit shared exponent; MSFP16 has the shape of BFP8) &rarr; OCP MX (32-value blocks, E8M0 scale, small-float elements), which tt-metal lists for Quasar.</li>
+    <li>Correctness is measured with PCC against a golden, with thresholds that loosen as the format narrows (about 0.9999 for BF16, 0.999 for BFP8_b, 0.97 for BFP4_b). PCC misses scale errors and can hide localized collapse, so pair it with a magnitude check.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A BF16 tensor is 33&times;33. How many tiles and bytes does it take in tile layout, and what fraction is useful?</summary>
+    <p>Both dimensions round up to 64, so it is 2&times;2 = 4 tiles &times; 2048 B = 8192 B. Useful elements: 33&times;33 = 1089 of 4096, about 27%. One extra row and column beyond 32 cost three extra tiles. This is why shapes that are multiples of 32 matter.</p></details>
+  <details class="quiz"><summary>2. Within one tile, where is element (row 17, column 3) in tile order, and where would it be in row-major order?</summary>
+    <p>Row 17 &ge; 16 and column 3 &lt; 16, so it is in face 2 (bottom-left). Offset = 2&times;256 + (17&minus;16)&times;16 + 3 = 531. In row-major order it would be 17&times;32 + 3 = 547. Same tile, different position: any code that indexes a tiled buffer as if it were row-major silently reads the wrong values.</p></details>
+  <details class="quiz"><summary>3. Why is BFP8_b &rarr; BF16 lossless, while BF16 &rarr; BFP8_b is not?</summary>
+    <p>A BFP8 value is at most a 7-bit magnitude times a power of two. After normalizing, at most 6 bits remain after the leading 1, and BF16 has 7 mantissa bits and the same 8-bit exponent, so every BFP8 value is exactly representable. Going the other way, BF16 has 8 significant bits (with the hidden 1) and its own exponent. BFP8 keeps at most 7 significant bits even for the block's largest value, and one fewer for every binade a value sits below the maximum.</p></details>
+  <details class="quiz"><summary>4. A face row holds 1000.0 and fifteen values between 1 and 2. What does BFP8_b store for the fifteen?</summary>
+    <p>1000 is in [512, 1024), exponent byte 127 + 9 = 136. Values in [1, 2) have exponent 127, so Shift = 9. The packer computes a magnitude only when Shift &lt; 8, so all fifteen become exactly 0. (With the host converter the shifted mantissa also rounds to 0.) Only that one face row is affected; the tile's other 63 rows have their own exponents.</p></details>
+  <details class="quiz"><summary>5. Your op passes with PCC 0.99998 in BF16 but gives 0.9985 with BFP8_b inputs. Is that a bug?</summary>
+    <p>Not by itself. tt-metal's own tests use 0.999 for BFP8_b where BF16 uses 0.9999 (for example <code>test_addmm.py:621</code>), because BFP8 keeps at most 7 bits per value relative to a shared exponent. Check the result against a magnitude-aware metric too, and look for face rows with outliers. If the PCC drop is concentrated in a few rows, it is the format's behaviour, not a kernel bug, and the fix is a wider format for that tensor.</p></details>
+  <details class="quiz"><summary>6. Why does the device packer write +0 when a negative value rounds to a magnitude of zero?</summary>
+    <p>Because the byte <code>0x80</code> (sign 1, magnitude 0) does not mean &minus;0 in BFP8. It decodes to BF16 <code>0xFF80</code>, "&minus;2<sup>128</sup> or &minus;Infinity" (<code>FloatBitPatterns.md:99</code>). Writing it would turn a tiny negative number into &minus;infinity. The reference code says so: <code>BFP8[i] = Mag ? ((Sign &lt;&lt; 7) | Mag) : 0; // Never 0x80</code>, and the host converter likewise adds the sign "only if result is not 0".</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_layouts/tensor_layouts.md">tt-metal tech report: Tensor and Memory Layouts</a>, row-major vs tiled pages, faces and tile shapes.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/data_formats/data_formats.md">tt-metal tech report: Data Formats</a>, diagrams of BF16 &rarr; BFP conversion and the host rounding rules.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/FloatBitPatterns.md">ISA: Floating-point bit patterns</a>, how the FPU and SFPU interpret every FP32/TF32/BF16/FP16/BFP bit pattern.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Packers/FormatConversion.md">ISA: Packer format conversion</a>, early and late conversions, E8M6, and the reference BF16 &rarr; BFP8 code.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md">ISA: SrcA and SrcB</a>, the 19-bit source registers, their data types and fidelity phases.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Dst.md">ISA: Dst</a>, the 16/32-bit accumulator views and the BF16 encode/decode helpers.</li>
+    <li><a href="https://arxiv.org/abs/1804.01526">Drumond et al., "Training DNNs with Hybrid Block Floating Point" (2018)</a>, HBFP, the early DNN-training case for shared exponents.</li>
+    <li><a href="https://proceedings.neurips.cc/paper/2020/hash/747e32ab0fea7fbd2ad9ec03daa3f840-Abstract.html">Rouhani et al., "Pushing the Limits of Narrow Precision Inferencing at Cloud Scale with Microsoft Floating Point" (NeurIPS 2020)</a>, MSFP, with bounding boxes of 16 values.</li>
+    <li><a href="https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf">OCP Microscaling Formats (MX) Specification v1.0</a>, the industry standard for 32-element blocks with E8M0 scales.</li>
+    <li><a href="https://arxiv.org/abs/2310.10537">Rouhani et al., "Microscaling Data Formats for Deep Learning" (2023)</a>, experimental results for MXINT8, MXFP8, MXFP6 and MXFP4.</li>
+    <li><a href="https://arxiv.org/abs/1905.12322">Kalamkar et al., "A Study of BFLOAT16 for Deep Learning Training" (2019)</a>, why 8 exponent bits and 7 mantissa bits are enough for training.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html">TT-NN docs: Tensor</a>, dtypes (<code>bfloat16</code>, <code>bfloat8_b</code>, <code>bfloat4_b</code>) and layouts from the user's side.</li>
+  </ul>
+
+  <div class="pager"><a href="a04-inside-tensix.html">&larr; 04 Inside a Tensix core</a><a class="next" href="a06-matrix-engine.html">06 The matrix engine and math fidelity &rarr;</a></div>
+</main>
+</body>
+</html>

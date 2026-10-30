@@ -73,6 +73,9 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
   `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
+- `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
+  on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
+  source `env.sh`, then run `python $W/py/bfp8_probe.py`.
 
 ## Common errors
 
