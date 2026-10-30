@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A02 · Two philosophies: GPU vs Tenstorrent · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a01-why-new-hardware.html">&larr; Prev</a>
+  <a href="a03-chip-tour.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 02</span><span class="tag">Prerequisites: A01</span>
+  <h1><span class="num">02.</span> Two philosophies: GPU vs Tenstorrent</h1>
+  <p class="subtitle">GPUs hide memory latency with thousands of threads and hardware caches. Tenstorrent instead tells every core exactly what to fetch and when. This chapter covers what each bet buys, what it costs, and why the two are slowly meeting in the middle.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#gpu">The GPU bet: many threads, hardware caches</a></li>
+      <li><a href="#systolic">A second lineage: systolic arrays and the TPU</a></li>
+      <li><a href="#dataflow">Spatial and dataflow chips, briefly</a></li>
+      <li><a href="#tt">Tenstorrent's choices</a></li>
+      <li><a href="#aha">The same matmul on both machines</a></li>
+      <li><a href="#hiding">Two ways to hide latency</a></li>
+      <li><a href="#tile">The unit of work: a 32×32 tile</a></li>
+      <li><a href="#converge">Convergence: Hopper's TMA and warp specialization</a></li>
+      <li><a href="#table">Side by side, with product names</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="question">The question</h2>
+
+  <p>Imagine you are a cook in a busy kitchen. You can work in one of two ways.</p>
+  <p>In the first, you reach for an ingredient whenever you need it. If it is on the counter, good. If not, someone runs to the storeroom while you wait. To make the counter useful, a helper watches what you reach for and keeps the most recently used things nearby, guessing that you will want them again. That helper is a <b>cache</b>.</p>
+  <p>In the second, you have the recipe in advance. Before you start, a runner fetches exactly the ingredients for the next step and puts them on your counter, while you are still busy with the current step. Nobody guesses. The counter holds what the recipe says it should, and nothing else. That counter is a <b>scratchpad</b>, and the runner is a <b>DMA engine</b>.</p>
+  <p>Neural-network math is unusual among programs because we almost always have the recipe. A matrix multiply touches its inputs in an order that is fixed before the first multiply happens. That leads to this chapter's question:</p>
+
+  <div class="callout key">If you knew exactly which data each core needs next, would you still want a cache?</div>
+
+  <p>Before answering, watch what a cache does with a pattern it cannot predict well. The figure below plays one simple, very common pattern: a loop that touches the same <i>n</i> tiles over and over, with only 4 slots of fast memory. The top row is a cache with least-recently-used (LRU) replacement, the textbook policy. The bottom row is a program that knows the loop and decides in advance what to keep.</p>
+
+  <div class="viz" id="figLoop"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figLoop");
+    var g = TT.canvas(root, 920, 330), ctx = g.ctx, C = TT.C;
+    var CAP = 4, ROUNDS = 3;
+    function seqFor(n) { var s = []; for (var r = 0; r < ROUNDS; r++) for (var x = 0; x < n; x++) s.push(x); return s; }
+    // LRU with fixed slot positions (victim = least recently used slot)
+    function runLRU(seq, upto) {
+      var slots = [], used = [], hits = [], miss = 0;
+      for (var a = 0; a < upto; a++) {
+        var x = seq[a], p = slots.indexOf(x);
+        if (p >= 0) { used[p] = a; hits.push(true); continue; }
+        miss++; hits.push(false);
+        if (slots.length < CAP) { slots.push(x); used.push(a); }
+        else { var v = 0; for (var s = 1; s < CAP; s++) if (used[s] < used[v]) v = s; slots[v] = x; used[v] = a; }
+      }
+      return { slots: slots, hits: hits, miss: miss };
+    }
+    // Planned: if everything fits, keep everything. Otherwise pin the first CAP-1 tiles
+    // of the loop and stream the rest through one slot.
+    function runPlan(seq, n, upto) {
+      var slots = [], hits = [], miss = 0, stream = -1;
+      for (var a = 0; a < upto; a++) {
+        var x = seq[a];
+        if (n <= CAP || x < CAP - 1) {
+          if (slots.indexOf(x) >= 0) { hits.push(true); continue; }
+          miss++; hits.push(false); slots.push(x); continue;
+        }
+        if (stream === x) { hits.push(true); continue; }
+        miss++; hits.push(false); stream = x;
+      }
+      var shown = slots.slice();
+      if (n > CAP) { while (shown.length < CAP - 1) shown.push(null); shown.push(stream < 0 ? null : stream); }
+      return { slots: shown, hits: hits, miss: miss };
+    }
+    var ns = [4, 5, 8, 8];
+    var steps = [
+      { dur: 3.0, text: "<b>The loop fits.</b> The loop touches tiles 0,1,2,3 three times and there are 4 slots. Both sides miss 4 times (the cold start), then hit every time. When the working set fits, a cache is excellent and needs no planning at all." },
+      { dur: 3.5, text: "<b>One tile too many.</b> Now the loop touches 5 tiles with 4 slots. LRU always evicts the tile that will be needed <i>soonest</i>, so <b>every</b> access misses: 15 out of 15. The planned side keeps tiles 0–2 pinned and streams 3 and 4 through the last slot, so it misses 5 + 2 + 2 = 9 times." },
+      { dur: 4.0, text: "<b>Twice the slots' worth.</b> With 8 tiles, LRU still misses all 24 accesses. The planned side misses 8 + 5 + 5 = 18. Knowing the order lets software choose what to keep. A cache has to infer the order from the past, and for cyclic patterns the past is a bad guide." },
+      { dur: 1.0, text: "<b>Fair caveats.</b> Real caches are not pure LRU, and real GPU kernels do not rely on the cache for this pattern: they stage tiles into <i>shared memory</i>, which is a scratchpad. The point is narrower. When the access pattern is known, the hardware spent on guessing (tags, comparators, replacement logic) buys nothing that the program could not have decided itself." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var n = ns[i], seq = seqFor(n), L = seq.length;
+        var upto = Math.round(t * L); if (i === 3) upto = L;
+        var lanes = [{ name: "Cache (LRU)", res: runLRU(seq, upto), y: 30, col: C.red },
+                     { name: "Planned scratchpad", res: runPlan(seq, n, upto), y: 185, col: C.green }];
+        lanes.forEach(function (ln, li) {
+          TT.text(ctx, ln.name, 20, ln.y, { color: li ? C.green : C.blue, font: "bold 15px" });
+          TT.text(ctx, "4 fast slots", 20, ln.y + 22, { color: C.muted, font: "12px" });
+          for (var s = 0; s < CAP; s++) {
+            var v = ln.res.slots[s];
+            var lab = (li === 1 && n > CAP) ? (s < CAP - 1 ? "kept" : "stream") : "";
+            TT.box(ctx, 20 + s * 52, ln.y + 38, 46, 40, { fill: C.bg3, stroke: C.border, label: v == null ? "" : String(v), font: "bold 16px", mono: true });
+            if (lab) TT.text(ctx, lab, 43 + s * 52, ln.y + 92, { color: C.muted, font: "11px", align: "center" });
+          }
+          // access strip
+          var x0 = 250, w = Math.min(34, (900 - x0) / L), bw = w - 4;
+          for (var a = 0; a < L; a++) {
+            var done = a < upto, fill = C.bg3, al = 1;
+            if (done) fill = ln.res.hits[a] ? C.green : C.red;
+            TT.box(ctx, x0 + a * w, ln.y + 38, bw, 40, { fill: fill, alpha: done ? 0.55 : 1, stroke: (a === upto - 1) ? C.yellow : C.border, lw: (a === upto - 1) ? 2.5 : 1, r: 3, label: String(seq[a]), font: "13px", mono: true });
+            if (done) TT.text(ctx, ln.res.hits[a] ? "H" : "M", x0 + a * w + bw / 2, ln.y + 92, { color: ln.res.hits[a] ? C.green : C.red, font: "11px", align: "center" });
+          }
+          TT.text(ctx, "DRAM trips (misses): " + ln.res.miss + " / " + upto + " accesses", x0, ln.y + 118, { color: C.fg, font: "14px" });
+        });
+        TT.text(ctx, "loop over " + n + " tiles, " + ROUNDS + " rounds, " + CAP + " slots", 900, 14, { color: C.muted, font: "12px", align: "right" });
+      }
+    });
+  })();
+  </script>
+
+  <p>So the answer to the opening question is mostly <i>no</i>, with two qualifications. First, a cache is a fine thing to have when you <i>don't</i> know the pattern, and much code is like that. Second, knowing the pattern is not enough: someone also has to issue the fetches early enough that the math never waits. The rest of this chapter is about how GPUs and Tenstorrent each deal with that second problem.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="gpu">The GPU bet: many threads, hardware caches</h2>
+
+  <p>A GPU began as a machine for shading millions of pixels, each computed by the same small program. NVIDIA's programming model still reflects that. You launch a <b>kernel</b> with a huge number of threads, often millions. Threads are grouped into <b>thread blocks</b>, and each block runs on one <b>streaming multiprocessor (SM)</b>. Inside the SM, threads are grouped in 32s called <b>warps</b>. All 32 threads of a warp execute the same instruction at the same time on different data. NVIDIA calls this <b>SIMT</b>, single instruction multiple threads. If threads in a warp take different branches, the inactive ones are masked off while the others run, so divergent code wastes lanes (CUDA Programming Guide §1.2.2.2).</p>
+
+  <h3>Hiding latency by having something else to do</h3>
+  <p>The defining trick is how a GPU copes with slow memory. Suppose a warp issues a load from DRAM and must wait many cycles for the answer. A CPU would try to predict, prefetch and reorder around the wait. A GPU instead keeps <i>many</i> warps resident on each SM at once, each with its own registers already allocated, and when one warp stalls the scheduler simply issues an instruction from another warp that is ready. Switching costs nothing because nothing has to be saved: every resident warp's registers live in the SM's large register file all the time. A microbenchmarking study of the Graphcore IPU sums up the GPU approach as hiding latency through "oversubscription of threads to cores and the ability to inexpensively switch among threads" (Jia et al., 2019, §1.2).</p>
+  <p>The numbers for an <b>H100 SXM5</b> show how seriously NVIDIA takes this (Hopper architecture blog, compute-capability table):</p>
+  <ul>
+    <li>132 SMs, each with 4 fourth-generation Tensor Cores (528 in total) and 128 FP32 lanes.</li>
+    <li>Up to <b>64 warps</b> (2,048 threads) resident per SM.</li>
+    <li><b>65,536 32-bit registers</b> per SM: a 256 KB register file per SM, about 33 MB across the chip. That is as big as the L1 storage, because it is what makes free warp switching possible.</li>
+  </ul>
+
+  <h3>The memory hierarchy</h3>
+  <p>Below the registers, the H100 SXM5 has (same sources):</p>
+  <ul>
+    <li><b>256 KB per SM of combined L1 data cache and shared memory.</b> The split is configurable, with up to 228 KB usable as <i>shared memory</i>.</li>
+    <li><b>50 MB of L2 cache</b> shared by all SMs.</li>
+    <li><b>80 GB of HBM3</b>. NVIDIA's product page gives 3.35 TB/s. The earlier architecture blog says "over 3 TB/s" and lists 3,000 GB/s as not yet final.</li>
+  </ul>
+  <p>Two of these deserve a closer look:</p>
+  <ul>
+    <li><b>The L1 and L2 caches</b> are what the cook's helper was: hardware that keeps recently used lines nearby without the program asking. They make ordinary code fast with no effort from the programmer.</li>
+    <li><b>Shared memory</b> is the opposite: a programmer-managed scratchpad that threads in a block explicitly fill and read. Every fast GPU matrix multiply (cuBLAS, CUTLASS and hand-written kernels) loads tiles of A and B from global memory into shared memory, synchronizes, computes from shared memory, and repeats. So GPUs already have the scratchpad idea. It sits beside the caches rather than replacing them.</li>
+  </ul>
+
+  <div class="callout gpu">Keep this in mind for the rest of the chapter: <b>a well-tuned GPU GEMM is already a software-managed, explicitly staged program.</b> The difference with Tenstorrent is not that one side can plan and the other cannot. It is about what the hardware is <i>built around</i>. A GPU spends silicon on caches, a huge register file and warp schedulers so that <i>unplanned</i> code also runs well. Tenstorrent spends almost nothing on caches (only tiny per-core instruction caches) and asks every program to plan.</div>
+
+  <p>The GPU's peak dense BF16 Tensor Core throughput on an H100 SXM is about <b>989 TFLOPS</b>. NVIDIA's product page lists 1,979 TFLOPS "with sparsity", and the dense figure is half that; the earlier architecture blog gave a preliminary 1,000. Its board power is up to 700 W. As chapter A01 showed, 989 TFLOPS over 3.35 TB/s gives a ridge point of roughly 295 FLOP per byte. Any kernel below that intensity is waiting for HBM, however many warps it has.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="systolic">A second lineage: systolic arrays and the TPU</h2>
+
+  <p>In 1982, H. T. Kung asked how a special-purpose chip could compute faster than its memory could feed it. His answer was the <b>systolic array</b>: a grid of simple cells through which data "pulses" rhythmically, "much as blood circulates to and from the heart". The point is reuse: "once a data item is brought out from the memory it can be used effectively at each cell it passes while being 'pumped' from cell to cell" (Kung, <i>Why Systolic Architectures?</i>, IEEE Computer 1982). Kung's paper even names matrix multiplication as the archetypal compute-bound problem, since "every entry in a matrix is multiplied by all entries in some row or column".</p>
+  <p>Think of a bucket brigade instead of a crowd running back and forth to the well. Each bucket is fetched once and then passed hand to hand, and every hand uses it.</p>
+  <p>Google's first <b>TPU</b> (Jouppi et al., ISCA 2017) put that idea into a datacenter chip:</p>
+  <ul>
+    <li><b>A 256 × 256 systolic matrix unit</b>: 65,536 8-bit multiply-accumulators, 92 TOPS peak.</li>
+    <li><b>A 28 MiB software-managed on-chip memory</b>, with no cache.</li>
+  </ul>
+  <p>The paper's abstract makes an argument this chapter will keep returning to:</p>
+  <blockquote>The TPU's deterministic execution model is a better match to the 99th-percentile response-time requirement of our NN applications than are the time-varying optimizations of CPUs and GPUs (caches, out-of-order execution, multithreading, multiprocessing, prefetching, …) that help average throughput more than guaranteed latency.</blockquote>
+  <p>The paper reports the TPU as about 15–30× faster than a contemporary K80 GPU or Haswell CPU on Google's inference workloads, with 30–80× better TOPS per watt. Those comparisons are against 2015-era parts, so read them as evidence for the <i>idea</i> rather than as a ranking against today's GPUs.</p>
+  <div class="callout warn">The analogy breaks here: a Tenstorrent core is <b>not</b> a systolic array. Its matrix engine computes on small register files (SrcA, SrcB, Dst; chapter A06), not on a large pulsing grid of cells. What Tenstorrent inherits from this lineage is the <i>memory</i> philosophy (software-managed SRAM, no caches, predictable timing), not the systolic datapath.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="dataflow">Spatial and dataflow chips, briefly</h2>
+
+  <p>A third family spreads both memory and compute across the die and moves data between many small units. They differ in who decides when data moves:</p>
+  <ul>
+    <li><b>Graphcore IPU (GC2).</b> 1,216 tiles, each one core plus 256 KiB of local SRAM, 304 MiB in total. "Except for the register file, the IPU offers no memory other than the distributed memories local to each tile." The memories are scratchpads, not caches. Execution follows the <i>bulk synchronous parallel</i> model: every tile computes on local data, then all tiles exchange data, then all synchronize (Jia et al., <i>Dissecting the Graphcore IPU</i>, 2019).</li>
+    <li><b>Groq TSP.</b> Taken furthest towards determinism. Groq's Hot Chips 34 talk lists "no 'reactive components' like arbiters, crossbars, replay mechanisms, caches", 220 MB of on-chip SRAM, and a compiler that does "cycle-accurate instruction scheduling", so it "knows the exact location of every tensor on-chip" at every cycle. Peak is about 750 INT8 TOPS at 900 MHz.</li>
+    <li><b>Cerebras WSE (first generation).</b> Taken furthest in size: a whole wafer with 400,000 cores, 18 GB of on-chip memory "fully distributed along with compute datapaths", and "dataflow scheduling in hardware" that is "triggered by data" and filters out zeros (Cerebras, Hot Chips 31).</li>
+  </ul>
+  <p>All three agree with the TPU on one thing: <b>large SRAM, no cache</b>, with software deciding where data lives. Tenstorrent belongs to this family, but with its own mix of choices.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="tt">Tenstorrent's choices</h2>
+
+  <p>A Tenstorrent chip is a 2D grid of tiles connected by a network-on-chip. Most tiles are <b>Tensix cores</b>; others hold DRAM controllers, Ethernet, PCIe and management. The Wormhole ASIC has 80 Tensix tiles (products expose 64, 72 or 80). Blackhole has 140 on the die (tt-isa-documentation <code>WormholeB0/README.md:4</code>, <code>BlackholeA0/README.md:4</code>). Chapter A03 explains why sold products enable fewer. Here are the design choices, each with the evidence for it.</p>
+
+  <h3>1. A grid of independent cores, not a pool of threads</h3>
+  <p>Each Tensix runs its own programs. There is no warp scheduler and no hardware multithreading. The tt-metal guide's section for GPU experts says it plainly: each baby RISC-V core "implements single-threaded execution without hardware multithreading capabilities", and the design "omits SIMT … as well as traditional latency-hiding mechanisms" (<code>METALIUM_GUIDE.md:239-248</code>). The usual programming style is still SPMD (the same kernel on many cores with different arguments), but the cores are not in lockstep (<code>METALIUM_GUIDE.md:64</code>).</p>
+
+  <h3>2. About 1.5 MB of software-managed SRAM per core</h3>
+  <p>Each Tensix has 1464 KiB (Wormhole) or 1536 KiB (Blackhole) of SRAM called "L1". The ISA documentation warns that the name "is somewhat of a misnomer, as it is suggestive of a hardware-managed cache, which is not the case — this is plain RAM" (<code>WormholeB0/TensixTile/L1.md:3</code>). On a Blackhole card with 120 enabled cores, that adds up to the 180 MB quoted on docs.tenstorrent.com. Compare that with an H100's 50 MB of L2 plus 132 × 256 KB of L1/shared memory. Tenstorrent has more SRAM but no data cache in front of it.</p>
+
+  <h3>3. Explicit data movement over two NoCs</h3>
+  <p>A Tensix cannot load from DRAM. There is no load instruction that reaches it. Instead its cores ask a <b>NoC interface</b> to copy bytes between its own L1 and some other tile's memory (DRAM or another Tensix). Each chip has <b>two</b> NoCs. Each is a 2D torus, and they run in opposite directions (<code>WormholeB0/NoC/README.md:5-9</code>). The guide describes the absence of caches as deliberate: SRAM "functions as addressable memory rather than transparent cache. Data movement requires explicit operations … This explicit model eliminates cache coherency protocols and provides predictable memory access latency, but places responsibility on developers" (<code>METALIUM_GUIDE.md:233-237</code>). Chapter A08 covers why there are two networks.</p>
+
+  <h3>4. Small RISC-V cores for control, separate engines for math</h3>
+  <p>Each Tensix contains five "baby" RV32IM cores, two NoC connections, unpackers, a matrix unit (FPU), a vector unit (SFPU) and packers (<code>WormholeB0/TensixTile/README.md:4-14</code>). The RISC-V cores do not do the heavy math. In the ISA documentation's words, they "are not intended to achieve high performance on their own; they are intended to oversee the other components that <i>actually</i> drive performance". The suggested split is two cores overseeing the NoC and three overseeing the math coprocessor (<code>WormholeB0/TensixTile/README.md:16</code>). In practice this becomes three kernels per core: a <b>reader</b>, a <b>compute</b> kernel and a <b>writer</b>, linked by circular buffers in L1 (<code>METALIUM_GUIDE.md:71-86</code>). Chapter A04 opens this box. Blackhole adds 16 SiFive x280 "big" RISC-V cores, which can run Linux, in four L2CPU tiles (<code>BlackholeA0/README.md:6</code>).</p>
+
+  <h3>5. Ethernet on the die for scale-out</h3>
+  <p>Instead of NVLink-style links plus a switch, each chip has Ethernet tiles, so chips connect directly to each other:</p>
+  <ul>
+    <li><b>Wormhole:</b> 16 Ethernet tiles at 100 GbE each (<code>WormholeB0/README.md:6</code>).</li>
+    <li><b>Blackhole:</b> 14 tiles at 400 GbE, paired into 800 GbE QSFP-DD ports; a p150 wires up four ports (<code>BlackholeA0/README.md:7</code>).</li>
+  </ul>
+  <p>The chips "have sufficient NoC bandwidth and processing capability to function as network switches themselves" (<code>METALIUM_GUIDE.md:260</code>). Chapter A21 covers meshes and TT-Fabric.</p>
+
+  <h3>6. Open source</h3>
+  <p>The TT-Metalium SDK and the ttsim simulator are both Apache-2.0 (the <code>LICENSE</code> files in both repositories at the pinned commits), and the ISA is documented publicly in <code>tt-isa-documentation</code>. That openness is why this series can show you real kernel code, the instructions it compiles to, and a simulator that runs them. NVIDIA's CUDA toolkit and GPU ISA are proprietary, although many NVIDIA libraries, CUTLASS among them, are open source.</p>
+
+  <h3>7. The original thesis: conditional execution</h3>
+  <p>Tenstorrent's founding pitch was not "a cheaper GPU". It was <i>dynamic</i> computation. The 2021 IEEE Micro paper <i>Compute Substrate for Software 2.0</i> (Vasiljevic, Bajic et al.) describes four approaches: block sparsity of activations, per-packet dynamic precision, conditional computation such as mixture-of-experts executed on the device rather than the host, and runtime control flow. It reports that "75% sparsity in activations (induced dynamically at runtime) results in 4x speedup on BERT layers" on Grayskull, and calls a full-model figure "work in progress", with a <i>projected</i> score.</p>
+  <div class="callout warn"><b>Treat this as design intent, not an established result.</b> These are vendor measurements and projections on the first-generation chip, and I found no independent reproduction. Today's TT-Metalium programming model, which the rest of this series teaches, is mostly dense SPMD: reader/compute/writer kernels on 32×32 tiles. Independent cores with their own control flow make conditional execution <i>possible</i>; this series does not claim it is a measured advantage.</div>
+
+  <p>Here is what explicit data movement looks like in real code. This is the reader kernel of tt-metal's single-core matmul example. It runs on one of the data-movement RISC-V cores and fetches tiles of A and B, in exactly the order the compute kernel will consume them:</p>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/kernels/dataflow/reader_single_core_mm.cpp:30-53 @7aad8aac</div>
+<pre><code>for (uint32_t mt = 0; mt &lt; Mt; mt++) {
+    uint32_t itileB = 0;
+    for (uint32_t nt = 0; nt &lt; Nt; nt++) {
+        for (uint32_t kt = 0; kt &lt; Kt; kt++) {
+            {                                          // Read A's tile at (mt, kt)
+                uint32_t a_tile_index = mt * Kt + kt;  // A is MK, so we stride by Kt
+                cb_reserve_back(cb_id_in0, 1);
+                uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
+                noc_async_read_page(a_tile_index, s0, l1_write_addr_in0);
+                noc_async_read_barrier();
+                cb_push_back(cb_id_in0, 1);
+            }
+
+            {                                          // Read B's tile at (kt, nt)
+                uint32_t b_tile_index = kt * Nt + nt;  // B is KN, so we stride by Nt
+                cb_reserve_back(cb_id_in1, 1);
+                uint32_t l1_write_addr_in1 = get_write_ptr(cb_id_in1);
+                noc_async_read_page(b_tile_index, s1, l1_write_addr_in1);
+                noc_async_read_barrier();
+                cb_push_back(cb_id_in1, 1);
+            }
+        }  // Kt loop
+    }  // Nt loop
+}  // Mt loop</code></pre>
+
+  <p>Read it as the runner in the kitchen:</p>
+  <ul>
+    <li><code>a_tile_index = mt * Kt + kt</code>: the kernel <i>computes</i> which 32×32 tile it needs next. Nothing is inferred from past accesses.</li>
+    <li><code>cb_reserve_back</code>: wait until there is a free slot in circular buffer 0, a queue in this core's L1.</li>
+    <li><code>noc_async_read_page(..., l1_write_addr_in0)</code>: ask the NoC to copy that tile from DRAM <i>into that slot</i>. This line is the DRAM trip, written out in the program.</li>
+    <li><code>noc_async_read_barrier</code>: wait until the copy has landed.</li>
+    <li><code>cb_push_back</code>: tell the compute kernel, running on other RISC-V cores, that the tile is ready.</li>
+  </ul>
+  <p>This simplest example re-reads tiles of A for every output column instead of keeping them. The blocked and multicast versions in chapters A15–A16 fix that. Because every DRAM trip is a line of code, you can count them by reading the loops, which is exactly what the next figure does.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="aha">The same matmul on both machines</h2>
+
+  <p>Take a small blocked matrix multiply measured in tiles: C (2×3 tiles) = A (2×4) × B (4×3). Each output tile <code>C[i][j]</code> is the sum over <code>k</code> of <code>A[i][k] · B[k][j]</code>. Both machines run the same loop order as the reader kernel above (<code>i</code>, then <code>j</code>, then <code>k</code>), so they make the same 48 tile accesses in the same order. Both get the same amount of fast memory. The only difference is who decides what that memory holds.</p>
+  <ul>
+    <li><b>Left: a cache machine.</b> LRU replacement. A miss is a DRAM trip, and compute stalls while it is fetched.</li>
+    <li><b>Right: a scratchpad machine.</b> The program keeps the current row of A (4 slots), streams B through 2 slots, and a reader fetches each tile one step before compute needs it.</li>
+  </ul>
+  <p>Use the buttons to change the fast-memory size.</p>
+
+  <div class="viz" id="figAha"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figAha");
+    var g = TT.canvas(root, 920, 470), ctx = g.ctx, C = TT.C;
+    var M = 2, K = 4, N = 3, LAT = 3; // LAT: illustrative stall ticks per miss
+    var cap = 6;
+    // Access sequence: i, j, k loop; each step touches A[i][k] then B[k][j]
+    var acc = [];
+    for (var i = 0; i < M; i++) for (var j = 0; j < N; j++) for (var k = 0; k < K; k++) {
+      acc.push({ m: "A", r: i, c: k, i: i, j: j }); acc.push({ m: "B", r: k, c: j, i: i, j: j });
+    }
+    var NA = acc.length; // 48
+    function key(a) { return a.m + a.r + a.c; }
+    // Planned loads: per row i, A[i][0..3] then B[k][j] in (j,k) order
+    var loads = [];
+    for (var i2 = 0; i2 < M; i2++) {
+      for (var k2 = 0; k2 < K; k2++) loads.push({ m: "A", r: i2, c: k2 });
+      for (var j2 = 0; j2 < N; j2++) for (var k3 = 0; k3 < K; k3++) loads.push({ m: "B", r: k3, c: j2 });
+    }
+    // index of the load serving access a
+    var need = acc.map(function (a) {
+      var base = a.i * (K + K * N);
+      return a.m === "A" ? base + a.c : base + K + a.j * K + a.r;
+    });
+    // slot for each load: A[i][k] -> slot k; B loads alternate between slots 4 and 5
+    var bCount = 0;
+    var loadSlot = loads.map(function (l) { return l.m === "A" ? l.c : 4 + (bCount++ % 2); });
+
+    function sim(n) {
+      // LRU cache
+      var slots = [], used = [], miss = 0, last = null;
+      for (var a = 0; a < n; a++) {
+        var x = key(acc[a]), p = slots.indexOf(x);
+        if (p >= 0) { used[p] = a; last = { hit: true, slot: p }; continue; }
+        miss++;
+        if (slots.length < cap) { slots.push(x); used.push(a); last = { hit: false, slot: slots.length - 1 }; }
+        else { var v = 0; for (var s = 1; s < cap; s++) if (used[s] < used[v]) v = s; slots[v] = x; used[v] = a; last = { hit: false, slot: v }; }
+      }
+      // planned scratchpad: prologue fills 6 slots, then the reader keeps the next access's
+      // tile loaded plus one more. Loads are never un-issued, so take the running max of need.
+      function issuedAfter(m) {
+        if (m <= 0) return 0;
+        var hi = -1;
+        for (var a2 = 0; a2 < Math.min(m + 1, NA); a2++) hi = Math.max(hi, need[a2]);
+        return Math.min(loads.length, Math.max(6, hi + 2));
+      }
+      var issued = issuedAfter(n);
+      var pslots = [];
+      for (var q = 0; q < issued; q++) pslots[loadSlot[q]] = loads[q].m + loads[q].r + loads[q].c;
+      var prevIssued = issuedAfter(n - 1);
+      return { slots: slots, miss: miss, last: last, issued: issued, newLoads: issued - prevIssued, pslots: pslots };
+    }
+
+    function drawMatrices(x0, y0, resident, cur, flash) {
+      var ts = 26;
+      function grid(name, rows, cols, gx, gy) {
+        TT.text(ctx, name, gx, gy - 10, { color: C.muted, font: "12px" });
+        for (var r = 0; r < rows; r++) for (var c = 0; c < cols; c++) {
+          var k = name[0] + r + c, isCur = cur && cur.m + cur.r + cur.c === k;
+          var inFast = resident.indexOf(k) >= 0;
+          TT.box(ctx, gx + c * (ts + 3), gy + r * (ts + 3), ts, ts, {
+            fill: isCur ? (flash ? C.red : C.yellow) : (inFast ? C.blue : C.bg3),
+            alpha: isCur ? 0.8 : (inFast ? 0.45 : 1), stroke: isCur ? C.yellow : C.border, r: 3
+          });
+        }
+      }
+      grid("A  2×4", 2, 4, x0 + 10, y0 + 18);
+      grid("B  4×3", 4, 3, x0 + 150, y0 + 18);
+      // C grid: highlight current output
+      TT.text(ctx, "C  2×3", x0 + 268, y0 + 8, { color: C.muted, font: "12px" });
+      for (var r = 0; r < 2; r++) for (var c = 0; c < 3; c++) {
+        var on = cur && cur.i === r && cur.j === c;
+        TT.box(ctx, x0 + 268 + c * (ts + 3), y0 + 18 + r * (ts + 3), ts, ts, { fill: on ? C.green : C.bg3, alpha: on ? 0.6 : 1, stroke: C.border, r: 3 });
+      }
+    }
+
+    function slotRow(x0, y0, vals, labels, highlight, hcol) {
+      for (var s = 0; s < 8; s++) {
+        var active = s < (labels ? labels.length : cap);
+        var lab = vals[s] || "";
+        TT.box(ctx, x0 + s * 52, y0, 46, 34, {
+          fill: !active ? C.bg : (s === highlight ? hcol : C.bg3), alpha: s === highlight ? 0.55 : 1,
+          stroke: active ? C.border : C.bg3, label: active ? lab : "", font: "13px", mono: true
+        });
+      }
+    }
+
+    function panel(x0, title, col, st, n, isCache) {
+      TT.text(ctx, title, x0 + 10, 18, { color: col, font: "bold 15px" });
+      var cur = n > 0 ? acc[n - 1] : null;
+      var resident = isCache ? st.slots : st.pslots.filter(Boolean);
+      var flash = isCache && st.last && !st.last.hit;
+      drawMatrices(x0, 34, resident, cur, flash);
+      TT.text(ctx, "fast memory (" + cap + " tile slots)", x0 + 10, 188, { color: C.muted, font: "12px" });
+      if (isCache) {
+        slotRow(x0 + 10, 198, st.slots, null, st.last ? st.last.slot : -1, st.last && st.last.hit ? C.green : C.red);
+      } else {
+        var labs = []; for (var s = 0; s < cap; s++) labs.push(s);
+        slotRow(x0 + 10, 198, st.pslots, labs.slice(0, cap), -1, C.green);
+        TT.text(ctx, "A row (kept)", x0 + 10 + 2 * 52, 246, { color: C.blue, font: "11px", align: "center" });
+        TT.text(ctx, "B stream", x0 + 10 + 4.5 * 52 + 23 - 23, 246, { color: C.teal, font: "11px", align: "center" });
+        if (cap > 6) TT.text(ctx, "unused by this plan", x0 + 10 + 6.5 * 52, 246, { color: C.muted, font: "11px", align: "center" });
+      }
+      // DRAM box and trip arrow
+      TT.box(ctx, x0 + 10, 300, 410, 34, { fill: C.bg2, stroke: C.border, label: "DRAM", color: C.muted });
+      var trip = isCache ? (st.last && !st.last.hit) : (st.newLoads > 0);
+      if (trip) {
+        var ts = isCache ? st.last.slot : loadSlot[st.issued - 1];
+        var ax = x0 + 10 + ts * 52 + 23;
+        TT.arrow(ctx, ax, 298, ax, 258, { color: isCache ? C.red : C.teal, lw: 3 });
+        TT.box(ctx, x0 + 10, 300, 410, 34, { stroke: isCache ? C.red : C.teal, lw: 2 });
+      }
+      // counters
+      var trips = isCache ? st.miss : st.issued;
+      TT.text(ctx, "DRAM trips", x0 + 10, 362, { color: C.muted, font: "13px" });
+      TT.text(ctx, String(trips), x0 + 10, 394, { color: isCache ? C.red : C.teal, font: "bold 30px", mono: true });
+      var hits = isCache ? n - st.miss : n;
+      TT.text(ctx, "accesses " + n + " / " + NA, x0 + 130, 362, { color: C.muted, font: "13px" });
+      TT.text(ctx, isCache ? ("compute stalled: " + st.miss * LAT + " ticks") : ("compute stalled: " + (n > 0 ? LAT : 0) + " ticks (first fill)"), x0 + 130, 384, { color: C.fg, font: "13px" });
+      TT.text(ctx, isCache ? ("hits " + hits + ", misses " + st.miss) : ("loads issued ahead of use: " + (n > 0 ? st.issued - (need[n - 1] + 1) : 0)), x0 + 130, 404, { color: C.muted, font: "12px" });
+      if (cur) {
+        var msg = isCache ? (key(cur) + (st.last.hit ? ": hit" : ": miss, go to DRAM, wait")) : (key(cur) + ": already in L1 (fetched earlier)");
+        TT.text(ctx, msg, x0 + 10, 440, { color: isCache ? (st.last.hit ? C.green : C.red) : C.teal, font: "14px", mono: true });
+      }
+    }
+
+    var ranges = [[0, 0], [0, 8], [8, 24], [24, 48], [48, 48]];
+    var steps = [
+      { dur: 1.2, text: "" }, { dur: 4.5, text: "" }, { dur: 6, text: "" }, { dur: 7, text: "" }, { dur: 1, text: "" }
+    ];
+    function setTexts() {
+      var f = sim(NA), r0 = sim(24);
+      steps[0].text = "<b>Setup.</b> Tiles of A (2×4) and B (4×3) live in DRAM. Each machine has <b>" + cap + "</b> tile slots of fast memory. Blue = resident in fast memory, yellow = being used now, green in C = the output tile being accumulated.";
+      steps[1].text = "<b>First output tile C[0][0].</b> Both sides must fetch 8 tiles: these are compulsory misses. The cache learns them one miss at a time and stalls on each. The reader on the right started early and is already one tile ahead.";
+      steps[2].text = cap === 6
+        ? "<b>Rest of row 0.</b> The loop touches 8 distinct tiles (A row + B column) but the cache holds 6, so LRU evicts A[0][0] just before it is needed again. Every access misses: <b>" + r0.miss + "</b> trips so far vs <b>" + r0.issued + "</b> on the right, where the A row is pinned on purpose."
+        : "<b>Rest of row 0.</b> With 8 slots, the A row and one B column fit, so LRU keeps the A row and the cache now hits on A. Trips so far: <b>" + r0.miss + "</b> vs <b>" + r0.issued + "</b>. The cache does fine here.";
+      steps[3].text = "<b>Row 1.</b> Each side loads the new A row and streams B again (B is 12 tiles, too big to keep).";
+      steps[4].text = cap === 6
+        ? "<b>Result with 6 slots:</b> cache <b>" + f.miss + "</b> DRAM trips and " + f.miss * LAT + " stalled ticks; scratchpad <b>" + f.issued + "</b> trips, stalled only for the first fill. Same capacity, same loop, " + (f.miss / f.issued).toFixed(1) + "× the traffic. Now try 8 slots."
+        : "<b>Result with 8 slots:</b> <b>" + f.miss + "</b> vs <b>" + f.issued + "</b> trips: a tie. A big-enough cache is as frugal as a plan. What remains is <i>when</i> the trips happen: the cache discovers each miss on demand (" + f.miss * LAT + " stalled ticks for a single thread), while the reader issued every load before it was needed. GPUs close that gap with many warps (next figure). With 10 slots, a plan could keep both A rows and read every B tile once: 20 trips.";
+    }
+    var api = TT.stepper({
+      root: root, steps: steps,
+      draw: function (si, t) {
+        TT.clear(ctx, g.W, g.H);
+        var r = ranges[si], n = Math.round(TT.lerp(r[0], r[1], t));
+        ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(460, 10); ctx.lineTo(460, 460); ctx.stroke();
+        var st = sim(n);
+        panel(10, "Cache machine (LRU, on demand)", C.red, st, n, true);
+        panel(470, "Scratchpad machine (explicit prefetch)", C.teal, st, n, false);
+      }
+    });
+    // capacity buttons
+    var ctrl = root.querySelector(".controls");
+    var lab = document.createElement("label"); lab.textContent = "fast memory:";
+    ctrl.insertBefore(lab, ctrl.lastChild);
+    [6, 8].forEach(function (c) {
+      var b = document.createElement("button"); b.textContent = c + " slots";
+      if (c === cap) b.className = "on";
+      b.onclick = function () {
+        cap = c; ctrl.querySelectorAll("button.cap").forEach(function (x) { x.className = "cap"; });
+        b.className = "cap on"; setTexts(); api.render();
+      };
+      b.className = "cap" + (c === cap ? " on" : "");
+      ctrl.insertBefore(b, ctrl.lastChild);
+    });
+    setTexts(); api.render();
+  })();
+  </script>
+
+  <p>Run it at 6 slots, then at 8. The two results together are the honest version of the "cache vs scratchpad" story:</p>
+  <ol>
+    <li><b>When capacity is tight, the policy matters.</b> At 6 slots LRU makes 48 DRAM trips where the plan makes 32. The cache keeps evicting the A tile it is about to reuse, just as in the first figure.</li>
+    <li><b>When capacity is ample, a cache is just as frugal.</b> At 8 slots both make 32 trips. Caches are good, and a GPU programmer who sizes blocks well gets this behaviour, or stages the tiles in shared memory and gets the scratchpad behaviour directly.</li>
+    <li><b>The difference that remains is timing.</b> The cache learns about each miss when it happens. The scratchpad program issued each load before it was needed. Somebody must cover that latency. A GPU covers it with other warps. A Tensix covers it with a dedicated data-movement core running ahead, which the next section shows.</li>
+  </ol>
+  <div class="callout warn">The "stall ticks" in the figure are illustrative: 3 ticks per miss and one compute access per tick. They model neither a GPU nor a Tensix. The DRAM-trip counts, however, are exact for the loop and capacities shown; the page computes them by simulating LRU and the plan.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="hiding">Two ways to hide latency</h2>
+
+  <p>Every machine that talks to DRAM must do something useful while it waits. The figure below compares the two strategies on toy numbers.</p>
+  <ul>
+    <li><b>Top: a GPU SM with one math unit and a variable number of warps.</b> Each warp loads a tile (6 cycles of waiting) and then computes on it (2 cycles of math). The scheduler gives the math unit to any warp whose data has arrived.</li>
+    <li><b>Bottom: a Tensix with three single-threaded roles.</b> A reader takes 4 cycles to bring a tile in over the NoC, compute takes 3 cycles, and a writer takes 2 cycles to send the result out. They are connected by circular buffers whose depth (slots per buffer) you can see change.</li>
+  </ul>
+
+  <div class="viz" id="figHide"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figHide");
+    var g = TT.canvas(root, 920, 470), ctx = g.ctx, C = TT.C;
+    var T = 44, X0 = 150, X1 = 900, sx = (X1 - X0) / T;
+    // ---- GPU model: W warps, memory latency L, compute C on one shared math unit
+    function gpu(W) {
+      var L = 6, CC = 2, segs = [], math = [];
+      var readyAt = [], state = [];
+      for (var w = 0; w < W; w++) { readyAt.push(L); state.push("load"); segs.push([{ k: "load", s: 0, e: L }]); }
+      var busyUntil = 0;
+      for (var t = 0; t < T; t++) {
+        if (t < busyUntil) continue;
+        // pick the ready warp that has waited longest
+        var pick = -1;
+        for (var w2 = 0; w2 < W; w2++) if (state[w2] === "load" && readyAt[w2] <= t) { if (pick < 0 || readyAt[w2] < readyAt[pick]) pick = w2; }
+        if (pick < 0) continue;
+        segs[pick].push({ k: "math", s: t, e: t + CC }); math.push({ s: t, e: t + CC, w: pick });
+        busyUntil = t + CC;
+        segs[pick].push({ k: "load", s: t + CC, e: t + CC + L }); readyAt[pick] = t + CC + L;
+      }
+      // ready-but-waiting segments
+      for (var w3 = 0; w3 < W; w3++) {
+        var sg = segs[w3], extra = [];
+        for (var q = 0; q < sg.length - 1; q++) if (sg[q].k === "load" && sg[q + 1].k === "math" && sg[q + 1].s > sg[q].e) extra.push({ k: "ready", s: sg[q].e, e: sg[q + 1].s });
+        segs[w3] = sg.concat(extra);
+      }
+      // utilization over a steady-state window [8, 40) (a whole number of 8-cycle periods)
+      var busy = 0; math.forEach(function (m) { busy += Math.max(0, Math.min(m.e, 40) - Math.max(m.s, 8)); });
+      return { segs: segs, math: math, util: busy / 32 };
+    }
+    // ---- Tensix model: reader R, compute CC, writer Wr; circular buffers of depth d
+    function tensix(d) {
+      var R = 4, CC = 3, Wr = 2, n = 14, rs = [], re = [], cs = [], ce = [], ws = [], we = [];
+      for (var i = 0; i < n; i++) {
+        rs[i] = Math.max(i ? re[i - 1] : 0, i >= d ? ce[i - d] : 0); re[i] = rs[i] + R;
+        cs[i] = Math.max(i ? ce[i - 1] : 0, re[i], i >= d ? we[i - d] : 0); ce[i] = cs[i] + CC;
+        ws[i] = Math.max(i ? we[i - 1] : 0, ce[i]); we[i] = ws[i] + Wr;
+      }
+      var done = 0; for (var j = 0; j < n; j++) if (we[j] <= T) done++;
+      var per = (we[n - 1] - we[n - 5]) / 4;
+      return { rows: [[rs, re], [cs, ce], [ws, we]], done: done, per: per, n: n };
+    }
+    var g1 = gpu(1), g2 = gpu(2), g4 = gpu(4), t1 = tensix(1), t2 = tensix(2);
+    var cfg = [
+      { gpu: g1, W: 1, tx: null }, { gpu: g2, W: 2, tx: null }, { gpu: g4, W: 4, tx: null },
+      { gpu: g4, W: 4, tx: t1, d: 1, gdim: true }, { gpu: g4, W: 4, tx: t2, d: 2, gdim: true }, { gpu: g4, W: 4, tx: t2, d: 2, all: true }
+    ];
+    function pct(x) { return Math.round(x * 100) + "%"; }
+    var steps = [
+      { dur: 3.5, text: "<b>One warp.</b> The warp waits 6 cycles for its tile and then computes for 2, so the math unit is busy 2 cycles in 8: <b>" + pct(g1.util) + "</b>. A single thread of control with on-demand loads leaves the expensive math idle." },
+      { dur: 3.5, text: "<b>Two warps.</b> While warp 0 waits, warp 1 computes. Math utilization rises to <b>" + pct(g2.util) + "</b>. Nobody planned this. The scheduler just picks whichever warp is ready." },
+      { dur: 3.5, text: "<b>Four warps.</b> With latency/compute = 6/2, four warps are enough to keep the math unit always busy: <b>" + pct(g4.util) + "</b> in steady state. Real DRAM latency is far longer than 6 cycles, which is why an H100 SM can hold 64 warps and 65,536 registers to switch between them for free." },
+      { dur: 4.5, text: "<b>Tensix, buffer depth 1.</b> There is one thread per role and no switching. With a single slot between stages, the reader cannot fetch tile <i>n+1</i> until compute has freed the slot, so the stages take turns: one tile every <b>" + t1.per + "</b> cycles (" + t1.done + " tiles finished by cycle " + T + ")." },
+      { dur: 4.5, text: "<b>Tensix, depth 2 (double buffering).</b> Now the reader fills slot B while compute works on slot A. All three roles overlap and throughput becomes one tile every <b>" + t2.per + "</b> cycles (" + t2.done + " tiles by cycle " + T + "), set by the slowest stage, here the reader. More slots cannot beat the slowest stage." },
+      { dur: 1.0, text: "<b>Same goal, different mechanism.</b> The GPU hides latency by <i>oversubscription</i>: many interchangeable warps and a hardware scheduler. The Tensix hides it by <i>pipelining</i>: a few specialized roles, each running ahead, linked by queues in L1. Chapter A11 covers real circular-buffer semantics. <i>All cycle counts here are illustrative.</i>" }
+    ];
+    function bar(s, e, y, h, col, alpha, cur, label) {
+      if (s >= cur) return;
+      var e2 = Math.min(e, cur, T);
+      if (e2 <= s) return;
+      TT.box(ctx, X0 + s * sx, y, (e2 - s) * sx - 1, h, { fill: col, alpha: alpha, r: 2, label: (e2 - s) * sx > 14 ? label : "", font: "11px", color: C.bg });
+    }
+    function axis(y) {
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      for (var t = 0; t <= T; t += 4) {
+        ctx.beginPath(); ctx.moveTo(X0 + t * sx, y); ctx.lineTo(X0 + t * sx, y + 5); ctx.stroke();
+        TT.text(ctx, String(t), X0 + t * sx, y + 14, { color: C.muted, font: "10px", align: "center" });
+      }
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (si, t) {
+        TT.clear(ctx, g.W, g.H);
+        var c = cfg[si];
+        var gcur = c.gdim ? T : (si <= 2 ? t * T : T);
+        var tcur = c.tx ? (c.all ? T : t * T) : 0;
+        if (c.all) gcur = T;
+        // GPU half
+        TT.text(ctx, "GPU SM: " + c.W + " warp" + (c.W > 1 ? "s" : "") + ", one math unit", 10, 16, { color: C.purple, font: "bold 15px" });
+        TT.text(ctx, "math busy (steady state): " + pct(c.gpu.util), 900, 16, { color: C.fg, font: "13px", align: "right" });
+        for (var w = 0; w < 4; w++) {
+          var y = 34 + w * 26;
+          TT.text(ctx, "warp " + w, 10, y + 10, { color: w < c.W ? C.fg : C.border, font: "12px" });
+          if (w >= c.W) continue;
+          c.gpu.segs[w].forEach(function (sg) {
+            var col = sg.k === "load" ? C.orange : (sg.k === "math" ? C.blue : C.yellow);
+            bar(sg.s, sg.e, y, 20, col, sg.k === "math" ? 0.9 : 0.35, gcur, sg.k === "math" ? "math" : (sg.k === "load" ? "wait" : ""));
+          });
+        }
+        var my = 34 + 4 * 26 + 6;
+        TT.text(ctx, "math unit", 10, my + 10, { color: C.blue, font: "bold 12px" });
+        TT.box(ctx, X0, my, T * sx, 20, { fill: C.bg2, stroke: C.border, r: 2 });
+        c.gpu.math.forEach(function (m) { bar(m.s, m.e, my, 20, C.blue, 0.9, gcur, "w" + m.w); });
+        axis(my + 24);
+        if (gcur < T && gcur > 0) { ctx.strokeStyle = C.yellow; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(X0 + gcur * sx, 28); ctx.lineTo(X0 + gcur * sx, my + 24); ctx.stroke(); }
+        if (c.gdim) { ctx.globalAlpha = 0.6; ctx.fillStyle = C.bg; ctx.fillRect(0, 0, g.W, 190); ctx.globalAlpha = 1; }
+        // legend
+        TT.box(ctx, 10, 196, 12, 10, { fill: C.orange, alpha: 0.35 }); TT.text(ctx, "waiting on memory", 26, 201, { color: C.muted, font: "11px" });
+        TT.box(ctx, 150, 196, 12, 10, { fill: C.yellow, alpha: 0.35 }); TT.text(ctx, "data ready, waiting for math unit", 166, 201, { color: C.muted, font: "11px" });
+        TT.box(ctx, 380, 196, 12, 10, { fill: C.blue, alpha: 0.9 }); TT.text(ctx, "computing", 396, 201, { color: C.muted, font: "11px" });
+        // Tensix half
+        ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(10, 220); ctx.lineTo(910, 220); ctx.stroke();
+        var ty = 250;
+        if (!c.tx) {
+          TT.text(ctx, "Tensix: reader / compute / writer (next steps)", 10, ty - 6, { color: C.border, font: "bold 15px" });
+          ["reader (NoC)", "compute (FPU)", "writer (NoC)"].forEach(function (nm, r) { TT.text(ctx, nm, 10, ty + 24 + r * 34, { color: C.border, font: "12px" }); });
+          return;
+        }
+        TT.text(ctx, "Tensix: 3 single-threaded roles, circular buffers of depth " + c.d, 10, ty - 6, { color: C.teal, font: "bold 15px" });
+        TT.text(ctx, "one tile every " + c.tx.per + " cycles", 900, ty - 6, { color: C.fg, font: "13px", align: "right" });
+        var names = ["reader (NoC)", "compute (FPU)", "writer (NoC)"], cols = [C.orange, C.blue, C.green];
+        for (var r = 0; r < 3; r++) {
+          var y2 = ty + 12 + r * 34;
+          TT.text(ctx, names[r], 10, y2 + 12, { color: cols[r], font: "12px" });
+          TT.box(ctx, X0, y2, T * sx, 24, { fill: C.bg2, stroke: C.border, r: 2 });
+          for (var i = 0; i < c.tx.n; i++) bar(c.tx.rows[r][0][i], c.tx.rows[r][1][i], y2, 24, cols[r], 0.85, tcur, "t" + i);
+        }
+        axis(ty + 12 + 3 * 34);
+        if (tcur < T && tcur > 0) { ctx.strokeStyle = C.yellow; ctx.beginPath(); ctx.moveTo(X0 + tcur * sx, ty + 6); ctx.lineTo(X0 + tcur * sx, ty + 112); ctx.stroke(); }
+        TT.text(ctx, "Tiles finished by cycle " + T + ": depth 1 → " + t1.done + ", depth 2 → " + t2.done + (c.d === 1 && !c.all ? "  (run the next step)" : ""), 10, 420, { color: C.muted, font: "13px" });
+        TT.text(ctx, "Toy latencies: reader 4, compute 3, writer 2; GPU load 6, math 2. Not hardware numbers.", 10, 446, { color: C.muted, font: "12px" });
+      }
+    });
+  })();
+  </script>
+
+  <p>Each strategy has a price.</p>
+  <ul>
+    <li><b>The GPU's</b> is silicon and power spent on state: a 256 KB register file per SM, so dozens of warps can sit ready, plus schedulers and caches. In return, a programmer can write plain per-thread code and still get decent overlap.</li>
+    <li><b>The Tensix's</b> is programmer effort. Someone has to write the reader, size the buffers and order the fetches. In return, the hardware is simpler, and the program states what moves and when it is requested. What sits in L1 never depends on how a cache happens to behave on a given run, although NoC contention can still vary the exact timing (question 4 below).</li>
+  </ul>
+  <div class="callout gpu">GPUs also use software pipelining: double-buffered shared memory and asynchronous copies (<code>cp.async</code> on Ampere, TMA on Hopper) are standard in fast kernels. So the comparison is not "the GPU can't pipeline". It is "the GPU <i>also</i> has oversubscription to fall back on, and Tenstorrent has only the pipeline".</div>
+
+  <!-- ============================================================ -->
+  <h2 id="tile">The unit of work: a 32×32 tile</h2>
+
+  <p>On a GPU the natural unit is the thread and its element. Tensor Cores work on small matrix fragments, but you reach them through warps. On Tenstorrent, the unit that moves, queues and computes is a <b>tile of 32×32 elements</b> (<code>TILE_HEIGHT = 32</code>, <code>TILE_WIDTH = 32</code> in <code>tt_metal/api/tt-metalium/constants.hpp:19-20</code>). A tile is made of four <b>faces</b> of 16×16, "because the matrix engine natively multiplies 16x16 matrices" (<code>tech_reports/tensor_layouts/tensor_layouts.md:60-62</code>).</p>
+
+  <div class="viz" id="figTile">
+    <svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <rect width="920" height="300" fill="#000"/>
+      <!-- a 64x96 tensor split into tiles -->
+      <text x="30" y="28" fill="#9aa4b2" font-size="13">a 64 × 96 tensor = 2 × 3 tiles</text>
+      <g stroke="#2d3540">
+        <rect x="30" y="40" width="240" height="160" fill="#161b22"/>
+        <line x1="110" y1="40" x2="110" y2="200"/><line x1="190" y1="40" x2="190" y2="200"/>
+        <line x1="30" y1="120" x2="270" y2="120"/>
+      </g>
+      <rect x="110" y="40" width="80" height="80" fill="#58c4dd" fill-opacity="0.35" stroke="#ffd866" stroke-width="2"/>
+      <text x="150" y="85" fill="#e6e6e6" font-size="13" text-anchor="middle">tile</text>
+      <line x1="195" y1="60" x2="345" y2="60" stroke="#ffd866" stroke-dasharray="4 4"/>
+      <line x1="195" y1="115" x2="345" y2="255" stroke="#ffd866" stroke-dasharray="4 4"/>
+      <!-- zoomed tile with faces -->
+      <text x="350" y="28" fill="#9aa4b2" font-size="13">one tile: 32 × 32 = 1024 elements, 4 faces of 16 × 16</text>
+      <g font-size="14" text-anchor="middle">
+        <rect x="350" y="40" width="105" height="105" fill="#58c4dd" fill-opacity="0.25" stroke="#58c4dd"/>
+        <rect x="455" y="40" width="105" height="105" fill="#83c167" fill-opacity="0.25" stroke="#83c167"/>
+        <rect x="350" y="145" width="105" height="105" fill="#f0a35e" fill-opacity="0.25" stroke="#f0a35e"/>
+        <rect x="455" y="145" width="105" height="105" fill="#b48ead" fill-opacity="0.25" stroke="#b48ead"/>
+        <text x="402" y="97" fill="#e6e6e6">face 0</text><text x="507" y="97" fill="#e6e6e6">face 1</text>
+        <text x="402" y="202" fill="#e6e6e6">face 2</text><text x="507" y="202" fill="#e6e6e6">face 3</text>
+      </g>
+      <text x="350" y="275" fill="#9aa4b2" font-size="12">stored face 0 → 1 → 2 → 3, each face row-major</text>
+      <!-- what uses tiles -->
+      <g font-size="13" fill="#e6e6e6">
+        <text x="600" y="60">A tile is the unit that…</text>
+        <text x="610" y="92" fill="#f0a35e">• a reader fetches with one NoC read</text>
+        <text x="610" y="120" fill="#5cd0b3">• occupies one slot of a circular buffer</text>
+        <text x="610" y="148" fill="#58c4dd">• the FPU consumes, face by face</text>
+        <text x="610" y="176" fill="#83c167">• a writer sends back to DRAM</text>
+        <text x="600" y="220" fill="#9aa4b2" font-size="12">bf16: 1024 × 2 B = 2048 B per tile</text>
+        <text x="600" y="242" fill="#9aa4b2" font-size="12">shapes are padded up to multiples of 32</text>
+      </g>
+    </svg>
+    <div class="caption">One picture to carry forward. Chapter A05 covers faces, padding and the block-float formats in which 16 values share one exponent; chapter A06 covers how the FPU multiplies faces.</div>
+  </div>
+
+  <p>The tile matters for this chapter's argument because it makes the access pattern <b>coarse and regular</b>. A GPU kernel computes addresses per thread, and the hardware has to coalesce them into memory transactions and catch reuse in caches. A Tenstorrent kernel deals in whole tiles. In the reader above, one <code>noc_async_read_page</code> moves one 2 KB bf16 tile, because the example's buffers use one tile per page. When the unit is that large and that predictable, "fetch exactly the next tiles" is a short loop rather than a heroic optimization.</p>
+  <div class="callout warn">"Tile" means three different things in this series: a <b>32×32 data tile</b> (this section), a <b>Tensix tile</b> (a grid position on the chip, as in "Ethernet tile"), and a node in ttsim's NoC model. When the context is unclear, the text will say which one it means.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="converge">Convergence: Hopper's TMA and warp specialization</h2>
+
+  <p>The two philosophies are moving towards each other, and the clearest evidence comes from NVIDIA itself.</p>
+  <p><b>The Tensor Memory Accelerator (TMA).</b> Hopper added a hardware unit that "can transfer large blocks of data and multidimensional tensors from global memory to shared memory and back again". Its programming model is single-threaded: "a single thread in a warp is elected to issue an asynchronous TMA operation", and other threads wait on a barrier for completion (Hopper architecture blog). That is a DMA engine moving a <i>tile</i> into a <i>scratchpad</i>, started by one thread and signalled through a barrier. It is close to <code>noc_async_read</code> plus a circular-buffer push.</p>
+  <p><b>Warp specialization.</b> CUTLASS 3 kernels for Hopper split a thread block into two groups:</p>
+  <ul>
+    <li>A <b>producer warp group</b> that "loads data from global memory into shared memory buffers using the new Tensor Memory Accelerator".</li>
+    <li>A <b>consumer warp group</b> that waits for "the buffer is filled and then launches tensor core MMA operations", then releases the buffer for the next load (CUTLASS <i>Efficient GEMM</i> docs).</li>
+  </ul>
+  <p>FlashAttention-3 uses the same scheme. It even moves registers away from the producer warps, which only issue TMA, to the consumers that do the math (<code>setmaxnreg</code>; Shah et al., 2024). Put that next to a Tensix:</p>
+
+  <table>
+    <tr><th>Role</th><th>Hopper, warp-specialized kernel</th><th>Tensix, Metalium kernel</th></tr>
+    <tr><td>Fetch tiles</td><td>Producer warp(s) issuing TMA copies</td><td>Reader kernel on a data-movement RISC-V, issuing NoC reads</td></tr>
+    <tr><td>Staging buffer</td><td>Multi-stage ring in shared memory</td><td>Circular buffer in L1</td></tr>
+    <tr><td>"Tile is ready" signal</td><td>Asynchronous transaction barrier</td><td><code>cb_push_back</code> / <code>cb_wait_front</code></td></tr>
+    <tr><td>Math</td><td>Consumer warp group issuing WGMMA</td><td>Compute kernel on three TRISC cores driving the FPU</td></tr>
+    <tr><td>Write results</td><td>Epilogue (consumer or another warp)</td><td>Writer kernel on the other data-movement core</td></tr>
+  </table>
+
+  <p>Even CUDA's programming guide now has a section on "tile programming", where the programmer "writes per-block code that operates on tiles" and leaves the mapping to threads to the compiler (CUDA Programming Guide §1.2.2.3).</p>
+  <p>Do not overread this. A Hopper SM still has caches, SIMT warps and a large register file. Warp specialization is a <i>software pattern</i> built on hardware that can also run code which never heard of it. Tenstorrent made that pattern the hardware's only mode. The fair summary is that the fastest GPU kernels found their way to the same producer/consumer, explicit-tile structure that Tenstorrent requires from the start.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="table">Side by side, with product names</h2>
+
+  <p>Comparisons between chips go wrong when numbers from different products, formats or sparsity settings get mixed. Every cell below names its product. The columns are an <b>NVIDIA H100 SXM5</b>, a <b>Tenstorrent Blackhole p150a/b</b> card and a <b>Tenstorrent Wormhole n150</b> card. The n150 is included because the simulator labs mostly target Wormhole.</p>
+
+  <table>
+    <tr><th></th><th>H100 SXM5</th><th>Blackhole p150</th><th>Wormhole n150</th></tr>
+    <tr><td>Compute units</td><td>132 SMs; 4 Tensor Cores each (528)</td><td>120 Tensix per docs.tenstorrent.com; 140 per tt-isa-documentation (see below)</td><td>72 Tensix (80 on the die)</td></tr>
+    <tr><td>Control model</td><td>SIMT: warps of 32 threads, up to 64 warps per SM, hardware scheduler</td><td colspan="2">5 single-threaded RV32 "baby" cores per Tensix; reader / compute / writer kernels; no SIMT, no multithreading</td></tr>
+    <tr><td>On-chip memory</td><td>256 KB L1+shared per SM (≤228 KB shared); 256 KB registers per SM; 50 MB L2</td><td>1536 KiB L1 per Tensix; 180 MB total (docs); no data cache hierarchy</td><td>1464 KiB L1 per Tensix; 108 MB total; no data cache hierarchy</td></tr>
+    <tr><td>How data reaches compute</td><td>Hardware caches, or explicit copies into shared memory (<code>cp.async</code>, TMA)</td><td colspan="2">Explicit NoC reads and writes only (DMA into L1)</td></tr>
+    <tr><td>On-chip network</td><td>SMs share the L2 over an on-chip interconnect</td><td colspan="2">2 NoCs, each a 2D torus, running in opposite directions</td></tr>
+    <tr><td>Off-chip memory</td><td>80 GB HBM3, 3.35 TB/s</td><td>32 GB GDDR6, 512 GB/s</td><td>12 GB GDDR6, 288 GB/s</td></tr>
+    <tr><td>Peak dense matrix math (vendor)</td><td>989 TF BF16; 1,979 TF FP8 (half the "with sparsity" numbers)</td><td>664 TF "BLOCKFP8"</td><td>74 TF FP16; 148 TF "BLOCKFP8"; 262 TF FP8</td></tr>
+    <tr><td>Ridge point (derived: peak ÷ DRAM BW)</td><td>≈ 295 FLOP/B (BF16)</td><td>≈ 1,300 FLOP/B (BLOCKFP8 figure)</td><td>≈ 257 FLOP/B (FP16)</td></tr>
+    <tr><td>On-board general CPUs</td><td>None; relies on the host CPU</td><td>16 SiFive x280 (Linux-capable)</td><td>None (ARC tile is for management)</td></tr>
+    <tr><td>Scale-out</td><td>NVLink 900 GB/s; NVSwitch; InfiniBand</td><td>Ethernet on die: 4 × 800 G QSFP-DD ports (8 of 12 Ethernet tiles wired)</td><td>16 × 100 GbE tiles on die; 2 × QSFP-DD 200 G on the card</td></tr>
+    <tr><td>Board power</td><td>Up to 700 W</td><td>300 W</td><td>160 W</td></tr>
+    <tr><td>Software</td><td>CUDA toolkit proprietary; many libraries (e.g. CUTLASS) open</td><td colspan="2">TT-Metalium and ttsim Apache-2.0; public ISA documentation</td></tr>
+  </table>
+
+  <p>Notes on the table:</p>
+  <ul>
+    <li><b>Sources.</b> H100: NVIDIA's H100 product page (bandwidth, TFLOPS, power, NVLink) and the Hopper architecture blog (SMs, caches, registers, warps). Tenstorrent: the docs.tenstorrent.com specification pages for Blackhole and Wormhole cards, plus tt-isa-documentation for L1 sizes, Ethernet and NoCs.</li>
+    <li><b>The two sources disagree on the p150 core count.</b> docs.tenstorrent.com lists 120 Tensix cores for the p100a, p150a and p150b. The tile-count table in tt-isa-documentation (<code>BlackholeA0/README.md:20</code>) lists 140 for the p150. The vendor's 664 TF figure equals 120 × 4096 FLOP/cycle × 1.35 GHz, which fits 120. Chapter A03 returns to this.</li>
+    <li><b>"No cache" means no hardware-managed cache between DRAM and L1.</b> The baby RISC-V cores do have tiny instruction caches, Blackhole's also have a 64-byte L0 data cache, and the x280 CPUs have ordinary L1/L2/L3 caches (tt-isa-documentation <code>BlackholeA0/TensixTile/BabyRISCV/README.md</code>, <code>BlackholeA0/README.md:6</code>). None of these hold tensor data on its way to the FPU.</li>
+    <li><b>The peak rows are not comparable across columns.</b> They use different number formats, and Tenstorrent's "BLOCKFP8" label does not even seem to mean the same thing on its two cards. The spec pages do not state a fidelity, but the arithmetic is telling: 664 TF on the p150 equals the one-fidelity-phase matrix rate (120 × 4096 × 1.35 GHz), while 148 TF on the n150 is half that card's one-phase rate (72 × 4096 × 1 GHz ≈ 295 TF), i.e. two phases. In the ISA's fidelity table, BFP8 needs one phase for "reasonable" precision and two for full precision (<code>WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md</code>, "Fidelity phases"). Chapter A06 explains fidelity phases and derives these numbers. BF16 at full fidelity takes four phases, about a quarter of the one-phase peak.</li>
+    <li><b>The H100 is a much larger part in every respect:</b> a 4N-process die of 814 mm², 80 GB of HBM, 700 W. Comparing peak per card says nothing about cost per unit of performance, which this chapter does not try to judge.</li>
+  </ul>
+
+  <div class="callout key">The table's deepest row is not the TFLOPS row but "How data reaches compute". Most of the rest of this series follows from that one difference: circular buffers, reader and writer kernels, sharding, multicast and the rest.</div>
+
+  <div class="callout sim">ttsim models exactly the explicit side of this story: every NoC read your kernel issues is a transaction the simulator executes, and it has no cache to hide anything behind. Lab <a href="../sim-labs/b05-noc-and-dram.html">B05</a> logs those transactions and shows what happens when a NoC read is misaligned. Remember that ttsim is a functional model, not a timing model, so it shows <i>which</i> trips happen, not how long they take.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>A cache guesses; a scratchpad is told.</b> When the access pattern is unknown, caches are excellent. When it is known, as in a matmul, software can choose what to keep and when to fetch it, and the guessing hardware buys little that the program could not decide itself. LRU can even do badly on cyclic patterns slightly larger than the cache.</li>
+    <li><b>GPUs hide latency by oversubscription.</b> SIMT warps of 32 threads, up to 64 warps per H100 SM and a 256 KB register file make warp switching free. Caches (256 KB L1/shared per SM, 50 MB L2) serve unplanned code, and shared memory serves planned code.</li>
+    <li><b>Systolic arrays and the TPU</b> showed that reusing each fetched value many times, plus deterministic software-managed memory, beats caches for NN inference. Groq, Graphcore and Cerebras also chose large SRAM with no cache.</li>
+    <li><b>Tenstorrent</b> is a grid of independent Tensix cores, each with about 1.5 MB of plain SRAM. All movement is explicit over two opposite-direction NoCs, directed by small RISC-V cores, with Ethernet on the die and Apache-2.0 software. Its original conditional-execution thesis is design intent, not a measured advantage.</li>
+    <li><b>The unit of work is a 32×32 tile</b> of four 16×16 faces. It is what is fetched, queued and computed.</li>
+    <li><b>Latency hiding</b> on a Tensix comes from pipelining: reader, compute and writer run ahead of each other through circular buffers, and throughput is set by the slowest stage.</li>
+    <li><b>Hopper's TMA and warp specialization</b> show the best GPU kernels converging on the same producer/consumer, explicit-tile structure that Tenstorrent requires from the start.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="quiz">Check yourself</h2>
+
+  <details class="quiz"><summary>1. In the matmul figure with 8 slots, the cache and the scratchpad both make 32 DRAM trips. Has the scratchpad lost its advantage?</summary>
+  <p>Not entirely. Traffic is equal, because 8 slots hold the A row plus one B column and LRU then keeps the A row. But the cache discovers every one of its 32 misses only when compute asks for the data, so a single thread stalls on each. The scratchpad program issued each load before it was needed, so its compute did not stall after the first fill. A GPU recovers that timing advantage with other warps (oversubscription) or with explicit async copies into shared memory. Note also that the scratchpad's count is the same at 6 slots, while the cache's jumps to 48: the plan's behaviour does not depend on how the replacement policy reacts to capacity.</p></details>
+
+  <details class="quiz"><summary>2. Why does an H100 SM need a 256 KB register file when each thread uses at most 255 registers?</summary>
+  <p>Because latency hiding by warp switching only works if switching is free, and that means every resident warp's registers must already be in the register file. Up to 64 warps × 32 threads = 2,048 threads per SM can be resident, sharing 65,536 registers. The register file is the price of oversubscription. A Tensix pays nothing like it because each baby core runs a single thread and covers latency by pipelining through L1 buffers.</p></details>
+
+  <details class="quiz"><summary>3. In the latency figure, the reader takes 4 cycles, compute 3 and the writer 2. What throughput would circular buffers of depth 8 give, and why?</summary>
+  <p>Still one tile every 4 cycles. Once there are enough slots for the stages to overlap (depth 2 already allows that here), throughput is set by the slowest stage, the reader. Deeper buffers absorb jitter, but they cannot make the reader faster. To go faster you must speed up the bottleneck, for example by issuing several NoC reads before one barrier, splitting reads across both NoCs or cores, or reducing traffic through reuse and multicast. Chapters A11, A15 and A16 cover these.</p></details>
+
+  <details class="quiz"><summary>4. Graphcore, Groq and Tenstorrent all have large SRAM and no cache. How does Tenstorrent differ from Groq in who decides timing?</summary>
+  <p>Groq's compiler schedules the whole chip cycle by cycle. Functional units run in lockstep and the hardware deliberately has no arbiters, so timing is fully static. Tenstorrent's cores each run their own programs asynchronously and synchronize at run time through circular buffers and semaphores. NoC transfers can still contend with one another. Tenstorrent's data <i>placement</i> is explicit, but its <i>timing</i> is decided dynamically by handshakes, not by a global static schedule.</p></details>
+
+  <details class="quiz"><summary>5. "H100 does 989 TFLOPS and a p150 does 664, so the H100 is 1.5× faster." What is wrong with this sentence?</summary>
+  <p>The figures use different formats: BF16 dense on the H100, Tenstorrent's one-phase "BLOCKFP8" rate on the p150. At the same nominal format the H100 lists 1,979 dense FP8 TFLOPS, while the p150's full-precision BF16 rate is about a quarter of its one-phase peak. Peak numbers also ignore memory: the p150's ridge point is about 1,300 FLOP/B against about 295 for the H100, so far more of its workloads are bandwidth-bound unless data is reused from SRAM. Power, price and die size differ too. Peak-versus-peak comparisons answer almost no practical question.</p></details>
+
+  <details class="quiz"><summary>6. Do Hopper's TMA and warp specialization turn an H100 into a Tenstorrent chip?</summary>
+  <p>No. They let a GPU kernel <i>adopt</i> the explicit producer/consumer, tile-into-scratchpad pattern, and the fastest Hopper GEMM and attention kernels do. But the SM still has hardware caches, SIMT warps, a large register file and a scheduler, so code that ignores the pattern still runs reasonably. On a Tensix there is no fallback: without an explicit NoC read, data never reaches L1. The convergence is in how the best kernels are structured, not in what the hardware requires.</p></details>
+
+  <!-- ============================================================ -->
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://www.eecs.harvard.edu/~htk/publication/1982-kung-why-systolic-architecture.pdf">H. T. Kung, "Why Systolic Architectures?" (1982)</a>: the origin of systolic arrays, short and still very readable.</li>
+    <li><a href="https://arxiv.org/abs/1704.04760">Jouppi et al., "In-Datacenter Performance Analysis of a Tensor Processing Unit" (ISCA 2017)</a>: TPU v1, its 28 MiB software-managed memory and the determinism argument.</li>
+    <li><a href="https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth">NVIDIA Hopper Architecture In-Depth</a>: H100 SMs, caches, registers, TMA and thread block clusters.</li>
+    <li><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html">CUDA Programming Guide: Programming Model</a>: warps, SIMT, shared memory vs caches, and the newer tile programming model.</li>
+    <li><a href="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html">CUTLASS: Efficient GEMM in CUDA</a>: how the fastest GPU GEMMs tile, pipeline and warp-specialize.</li>
+    <li><a href="https://arxiv.org/abs/2407.08608">Shah et al., "FlashAttention-3" (2024)</a>: producer/consumer warp specialization with TMA on Hopper.</li>
+    <li><a href="https://arxiv.org/abs/1912.03413">Jia et al., "Dissecting the Graphcore IPU Architecture via Microbenchmarking" (2019)</a>: a scratchpad-only, bulk-synchronous many-core chip, measured.</li>
+    <li><a href="https://hc34.hotchips.org/assets/program/conference/day2/Machine%20Learning/HotChips34%20-%20Groq%20-%20Abts%20-%20final.pdf">Groq at Hot Chips 34 (Abts)</a>: "design for determinism" taken to its limit.</li>
+    <li><a href="https://www.computer.org/csdl/magazine/mi/2021/02/09373921/1rPtnvMohpe">Vasiljevic, Bajic et al., "Compute Substrate for Software 2.0" (IEEE Micro 2021)</a>: Tenstorrent's own statement of its thesis, including dynamic and conditional execution.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">TT-Metalium Guide</a>: the official architecture overview, including the sections "Where is the cache hierarchy" and "Tenstorrent hardware for GPU experts".</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation">tt-isa-documentation</a>: the authoritative description of Tensix tiles, L1, NoCs and Ethernet.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole card specifications</a>: the vendor numbers used in the comparison table.</li>
+  </ul>
+
+  <div class="pager"><a href="a01-why-new-hardware.html">&larr; 01 Why AI needs new hardware</a><a class="next" href="a03-chip-tour.html">03 A tour of the chip &rarr;</a></div>
+</main>
+</body>
+</html>

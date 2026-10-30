@@ -8,7 +8,7 @@
   - `TT_METAL_RUNTIME_ROOT`, `TT_METAL_KERNEL_PATH=$LAB_HOME/kernels`, `LOGS_PATH`, `PROFILER_DIR`
   - It then changes into `$LAB_HOME/run`.
   - Set `LAB_HOME` (default `~/ttlab`) to a unique directory per lab when several labs run at once.
-- **`build_host.sh file.cpp`** builds a host program out of tree against `build_Release` in about 6 s. Example: `host/mm_fid.cpp` is a single-core matmul that takes `MM_FIDELITY=LoFi|HiFi2|HiFi3|HiFi4` and `MM_SEED`, and prints `mean_abs_err` and `result_hash`.
+- **`build_host.sh file.cpp`** builds a host program out of tree against `build_Release` in about 6 s. Example: `host/mm_fid.cpp` is a single-core matmul that takes `MM_FIDELITY=0|2|3|4` (numeric MathFidelity: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; parsed with atoi, so names silently mean LoFi) and `MM_SEED`, and prints `mean_abs_err` and `result_hash`.
 - **`build_ttsim.sh <name> [wh|bh] [release|debug]`** copies ttsim into `$LAB_HOME/ttsim-<name>`, builds it (about 3.5 s), packages the `.so` next to `soc_descriptor.yaml`, and prints the `export TT_METAL_SIMULATOR=...` line.
 - **Kernel path search order** (`tt_metal/impl/kernels/kernel.cpp:50-95`): absolute path, then cwd, then `TT_METAL_KERNEL_PATH`, then the system kernel directory, then the runtime root. Running from `TT_METAL_HOME` therefore silently uses the stock kernels.
 - **Editing a kernel and rerunning needs no rebuild.** The JIT cache keys on the source content.
