@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A04 · Inside a Tensix core · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  #tile svg text { pointer-events: none; font-family: Inter, sans-serif; }
+  #tile svg .comp { cursor: pointer; }
+  #tile svg .comp:hover rect { stroke-width: 3; }
+  #tile .info { padding: .8rem 1rem; background: var(--bg2); border-top: 1px solid var(--border); min-height: 9em; font-size: 15px; }
+  #tile .info h4 { margin: 0 0 .3rem; color: var(--yellow); }
+  #tile .info ul { margin: .3rem 0; padding-left: 1.2rem; }
+  .bits { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a03-chip-tour.html">&larr; Prev</a>
+  <a href="a05-tiles-and-formats.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 04</span><span class="tag">Prerequisites: A02, A03</span>
+  <h1><span class="num">04.</span> Inside a Tensix core</h1>
+  <p class="subtitle">Five small CPUs, one big coprocessor that never fetches its own instructions, and the synchronization that keeps them honest.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#map">A map of one Tensix tile</a></li>
+      <li><a href="#riscv">Five baby RISC-Vs</a></li>
+      <li><a href="#l1">L1: 1464 KiB of plain RAM, in 16 banks</a></li>
+      <li><a href="#coproc">The coprocessor: three threads, one backend</a></li>
+      <li><a href="#push">How a TRISC pushes an instruction</a></li>
+      <li><a href="#ahead">The RISC-V runs ahead</a></li>
+      <li><a href="#sync">The Sync unit: 8 semaphores, 7 mutexes</a></li>
+      <li><a href="#sim">Seeing it in ttsim</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="a03-chip-tour.html">A03</a> we walked across the chip and saw a Wormhole die with 80 Tensix tiles in a grid. Now we open one up. The first surprise is that one Tensix tile contains <b>five</b> RISC-V CPUs, and the second is that none of them does the math. So:</p>
+  <blockquote><b>Why does one core need five CPUs, none of which does the math?</b></blockquote>
+  <p>Here's a toy problem to start. You want to add two 32×32 matrices that sit in local SRAM and write the sum back to SRAM. That's 1024 additions. A simple in-order CPU core could do it in a loop: load, load, add, store, 1024 times. On this chip that loop is painfully slow. As we'll see, a baby RISC-V core can only <em>store</em> to SRAM once every five cycles, so writing the 1024 results alone takes thousands of cycles. The matrix unit next to it can add a whole 8×16 block of numbers per instruction.</p>
+  <p>So the work splits into two kinds. <em>Deciding</em> what to do (loops, addresses, which tile comes next, when it's safe to proceed) is branchy, scalar work that suits a CPU. <em>Doing</em> it (moving kilobytes and multiplying matrices) is wide, regular work that suits dedicated hardware. A Tensix tile gives each kind its own machinery. Small CPUs make the decisions and <em>push</em> commands to big engines that do the work. Five CPUs are there because there are five streams of decisions to make at once: two for moving data over the network and three for feeding the compute engine.</p>
+  <p>The rest of this chapter turns that sentence into a picture, then into code, and then into a bug you can reproduce in the simulator.</p>
+
+  <h2 id="map">A map of one Tensix tile</h2>
+  <p>The ISA documentation lists what a Wormhole Tensix tile contains: 1464 KiB of RAM called L1, five "baby" RV32IM cores, two NoC connections plus a NoC overlay, and one Tensix coprocessor. The coprocessor itself holds two unpackers, a matrix unit (FPU), a vector unit (SFPU), a scalar unit (ThCon) and four packers, plus a few small utility devices <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/README.md">(TensixTile/README.md)</a>. Click any block below to see what it is and the numbers that matter.</p>
+
+  <div class="viz" id="tile">
+    <svg viewBox="0 0 900 520" id="tilesvg" role="img" aria-label="Clickable diagram of a Wormhole Tensix tile"></svg>
+    <div class="info" id="tileinfo"><h4>Click a component</h4>The <span class="c-blue">blue</span> boxes are the five RISC-V cores, <span class="c-teal">teal</span> is memory, <span class="c-yellow">yellow</span> is the coprocessor frontend (one copy per thread), and <span class="c-orange">orange</span> and <span class="c-purple">purple</span> are the shared backend units. The dashed line is BRISC's push path, which joins each thread after its MOP expander (blue dots). The solid arrows trace the main data path: L1 → unpackers → SrcA/SrcB → FPU → Dst → packers → L1.</div>
+  </div>
+  <script>
+  (function () {
+    var svg = document.getElementById("tilesvg"), info = document.getElementById("tileinfo"), C = TT.C;
+    var NS = "http://www.w3.org/2000/svg";
+    function el(tag, attrs, parent) {
+      var e = document.createElementNS(NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      (parent || svg).appendChild(e); return e;
+    }
+    // defs: arrow marker
+    var defs = el("defs", {});
+    var mk = el("marker", { id: "ah", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, defs);
+    el("path", { d: "M0,0 L10,5 L0,10 z", fill: C.muted }, mk);
+    el("rect", { x: 0, y: 0, width: 900, height: 520, fill: "#000" });
+    // frames
+    el("rect", { x: 195, y: 12, width: 695, height: 415, rx: 10, fill: "none", stroke: C.border, "stroke-width": 2, "stroke-dasharray": "6 4" });
+    var t = el("text", { x: 500, y: 30, fill: C.muted, "font-size": 12 }); t.textContent = "Tensix coprocessor: 3 frontends, 1 shared backend";
+    t = el("text", { x: 20, y: 30, fill: C.muted, "font-size": 12 }); t.textContent = "Baby RISC-V cores (RV32IM)";
+
+    function line(x1, y1, x2, y2, dash) {
+      el("line", { x1: x1, y1: y1, x2: x2, y2: y2, stroke: C.muted, "stroke-width": 1.6, "marker-end": "url(#ah)", "stroke-dasharray": dash ? "4 3" : "none", opacity: 0.8 });
+    }
+    function poly(pts, dash, arrow) {
+      el("polyline", { points: pts, fill: "none", stroke: C.muted, "stroke-width": 1.6, "marker-end": arrow ? "url(#ah)" : "none", "stroke-dasharray": dash ? "4 3" : "none", opacity: 0.8 });
+    }
+    // data-path arrows (drawn first, under boxes)
+    poly("208,438 208,235 213,235", false, true);                 // L1 -> unpacker 0
+    line(260, 438, 260, 317);                                     // L1 -> unpacker 1
+    line(305, 235, 323, 235); line(305, 295, 323, 295);           // unpack -> Src
+    line(415, 235, 433, 252); line(415, 295, 433, 275);           // Src -> FPU
+    line(535, 260, 553, 260);                                     // FPU -> Dst
+    line(615, 317, 615, 333); line(635, 333, 635, 318);           // Dst <-> SFPU
+    line(697, 260, 713, 260);                                     // Dst -> packers
+    line(790, 292, 790, 438);                                     // packers -> L1
+    line(370, 396, 370, 438); line(380, 438, 380, 397);           // mover <-> L1
+    poly("260,213 260,200 300,200", true, false); poly("300,200 625,200 625,204", true, true); // unpack0 -> Dst (optional)
+    [64, 114, 164].forEach(function (y) {
+      line(170, y, 213, y);                                       // TRISC -> MOP expander
+      line(295, y, 323, y); line(405, y, 413, y);                 // MOP -> Replay -> Gate
+      el("circle", { cx: 310, cy: y, r: 3.5, fill: C.blue });     // mux where BRISC joins
+    });
+    poly("170,252 185,252 185,185 310,185 310,64", true, false);  // BRISC bus into the three muxes
+    line(442, 183, 442, 189);
+    line(170, 460, 198, 460); line(170, 495, 198, 495);           // NoCs <-> L1
+
+    var comps = [
+      { id: "brisc", x: 20, y: 228, w: 150, h: 48, col: C.blue, label: "BRISC (B)", sub: "4 KiB data RAM",
+        body: "<h4>RISCV B (BRISC)</h4><ul><li>In TT-Metalium it runs data-movement kernel 0 (<code>DM0</code>), typically a reader or writer that drives the NoC.</li><li>4 KiB local data RAM, 2 KiB instruction cache. The ISA docs rate it best at controlling the other RISC-V cores.</li><li>It can push Tensix instructions to <em>any</em> of the three coprocessor threads, entering after the MOP expander (the dashed arrow). The docs warn that this collides with the TRISC's own pushes if both happen on the same cycle.</li></ul>" },
+      { id: "ncrisc", x: 20, y: 290, w: 150, h: 48, col: C.blue, label: "NCRISC (NC)", sub: "4 KiB RAM + 16 KiB IRAM",
+        body: "<h4>RISCV NC (NCRISC)</h4><ul><li>Runs data-movement kernel 1 (<code>DM1</code>) in TT-Metalium.</li><li>4 KiB local data RAM, a ½ KiB instruction cache, plus a 16 KiB core-local <em>instruction</em> RAM that its own load/store unit cannot read or write.</li><li>It <b>cannot</b> push Tensix instructions (only via the debug bus) and has no GDB/debug interface.</li></ul>" },
+      { id: "t0", x: 20, y: 42, w: 150, h: 44, col: C.blue, label: "TRISC0 (T0)", sub: "UNPACK · 2 KiB RAM",
+        body: "<h4>RISCV T0 (TRISC0)</h4><ul><li>Runs the <code>UNPACK</code> part of a compute kernel and pushes instructions to Tensix thread T0.</li><li>2 KiB local data RAM, 2 KiB instruction cache.</li><li>A TRISC can read and write the Tensix semaphores, GPRs and configuration directly with ordinary <code>lw</code>/<code>sw</code>.</li></ul>" },
+      { id: "t1", x: 20, y: 92, w: 150, h: 44, col: C.blue, label: "TRISC1 (T1)", sub: "MATH · 2 KiB RAM",
+        body: "<h4>RISCV T1 (TRISC1)</h4><ul><li>Runs the <code>MATH</code> part of a compute kernel and pushes to Tensix thread T1, which usually drives the FPU and SFPU.</li><li>2 KiB data RAM but only a <b>½ KiB</b> instruction cache, the smallest of the five. Math loops are meant to live in the MOP and replay expanders, not in RISC-V code.</li></ul>" },
+      { id: "t2", x: 20, y: 142, w: 150, h: 44, col: C.blue, label: "TRISC2 (T2)", sub: "PACK · 2 KiB RAM",
+        body: "<h4>RISCV T2 (TRISC2)</h4><ul><li>Runs the <code>PACK</code> part of a compute kernel and pushes to Tensix thread T2.</li><li>2 KiB local data RAM, 2 KiB instruction cache.</li></ul>" },
+      { id: "l1", x: 200, y: 440, w: 690, h: 72, col: C.teal, label: "", sub: "",
+        body: "<h4>L1: 1464 KiB scratchpad SRAM (Wormhole)</h4><ul><li>Plain RAM, not a cache, despite the name. Address range <code>0x0000_0000</code>–<code>0x0016_DFFF</code>, the same for all five cores.</li><li>16 banks × 91.5 KiB. Each bank does one 128-bit read <em>or</em> write per cycle, behind 16 access ports with round-robin arbitration.</li><li>Narrow (&lt;128-bit) writes and atomics are 5-cycle read-modify-writes.</li><li>Blackhole: 1536 KiB.</li></ul>" },
+      { id: "noc0", x: 20, y: 443, w: 150, h: 32, col: C.green, label: "NoC 0", sub: "",
+        body: "<h4>NoC 0 connection</h4><ul><li>Each NoC has four 128-bit connections to L1, two for reading and two for writing: 256 bits/cycle each way.</li><li>Data-movement kernels drive it through memory-mapped command registers. See <a href='a08-noc.html'>A08</a>.</li></ul>" },
+      { id: "noc1", x: 20, y: 479, w: 150, h: 32, col: C.green, label: "NoC 1", sub: "",
+        body: "<h4>NoC 1 connection</h4><ul><li>The second network, with the same 256 + 256 bits/cycle into L1. It routes in the opposite direction to NoC 0 (<a href='a08-noc.html'>A08</a>).</li></ul>" }
+    ];
+    var fe = [["T0", 45], ["T1", 95], ["T2", 145]];
+    fe.forEach(function (f) {
+      comps.push({ id: "mop" + f[0], x: 215, y: f[1], w: 80, h: 38, col: C.yellow, label: "MOP " + f[0], sub: "",
+        body: "<h4>MOP expander (thread " + f[0] + ")</h4><ul><li>The first frontend stage. A single <code>MOP</code> instruction expands into a looped sequence from a per-thread template: up to 32,639 instructions on Wormhole, typically 10–100.</li><li>Configured through <code>MOP_CFG</code> and memory-mapped registers at <code>0xFFB8_0000</code>.</li><li>Lower-level details are in <a href='a13-llk-mops-jit.html'>A13</a>.</li></ul>" });
+      comps.push({ id: "rep" + f[0], x: 325, y: f[1], w: 80, h: 38, col: C.yellow, label: "Replay " + f[0], sub: "",
+        body: "<h4>Replay expander (thread " + f[0] + ")</h4><ul><li>The second frontend stage, with a 32-entry replay buffer per thread. <code>REPLAY</code> either records the next N instructions or plays back N recorded ones.</li><li>The MOP expander's output can contain <code>REPLAY</code>, but not the other way round.</li></ul>" });
+      comps.push({ id: "wg" + f[0], x: 415, y: f[1], w: 55, h: 38, col: C.yellow, label: "Gate", sub: "",
+        body: "<h4>Wait gate (thread " + f[0] + ")</h4><ul><li>The last frontend stage. Everything before it is strictly in order.</li><li>An instruction waits here if its unit is busy, if another thread wins the unit this cycle, if a mutex is held, if SrcA/SrcB are not yet handed to the FPU, or if a <code>STALLWAIT</code>/<code>SEMWAIT</code> condition is not met.</li><li>Once one instruction waits, everything behind it waits too, and the FIFO fills up behind it.</li></ul>" });
+    });
+    comps = comps.concat([
+      { id: "sync", x: 500, y: 45, w: 380, h: 38, col: C.purple, label: "Sync unit", sub: "",
+        body: "<h4>Sync unit</h4><ul><li><b>8 semaphores</b> (4-bit value, a <code>Max</code> of up to 15) and <b>7 mutexes</b> (indices 0 and 2–7) on Wormhole. Blackhole has 4 mutexes.</li><li>Instructions: <code>SEMINIT</code>, <code>SEMPOST</code>, <code>SEMGET</code>, <code>SEMWAIT</code>, <code>STALLWAIT</code>, <code>ATGETM</code>, <code>ATRELM</code>.</li><li>TRISCs can also <code>lw</code> a semaphore value or <code>sw</code> to increment or decrement one.</li></ul>" },
+      { id: "cfg", x: 500, y: 95, w: 185, h: 38, col: C.purple, label: "Config", sub: "",
+        body: "<h4>Configuration unit</h4><ul><li>Instructions are only 32 bits wide, so many take extra operands from configuration registers. Some are per thread; others have two copies that a thread picks between.</li><li>This configuration is also memory-mapped for B/T0/T1/T2 at <code>0xFFEF_0000</code>, which is why changing it from the RISC-V too early is a classic bug (see “runs ahead”).</li></ul>" },
+      { id: "misc", x: 695, y: 95, w: 185, h: 38, col: C.purple, label: "Misc", sub: "",
+        body: "<h4>Miscellaneous unit</h4><ul><li>One of the nine backend execution units. It handles assorted bookkeeping instructions, such as address-counter setup (<code>SETADC*</code>).</li></ul>" },
+      { id: "thcon", x: 500, y: 145, w: 380, h: 38, col: C.purple, label: "Scalar unit (ThCon)", sub: "",
+        body: "<h4>Scalar unit (ThCon)</h4><ul><li>Integer operations on per-thread Tensix GPRs, plus 32- and 128-bit loads and stores against L1, including atomics. The baby RISC-Vs have no “A” extension, so they ask ThCon or the NoC to do atomics for them.</li><li>Not pipelined: one memory request every 3 cycles, and the issuing thread stalls until the instruction finishes.</li></ul>" },
+      { id: "unp0", x: 215, y: 215, w: 90, h: 40, col: C.orange, label: "Unpacker 0", sub: "",
+        body: "<h4>Unpacker 0</h4><ul><li>Moves data from L1 into <b>SrcA</b> (or straight into Dst), converting formats on the way (for example BFP8 → BF16, see <a href='a05-tiles-and-formats.html'>A05</a>).</li><li>Alone it can do 4 × 128-bit L1 reads per cycle. Both unpackers together get 5, because they share three ports.</li><li>Instruction: <code>UNPACR</code>.</li></ul>" },
+      { id: "unp1", x: 215, y: 275, w: 90, h: 40, col: C.orange, label: "Unpacker 1", sub: "",
+        body: "<h4>Unpacker 1</h4><ul><li>Moves data from L1 into <b>SrcB</b>.</li></ul>" },
+      { id: "srca", x: 325, y: 215, w: 90, h: 40, col: C.teal, label: "SrcA", sub: "",
+        body: "<h4>SrcA</h4><ul><li>2 banks × 64 rows × 16 columns × <b>19-bit</b> datums. One bank holds a 32×32 tile (4 faces × 16 rows).</li><li>Double-buffered: the unpackers fill one bank while the FPU reads the other. An FPU instruction waits at the gate until its bank is handed over.</li><li>Details in <a href='a06-matrix-engine.html'>A06</a>.</li></ul>" },
+      { id: "srcb", x: 325, y: 275, w: 90, h: 40, col: C.teal, label: "SrcB", sub: "",
+        body: "<h4>SrcB</h4><ul><li>The same shape as SrcA: 2 × 64 × 16 × 19 bits. It is the second operand of the FPU.</li></ul>" },
+      { id: "fpu", x: 435, y: 230, w: 100, h: 60, col: C.orange, label: "Matrix unit", sub: "(FPU)",
+        body: "<h4>Matrix unit (FPU)</h4><ul><li>Where most of the FLOP/s are: low-precision (≤19-bit) matrix multiply-accumulate (<code>MVMUL</code>) and element-wise <code>ELWADD</code>/<code>ELWSUB</code>/<code>ELWMUL</code>, accumulating into Dst.</li><li>It can only <em>start</em> one instruction per cycle, no matter how many threads want it.</li><li>Fidelity and peak TFLOPS are in <a href='a06-matrix-engine.html'>A06</a>.</li></ul>" },
+      { id: "dst", x: 555, y: 205, w: 140, h: 110, col: C.teal, label: "Dst", sub: "1024 × 16 × 16b",
+        body: "<h4>Dst</h4><ul><li>1024 rows × 16 columns × 16 bits = 32 KiB, or the same storage viewed as 512 × 16 × 32 bits.</li><li>Only <b>one</b> copy, shared by all three threads. Software must stop MATH and PACK from trampling each other, which is exactly the handshake in the animation below.</li><li>No power-on reset value.</li></ul>" },
+      { id: "sfpu", x: 555, y: 335, w: 140, h: 44, col: C.orange, label: "Vector unit (SFPU)", sub: "LReg 17 × 32 lanes",
+        body: "<h4>Vector unit (SFPU) and LReg</h4><ul><li>A 32-lane SIMD engine with 32-bit lanes (FP32 and integer).</li><li>Works on <code>LReg[17][32]</code>: 8 general registers plus constants and special registers. Data moves Dst ↔ LReg with <code>SFPLOAD</code>/<code>SFPSTORE</code>.</li><li>Details in <a href='a07-vector-engine.html'>A07</a>.</li></ul>" },
+      { id: "pack", x: 715, y: 230, w: 150, h: 60, col: C.orange, label: "Packers ×4", sub: "",
+        body: "<h4>Four packers</h4><ul><li>Move data from Dst back to L1, with format conversion, ReLU and edge masking available.</li><li>Each can write 128 bits per cycle, or accumulate into L1 (4 × FP32 or 8 × BF16 lanes) as a read-modify-write.</li><li>Instruction: <code>PACR</code>.</li></ul>" },
+      { id: "mover", x: 325, y: 352, w: 90, h: 44, col: C.purple, label: "Mover", sub: "",
+        body: "<h4>Mover</h4><ul><li>An L1 → L1 copy engine with one read and one write connection. Measured: eight 128-bit reads and eight writes every 11 cycles (~93 bits/cycle each way).</li><li>The ISA docs suggest using it (or the NoC, or unpack + pack) for <code>memcpy</code> instead of RISC-V loads and stores.</li></ul>" }
+    ]);
+    var groups = {};
+    comps.forEach(function (c) {
+      var g = el("g", { "class": "comp" });
+      var r = el("rect", { x: c.x, y: c.y, width: c.w, height: c.h, rx: 6, fill: c.col, "fill-opacity": 0.18, stroke: c.col, "stroke-width": 1.5 }, g);
+      if (c.label) {
+        var tx = el("text", { x: c.x + c.w / 2, y: c.y + c.h / 2 + (c.sub ? -6 : 4), fill: C.fg, "font-size": 13, "text-anchor": "middle" }, g);
+        tx.textContent = c.label;
+      }
+      if (c.sub) {
+        var ts = el("text", { x: c.x + c.w / 2, y: c.y + c.h / 2 + 12, fill: C.muted, "font-size": 11, "text-anchor": "middle" }, g);
+        ts.textContent = c.sub;
+      }
+      g.addEventListener("click", function () { select(c.id); });
+      groups[c.id] = { g: g, r: r, c: c };
+    });
+    // L1 banks drawn inside the L1 box
+    var l1 = groups.l1.g;
+    var tl = el("text", { x: 210, y: 455, fill: C.fg, "font-size": 12.5 }, l1); tl.textContent = "L1 · 1464 KiB scratchpad · 16 banks × 91.5 KiB · 128 bits per bank per cycle";
+    for (var b = 0; b < 16; b++) {
+      el("rect", { x: 208 + b * 42.5, y: 463, width: 38, height: 42, rx: 3, fill: C.teal, "fill-opacity": 0.12, stroke: C.teal, "stroke-opacity": 0.5 }, l1);
+      var bt = el("text", { x: 227 + b * 42.5, y: 489, fill: C.muted, "font-size": 11, "text-anchor": "middle" }, l1);
+      bt.textContent = "b" + b;
+    }
+    function select(id) {
+      for (var k in groups) groups[k].r.setAttribute("fill-opacity", k === id ? 0.45 : 0.18);
+      info.innerHTML = groups[id].c.body;
+    }
+  })();
+  </script>
+
+  <p>Look at where the arrows go. Data never passes <em>through</em> a RISC-V core on its way to the FPU. It flows L1 → unpacker → SrcA/SrcB → FPU → Dst → packer → L1. The RISC-V cores sit off to the side and only send commands. That's the first answer to the opening question: the CPUs are the <b>control plane</b>, and the coprocessor and NoCs are the <b>data plane</b>.</p>
+
+  <div class="callout key">A Tensix tile is one big data engine (the coprocessor plus two NoC connections) steered by five small CPUs. The CPUs decide what to do; the engines move and compute the bytes.</div>
+
+  <h2 id="riscv">Five baby RISC-Vs</h2>
+  <p>The ISA docs call them "baby" cores: 32-bit, in-order, single-issue, designed for area and power rather than speed, each meant to run one RV32IM instruction per cycle at 1 GHz on Wormhole <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/README.md">(BabyRISCV/README.md)</a>. They are named B, NC, T0, T1 and T2. TT-Metalium calls them BRISC, NCRISC and TRISC0–2 and gives each a fixed job:</p>
+
+  <table>
+    <tr><th>Core</th><th>Metalium role</th><th>Local data RAM</th><th>Instruction memory</th><th>Can push Tensix instructions?</th></tr>
+    <tr><td>B (BRISC)</td><td>data movement 0 (reader/writer)</td><td>4 KiB</td><td>2 KiB cache</td><td>yes, to any thread (“OK”)</td></tr>
+    <tr><td>NC (NCRISC)</td><td>data movement 1</td><td>4 KiB</td><td>½ KiB cache + 16 KiB IRAM</td><td>no (debug bus only)</td></tr>
+    <tr><td>T0 (TRISC0)</td><td>compute: <code>UNPACK</code></td><td>2 KiB</td><td>2 KiB cache</td><td>yes, thread T0 (“Great”)</td></tr>
+    <tr><td>T1 (TRISC1)</td><td>compute: <code>MATH</code></td><td>2 KiB</td><td>½ KiB cache</td><td>yes, thread T1</td></tr>
+    <tr><td>T2 (TRISC2)</td><td>compute: <code>PACK</code></td><td>2 KiB</td><td>2 KiB cache</td><td>yes, thread T2</td></tr>
+  </table>
+  <p>Source: the comparison table at <code>WormholeB0/TensixTile/BabyRISCV/README.md:5-13</code>. ttsim models the same sizes in <code>src/config.h:29-38</code>, where <code>TENSIX_SRAM_SIZE</code> is <code>1464 * 1024</code>, BRISC and NCRISC get 4 KiB, TRISCs get 2 KiB, and NCRISC also gets a 16 KiB IRAM.</p>
+
+  <p>A few details tell you what kind of CPU these are:</p>
+  <ul>
+    <li><b>RV32IM only.</b> There is no "A" extension (no atomics), no "C" extension (no compressed instructions), and no floating point. <code>fence</code> runs as a <code>nop</code>, so it cannot enforce memory ordering. There is one custom extension, <code>.ttinsn</code>, which we'll take apart <a href="#push">below</a>.</li>
+    <li><b>They cannot fault.</b> Unaligned accesses are silently rounded down. A load from unmapped memory usually hangs forever. Invalid instructions are <code>UndefinedBehavior</code>.</li>
+    <li><b>The local data RAM is the fast memory.</b> A load from local RAM has 2-cycle latency and never contends. A load from L1 takes at least 8 cycles. The docs strongly recommend putting the call stack and hot variables in local RAM <code>(BabyRISCV/README.md:117-119)</code>.</li>
+  </ul>
+
+  <p>Look at the instruction-memory column too. TRISC1, the core that runs the math, has the <em>smallest</em> instruction cache: half a kilobyte. That only makes sense if the math loop doesn't run as RISC-V code. In practice it lives inside the coprocessor's MOP and replay expanders, so TRISC1 issues a handful of instructions that expand into hundreds. We'll see one <code>MOP</code> become eight <code>ELWADD</code>s in the simulator.</p>
+
+  <div class="callout gpu">A GPU SM has its own instruction fetch, and its warp schedulers issue math instructions straight from the program stream. A Tensix tile splits that job in two. The RISC-V cores fetch and run ordinary code, and the coprocessor never fetches anything: it only executes what is pushed into it. The nearest GPU analogy is a CPU thread feeding a command queue to a DMA engine or tensor core, except that here the "host" is a tiny in-order core sitting right next to the engine, and there are three of them feeding one engine at once.</div>
+
+  <div class="callout warn">"Five cores per tile" does not mean five independent programs on equal footing. In TT-Metalium a compute kernel is <em>one</em> source file compiled three times, once each for TRISC0, TRISC1 and TRISC2, with the <code>UNPACK(...)</code>, <code>MATH(...)</code> and <code>PACK(...)</code> macros selecting which lines each copy keeps. That's the topic of <a href="a12-compute-kernels.html">A12</a>. This chapter is about the hardware those three copies run on.</div>
+
+  <h2 id="l1">L1: 1464 KiB of plain RAM, in 16 banks</h2>
+  <p>"L1" sounds like a cache. It isn't: it's a software-managed scratchpad with no tags and no eviction, and nothing moves in or out unless something is told to move it <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/L1.md">(L1.md)</a>. On Wormhole it is <b>16 banks of 91.5 KiB</b>. Each bank does one 128-bit read or one 128-bit write per cycle, reached through 16 access ports. Any port can reach any bank, but if two ports hit the same bank in the same cycle, all but one wait. Some ports are shared by several clients, which then take turns round-robin.</p>
+  <p>The ports do slightly more than the banks underneath them. A narrow read (under 128 bits) reads all 128 and throws the rest away, so it costs the same bandwidth as a full read. A narrow <em>write</em> is a read-modify-write that blocks the port and bank for five cycles. The same 5-cycle read-modify-write is used for atomic increments and compare-and-swap (offered to the NoC and ThCon) and for the packers' near-memory accumulate.</p>
+  <p>Now look at the baby RISC-V from L1's point of view. Every RISC-V store is a narrow 32-bit store, so it takes five cycles. Every load is narrow too, and only four can be in flight, so well-scheduled loads top out around 18 bits/cycle and dependent loads manage 4. The figure compares the clients L1 serves. Switch it to "cycles to move one BF16 tile" to make the numbers concrete.</p>
+
+  <div class="viz" id="bw">
+    <div class="controls" id="bwctl">
+      <button class="on" data-m="bits">bits per cycle</button>
+      <button data-m="tile">cycles to move one 2 KiB tile</button>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("bw");
+    var g = TT.canvas(root, 860, 360), ctx = g.ctx, C = TT.C;
+    // Numbers from tt-isa-documentation WormholeB0/TensixTile/L1.md "Maximum theoretical bandwidth"
+    var rows = [
+      { n: "RISC-V dependent loads (1 × 32b / 8 cyc)", v: 4, col: C.red },
+      { n: "RISC-V stores (1 × 32b / 5 cyc)", v: 6.4, col: C.red },
+      { n: "RISC-V scheduled loads (4 × 32b / 7 cyc)", v: 128 / 7, col: C.red },
+      { n: "ThCon 128b stores (1 / 3 cyc)", v: 128 / 3, col: C.purple },
+      { n: "Mover, measured (8 × 128b / 11 cyc)", v: 1024 / 11, col: C.purple },
+      { n: "One packer write (128b / cyc)", v: 128, col: C.orange },
+      { n: "One NoC, read side (2 × 128b / cyc)", v: 256, col: C.green },
+      { n: "One unpacker alone (4 × 128b / cyc)", v: 512, col: C.orange }
+    ];
+    var mode = "bits";
+    var TILE_BITS = 2048 * 8; // one 32x32 BF16 tile
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var x0 = 330, x1 = 800, y0 = 30, rh = 38;
+      var lmax = Math.log10(mode === "bits" ? 1000 : 5000), lmin = Math.log10(mode === "bits" ? 1 : 10);
+      TT.text(ctx, mode === "bits" ? "L1 bandwidth, bits per cycle (log scale)" : "Cycles to move one 32×32 BF16 tile = 16,384 bits (log scale, shorter is better)", 20, 14, { color: C.muted, font: "13px" });
+      rows.forEach(function (r, i) {
+        var val = mode === "bits" ? r.v : TILE_BITS / r.v;
+        var y = y0 + i * rh;
+        var w = (Math.log10(val) - lmin) / (lmax - lmin) * (x1 - x0);
+        TT.text(ctx, r.n, x0 - 10, y + 13, { align: "right", font: "13px" });
+        TT.box(ctx, x0, y + 2, Math.max(2, w), 22, { fill: r.col, alpha: 0.55, r: 3 });
+        var s = mode === "bits" ? (val < 20 ? val.toFixed(1) : Math.round(val)) : Math.round(val).toLocaleString();
+        TT.text(ctx, s, x0 + Math.max(2, w) + 8, y + 13, { font: "13px", mono: true });
+      });
+      TT.text(ctx, "Theoretical peaks from tt-isa-documentation L1.md; port and bank conflicts reduce all of them.", 20, g.H - 14, { color: C.muted, font: "12px" });
+    }
+    root.querySelectorAll("#bwctl button").forEach(function (b) {
+      b.onclick = function () {
+        mode = b.getAttribute("data-m");
+        root.querySelectorAll("#bwctl button").forEach(function (x) { x.classList.toggle("on", x === b); });
+        draw();
+      };
+    });
+    draw();
+  })();
+  </script>
+
+  <p>A RISC-V core copying a 2 KiB tile word by word needs about 2,560 cycles just for the stores. A single unpacker reads the same tile in about 32. That two-orders-of-magnitude gap is the hardware's way of saying "don't move data with the CPU". The ISA docs say so plainly: RISC-V cores "are <em>strongly</em> encouraged to instruct other clients to access L1 on their behalf", namely the mover, an unpacker plus the packers, or a NoC <code>(L1.md:25-27)</code>.</p>
+
+  <div class="callout warn">Being able to <code>lw</code> and <code>sw</code> L1 from a kernel doesn't make it cheap. Keep RISC-V code to control: counters, pointers, small arguments. Things that look like a loop over data elements belong to an engine. (Debug prints and small mailboxes are fine.)</div>
+
+  <p>Bank conflicts are the other cost. The ISA docs give the bank count and the port assignment, but this chapter doesn't depend on which address bits pick a bank, so I won't guess at it here. For how tt-metal lays out buffers across L1 and DRAM, see <a href="a09-memory.html">A09</a>.</p>
+
+  <h2 id="coproc">The coprocessor: three threads, one backend</h2>
+  <p>Now the big box. The Tensix coprocessor runs three instruction streams, called threads T0, T1 and T2, at up to one instruction per thread per cycle. Normally RISC-V T<i>i</i> feeds thread T<i>i</i>. The key design choice is in the first paragraph of its documentation: "Instructions are <em>not</em> pulled from memory — instead the Baby RISCV cores <em>push</em> instructions to the three threads" <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/README.md">(TensixCoprocessor/README.md)</a>.</p>
+
+  <h3>Frontend: one copy per thread</h3>
+  <p>Each thread has its own frontend of three in-order stages, joined by FIFOs:</p>
+  <ol>
+    <li><b>MOP expander.</b> Turns one <code>MOP</code> instruction into a loop of up to 32,639 instructions (on Wormhole) from a per-thread template <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MOPExpander.md">(MOPExpander.md)</a>.</li>
+    <li><b>Replay expander.</b> A 32-entry buffer per thread. <code>REPLAY</code> either records the next N instructions or plays back N recorded ones, for straight-line sequences (REPLAY.md).</li>
+    <li><b>Wait gate.</b> Decides when the instruction at the head may enter the backend. It holds the instruction if the unit is busy, if another thread won the unit this cycle, if a mutex is held, if SrcA/SrcB are not yet handed to the FPU, or if a <code>STALLWAIT</code>/<code>SEMWAIT</code> condition isn't met (WaitGate.md).</li>
+  </ol>
+  <p>The two expanders exist because a RISC-V can't push an instruction every cycle and still do its own bookkeeping. With them, a TRISC can push slowly and the backend still gets one instruction per cycle. (How LLK code configures MOPs is in <a href="a13-llk-mops-jit.html">A13</a>.)</p>
+
+  <h3>Backend: nine units, mostly shared</h3>
+  <p>After the wait gate, an instruction goes to one of nine units: Sync, Unpackers, Matrix (FPU), Packers, Vector (SFPU), Scalar (ThCon), Configuration, Mover and Miscellaneous. They run in parallel, so <em>reordering starts here</em>. The frontend is in order, but an <code>ELWADD</code> on T1 and a <code>PACR</code> on T2 can run in either order unless something forces one to wait.</p>
+  <p>Each instruction remembers which thread sent it, so per-thread state (some configuration, GPRs, address counters, mutex ownership) stays separate. Most of the backend exists <b>only once</b>, though. That includes the registers the engines work on:</p>
+
+  <table>
+    <tr><th>Register</th><th>Shape</th><th>Size</th><th>Copies</th><th>More in</th></tr>
+    <tr><td>SrcA</td><td>2 banks × 64 rows × 16 cols × 19 bit</td><td>one bank = one 32×32 tile</td><td>double-buffered between unpacker and FPU</td><td><a href="a06-matrix-engine.html">A06</a></td></tr>
+    <tr><td>SrcB</td><td>2 banks × 64 × 16 × 19 bit</td><td>one bank = one tile</td><td>double-buffered</td><td><a href="a06-matrix-engine.html">A06</a></td></tr>
+    <tr><td>Dst</td><td>1024 rows × 16 cols × 16 bit (or 512 × 16 × 32 bit)</td><td>32 KiB</td><td><b>one</b>, shared by all threads</td><td><a href="a06-matrix-engine.html">A06</a>, <a href="a12-compute-kernels.html">A12</a></td></tr>
+    <tr><td>LReg</td><td>17 × 32 lanes × 32 bit (8 general)</td><td>~2 KiB</td><td>one, shared</td><td><a href="a07-vector-engine.html">A07</a></td></tr>
+  </table>
+  <p>Sources: SrcASrcB.md, Dst.md and LReg.md in <code>WormholeB0/TensixTile/TensixCoprocessor/</code>. The docs spell out the consequence: "software needs to carefully manage concurrent access to these memories, as otherwise threads can overwrite each other's data" (TensixCoprocessor/README.md:62). ttsim's data structure has exactly this split. Per-thread arrays are sized <code>[TENSIX_INST_PIPES]</code> (3), and the big registers appear once:</p>
+
+  <div class="filename">ttsim/src/sim.h:227-283 @b3620244 (excerpt, unrelated fields elided; the comments on <code>inst</code>, <code>replay_buf</code>, <code>mop</code> and <code>dst</code> are ours)</div>
+<pre><code>struct TensixState {
+    ...
+    uint32_t inst[TENSIX_INST_PIPES][TENSIX_INST_FIFO_SIZE];   // one instruction FIFO per thread
+    ...
+    uint32_t replay_buf[TENSIX_INST_PIPES][REPLAY_BUF_ENTRIES]; // one replay buffer per thread (32)
+    TensixMopState mop[TENSIX_INST_PIPES];                      // one MOP expander per thread
+    ...
+    uint8_t mutex[TT_ARCH_VERSION ? 5 : 8]; // odd, but per docs, BH has fewer mutexes than WH
+    uint8_t sem[8];
+    uint8_t sem_max[8];
+    ...
+    uint32_t src_a[2][SRC_ROWS][ROW_SIZE]; // only 19 real bits per cell; make sure low 13 bits are always zero
+    uint32_t src_b[2][SRC_ROWS][ROW_SIZE]; // only 19 real bits per cell; make sure low 13 bits are always zero
+    uint16_t dst[DST_ROWS][ROW_SIZE];      // DST_ROWS = 1024, ROW_SIZE = 16: one copy, shared
+    ...
+    uint32_t l_regs[16][32]; // only 8 fully usable regs, but 16 sources easier to implement this way</code></pre>
+  <p><code>SRC_ROWS</code> is 64, <code>DST_ROWS</code> is 1024, <code>ROW_SIZE</code> is 16 and <code>REPLAY_BUF_SIZE</code> is 32 (<code>sim.h:47-54</code>), which matches the ISA docs. Two small notes. ttsim keeps 19-bit Src values in the top bits of a <code>uint32_t</code>. Its mutex array has 8 slots on Wormhole, although the docs count 7 usable mutexes (index 1 doesn't exist).</p>
+
+  <h2 id="push">How a TRISC pushes an instruction</h2>
+  <p>If the coprocessor doesn't fetch, how does an instruction get in? Through a memory-mapped store. A Tensix instruction is a 32-bit word, and a TRISC pushes it with an ordinary <code>sw</code> of that word to <code>INSTRN_BUF_BASE = 0xFFE4_0000</code>. The address is the same for all three TRISCs, and each one's store lands in its own thread's FIFO. BRISC can also reach T1 and T2 through <code>0xFFE5_0000</code> and <code>0xFFE6_0000</code>. NCRISC has no mapping at all. If the FIFO is full, the store simply stalls the RISC-V until there's room <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/PushTensixInstruction.md">(PushTensixInstruction.md)</a>.</p>
+  <p>tt-metal names the address in two places:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/tensix.h:52 and tt_metal/hw/toolchain/main.ld:414 @7aad8aac</div>
+<pre><code>#define INSTRN_BUF_BASE 0xFFE40000
+PROVIDE(__instrn_buffer = 0xFFE40000);</code></pre>
+
+  <h3>The <code>.ttinsn</code> trick</h3>
+  <p>An <code>sw</code> needs a register holding the value and a register holding the address. Before that, each instruction has to be loaded into a register with <code>lui</code>/<code>addi</code>. That's three or so RISC-V instructions per Tensix instruction, and pushing is the most common thing a TRISC does. So the baby cores add one custom encoding. If the low two bits of a 32-bit RISC-V instruction are <em>not</em> <code>11</code>, the core treats the word as a Tensix instruction: it rotates the word right by two bits and pushes the result to <code>0xFFE40000</code>. The behaviour is exactly that of the <code>sw</code>.</p>
+  <p>Why the low two bits? In standard RISC-V, every 32-bit instruction ends in <code>11</code>, and the other three patterns are reserved for the 16-bit "C" extension, which these cores don't implement. That space was free. The assembler builds <code>.ttinsn IMM32</code> by rotating <code>IMM32</code> <em>left</em> two bits. This only works if the top two bits of <code>IMM32</code> aren't both 1, because those bits become the low bits. So every valid Tensix instruction is below <code>0xC000_0000</code>, and the docs note that this always holds. Step through it:</p>
+
+  <div class="viz" id="enc">
+    <div class="controls"><label>Instruction word:
+      <select id="encsel">
+        <option value="0">SEMPOST(MATH_PACK) = 0xA4000008</option>
+        <option value="1">ELWADD(0,0,0,0,0) = 0x28000000</option>
+        <option value="2">NOP = 0x02000000</option>
+        <option value="3">RISC-V addi a0,a0,1 = 0x00150513</option>
+      </select></label></div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("enc");
+    var g = TT.canvas(root, 860, 300), ctx = g.ctx, C = TT.C;
+    var W = [
+      { v: 0xA4000008, tt: true, name: "SEMPOST", note: "TT_OP(0xa4, sem_sel << 2), sem_sel = t6_sem(MATH_PACK = 1) = 0b10" },
+      { v: 0x28000000, tt: true, name: "ELWADD", note: "TT_OP(0x28, 0): opcode in bits 31:24" },
+      { v: 0x02000000, tt: true, name: "NOP", note: "TT_OP(0x02, 0)" },
+      { v: 0x00150513, tt: false, name: "addi a0,a0,1", note: "an ordinary RV32I instruction: low bits are 11" }
+    ];
+    var sel = document.getElementById("encsel"), cur = 0;
+    function rotl2(x) { return ((x << 2) | (x >>> 30)) >>> 0; }
+    function rotr2(x) { return ((x >>> 2) | (x << 30)) >>> 0; }
+    function hex(x) { return "0x" + (x >>> 0).toString(16).toUpperCase().padStart(8, "0"); }
+    function drawBits(x, y, val, shift, hiLow, label) {
+      // shift: fractional bit offset for animation (positive = left)
+      TT.text(ctx, label, 20, y + 12, { color: C.muted, font: "13px" });
+      var bw = 17;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y - 4, 32 * bw, 32); ctx.clip();
+      for (var i = 0; i < 34; i++) {
+        var bitIdx = 31 - ((i % 32));
+        var b = (val >>> bitIdx) & 1;
+        var px = x + (i - shift) * bw;
+        if (i >= 32) px = x + (i - shift) * bw; // wrapped copies
+        var colr = C.blue;
+        if (hiLow === "hi" && bitIdx >= 30) colr = C.yellow;
+        if (hiLow === "lo" && bitIdx <= 1) colr = C.yellow;
+        TT.box(ctx, px + 1, y, bw - 2, 24, { fill: colr, alpha: b ? 0.6 : 0.12, stroke: colr, lw: 1, r: 2 });
+        TT.text(ctx, String(b), px + bw / 2, y + 12, { align: "center", mono: true, font: "12px" });
+      }
+      ctx.restore();
+    }
+    var steps = [
+      { dur: 1, text: "" }, { dur: 1.4, text: "" }, { dur: 1, text: "" }, { dur: 1, text: "" }
+    ];
+    function texts(w) {
+      var enc = w.tt ? rotl2(w.v) : w.v;
+      return [
+        "<b>Step 1.</b> " + (w.tt ? "The Tensix instruction <code>" + w.name + "</code> is the 32-bit word <code>" + hex(w.v) + "</code> (" + w.note + "). Its top two bits (yellow) are never <code>11</code>, because every valid Tensix instruction is below 0xC0000000." : "This is an ordinary RISC-V instruction, <code>" + w.name + "</code> = <code>" + hex(w.v) + "</code> (" + w.note + ")."),
+        w.tt ? "<b>Step 2.</b> The assembler encodes <code>.ttinsn</code> by rotating the word <em>left</em> by 2 bits. The top two bits wrap around to the bottom. The word stored in the kernel binary is <code>" + hex(enc) + "</code>." : "<b>Step 2.</b> An ordinary RISC-V instruction isn't rotated: it is stored as is.",
+        "<b>Step 3.</b> When the core fetches <code>" + hex(enc) + "</code>, ttsim checks <code>(inst &amp; 3) == 3</code>. The low two bits are <code>" + ((enc & 3) >>> 0).toString(2).padStart(2, "0") + "</code>, so " + ((enc & 3) === 3 ? "this goes to the normal RV32IM decode table." : "this is <b>not</b> a standard 32-bit RISC-V instruction, and it goes down the <code>tti</code> path."),
+        (enc & 3) === 3 ? "<b>Step 4.</b> Decoded and executed as <code>" + w.name + "</code>. Nothing is pushed to the coprocessor." : "<b>Step 4.</b> <code>(inst &lt;&lt; 30) | (inst &gt;&gt; 2)</code> rotates the word right by 2 and gets back <code>" + hex(rotr2(enc)) + "</code>. That value is pushed into this TRISC's Tensix FIFO, exactly as if the core had done <code>sw</code> to 0xFFE40000."
+      ];
+    }
+    var st = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        var w = W[cur], enc = w.tt ? rotl2(w.v) : w.v, tx = texts(w);
+        steps.forEach(function (s, k) { s.text = tx[k]; });
+        TT.clear(ctx, g.W, g.H);
+        var x = 190;
+        TT.text(ctx, "bit 31", x, 22, { color: C.muted, font: "11px" });
+        TT.text(ctx, "bit 0", x + 32 * 17, 22, { color: C.muted, font: "11px", align: "right" });
+        if (i === 0) {
+          drawBits(x, 40, w.v, 0, w.tt ? "hi" : "lo", w.tt ? "Tensix instruction" : "RISC-V instruction");
+        } else if (i === 1) {
+          drawBits(x, 40, w.v, w.tt ? 2 * t : 0, w.tt ? "hi" : "lo", w.tt ? "rotating left by 2…" : "unchanged");
+          if (t > 0.99) drawBits(x, 100, enc, 0, "lo", "stored in binary");
+        } else {
+          drawBits(x, 40, w.v, 0, w.tt ? "hi" : "lo", w.tt ? "Tensix instruction" : "RISC-V instruction");
+          TT.text(ctx, hex(w.v), x + 32 * 17 + 10, 52, { mono: true, font: "13px", color: C.muted });
+          drawBits(x, 100, enc, 0, "lo", "stored in binary");
+          TT.text(ctx, hex(enc), x + 32 * 17 + 10, 112, { mono: true, font: "13px" });
+          var isRV = (enc & 3) === 3;
+          var a = i === 2 ? t : 1;
+          TT.box(ctx, 250, 160, 260, 40, { fill: C.green, alpha: isRV ? 0.25 * a + 0.05 : 0.05, stroke: C.green, label: "(inst & 3) == 3 → RV32IM decode", font: "13px" });
+          TT.box(ctx, 540, 160, 260, 40, { fill: C.orange, alpha: !isRV ? 0.25 * a + 0.05 : 0.05, stroke: C.orange, label: "else → tti(): rotate right 2, push", font: "13px" });
+          if (i === 3 && !isRV) {
+            TT.arrow(ctx, 670, 202, 670, 232, { color: C.orange });
+            TT.box(ctx, 540, 236, 260, 40, { fill: C.orange, alpha: 0.3 * t + 0.05, stroke: C.orange, label: "push " + hex(rotr2(enc)) + " → thread FIFO", font: "13px", mono: true });
+          }
+          if (i === 3 && isRV) {
+            TT.arrow(ctx, 380, 202, 380, 232, { color: C.green });
+            TT.box(ctx, 250, 236, 260, 40, { fill: C.green, alpha: 0.3, stroke: C.green, label: "execute " + w.name, font: "13px" });
+          }
+        }
+      }
+    });
+    sel.onchange = function () { cur = +sel.value; st.render(); };
+  })();
+  </script>
+
+  <p>Here is the real code in ttsim. The fetch loop checks the low two bits first:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:1967-1976 @b3620244</div>
+<pre><code>    if ((inst &amp; 3) == 3) [[likely]] { // RISCV
+        uint32_t opcode = ((inst &gt;&gt; 2) &amp; 31) | ((inst &amp; 0x7000) &gt;&gt; 7);
+        s_decode_table[opcode](p_hart, inst);
+    } else {
+#if XLEN == 32
+        RV_XLEN_PREFIX(tti)(p_hart, inst);
+#else
+        p_hart-&gt;pc = pc + 2; // again, optimizes for the common case
+        uint32_t opcode = (inst &amp; 3) | (bits&lt;15,13&gt;(inst) &lt;&lt; 2);
+        s_rv64c_decode_table[opcode](p_hart, inst);</code></pre>
+  <p>The <code>#else</code> branch is for ttsim's 64-bit cores (Blackhole's x280s), where the same bit pattern really does mean a compressed instruction. On the 32-bit baby cores it means "Tensix instruction". Here is <code>tti</code>:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:1460-1484 @b3620244</div>
+<pre><code>static void RV_XLEN_PREFIX(tti)(RiscvHartState *p_hart, uint32_t inst) {
+    TTSIM_VERIFY(p_hart-&gt;tile_type == 'T', UndefinedBehavior, "tile_type=%c", p_hart-&gt;tile_type);
+    uint32_t riscv_id = p_hart-&gt;riscv_id;
+    bool bypass_mop_expander = false;
+    uint32_t tensix_id;
+    uint32_t pipe;
+    if (riscv_id == RV32_ID_BRISC) {
+        pipe = 0; // this writes the MMIO aperture for pipe 0
+        bypass_mop_expander = true;
+    } else {
+        ...
+        TTSIM_VERIFY((riscv_id &gt;= RV32_ID_TRISC0) &amp;&amp; (riscv_id &lt;= RV32_ID_TRISC2), UndefinedBehavior, "riscv_id=%d", riscv_id);
+        pipe = riscv_id - RV32_ID_TRISC0;
+    }
+    tensix_id = 0;
+
+    TensixState *p_tensix = &amp;g_t_tiles[p_hart-&gt;tile_id].tensix[tensix_id];
+    if (tensix_can_push_inst(p_tensix, pipe)) {
+        uint32_t tensix_inst = (inst &lt;&lt; 30) | (inst &gt;&gt; 2);
+        tensix_push_inst(p_tensix, pipe, tensix_inst, bypass_mop_expander);
+    } else {
+        p_hart-&gt;pc -= 4; // replay TTI instruction
+    }
+}</code></pre>
+  <p>Line by line:</p>
+  <ul>
+    <li><b>The tile check.</b> A <code>.ttinsn</code> outside a Tensix tile (on an Ethernet core, for example) is undefined behaviour, so ttsim stops.</li>
+    <li><b>Choosing the thread.</b> TRISC<i>i</i> pushes to thread <i>i</i> (<code>pipe = riscv_id - RV32_ID_TRISC0</code>). BRISC writes to thread 0 and bypasses the MOP expander. That matches the ISA memory map, where BRISC's store to 0xFFE40000 enters "after T0 MOP expander". NCRISC fails the <code>TTSIM_VERIFY</code>, matching the hardware, where it can't push.</li>
+    <li><b>Undoing the rotation.</b> <code>(inst &lt;&lt; 30) | (inst &gt;&gt; 2)</code> is a rotate right by 2, the inverse of the assembler's rotate left.</li>
+    <li><b>Back-pressure.</b> If the FIFO is full, ttsim sets the PC back by 4, so the same <code>.ttinsn</code> runs again next step. That's how ttsim models "the store stalls until FIFO space is available". In ttsim, <code>tensix_can_push_inst</code> refuses when the thread's expanders are busy or more than 52 entries are queued (<code>tensix.cpp:284-293</code>). That threshold is ttsim's own choice. The Wormhole ISA page doesn't give a FIFO depth, so don't read 52 as a hardware number.</li>
+  </ul>
+  <p>On the compiler side, tt-metal's <code>TTI_*</code> macros all go through one builtin of the SFPI compiler, which emits the rotated word. There's also a hand-written fallback for the LLK test harness that runs TTI macros on BRISC, and it spells out the rotation:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel_ops.h:12-17,24 @7aad8aac</div>
+<pre><code>#define TT_INSN(ENCODING)  __builtin_rvtt_ttinsn(::ckernel::instrn_buffer, (ENCODING), 0, 0, 0)
+#define TTI_INSN(ENCODING) __builtin_rvtt_ttinsn(nullptr, (ENCODING), 0, 0, 0)
+#elif defined(ARCH_WORMHOLE) &amp;&amp; defined(LLK_BOOT_BRISC)
+// The llk test infra uses TTI macros on brisc and somehow executes
+// it. So icky. See #58141
+#define TTI_INSN(ENCODING) ({ __asm__ __volatile__(".4byte %0" ::"n"(unsigned((((ENCODING) &gt;&gt; 30) &amp; 3) | (((ENCODING) &amp; 0x3fffffff) &lt;&lt; 2)))); })
+...
+#define TT_OP(opcode, params) ((opcode &lt;&lt; 24) + params)</code></pre>
+  <p>Two flavours appear here. <code>TTI_</code> ("immediate") instructions are compile-time constants and become a single <code>.ttinsn</code>. <code>TT_</code> instructions take runtime operands, so they're assembled in a register and stored through the <code>instrn_buffer</code> pointer, which is the plain <code>sw</code> path. In ttsim the two paths arrive at different functions, <code>tti()</code> and <code>tensix_inst_wr32()</code> in <code>tile.cpp</code>. Both end in <code>tensix_push_inst</code>. <code>TT_OP</code> shows the encoding: the opcode sits in the top byte.</p>
+
+  <div class="callout sim">Lab <a href="../sim-labs/b03-riscv-interpreter.html">B03</a> walks through ttsim's decode table and the TTI escape and counts instructions per core. Lab <a href="../sim-labs/b04-tensix-instructions.html">B04</a> follows the pushed instructions through MOP expansion to the backend units.</div>
+
+  <div class="callout gpu">Blackhole goes further. Its TRISC instruction caches can fuse up to four adjacent <code>.ttinsn</code>s into one cycle, so a thread can <em>enqueue</em> four Tensix instructions per cycle, although the frontend still dequeues only one per thread per cycle (BlackholeA0 BabyRISCV/README.md). Blackhole's baby cores also get a 64-byte, non-coherent L0 data cache and twice the local RAM (8 KiB for B/NC, 4 KiB for T). They run at 1.35 GHz and are no longer plain RV32IM: they add Zicsr, Zaamo (atomics), Zba/Zbb and parts of F/Zfh, and T2 gets part of V. L1 grows to 1536 KiB.</div>
+
+  <h2 id="ahead">The RISC-V runs ahead</h2>
+  <p>Look again at the last line of <code>tti()</code>. Once the push succeeds, the function returns and the RISC-V moves on to its next instruction. Nothing waits for the Tensix instruction to <em>execute</em>. The ISA docs make this the central warning about the coprocessor:</p>
+  <blockquote>"Once a RISCV core has pushed a Tensix instruction, execution of the RISCV core proceeds completely asynchronously to execution of the Tensix Coprocessor. […] the RISCV can get quite far ahead before the pushed instruction actually executes." (TensixCoprocessor/README.md:9)</blockquote>
+  <p>Think of a restaurant pass. Three waiters (the TRISCs) each spike order tickets onto their own rail (the FIFOs). A waiter who has spiked a ticket goes off to take the next order without waiting for the food. The kitchen (the backend) has one grill (the FPU), one set of plates being plated (Dst) and one pass to the dining room (the packers). The waiters' rails are each strictly first-in, first-out. Nothing on the rails says that table 7's plate can't go out until table 7's steak is cooked. If the plating waiter's ticket reaches the pass first, an empty plate goes out.</p>
+  <p>Here's where the analogy breaks. Real waiters would notice an empty plate. The Tensix backend won't. The rails also have a fixed length: once a rail is full, the waiter <em>is</em> forced to stand and wait. Back-pressure exists, but it limits how far ahead the RISC-V gets. It doesn't order one thread against another.</p>
+
+  <p>Below is the core of an <code>add_tiles</code> compute kernel on three TRISCs. Instruction names, their order and the semaphore handshake come from the real LLK code (cited below the figure). Cycle counts are illustrative. The labels at the end of each program line (<code>add_tiles</code>, <code>tile_regs_wait</code> and so on) are the TT-Metalium compute-API calls that emit each group. You'll write those calls yourself in <a href="a12-compute-kernels.html">A12</a>, so for now treat them as names. Press Play, then switch the mode and play again.</p>
+
+  <div class="viz" id="race"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("race");
+    var g = TT.canvas(root, 960, 600), ctx = g.ctx, C = TT.C;
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    var narr = document.createElement("div"); narr.className = "narration";
+    function mkb(l) { var b = document.createElement("button"); b.textContent = l; ctrl.appendChild(b); return b; }
+    var bPlay = mkb("Play"), bStep = mkb("Step 1 cycle"), bReset = mkb("Restart");
+    var lab = document.createElement("label"); lab.innerHTML = "Mode: ";
+    var sel = document.createElement("select");
+    [["sync", "with sync (tile_regs_wait + release)"], ["nowait", "remove tile_regs_wait only"], ["nosync", "remove wait and release"]].forEach(function (o) {
+      var op = document.createElement("option"); op.value = o[0]; op.textContent = o[1]; sel.appendChild(op);
+    });
+    lab.appendChild(sel); ctrl.appendChild(lab);
+    var info = document.createElement("span"); info.style.marginLeft = "auto"; info.style.color = C.muted; ctrl.appendChild(info);
+    root.appendChild(ctrl); root.appendChild(narr);
+
+    var A = [1, 2, 3, 4, 5, 6, 7, 8], B = [2, 2, 2, 2, 2, 2, 2, 2]; // per row-group sample values
+    var UNP_CYC = 3, PACR_CYC = 8, QCAP = 4;
+    function I(op, x) { var o = { op: op }; for (var k in x) o[k] = x[k]; return o; }
+    function progs(mode) {
+      var unpExp = [];
+      for (var f = 0; f < 4; f++) { unpExp.push(I("UNPACR", { u: "B", f: f })); unpExp.push(I("UNPACR", { u: "A", f: f })); }
+      var elw = []; for (var k = 0; k < 8; k++) elw.push(I("ELWADD", { gidx: k }));
+      var P = [
+        [ { rv: 2, t: "cb_wait_front: poll CB counters" },
+          { push: I("MOP", { exp: unpExp, lbl: "MOP→8×UNPACR" }), t: ".ttinsn MOP (8× UNPACR)   add_tiles" },
+          { rv: 2, t: "RISC-V bookkeeping" } ],
+        [ { push: I("SEMWAIT", { cond: "max" }), t: ".ttinsn SEMWAIT max   tile_regs_acquire" },
+          { rv: 1, t: "RISC-V bookkeeping" },
+          { push: I("MOP", { exp: elw, lbl: "MOP→8×ELWADD" }), t: ".ttinsn MOP (8× ELWADD)  add_tiles" },
+          { push: I("STALLWAIT", { unit: "fpu" }), t: ".ttinsn STALLWAIT math  tile_regs_commit" },
+          { push: I("SEMPOST", {}), t: ".ttinsn SEMPOST" } ]
+      ];
+      var p2 = [];
+      if (mode === "sync") p2.push({ push: I("SEMWAIT", { cond: "zero" }), t: ".ttinsn SEMWAIT zero  tile_regs_wait" });
+      p2.push({ push: I("PACR", {}), t: ".ttinsn PACR            pack_tile" });
+      if (mode !== "nosync") {
+        p2.push({ push: I("STALLWAIT", { unit: "pack" }), t: ".ttinsn STALLWAIT pack  tile_regs_release" });
+        p2.push({ push: I("ZEROACC", {}), t: ".ttinsn ZEROACC" });
+        p2.push({ push: I("SEMGET", {}), t: ".ttinsn SEMGET" });
+      }
+      P.push(p2);
+      return P;
+    }
+    var S;
+    function reset() {
+      var mode = sel.value;
+      S = { mode: mode, P: progs(mode), cyc: 0, pc: [0, 0, 0], rvc: [0, 0, 0], rvDone: [-1, -1, -1], q: [[], [], []],
+        unpA: 0, unpB: 0, fA: 0, fB: 0, fpu: null, pack: null, sem: 0, semMax: 2,
+        dst: [0, 0, 0, 0, 0, 0, 0, 0], dstW: [false, false, false, false, false, false, false, false],
+        out: [null, null, null, null, null, null, null, null], hold: [null, null, null], issued: [null, null, null],
+        ev: [], done: false, err: null, copDone: -1, notedAhead: false, rvStall: [false, false, false] };
+      narr.innerHTML = "<b>Cycle 0.</b> Three TRISCs are about to run their parts of the kernel. Each <code>.ttinsn</code> line pushes into that thread's FIFO (middle). The wait gates (vertical bars) decide when an instruction enters the shared backend (right). The semaphore <code>MATH_PACK</code> starts at 0, with max 2 (SyncHalf).";
+      draw();
+    }
+    function head(t) {
+      var q = S.q[t]; if (!q.length) return null;
+      var h = q[0]; if (h.op === "MOP") return h.exp[h.i || 0];
+      return h;
+    }
+    function popHead(t) {
+      var q = S.q[t], h = q[0];
+      if (h.op === "MOP") { h.i = (h.i || 0) + 1; if (h.i >= h.exp.length) q.shift(); }
+      else q.shift();
+    }
+    var TN = ["UNPACK", "MATH", "PACK"];
+    function step() {
+      if (S.done) return;
+      S.cyc++;
+      var c = S.cyc, ev = [];
+      S.issued = [null, null, null];
+      // 1. backend units progress
+      if (S.unpA > 0 && --S.unpA === 0) S.fA++;
+      if (S.unpB > 0 && --S.unpB === 0) S.fB++;
+      if (S.fpu) { S.dst[S.fpu.g] = A[S.fpu.g] + B[S.fpu.g]; S.dstW[S.fpu.g] = true; S.fpu = null; }
+      if (S.pack) {
+        var j = PACR_CYC - S.pack.left;
+        S.out[j] = S.dst[j];
+        if (--S.pack.left === 0) { S.pack = null; ev.push("the packer finishes writing the output tile to L1"); }
+      }
+      // 2. frontends / wait gates
+      for (var t = 0; t < 3; t++) {
+        var h = head(t); S.hold[t] = null;
+        if (!h) continue;
+        var ok = true, why = "";
+        if (h.op === "UNPACR") { if ((h.u === "A" ? S.unpA : S.unpB) > 0) { ok = false; why = "unpacker " + (h.u === "A" ? 0 : 1) + " busy"; } }
+        else if (h.op === "ELWADD") {
+          if (S.fA < 4 || S.fB < 4) { ok = false; why = "SrcA/SrcB not yet given to FPU"; }
+          else if (S.fpu) { ok = false; why = "FPU busy"; }
+        } else if (h.op === "SEMWAIT") {
+          if (h.cond === "max" && S.sem >= S.semMax) { ok = false; why = "MATH_PACK at max"; }
+          if (h.cond === "zero" && S.sem === 0) { ok = false; why = "MATH_PACK = 0"; }
+        } else if (h.op === "STALLWAIT") {
+          if (h.unit === "fpu" && (S.fpu || (head(1) && head(1).op === "ELWADD" && t !== 1))) { ok = false; why = "math still busy"; }
+          if (h.unit === "pack" && S.pack) { ok = false; why = "packer still busy"; }
+        } else if (h.op === "PACR") { if (S.pack) { ok = false; why = "packer busy"; } }
+        if (!ok) { S.hold[t] = why; continue; }
+        // execute
+        if (h.op === "UNPACR") { if (h.u === "A") S.unpA = UNP_CYC; else S.unpB = UNP_CYC; S.issued[t] = h.u === "A" ? "unp0" : "unp1"; }
+        else if (h.op === "ELWADD") { S.fpu = { g: h.gidx }; S.issued[t] = "fpu"; }
+        else if (h.op === "PACR") {
+          S.pack = { left: PACR_CYC }; S.issued[t] = "pack";
+          var ready = S.dstW.filter(function (x) { return x; }).length;
+          ev.push("PACK thread issues <code>PACR</code>. Dst has " + ready + " of 8 row groups written" + (ready < 8 ? ": <b style='color:#fc6255'>the packer is about to copy stale data</b>" : ""));
+        }
+        else if (h.op === "SEMPOST") { S.sem = Math.min(15, S.sem + 1); S.issued[t] = "sync"; ev.push("MATH thread: <code>SEMPOST</code>. MATH_PACK becomes " + S.sem + " (\"Dst is ready\")"); }
+        else if (h.op === "SEMGET") {
+          S.issued[t] = "sync";
+          if (S.sem === 0) {
+            S.err = "[ttsim] ERROR: NonContractualBehavior: tensix_semget: sem=0 sem_max=2";
+            ev.push("PACK thread: <code>SEMGET</code> while MATH_PACK = 0. Real ttsim stops here with <code>NonContractualBehavior: tensix_semget: sem=0 sem_max=2</code>");
+          } else { S.sem--; ev.push("PACK thread: <code>SEMGET</code>. MATH_PACK drops to " + S.sem + " (\"Dst is free again\")"); }
+        }
+        else if (h.op === "SEMWAIT") { S.issued[t] = "sync"; ev.push(TN[t] + " thread's <code>SEMWAIT</code> is satisfied (MATH_PACK = " + S.sem + ") and passes the gate"); }
+        else if (h.op === "ZEROACC") { S.dst = [0, 0, 0, 0, 0, 0, 0, 0]; S.dstW = S.dstW.map(function () { return false; }); S.issued[t] = "fpu"; }
+        popHead(t);
+      }
+      // 3. RISC-V cores
+      for (t = 0; t < 3; t++) {
+        if (S.rvDone[t] >= 0) continue;
+        var s = S.P[t][S.pc[t]];
+        S.rvStall[t] = false;
+        if (s.rv) { if (++S.rvc[t] >= s.rv) { S.rvc[t] = 0; S.pc[t]++; } }
+        else if (S.q[t].length >= QCAP) { S.rvStall[t] = true; }
+        else {
+          var cp = JSON.parse(JSON.stringify(s.push)); S.q[t].push(cp); S.pc[t]++;
+          if (cp.op === "PACR") ev.push("TRISC2 pushes <code>PACR</code> and moves straight on");
+        }
+        if (S.pc[t] >= S.P[t].length) { S.rvDone[t] = c; ev.push("TRISC" + t + " has finished its whole program"); }
+      }
+      if (!S.notedAhead && S.rvDone.every(function (x) { return x >= 0; })) {
+        S.notedAhead = true;
+        ev.push("<b>All three RISC-Vs are done, yet most Tensix instructions haven't executed.</b> The RISC-V ran ahead");
+      }
+      var busy = S.unpA || S.unpB || S.fpu || S.pack || S.q.some(function (q) { return q.length; }) || S.rvDone.some(function (x) { return x < 0; });
+      if (S.err || !busy) { S.done = true; S.copDone = c; }
+      if (S.done && !S.err) {
+        var good = S.out.every(function (v, k) { return v === A[k] + B[k]; });
+        ev.push(good ? "<b style='color:#83c167'>Coprocessor finished: the output tile is correct</b>" : "<b style='color:#fc6255'>Coprocessor finished: the output tile is wrong.</b> PACR read Dst before ELWADD wrote it (ttsim prints \"got 0\" for all 1024 elements)");
+      }
+      S.ev = ev;
+      narr.innerHTML = "<b>Cycle " + c + ".</b> " + (ev.length ? ev.join(". ") + "." : quiet());
+      draw();
+    }
+    function quiet() {
+      var hs = [];
+      for (var t = 0; t < 3; t++) if (S.hold[t]) hs.push(TN[t] + " waits at its gate (" + S.hold[t] + ")");
+      for (t = 0; t < 3; t++) if (S.rvStall[t]) hs.push("TRISC" + t + " is stalled: its FIFO is full, so its next push waits (back-pressure)");
+      return hs.length ? hs.join("; ") + "." : "The backend works through the queued instructions.";
+    }
+    var X_RV = 10, X_Q = 288, X_G = 562, X_U = 616;
+    function shortName(o) {
+      if (!o) return "";
+      if (o.op === "MOP") return o.lbl ? o.lbl.replace("MOP→", "MOP ") : "MOP";
+      if (o.op === "SEMWAIT") return "SEMWAIT";
+      if (o.op === "STALLWAIT") return "STALLW";
+      return o.op;
+    }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var colT = [C.orange, C.blue, C.pink];
+      TT.text(ctx, "cycle " + S.cyc, 940, 14, { align: "right", mono: true, font: "14px", color: C.yellow });
+      TT.text(ctx, "RISC-V cores (program + PC)", X_RV, 14, { color: C.muted, font: "12px" });
+      TT.text(ctx, "frontend FIFO (in order)", X_Q, 14, { color: C.muted, font: "12px" });
+      TT.text(ctx, "gate", X_G - 6, 14, { color: C.muted, font: "12px" });
+      TT.text(ctx, "shared backend", X_U, 14, { color: C.muted, font: "12px" });
+      for (var t = 0; t < 3; t++) {
+        var y = 28 + t * 118;
+        TT.box(ctx, X_RV, y, 268, 108, { fill: C.bg2, stroke: colT[t], lw: 1.2 });
+        TT.text(ctx, "TRISC" + t + " · " + TN[t], X_RV + 8, y + 12, { color: colT[t], font: "bold 12px" });
+        if (S.rvDone[t] >= 0) TT.text(ctx, "done @ cycle " + S.rvDone[t], X_RV + 260, y + 12, { align: "right", color: C.green, font: "11px" });
+        else if (S.rvStall[t]) TT.text(ctx, "stalled: FIFO full", X_RV + 260, y + 12, { align: "right", color: C.red, font: "11px" });
+        S.P[t].forEach(function (s, k) {
+          var yy = y + 30 + k * 16, cur = k === S.pc[t] && S.rvDone[t] < 0, past = k < S.pc[t];
+          if (cur) TT.box(ctx, X_RV + 4, yy - 7, 260, 14, { fill: colT[t], alpha: 0.25, r: 2 });
+          TT.text(ctx, (cur ? "▶ " : "  ") + s.t, X_RV + 6, yy, { mono: true, font: "10px", color: past ? C.muted : C.fg });
+        });
+        // queue
+        TT.box(ctx, X_Q, y + 30, 4 * 66 + 4, 44, { stroke: C.border, r: 4 });
+        var q = S.q[t];
+        for (var i = 0; i < Math.min(q.length, 4); i++) {
+          var o = q[i], lb = shortName(o);
+          if (o.op === "MOP") lb = "MOP " + (o.exp.length - (o.i || 0)) + "×" + (o.exp[0].op === "ELWADD" ? "ELW" : "UNP");
+          TT.box(ctx, X_Q + 4 + i * 66, y + 34, 62, 36, { fill: colT[t], alpha: 0.28, stroke: colT[t], lw: 1, label: lb, font: "10px", mono: true });
+        }
+        // gate
+        var h = head(t), held = !!S.hold[t];
+        ctx.fillStyle = held ? C.red : (S.issued[t] ? C.green : C.border);
+        ctx.fillRect(X_G, y + 26, 8, 52);
+        if (held) TT.text(ctx, "held: " + S.hold[t], X_Q, y + 90, { color: C.red, font: "11px" });
+        else if (h) TT.text(ctx, "next out: " + h.op, X_Q, y + 90, { color: C.muted, font: "11px", mono: true });
+      }
+      // backend units
+      var U = { unp0: [X_U, 30, "Unpacker 0 → SrcA"], unp1: [X_U, 86, "Unpacker 1 → SrcB"], fpu: [X_U, 142, "FPU (ELWADD)"], pack: [X_U, 198, "Packer (PACR)"], sync: [X_U, 254, "Sync unit"] };
+      var busyU = { unp0: S.unpA > 0, unp1: S.unpB > 0, fpu: !!S.fpu, pack: !!S.pack, sync: false };
+      for (var k in U) {
+        var u = U[k];
+        TT.box(ctx, u[0], u[1], 210, 46, { fill: busyU[k] ? C.orange : C.bg2, alpha: busyU[k] ? 0.35 : 1, stroke: C.orange, lw: 1.2 });
+        TT.text(ctx, u[2], u[0] + 10, u[1] + 15, { font: "12px" });
+      }
+      TT.text(ctx, "faces in SrcA: " + S.fA + "/4", X_U + 10, 63, { font: "11px", color: C.muted });
+      TT.text(ctx, "faces in SrcB: " + S.fB + "/4", X_U + 10, 119, { font: "11px", color: C.muted });
+      TT.text(ctx, S.fpu ? "ELWADD row group " + S.fpu.g : "idle", X_U + 10, 175, { font: "11px", color: C.muted });
+      TT.text(ctx, S.pack ? "reading Dst group " + (PACR_CYC - S.pack.left) : "idle", X_U + 10, 231, { font: "11px", color: C.muted });
+      // semaphore
+      TT.text(ctx, "MATH_PACK = " + S.sem + "  (max " + S.semMax + ")", X_U + 10, 287, { font: "bold 12px", mono: true, color: C.purple });
+      for (var s2 = 0; s2 < S.semMax; s2++) TT.box(ctx, X_U + 222 + s2 * 30, 262, 24, 24, { fill: C.purple, alpha: s2 < S.sem ? 0.7 : 0.08, stroke: C.purple });
+      TT.text(ctx, "semaphore 1", X_U + 222, 300, { font: "10px", color: C.muted });
+      // issue arrows
+      for (t = 0; t < 3; t++) if (S.issued[t] && U[S.issued[t]]) {
+        var uu = U[S.issued[t]];
+        TT.arrow(ctx, X_G + 10, 28 + t * 118 + 52, uu[0] - 2, uu[1] + 23, { color: colT[t], lw: 2 });
+      }
+      // Dst and output
+      var yb = 395;
+      TT.text(ctx, "Dst (shared, 8 row groups of one 32×32 tile)", X_RV, yb, { color: C.muted, font: "12px" });
+      TT.text(ctx, "Output tile in L1 (what PACR copied)", X_RV, yb + 92, { color: C.muted, font: "12px" });
+      for (var r = 0; r < 8; r++) {
+        var x = X_RV + r * 74;
+        TT.box(ctx, x, yb + 12, 68, 40, { fill: S.dstW[r] ? C.teal : C.bg3, alpha: S.dstW[r] ? 0.45 : 1, stroke: C.teal, lw: 1, label: S.dstW[r] ? A[r] + "+" + B[r] + "=" + S.dst[r] : "0", font: "12px", mono: true });
+        var o2 = S.out[r], good = o2 === A[r] + B[r];
+        TT.box(ctx, x, yb + 104, 68, 40, { fill: o2 === null ? C.bg3 : (good ? C.green : C.red), alpha: o2 === null ? 1 : 0.45, stroke: o2 === null ? C.border : (good ? C.green : C.red), lw: 1, label: o2 === null ? "·" : String(o2), font: "13px", mono: true });
+      }
+      TT.text(ctx, "expected: " + A.map(function (a, k) { return a + B[k]; }).join("  "), X_RV, yb + 162, { color: C.muted, font: "11px", mono: true });
+      if (S.err) {
+        TT.box(ctx, X_U - 10, yb + 12, 330, 52, { fill: C.red, alpha: 0.2, stroke: C.red });
+        TT.text(ctx, "ttsim stops:", X_U, yb + 28, { color: C.red, font: "bold 12px" });
+        TT.text(ctx, "NonContractualBehavior: tensix_semget", X_U, yb + 46, { color: C.red, font: "11px", mono: true });
+      }
+      if (S.done && S.copDone > 0) {
+        var rv = Math.max.apply(null, S.rvDone);
+        TT.text(ctx, "RISC-Vs done by cycle " + (rv < 0 ? "-" : rv) + " · coprocessor done at cycle " + S.copDone, 950, yb + 186, { align: "right", color: C.yellow, font: "12px" });
+      }
+      info.textContent = S.done ? "finished" : "";
+      bPlay.textContent = playing ? "Pause" : "Play";
+    }
+    var playing = false, timer = null;
+    function tick() { if (!playing) return; step(); if (S.done) { playing = false; draw(); return; } timer = setTimeout(tick, 380); }
+    bPlay.onclick = function () { if (S.done) reset(); playing = !playing; draw(); if (playing) tick(); };
+    bStep.onclick = function () { playing = false; step(); };
+    bReset.onclick = function () { playing = false; clearTimeout(timer); reset(); };
+    sel.onchange = function () { playing = false; clearTimeout(timer); reset(); };
+    reset();
+  })();
+  </script>
+
+  <p>Things to watch in each mode:</p>
+  <ul>
+    <li><b>With sync.</b> TRISC0 and TRISC1 have pushed everything by cycle 5 and show "done", while the coprocessor needs about 20 more cycles to finish their work (and the whole tile isn't done until cycle 37). That's "running ahead". TRISC2 gets far enough ahead to fill its FIFO (4 entries in this toy) and stalls. Unless the code explicitly asks to wait (TTSync, or polling a semaphore), back-pressure is the only thing that makes a RISC-V wait for the coprocessor. The PACK thread's <code>SEMWAIT</code> sits red at its gate, and the <code>PACR</code> waits in the FIFO behind it, until MATH's <code>SEMPOST</code> raises <code>MATH_PACK</code> to 1. (A simplification: on the hardware the <code>SEMWAIT</code> itself passes into the wait gate and stays latched there, and the gate holds the <code>PACR</code> behind it. The figure draws the two as one hold.) Then the packer copies a fully written Dst, and the release sequence (<code>STALLWAIT</code>, <code>ZEROACC</code>, <code>SEMGET</code>) hands Dst back.</li>
+    <li><b>Remove wait and release.</b> TRISC2's program is now a single <code>PACR</code>. It passes its gate almost at once, because nothing tells it to wait. The packer copies Dst while the unpackers are still filling SrcA/SrcB, before any <code>ELWADD</code> has run. The output tile is all stale values.</li>
+    <li><b>Remove only <code>tile_regs_wait</code>.</b> The PACK thread runs its release early and issues <code>SEMGET</code> while the semaphore is still 0. On silicon that's <code>NonContractualBehavior</code> (the value just stays at 0). ttsim refuses to continue.</li>
+  </ul>
+  <p>The orderings in the figure come from these sources:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cmath_common.h:237-241, 307-310 @7aad8aac (MATH side)</div>
+<pre><code>inline void set_math_semaphores()
+{
+    // Tell packer that it has something to pack
+    t6_semaphore_post&lt;p_stall::MATH | p_stall::WAIT_SFPU&gt;(semaphore::MATH_PACK);
+}
+...
+inline void math_dest_wait()
+{
+    TTI_SEMWAIT(p_stall::STALL_MATH | p_stall::STALL_SFPU | p_stall::STALL_SYNC, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_MAX);
+}</code></pre>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_pack_common.h:26-29, 59-61 @7aad8aac (PACK side)</div>
+<pre><code>inline void _llk_packer_wait_for_math_done_()
+{
+    TTI_SEMWAIT(p_stall::STALL_TDMA, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO);
+}
+...
+inline void _llk_pack_dest_section_done_()
+{
+    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::PACK); // wait for pack to finish</code></pre>
+  <p>The release then issues a <code>ZEROACC</code> to clear its half of Dst and a <code>SEMGET</code> on <code>MATH_PACK</code> (<code>llk_pack_common.h:63-76</code>). <code>t6_semaphore_post</code> is a <code>STALLWAIT</code> on the given resources followed by <code>SEMPOST</code> (<code>ckernel.h:300-308</code>). The figure draws it as two pushes. The compute API wraps these in the calls used as labels in the figure: <code>tile_regs_acquire</code>/<code>commit</code> run on MATH and <code>tile_regs_wait</code>/<code>release</code> run on PACK (<code>tt_metal/hw/inc/api/compute/reg_api.h</code>). How you write kernels with these is <a href="a12-compute-kernels.html">A12</a>'s job.</p>
+  <p>Unpack → math needs no semaphore in this kernel. The FPU instruction can't pass its wait gate until the unpacker hands the SrcA/SrcB bank to the matrix unit, and that check is in hardware (WaitGate.md). Dst has no such check, so the math → pack direction needs software synchronization.</p>
+
+  <div class="callout key">The frontend keeps each thread's instructions in order. Nothing keeps the three threads in order relative to each other, or relative to the RISC-V that pushed them. Every cross-thread dependency through shared state (Dst above all) needs an explicit semaphore, mutex or stall.</div>
+
+  <div class="callout warn">A second "runs ahead" trap involves no other thread. A RISC-V that pushes an instruction and then writes a configuration register with <code>sw</code> may change the configuration <em>before</em> its own earlier instruction reads it, because that instruction may still be queued. The ISA docs call this out (TensixCoprocessor/README.md:9 and PushTensixInstruction.md "Memory ordering"). The fixes are to change configuration through Tensix instructions in the same stream, or to wait for the coprocessor first. For that wait, TRISCs have <b>TTSync</b>: a load from a special address that doesn't return until the thread has no instructions in flight (BabyRISCV/TTSync.md). tt-llk wraps it as <code>tensix_sync()</code>, which you can see at the top of <code>_llk_math_pack_sync_init_</code>.</div>
+
+  <h2 id="sync">The Sync unit: 8 semaphores, 7 mutexes</h2>
+  <p>Everything above runs on a very small piece of hardware <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">(SyncUnit.md)</a>:</p>
+  <ul>
+    <li><b>Eight semaphores.</b> Each is a 4-bit <code>Value</code> (reset 0) with a 4-bit <code>Max</code> (reset 15).
+      <ul>
+        <li><code>SEMINIT</code> sets both fields. <code>SEMPOST</code> adds one and <code>SEMGET</code> subtracts one.</li>
+        <li><code>SEMWAIT</code> blocks the thread at its wait gate while <code>Value == 0</code> or while <code>Value &gt;= Max</code>. Its block mask picks which kinds of instruction it holds.</li>
+        <li>There is no combined "wait then decrement". That's why the PACK side issues <code>SEMWAIT</code> first and <code>SEMGET</code> later.</li>
+      </ul></li>
+    <li><b>RISC-V access.</b> TRISC0–2 can <code>lw</code> a semaphore's value, and an <code>sw</code> increments it (even value) or decrements it (odd value). <code>_llk_math_pack_sync_init_</code> polls <code>semaphore_read(MATH_PACK)</code> this way (<code>llk_math_common.h:108</code>). One hardware bug to know about: after starting a semaphore load, a TRISC must not start another one until the first completes, or it can hang.</li>
+    <li><b>Seven mutexes</b>, numbered 0 and 2–7. Each is either free or held by T0, T1 or T2. <code>ATGETM</code> waits for a mutex and takes it; <code>ATRELM</code> releases it. tt-llk reserves indices such as <code>REG_RMW = 0</code> (atomic register read-modify-write across threads) and <code>SFPU = 4</code> (the SFPU can be fed from both TRISC1 and TRISC2) in <code>ckernel_structs.h:35-44</code>. Blackhole cuts the mutex count to four.</li>
+  </ul>
+  <p>tt-llk names all eight semaphores (<code>ckernel_structs.h:12-24</code>): <code>FPU_SFPU=0</code>, <code>MATH_PACK=1</code>, <code>UNPACK_TO_DEST=2</code>, <code>UNPACK_OPERAND_SYNC=3</code>, <code>PACK_DONE=4</code>, <code>UNPACK_SYNC=5</code>, <code>UNPACK_MATH_DONE=6</code> and <code>MATH_DONE=7</code>. The Dst handshake needs only one of them. In SyncHalf mode its <code>Max</code> is 2, which lets MATH fill one half of Dst while PACK drains the other (<code>llk_math_common.h:98-120</code>). That's why ttsim's error message says <code>sem_max=2</code>.</p>
+  <div class="callout warn">Don't confuse these 4-bit hardware semaphores with the TT-Metalium <code>CreateSemaphore</code> / <code>noc_semaphore_*</code> semaphores, which are plain words in L1 that other cores update over the NoC. The Sync unit's semaphores are private to one tile's three Tensix threads and its TRISCs. Cross-core synchronization is <a href="a16-multicast-sync.html">A16</a>.</div>
+
+  <h2 id="sim">Seeing it in ttsim</h2>
+  <p>Everything above can be checked in the simulator, and I ran each experiment in this orb on ttsim b3620244 (Wormhole build) with the prebuilt tt-metal example <code>add_2_integers_in_compute</code>, which adds two BF16 tiles on core (0,0).</p>
+
+  <h3>1. Counting pushes</h3>
+  <p>I built an instrumented copy of ttsim with <code>sim-labs/workbench/build_ttsim.sh push wh</code>. My instrumentation is <em>not</em> part of ttsim: it adds a few counters in <code>tti()</code> (the <code>.ttinsn</code> path), in <code>tensix_inst_wr32()</code> (the <code>sw</code> path) and in <code>tensix_push_inst_fifo()</code> (after the expanders), and prints them when the process exits. The patch is <a href="../sim-labs/patches/a04-push-counters.patch"><code>sim-labs/patches/a04-push-counters.patch</code></a>. To reproduce, run <code>build_ttsim.sh push wh</code> once to make the copy, then <code>(cd $LAB_HOME/ttsim-push &amp;&amp; patch -p1 &lt; …/sim-labs/patches/a04-push-counters.patch)</code>, then run <code>build_ttsim.sh push wh</code> again. Trimmed output:</p>
+<pre><code>$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-push-wh-release/libttsim.so
+$ $EX/metal_example_add_2_integers_in_compute
+Success: Result matches expected value!
+[4682] 0.2 seconds (27.0 KHz)
+A04 BRISC  pushes: .ttinsn=0 sw=648  ttinsn-retries(queue full)=0
+A04 TRISC0 pushes: .ttinsn=23 sw=4  ttinsn-retries(queue full)=0
+A04 TRISC1 pushes: .ttinsn=34 sw=3  ttinsn-retries(queue full)=0
+A04 TRISC2 pushes: .ttinsn=57 sw=6  ttinsn-retries(queue full)=0
+A04 NCRISC pushes: .ttinsn=0 sw=0  ttinsn-retries(queue full)=0
+A04 tile 0: B=9 T0=27 T1=37 T2=63
+A04 tile 1: B=9 T0=0 T1=0 T2=0
+A04 tiles with pushes: 72
+A04 pipe1 pushed: 01:1 10:1 37:2 a2:4 a3:1 a4:1 a6:1 b2:17 b3:1 b4:1 b5:1 b6:3 (total 34)
+A04 pipe1 after expanders: 10:1 28:8 37:6 a2:4 a3:1 a4:1 a6:1 b2:19 b3:2 b4:1 b5:1 b6:3 (total 48)</code></pre>
+  <p>What the counts say:</p>
+  <ul>
+    <li><b>NCRISC pushed nothing, as the hardware requires.</b> BRISC pushed 9 instructions on each of 72 tiles (72 × 9 = 648), all with plain <code>sw</code>, on every worker tile tt-metal brought up and not only the one running the kernel. That looks like firmware initialisation at boot. I didn't trace which instructions they are.</li>
+    <li><b>The TRISCs mostly use <code>.ttinsn</code>.</b> A few <code>sw</code> pushes carry runtime operands (<code>TT_</code> rather than <code>TTI_</code> macros).</li>
+    <li><b>The MATH thread (pipe 1) gives the clearest picture.</b> TRISC1 pushed one <code>MOP</code> (opcode <code>0x01</code>) and zero <code>ELWADD</code>s. After the expanders, its FIFO received exactly 8 <code>ELWADD</code>s (<code>0x28</code>), which is 8 × (8 rows × 16) = 1024 elements, one 32×32 tile. Next to them are the handshake: one <code>SEMWAIT</code> (<code>0xa6</code>), one <code>SEMPOST</code> (<code>0xa4</code>), four <code>STALLWAIT</code>s (<code>0xa2</code>) and a <code>SEMINIT</code> (<code>0xa3</code>). Most of the rest are configuration writes (<code>SETC16 0xb2</code>, <code>RMWCIB* 0xb3–0xb6</code>).</li>
+    <li><b>The unpack thread shows the same pattern.</b> Its one <code>MOP</code> became 8 <code>UNPACR</code>s (<code>0x42</code>). Opcode names come from <code>TT_OP_*</code> in <code>ckernel_ops.h</code>.</li>
+  </ul>
+
+  <h3>2. Removing the synchronization</h3>
+  <p>Next I used the kernel overlay to put a modified <code>add_2_tiles.cpp</code> at <code>$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/</code>, running on the <em>stock</em> ttsim. With only <code>tile_regs_wait();</code> commented out:</p>
+<pre><code>[4499] ERROR: NonContractualBehavior: tensix_semget: sem=0 sem_max=2</code></pre>
+  <p>ttsim stops at the PACK thread's <code>SEMGET</code>, because the semaphore is still 0. Without its wait, PACK got there before MATH's <code>SEMPOST</code>. The check that fired:</p>
+  <div class="filename">ttsim/src/tensix.cpp:5544-5553 @b3620244</div>
+<pre><code>TENSIX_EXECUTE_SEMGET() {
+    ...
+    TTSIM_VERIFY(p_tensix-&gt;sem[sem_index], NonContractualBehavior, "sem=%d sem_max=%d", p_tensix-&gt;sem[sem_index], p_tensix-&gt;sem_max[sem_index]);
+    p_tensix-&gt;sem[sem_index]--;
+    return true;
+}</code></pre>
+  <p>With both <code>tile_regs_wait();</code> and <code>tile_regs_release();</code> commented out, nothing is left for ttsim to flag. The program runs to completion and the result is wrong everywhere:</p>
+<pre><code>Mismatch at index 0: expected 18.5625, got 0
+Mismatch at index 1: expected 7.328125, got 0
+...
+Mismatch at index 1023: expected 8.9375, got 0
+Error: Result does not match expected value!
+[4658] 0.2 seconds (25.4 KHz)</code></pre>
+  <p>All 1024 elements are wrong, and every one reads 0. The packer copied Dst before <code>ELWADD</code> wrote it. A control run with the unmodified kernel prints <code>Success: Result matches expected value!</code> at <code>[4682]</code>. (The bracketed number is ttsim's clock count. ttsim isn't a timing model, so don't read these as performance figures.)</p>
+
+  <div class="callout warn">ttsim is functional and deterministic: its threads interleave the same way every run, and here that interleaving exposed the race every time. On silicon, timing decides which thread wins, so a missing semaphore can pass a test for weeks and then fail under different load. A ttsim run that passes doesn't prove a kernel has no races. It only shows that one particular interleaving gave the right answer.</div>
+
+  <div class="callout sim">Reproduce both experiments, then trace <code>SEMPOST</code>/<code>SEMGET</code> as they happen, in <a href="../sim-labs/b04-tensix-instructions.html">B04</a> and <a href="../sim-labs/b06-cbs-and-semaphores.html">B06</a>. To watch the cores come out of reset and see which PCs they start at, see <a href="../sim-labs/b02-map-and-boot.html">B02</a>.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A Wormhole Tensix tile has <b>1464 KiB of L1</b> (16 banks × 91.5 KiB, 128 bits per bank per cycle), <b>five RV32IM baby cores</b>, two NoC connections and one <b>Tensix coprocessor</b>.</li>
+    <li>The cores are the <b>control plane</b>. BRISC and NCRISC run data-movement kernels; TRISC0/1/2 run the UNPACK, MATH and PACK parts of a compute kernel. Each core has 2–4 KiB of fast local RAM (2-cycle loads). L1 is slow for them: ≥8-cycle loads and one store every 5 cycles. Bulk data should move through engines.</li>
+    <li>The coprocessor has <b>three threads</b>, each with an in-order frontend (MOP expander → replay expander → wait gate), feeding <b>nine mostly shared backend units</b>: Sync, Unpack, FPU, Pack, SFPU, ThCon, Config, Mover and Misc.</li>
+    <li>Registers: <b>SrcA/SrcB</b> are 2 × 64 × 16 × 19 bit, double-buffered. <b>Dst</b> is 1024 × 16 × 16 bit (32 KiB) and shared. <b>LReg</b> is 17 × 32 lanes × 32 bit. Details are in A06 and A07.</li>
+    <li>The coprocessor <b>never fetches</b>. A TRISC pushes a 32-bit instruction with <code>sw</code> to <code>0xFFE40000</code>, or with a one-word <code>.ttinsn</code>: the instruction rotated left by 2, recognised because its low bits aren't <code>11</code>. ttsim's <code>tti()</code> rotates it back with <code>(inst &lt;&lt; 30) | (inst &gt;&gt; 2)</code>.</li>
+    <li>After a push, the <b>RISC-V runs ahead</b>. Each thread stays in order internally, but threads aren't ordered against each other or against their RISC-V. The <b>Sync unit</b> (8 four-bit semaphores, 7 mutexes on WH) and <code>STALLWAIT</code>/TTSync restore order. Remove the MATH_PACK handshake and ttsim either reports an error or, with the whole handshake gone, packs zeros.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. Why is TRISC1 (MATH) given only a ½ KiB instruction cache when it drives the core's most important unit?</summary>
+    <p>Because its hot loop isn't meant to be RISC-V code. TRISC1 pushes a few instructions, typically a <code>MOP</code>, and the MOP and replay expanders turn them into long runs of FPU instructions at one per cycle. In the ttsim count, one <code>MOP</code> from TRISC1 became 8 <code>ELWADD</code>s. The RISC-V code is mostly setup and synchronization, which fits in a small cache.</p></details>
+  <details class="quiz"><summary>2. A TRISC fetches the word 0x90000022. What does it do? What about 0x00150513?</summary>
+    <p>0x90000022 ends in binary <code>10</code>, not <code>11</code>, so it's a <code>.ttinsn</code>. Rotating right by 2 gives 0xA4000008. The opcode byte is 0xA4 (<code>SEMPOST</code>) with <code>sem_sel</code> = 0b10, which is semaphore 1 (<code>MATH_PACK</code>). The core pushes that into its own Tensix thread. 0x00150513 ends in <code>11</code>, so it's an ordinary RV32I instruction (<code>addi a0,a0,1</code>) and nothing is pushed.</p></details>
+  <details class="quiz"><summary>3. Why must every valid Tensix instruction be below 0xC0000000?</summary>
+    <p>The <code>.ttinsn</code> encoding rotates the instruction left by 2, so its top two bits become the low two bits of the RISC-V word. If both were 1, the word would end in <code>11</code> and the core would decode it as a normal RISC-V instruction. Keeping Tensix opcodes below 0xC0 in the top byte guarantees the low bits are <code>00</code>, <code>01</code> or <code>10</code>, the space RISC-V reserves for compressed instructions, which these cores don't implement.</p></details>
+  <details class="quiz"><summary>4. TRISC2 executes its <code>.ttinsn PACR</code> and then immediately reads the output tile from L1 with <code>lw</code>. What can it see, and how would you fix it?</summary>
+    <p>Probably old data. A successful push only means the instruction is in the FIFO. It may still be queued behind a <code>SEMWAIT</code>, or the packer may still be writing. To wait for the coprocessor, the TRISC needs an explicit mechanism, for example TTSync (a load that doesn't return until the thread has no instructions in flight) or a semaphore the Tensix thread posts after a <code>STALLWAIT</code> on the packer. The same reasoning applies to changing configuration registers with <code>sw</code> while earlier instructions that use them are still queued.</p></details>
+  <details class="quiz"><summary>5. Why does the unpack → math hand-off in <code>add_tiles</code> need no semaphore, while math → pack does?</summary>
+    <p>SrcA and SrcB have hardware ownership. Each bank has an <code>AllowedClient</code> (unpackers or matrix unit), and an FPU instruction can't pass its wait gate until the bank belongs to the matrix unit. Dst has no ownership tracking. It's one shared array that any thread can read or write, so the packer would happily read it mid-computation. Software provides the missing ownership with the <code>MATH_PACK</code> semaphore.</p></details>
+  <details class="quiz"><summary>6. Your kernel passes on ttsim every time. Does that prove it has no synchronization bugs?</summary>
+    <p>No. ttsim is deterministic and is not a timing model, so it tests one interleaving of the three threads. Silicon's interleaving depends on real latencies, contention and data. ttsim's checks (like the <code>SEMGET</code> at 0 check) catch some misuse, but a race whose wrong ordering never happens in ttsim's schedule goes unseen. Review every shared resource (Dst, configuration, CBs) for an explicit hand-off.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/README.md">tt-isa-documentation: Tensix Tile</a>: the contents of a Wormhole Tensix tile, with links to every component.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/README.md">Baby RISC-V cores</a>: the five-core comparison table, pipeline, load latencies and the full memory map.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/PushTensixInstruction.md">Push Tensix Instruction</a>: the <code>sw</code> addresses and the <code>.ttinsn</code> rotated encoding.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/README.md">Tensix Coprocessor overview</a>: three threads, frontend stages, the nine backend units and the "runs ahead" warning.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MOPExpander.md">MOP Expander</a>: a functional model of the two MOP templates.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">Sync Unit</a>: semaphores, mutexes and the RISC-V access path, including its hardware bug.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/L1.md">L1</a>: banking, port behaviour, atomics and per-client peak bandwidth.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/BabyRISCV/README.md">Blackhole baby RISC-V cores</a>: what changed in the next generation (L0 data cache, <code>.ttinsn</code> fusion, larger RAMs).</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute Engines and Data Flow within Tensix</a>: the official TT-Metalium docs page on the same material.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: Tenstorrent's programming guide, including the Tensix core architecture and why there are no caches.</li>
+    <li><a href="https://www.corsix.org/content/tt-wh-part1">Tenstorrent Wormhole Series (corsix.org)</a>: a hands-on blog series that pokes at the hardware directly.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Hot Chips 2024: Tenstorrent</a>: the official architecture slides for Wormhole and Blackhole.</li>
+  </ul>
+
+  <div class="pager"><a href="a03-chip-tour.html">&larr; 03 A tour of the chip</a><a class="next" href="a05-tiles-and-formats.html">05 Tiles, faces and number formats &rarr;</a></div>
+</main>
+</body>
+</html>

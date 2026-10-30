@@ -1,0 +1,81 @@
+diff -ru a/src/riscv_impl.h b/src/riscv_impl.h
+--- a/src/riscv_impl.h	2026-10-30 07:45:41.463526883 +0000
++++ b/src/riscv_impl.h	2026-10-30 07:45:41.467526883 +0000
+@@ -1478,8 +1478,12 @@
+     TensixState *p_tensix = &g_t_tiles[p_hart->tile_id].tensix[tensix_id];
+     if (tensix_can_push_inst(p_tensix, pipe)) {
+         uint32_t tensix_inst = (inst << 30) | (inst >> 2);
++        g_a04_push[riscv_id][0]++; g_a04_tile[p_hart->tile_id & 255][riscv_id]++;
++        if (riscv_id >= 1 && riscv_id <= 3 && g_a04_nfirst[pipe] < 12) g_a04_first[pipe][g_a04_nfirst[pipe]++] = tensix_inst;
++        if (riscv_id >= 1 && riscv_id <= 3) g_a04_hpush[pipe][tensix_inst >> 24]++;
+         tensix_push_inst(p_tensix, pipe, tensix_inst, bypass_mop_expander);
+     } else {
++        g_a04_stall[riscv_id]++;
+         p_hart->pc -= 4; // replay TTI instruction
+     }
+ }
+diff -ru a/src/sim.h b/src/sim.h
+--- a/src/sim.h	2026-10-30 07:45:41.471526883 +0000
++++ b/src/sim.h	2026-10-30 07:45:41.471526883 +0000
+@@ -630,6 +630,7 @@
+ 
+ void tensix_init(TensixState *p_tensix, uint32_t tile_id, uint32_t tensix_id);
+ bool tensix_can_push_inst(TensixState *p_tensix, uint32_t pipe);
++extern uint64_t g_a04_push[5][2]; extern uint64_t g_a04_stall[5]; extern uint32_t g_a04_maxocc[3]; extern uint32_t g_a04_first[3][12]; extern uint32_t g_a04_nfirst[3]; extern uint32_t g_a04_tile[256][5]; extern uint32_t g_a04_hpush[3][256], g_a04_hfifo[3][256];
+ bool tensix_thread_idle(const TensixState *p_tensix, uint32_t pipe);
+ bool tensix_mop_expander_idle(const TensixState *p_tensix, uint32_t pipe);
+ void tensix_frontend_step(TensixState *p_tensix, uint32_t pipe);
+diff -ru a/src/tensix.cpp b/src/tensix.cpp
+--- a/src/tensix.cpp	2026-10-30 07:45:41.475526883 +0000
++++ b/src/tensix.cpp	2026-10-30 07:45:41.479526883 +0000
+@@ -46,14 +46,39 @@
+     return 0;
+ }
+ 
++uint64_t g_a04_push[5][2]; uint64_t g_a04_stall[5]; uint32_t g_a04_maxocc[3]; uint32_t g_a04_first[3][12]; uint32_t g_a04_nfirst[3]; uint32_t g_a04_tile[256][5]; uint32_t g_a04_hpush[3][256], g_a04_hfifo[3][256];
++__attribute__((destructor)) static void a04_report() {
++    const char *n[5] = {"BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"};
++    for (int i = 0; i < 5; i++)
++        fprintf(stderr, "A04 %-6s pushes: .ttinsn=%llu sw=%llu  ttinsn-retries(queue full)=%llu\n", n[i],
++                (unsigned long long)g_a04_push[i][0], (unsigned long long)g_a04_push[i][1], (unsigned long long)g_a04_stall[i]);
++    int nt = 0;
++    for (int t = 0; t < 256; t++) if (g_a04_tile[t][0] | g_a04_tile[t][1] | g_a04_tile[t][2] | g_a04_tile[t][3]) {
++        if (nt++ < 3 || g_a04_tile[t][1] > 4) fprintf(stderr, "A04 tile %d: B=%u T0=%u T1=%u T2=%u\n", t, g_a04_tile[t][0], g_a04_tile[t][1], g_a04_tile[t][2], g_a04_tile[t][3]);
++    }
++    fprintf(stderr, "A04 tiles with pushes: %d\n", nt);
++    for (int p = 0; p < 3; p++) {
++        fprintf(stderr, "A04 pipe%d max FIFO occupancy=%u first opcodes:", p, g_a04_maxocc[p]);
++        for (uint32_t k = 0; k < g_a04_nfirst[p]; k++) fprintf(stderr, " %02x", g_a04_first[p][k] >> 24);
++        fprintf(stderr, "\n");
++        unsigned tp = 0, tf = 0;
++        fprintf(stderr, "A04 pipe%d pushed:", p);
++        for (int o = 0; o < 256; o++) if (g_a04_hpush[p][o]) { tp += g_a04_hpush[p][o]; fprintf(stderr, " %02x:%u", o, g_a04_hpush[p][o]); }
++        fprintf(stderr, " (total %u)\nA04 pipe%d after expanders:", tp, p);
++        for (int o = 0; o < 256; o++) if (g_a04_hfifo[p][o]) { tf += g_a04_hfifo[p][o]; fprintf(stderr, " %02x:%u", o, g_a04_hfifo[p][o]); }
++        fprintf(stderr, " (total %u)\n", tf);
++    }
++}
+ static void tensix_push_inst_fifo(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+     if (IS_TENSIX_NOP(inst)) {
+         return; // eat NOPs here so we don't overflow as quickly on MOP
+     }
+     uint32_t inst_wr_ptr = p_tensix->inst_wr_ptr[pipe];
++    if (p_tensix->tile_id == 0) g_a04_hfifo[pipe][inst >> 24]++;
+     p_tensix->inst[pipe][inst_wr_ptr] = inst;
+     inst_wr_ptr = (inst_wr_ptr + 1) % TENSIX_INST_FIFO_SIZE;
+     p_tensix->inst_wr_ptr[pipe] = inst_wr_ptr;
++    { int32_t occ = (int32_t)inst_wr_ptr - (int32_t)p_tensix->inst_rd_ptr[pipe]; if (occ < 0) occ += TENSIX_INST_FIFO_SIZE; if ((uint32_t)occ > g_a04_maxocc[pipe]) g_a04_maxocc[pipe] = occ; }
+     p_tensix->inst_pipes_active |= 1 << pipe;
+     ttsim_t_tile_set_busy(p_tensix->tile_id);
+ 
+diff -ru a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 07:45:41.483526883 +0000
++++ b/src/tile.cpp	2026-10-30 07:45:41.483526883 +0000
+@@ -1876,6 +1876,7 @@
+ [[nodiscard]] static bool tensix_inst_wr32(uint32_t tile_id, uint32_t riscv_id, uint32_t pipe_aperture, uint32_t offset,
+                                            uint32_t data) {
+     TTSIM_VERIFY(!offset, UnimplementedFunctionality, "offset=0x%x", offset);
++    g_a04_push[riscv_id][1]++; g_a04_tile[tile_id & 255][riscv_id]++;
+     TensixTile *p_tile = &g_t_tiles[tile_id];
+     if (riscv_id == RV32_ID_BRISC) {
+         tensix_push_inst(&p_tile->tensix[0], pipe_aperture, data, true); // bypasses MOP expander
