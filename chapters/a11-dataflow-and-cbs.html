@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A11 · Data movement kernels and circular buffers · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a10-first-program.html">&larr; Prev</a>
+  <a href="a12-compute-kernels.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 11</span><span class="tag">Prerequisites: A04, A08, A09, A10</span>
+  <h1><span class="num">11.</span> Data movement kernels and circular buffers</h1>
+  <p class="subtitle">By the end you will be able to write a reader and a writer kernel, explain every pointer and counter behind <code>cb_reserve_back</code> &hellip; <code>cb_pop_front</code>, say why two pages hide latency and one does not, and find a hung kernel with Watcher.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#rw">Reader, compute, writer</a></li>
+      <li><a href="#barriers">Async copies and the barriers that end them</a></li>
+      <li><a href="#accessor">Finding the pages: InterleavedAddrGen and TensorAccessor</a></li>
+      <li><a href="#ring">A circular buffer from first principles</a></li>
+      <li><a href="#protocol">The six calls, exactly</a></li>
+      <li><a href="#rules">Two rules the counters cannot enforce</a></li>
+      <li><a href="#host">Circular buffers on the host</a></li>
+      <li><a href="#pipeline">Double buffering and the pipeline</a></li>
+      <li><a href="#dialects">Two dialects: free functions and Device 2.0 objects</a></li>
+      <li><a href="#watcher">Debugging hangs with Watcher</a></li>
+      <li><a href="#sim">In the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In A10 one kernel did everything: it copied two numbers into L1, waited, added them, and copied the sum out. That works for 4 bytes. For 64 tiles it wastes the core, because while the CPU waits for a copy, nothing else happens. A04 showed that a Tensix core has <b>five</b> RISC-V CPUs precisely so that this need not happen. One CPU can fetch tile 8 while three others compute tile 7 and the fifth writes tile 6 back to DRAM.</p>
+  <p>That raises a coordination problem. The fetching CPU (BRISC) and the computing CPUs (the TRISCs) run separate programs, each compiled on its own, each with its own private data RAM. A C variable in the reader kernel does not exist in the compute kernel. So:</p>
+  <p style="text-align:center;font-size:1.15rem"><b>How do two processors with no shared variables agree that a tile is ready, and that its slot is free again?</b></p>
+  <p>They share exactly two things: the L1 SRAM, where the tile bytes sit, and a few memory-mapped hardware registers that every CPU in the core can read and write. This chapter builds the protocol that tt-metal runs on top of those, the <b>circular buffer</b> (CB), from the ground up. We start with the kernels at each end of the pipe, then the CB itself, then the tools for when it jams.</p>
+
+  <h2 id="rw">Reader, compute, writer</h2>
+  <p>The <code>eltwise_binary</code> programming example is the template for most single-core programs. It adds two 64-tile bf16 tensors with three kernels on core (0,0):</p>
+  <ul>
+    <li>A <b>reader</b> on RISCV_0 (BRISC), using NoC&nbsp;0. It copies tile <i>i</i> of A into CB <code>c_0</code> and tile <i>i</i> of B into <code>c_1</code>.</li>
+    <li>A <b>compute</b> kernel on the three TRISCs. It takes one tile from each input CB, adds them, and puts the result in <code>c_16</code>. A12 covers it in full; here it is just "the thing between the two CBs".</li>
+    <li>A <b>writer</b> on RISCV_1 (NCRISC), using NoC&nbsp;1. It copies each tile from <code>c_16</code> to the output buffer in DRAM.</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/programming_examples/eltwise_binary/eltwise_binary.cpp:118-132 @7aad8aac</div>
+<pre><code>std::vector&lt;uint32_t&gt; reader_compile_time_args;
+TensorAccessorArgs(*src0_dram_buffer).append_to(reader_compile_time_args);
+TensorAccessorArgs(*src1_dram_buffer).append_to(reader_compile_time_args);
+auto reader = CreateKernel(
+    program,
+    OVERRIDE_KERNEL_PREFIX "eltwise_binary/kernels/dataflow/read_tiles.cpp",
+    core,
+    DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_compile_time_args});
+std::vector&lt;uint32_t&gt; writer_compile_time_args;
+TensorAccessorArgs(*dst_dram_buffer).append_to(writer_compile_time_args);
+auto writer = CreateKernel(
+    program,
+    OVERRIDE_KERNEL_PREFIX "eltwise_binary/kernels/dataflow/write_tile.cpp",
+    core,
+    DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default, .compile_args = writer_compile_time_args});</code></pre>
+  <p>This is the convention from A10: reader on BRISC and NoC&nbsp;0, writer on NCRISC and NoC&nbsp;1, so inbound and outbound traffic use the two opposite tori from A08. The new things are the <code>TensorAccessorArgs</code> lines, which come up <a href="#accessor">below</a>. Strip the comments from the two data-movement kernels and each has the same four-beat loop:</p>
+  <div class="grid2">
+  <div>
+  <div class="filename">reader (paraphrase of read_tiles.cpp:42-57)</div>
+<pre><code>for each tile i:
+  cb_reserve_back(cb_in, 1)   // wait for a free slot
+  addr = get_write_ptr(cb_in)
+  noc_async_read_page(i, in, addr)
+  noc_async_read_barrier()    // bytes have landed
+  cb_push_back(cb_in, 1)      // publish the slot</code></pre>
+  </div>
+  <div>
+  <div class="filename">writer (paraphrase of write_tile.cpp:28-40)</div>
+<pre><code>for each tile i:
+  cb_wait_front(cb_out, 1)    // wait for a full slot
+  addr = get_read_ptr(cb_out)
+  noc_async_write_page(i, out, addr)
+  noc_async_write_barrier()   // bytes have landed
+  cb_pop_front(cb_out, 1)     // free the slot</code></pre>
+  </div>
+  </div>
+  <p>The two loops mirror each other. The reader is a <em>producer</em> into a CB and the writer is a <em>consumer</em> from one. The compute kernel is both: a consumer of <code>c_0</code> and <code>c_1</code>, and a producer into <code>c_16</code>. Every function in these loops is one of two kinds: a NoC call (start a copy, wait for copies) or a CB call (claim a slot, publish it, wait for it, release it). We take them in that order.</p>
+
+  <h2 id="barriers">Async copies and the barriers that end them</h2>
+  <p><code>noc_async_read(src_noc_addr, dst_l1_addr, size)</code> and <code>noc_async_write(src_l1_addr, dst_noc_addr, size)</code> each program a NoC command buffer and return at once (A08 showed the stores that do it). Nothing has moved yet. The <code>_page</code> variants used above just compute the NoC address of page <i>i</i> through an address generator first.</p>
+  <p>A08 explained why you then need a barrier: the NoC is <b>weakly ordered</b>. Packets on different NoCs or virtual channels can overtake each other, and the only way a core learns that its transfer finished is by watching NIU counters. A barrier is a spin loop that compares a hardware counter with a software count of what this core issued. There are several barriers, and they differ in which counter they watch:</p>
+  <table>
+    <tr><th>Call</th><th>Spins until (Wormhole)</th><th>What it proves</th><th>Watcher waypoint</th></tr>
+    <tr><td><code>noc_async_read_barrier()</code></td><td><code>NIU_MST_RD_RESP_RECEIVED</code> == reads issued</td><td>Every read's data is in this core's L1</td><td>NRBW / NRBD</td></tr>
+    <tr><td><code>noc_async_write_barrier()</code></td><td><code>NIU_MST_WR_ACK_RECEIVED</code> == non-posted writes issued</td><td>Every write has been acknowledged by its destination: the data has landed</td><td>NWBW / NWBD</td></tr>
+    <tr><td><code>noc_async_writes_flushed()</code></td><td><code>NIU_MST_NONPOSTED_WR_REQ_SENT</code> == non-posted writes issued</td><td>Every write has <em>departed</em> into the network, but may not have arrived</td><td>NWFW / NWFD</td></tr>
+    <tr><td><code>noc_async_atomic_barrier()</code></td><td>atomic acks == atomics issued</td><td>Every atomic (for example a semaphore increment) has completed</td><td>NABW / NABD</td></tr>
+    <tr><td><code>noc_async_full_barrier()</code></td><td>all of the above in turn</td><td>Nothing of this core's is still in flight</td><td>NFBW&hellip;</td></tr>
+  </table>
+  <p>Sources: the functions are at <code>tt_metal/hw/inc/api/dataflow/dataflow_api.h:1919-2075</code>, and the counter comparisons at <code>hw/inc/internal/tt-1xx/wormhole/noc_nonblocking_api.h:461-463, 582-584, 604-606</code>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc_nonblocking_api.h:582-584,604-606 @7aad8aac</div>
+<pre><code>inline __attribute__((always_inline)) bool ncrisc_noc_nonposted_writes_sent(uint32_t noc) {
+    return (NOC_STATUS_READ_REG(noc, NIU_MST_NONPOSTED_WR_REQ_SENT) == noc_nonposted_writes_num_issued[noc]);
+}
+...
+inline __attribute__((always_inline)) bool ncrisc_noc_nonposted_writes_flushed(uint32_t noc) {
+    return (NOC_STATUS_READ_REG(noc, NIU_MST_WR_ACK_RECEIVED) == noc_nonposted_writes_acked[noc]);
+}</code></pre>
+  <p>Notice the confusing names: the function called <code>..._flushed</code> backs <code>noc_async_write_barrier</code>, and the one called <code>..._sent</code> backs <code>noc_async_writes_flushed</code>. Go by the counter, not the name.</p>
+  <h3>Which barrier, where?</h3>
+  <p>The reader has no choice. Its <code>cb_push_back</code> tells compute "this slot holds a tile", so the bytes must be in L1 first, and only <code>noc_async_read_barrier</code> proves that. Push before the barrier and the unpacker may read a half-written tile.</p>
+  <p>The writer has a choice. Its <code>cb_pop_front</code> says "this slot may be overwritten". All the writer must know is that the NoC has finished <em>reading the slot</em>. It does not need to know that DRAM has the data. That is the case for <code>noc_async_writes_flushed</code>, and the example's own comment says so:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/write_tile.cpp:28-40 @7aad8aac</div>
+<pre><code>for (uint32_t i = 0; i &lt; n_tiles; i++) {
+    // Make sure there is a tile in the circular buffer
+    cb_out.wait_front(1);
+    // write the tile to DRAM
+    noc.async_write(cb_out, out0, tile_size_bytes, {}, {.page_id = i});
+    noc.async_write_barrier();  // This will wait until the write is done. As an alternative,
+                                // noc_async_write_flushed() can be faster because it waits
+                                // until the write request is sent. In that case, you have to
+                                // use noc_async_write_barrier() at least once at the end of
+                                // data movement kernel to make sure all writes are done.
+    // Mark the tile as consumed
+    cb_out.pop_front(1);
+}</code></pre>
+  <p>The flushed variant lets the writer free the slot without waiting for the data to reach DRAM and the acknowledgement to travel back, which matters when the CB is shallow. You still need one real barrier before the kernel exits, because the program is not done until the data has landed.</p>
+  <div class="callout warn"><b>The sources differ on what "departed" means.</b> tt-metal describes <code>noc_async_writes_flushed</code> as waiting for writes "to depart" (<code>dataflow_api.h:1966-1968</code>), and the Ethernet guide says it tells you "when the write has left the sender L1" (<code>tech_reports/EthernetMultichip/BasicEthernetGuide.md:198</code>). The ISA's counter table is more careful. It says <code>NIU_MST_NONPOSTED_WR_REQ_SENT</code> is incremented "before the data reads from L1 &hellip; are complete", and the counter that drops "after the data reads from L1 &hellip; are complete" is <code>NIU_MST_WRITE_REQS_OUTGOING_ID</code> (tt-isa-documentation <code>WormholeB0/NoC/Counters.md:130-134</code>). I could not settle whether that gap can be observed on silicon. The matmul lab takes the safe line: "the sender calls <code>noc_async_write_barrier()</code> to wait until the multicast data transfer completes before reusing the CB slot" (<code>docs/.../labs/matmul/lab3/lab3.rst:500</code>). Use a full write barrier until you have profiled a reason not to.</div>
+
+  <h3>What is in a NoC address?</h3>
+  <p>A10 printed <code>noc addr src0=0x2c00002d4c40</code> and promised to decode it. On Wormhole a NoC address is 48 bits: 36 bits of local address, then 6 bits of x, then 6 bits of y:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc/noc_parameters.h:163-164,256-258 @7aad8aac</div>
+<pre><code>#define NOC_ADDR_LOCAL_BITS 36
+#define NOC_ADDR_NODE_ID_BITS 6
+...
+#define NOC_XY_ADDR(x, y, addr)                                                                                      \
+    ((((uint64_t)(y)) &lt;&lt; (NOC_ADDR_LOCAL_BITS + NOC_ADDR_NODE_ID_BITS)) | (((uint64_t)(x)) &lt;&lt; NOC_ADDR_LOCAL_BITS) | \
+     ((uint64_t)(addr)))</code></pre>
+  <p>So <code>0x2c0_0002d4c40</code> splits into a low 36 bits of <code>0x0002d4c40</code> (the buffer's address in the bank) and a high part of <code>0x2c0</code> = <code>0b001011_000000</code>, which is y&nbsp;=&nbsp;11, x&nbsp;=&nbsp;0. That is DRAM tile (0,11), which A09's table lists as the endpoint for bank&nbsp;0. With 36 local bits, the 1&nbsp;GiB offset of the odd Wormhole banks (<code>0x40000000</code>) fits in the local part. You will see it in a Watcher message <a href="#sanitizer">later</a>.</p>
+
+  <h2 id="accessor">Finding the pages: InterleavedAddrGen and TensorAccessor</h2>
+  <p>A10's kernel built its address generator by hand: <code>InterleavedAddrGen&lt;true&gt;{.bank_base_address = addr, .page_size = 4}</code>. The kernel has to restate two facts the host already knows, the memory type (as a template flag) and the page size. As A10 warned, if they drift apart, every page after the first is read from the wrong offset. <code>InterleavedAddrGenFast</code> (used by <code>add_2_integers_in_compute</code>'s reader) adds a data format but has the same weakness.</p>
+  <p><code>TensorAccessor</code> fixes this by having the host describe the buffer <em>into the compile-time arguments</em>:</p>
+  <ul>
+    <li>Host: <code>TensorAccessorArgs(*buffer).append_to(compile_args)</code> appends a few words describing the buffer.</li>
+    <li>Kernel: <code>TensorAccessorArgs&lt;offset&gt;()</code> reads those words, as <code>constexpr</code> values, starting at compile-time-arg index <code>offset</code>. <code>TensorAccessor(args, base_address)</code> combines them with the runtime address.</li>
+  </ul>
+  <p>Because one kernel often reads several tensors, the words are laid end to end, and each accessor tells you where the next one starts:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp:24-28 @7aad8aac</div>
+<pre><code>constexpr auto in0_args = TensorAccessorArgs&lt;0&gt;();
+const auto in0 = TensorAccessor(in0_args, dram_buffer_src_addr);
+
+constexpr auto out0_args = TensorAccessorArgs&lt;in0_args.next_compile_time_args_offset()&gt;();
+const auto out0 = TensorAccessor(out0_args, dram_buffer_dst_addr);</code></pre>
+  <p>How many words does one accessor use? It depends on the buffer, which is why you chain the offsets instead of hard-coding them:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/tensor/tensor_accessor_args.h:106-112,198 @7aad8aac</div>
+<pre><code>static constexpr uint32_t NumArgsCT = [] {
+    if constexpr (is_sharded) {
+        return BankCoordsCTAOffset + (bank_coords_is_crta ? 0 : PhysicalNumBanksCT) - CTA_OFFSET;
+    } else {
+        return page_size_is_crta ? 1u : 2u;
+    }
+}();
+...
+static constexpr uint32_t next_compile_time_args_offset() { return CTA_OFFSET + num_compile_time_args(); }</code></pre>
+  <p>An interleaved buffer needs two words: a flags word and the aligned page size. A sharded buffer adds its rank, bank count, tensor shape, shard shape and packed bank coordinates. The flags word is a bit set: <code>Sharded = 1</code>, <code>IsDram = 2</code>, and bits for which parts to pass at runtime instead (<code>hostdevcommon/.../tensor_accessor/arg_config.hpp:17-29</code>). I checked this in the simulator with a DPRINT in <code>eltwise_binary</code>'s reader. It printed:</p>
+<pre><code>0:0-0:BR: cta: 2 2048 2 2048  in1 offset=2</code></pre>
+  <p>Compile-time args 0&ndash;1 are input A: flags 2 (DRAM, interleaved) and a 2048-byte page. Args 2&ndash;3 are input B, and <code>in0_args.next_compile_time_args_offset()</code> is 2. If A were ever height-sharded, its block would grow, B's would move, and the chained offset would follow. A hard-coded <code>TensorAccessorArgs&lt;2&gt;</code> would quietly read A's shard shape as B's flags.</p>
+  <div class="callout key">An address generator turns "page <i>i</i> of this buffer" into a 64-bit NoC address. <code>TensorAccessor</code> gets the buffer's layout from compile-time args written by the host, so the kernel cannot disagree with the allocator, and the same kernel code handles DRAM or L1, interleaved or sharded. Chain multiple accessors with <code>next_compile_time_args_offset()</code>.</div>
+  <p>The tech report lets you move parts of the description (rank, bank count, shapes, bank coordinates) to common runtime args with <code>ArgConfig</code> flags. That trades a little address arithmetic for fewer recompiles when shapes change (<code>tech_reports/tensor_accessor/tensor_accessor.md:34-47</code>). With a static rank, construction is free: "everything is precomputed in compile time" (same file, line 199).</p>
+
+  <h2 id="ring">A circular buffer from first principles</h2>
+  <p>Back to the question. The reader puts a tile into L1. How does compute learn it is there? Build the answer up from the smallest thing that could work.</p>
+  <h3>Attempt 1: a flag</h3>
+  <p>Reserve one tile-sized slot in L1 and one shared word, <code>full</code>. The reader waits for <code>full == 0</code>, copies the tile in, and sets <code>full = 1</code>. Compute waits for <code>full == 1</code>, uses the tile, and sets <code>full = 0</code>. This is correct, because each side only acts after seeing the other's write. But it is strictly alternating: while compute works, the reader cannot start the next tile, and while the reader waits on DRAM, compute sits idle. One slot means no overlap.</p>
+  <h3>Attempt 2: a ring of N slots and two counters</h3>
+  <p>Give the pair N slots, used in order 0, 1, &hellip;, N&minus;1, 0, 1, &hellip;. Now one shared flag is not enough. The classic single-producer single-consumer ring uses <b>two monotonically increasing counters</b>, each written by only one side:</p>
+  <ul>
+    <li><b>received</b>: how many pages the producer has published in total. Only the producer writes it.</li>
+    <li><b>acked</b>: how many pages the consumer has released in total. Only the consumer writes it.</li>
+  </ul>
+  <p>Everything else follows by subtraction. Pages holding data: <code>received &minus; acked</code>. Free pages: <code>N &minus; (received &minus; acked)</code>. Because each counter has one writer, no lock or atomic is needed. A reader of a counter can only see it too low (stale), never too high, and a stale value only makes a side wait a little longer. Counting totals instead of positions also avoids the classic ring-buffer ambiguity where "read index == write index" could mean empty or full. And since only the difference matters, the counters may wrap: tt-metal does the subtraction in <code>uint16_t</code>, so they wrap at 65536 without harm, as long as fewer than 65536 pages are ever outstanding.</p>
+  <p>The counters say <em>how many</em> slots are full. They do not say <em>where</em>. Each side therefore also keeps a private pointer: the producer a <b>write pointer</b> (where its next page goes) and the consumer a <b>read pointer</b> (where its next page comes from). Both start at the base of the ring, move forward one page size at a time, and jump back to the base at the end. Neither side ever needs the other's pointer. Both are simply following the same sequence.</p>
+  <h3>Where tt-metal puts them</h3>
+  <p>The two counters live in hardware registers. Each Tensix has a set of NoC <em>overlay stream</em> registers that every one of its five CPUs can reach as memory-mapped I/O. tt-metal repurposes two scratch registers of stream <i>n</i> as the counters of CB <i>n</i>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/stream_io_map.h:21-32 @7aad8aac</div>
+<pre><code>// Pointers to stream scratch registers (implemented using don't-care functional registers) that are used for CB
+// synchronization
+
+inline __attribute__((always_inline)) volatile uint32_t* get_cb_tiles_received_ptr(int operand) {
+    return (volatile uint32_t*)(uintptr_t)(STREAM_REG_ADDR(
+        get_operand_stream_id(operand), STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX));
+}
+
+inline __attribute__((always_inline)) volatile uint32_t* get_cb_tiles_acked_ptr(int operand) {
+    return (volatile uint32_t*)(uintptr_t)(STREAM_REG_ADDR(
+        get_operand_stream_id(operand), STREAM_REMOTE_DEST_BUF_START_REG_INDEX));
+}</code></pre>
+  <p>The pointers are ordinary C structs, one array per CPU, in each CPU's own memory. The firmware fills them in from the program's CB configuration at every launch (<code>hw/inc/internal/circular_buffer_init.h</code>):</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/circular_buffer_interface.h:85-105 @7aad8aac</div>
+<pre><code>struct LocalCBInterface {
+    uint32_t fifo_size;
+    uint32_t fifo_limit;  // range is inclusive of the limit
+    uint32_t fifo_page_size;
+    uint32_t fifo_num_pages;
+
+    uint32_t fifo_rd_ptr;
+    uint32_t fifo_wr_ptr;
+
+    // Save a cycle during init by writing 0 to the uint32 below
+    union {
+        uint32_t tiles_acked_received_init;
+        struct {
+            uint16_t tiles_acked;
+            uint16_t tiles_received;
+        };
+    };
+
+    // used by packer for in-order packing
+    uint32_t fifo_wr_tile_ptr;
+};</code></pre>
+  <p>That is eight words, or 32 bytes per CB. Here is a nice consequence. A TRISC on Wormhole has 2&nbsp;KiB of private data RAM (A09), and 32 CBs &times; 32&nbsp;B is already 1&nbsp;KiB of it. That is why the device header sets <code>NUM_CIRCULAR_BUFFERS = 32</code> on Wormhole, "limited by 2KB TRISC memory", and 64 on Blackhole (<code>hw/inc/api/circular_buffer_constants.h:14-27</code>).</p>
+  <div class="callout gpu">On a GPU the same pattern appears when you hand-pipeline global&rarr;shared memory copies: a ring of shared-memory stages, a producer that issues async copies and a consumer that waits on per-stage barriers (CUTLASS-style multistage pipelines). The difference is who the parties are. On a GPU they are warps or threads in one SM, synchronising through shared-memory barriers. Here they are separate in-order CPUs running separate binaries, and the "barrier" is two counters in MMIO registers that only ever count up.</div>
+  <div class="callout warn">Analogy check: think of a shelf of N numbered slots, a cook and a waiter. The cook keeps a tally of plates put out and the waiter a tally of plates taken. Each looks at the other's tally to decide whether to act, and each remembers privately which slot is next. The analogy breaks in one important way: a cook would never put a plate where there is no shelf, but the CB hardware has no idea where the shelf ends. Only the pointers know about the end, and only by an exact-equality check. That is the next section's trap.</div>
+
+  <h2 id="protocol">The six calls, exactly</h2>
+  <p>Here is the whole data-movement API, with what each call does to the four pieces of state. "Page" is the CB's unit, set on the host. It is usually one tile.</p>
+  <table>
+    <tr><th>Call (side)</th><th>Blocks until</th><th>Counters</th><th>Pointer</th><th>Waypoint</th></tr>
+    <tr><td><code>cb_reserve_back(cb, n)</code> (producer)</td><td><code>N &minus; (received &minus; acked) &ge; n</code></td><td>read only</td><td>none</td><td>CRBW / CRBD</td></tr>
+    <tr><td><code>get_write_ptr(cb)</code> (producer)</td><td>never</td><td>&mdash;</td><td>returns <code>fifo_wr_ptr</code></td><td>&mdash;</td></tr>
+    <tr><td><code>cb_push_back(cb, n)</code> (producer)</td><td>never</td><td><code>received += n</code></td><td>wr += n pages; if wr == limit, wr = base</td><td>&mdash;</td></tr>
+    <tr><td><code>cb_wait_front(cb, n)</code> (consumer)</td><td><code>received &minus; acked &ge; n</code></td><td>read only</td><td>none</td><td>CWFW / CWFD</td></tr>
+    <tr><td><code>get_read_ptr(cb)</code> (consumer)</td><td>never</td><td>&mdash;</td><td>returns <code>fifo_rd_ptr</code></td><td>&mdash;</td></tr>
+    <tr><td><code>cb_pop_front(cb, n)</code> (consumer)</td><td>never</td><td><code>acked += n</code></td><td>rd += n pages; if rd == limit, rd = base</td><td>&mdash;</td></tr>
+  </table>
+  <p>Read the real code for the two producer calls. They are short:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:406-428 @7aad8aac</div>
+<pre><code>void cb_reserve_back(int32_t operand, int32_t num_pages) {
+    uintptr_t pages_acked_ptr = (uintptr_t)get_cb_tiles_acked_ptr(operand);
+
+    // while the producer (write-side interface) is waiting for space to free up "tiles_pushed" is not changing
+    // "tiles_pushed" is updated by the producer only when the tiles are pushed
+    uint32_t pages_received = get_cb_tiles_received_ptr(operand)[0];
+
+    int32_t free_space_pages;
+    WAYPOINT("CRBW");
+    {
+        SYNC_WAIT("SYNC-CB-RESERVE", operand);
+        do {
+            // uint16_t's here because Tensix updates the val at tiles_acked_ptr as uint16 in llk_pop_tiles
+            ...
+            invalidate_l1_cache();
+            uint16_t pages_acked = (uint16_t)reg_read(pages_acked_ptr);
+            uint16_t free_space_pages_wrap =
+                get_local_cb_interface(operand).fifo_num_pages - (pages_received - pages_acked);
+            free_space_pages = (int32_t)free_space_pages_wrap;
+        } while (free_space_pages &lt; num_pages);
+    }
+    WAYPOINT("CRBD");
+}</code></pre>
+  <ul>
+    <li><code>received</code> is read <em>once</em>, outside the loop. The comment says why: only this CPU writes it, so it cannot change while we wait.</li>
+    <li><code>acked</code> is re-read on every iteration, because the consumer is changing it.</li>
+    <li>The arithmetic is in <code>uint16_t</code>: the 16-bit wrap described above.</li>
+    <li>Nothing moves. Reserve is purely a wait, so you may call it more than once before a push (<code>cb_pages_reservable_at_back</code>, line 377, is the non-blocking version).</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:208-224 @7aad8aac</div>
+<pre><code>void cb_push_back(const int32_t operand, const int32_t num_pages) {
+    uint32_t num_words = num_pages * get_local_cb_interface(operand).fifo_page_size;
+
+    volatile tt_reg_ptr uint32_t* pages_received_ptr = get_cb_tiles_received_ptr(operand);
+    SYNC_SIGNAL("SYNC-CB-PUSH", operand);
+    pages_received_ptr[0] += num_pages;
+
+    get_local_cb_interface(operand).fifo_wr_ptr += num_words;
+
+    // this will basically reset fifo_wr_ptr to fifo_addr -- no other wrap is legal
+    // producer always writes into contiguous memory, it cannot wrap
+    ASSERT(get_local_cb_interface(operand).fifo_wr_ptr &lt;= get_local_cb_interface(operand).fifo_limit);
+    if (get_local_cb_interface(operand).fifo_wr_ptr == get_local_cb_interface(operand).fifo_limit) {
+        // TODO: change this to fifo_wr_ptr
+        get_local_cb_interface(operand).fifo_wr_ptr -= get_local_cb_interface(operand).fifo_size;
+    }
+}</code></pre>
+  <p>Push bumps the shared counter, which is the moment the consumer may see the data, and then advances the private pointer. The wrap is <code>==</code>, not <code>&gt;=</code>. Keep that in mind. The consumer's pair is symmetric: <code>cb_wait_front</code> (lines 479-493) spins on <code>received &minus; acked &ge; n</code> between the CWFW and CWFD waypoints, and <code>cb_pop_front</code> (lines 260-275) bumps <code>acked</code> and advances the read pointer with the same exact-equality wrap.</p>
+  <p>Writing into the slot does not publish it. Only push does. So between reserve and push the producer may fill the slot however it likes: several small NoC reads, or even random access, as the doc comment says (lines 184-188). Likewise the consumer may read the visible pages in any order between wait and pop.</p>
+
+  <h3>The aha: watch the ring</h3>
+  <p>Below, a producer (the reader) and a consumer (compute) share one CB. The producer takes <i>P</i> time units to fill a page (NoC read plus barrier) and the consumer <i>C</i> to use one. Choose 1, 2 or 4 pages and press Play. Red in the strips is time spent spinning in <code>cb_reserve_back</code> or <code>cb_wait_front</code>. Turn on <b>jitter</b> to make each page's time vary between 0.4&times; and 1.6&times; its nominal value, as real DRAM reads do.</p>
+
+  <div class="viz" id="figRing"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figRing");
+    var g = TT.canvas(root, 800, 400), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML =
+      '<span style="color:#9aa4b2">pages</span><button data-n="1">1</button><button data-n="2" class="on">2</button><button data-n="4">4</button>' +
+      '<label>producer P <input type="range" id="rgP" min="2" max="10" value="4"><span id="rgPv">4</span></label>' +
+      '<label>consumer C <input type="range" id="rgC" min="2" max="10" value="4"><span id="rgCv">4</span></label>' +
+      '<label><input type="checkbox" id="rgJ"> jitter</label>';
+    root.appendChild(bar);
+    var bar2 = document.createElement("div"); bar2.className = "controls";
+    bar2.innerHTML = '<button id="rgPlay">Play</button><button id="rgStep">Step</button><button id="rgReset">Restart</button><span id="rgInfo" style="color:#9aa4b2;margin-left:auto"></span>';
+    root.appendChild(bar2);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+
+    var N = 2, P = 4, Cc = 4, jitter = false, K = 40;
+    var ps, pe, cs, ce, events, t = 0, playing = false, last = 0;
+    function rng(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+    function build() {
+      var r1 = rng(7), r2 = rng(1234);
+      ps = []; pe = []; cs = []; ce = [];
+      for (var k = 0; k < K; k++) {
+        var pk = P * (jitter ? 0.4 + 1.2 * r1() : 1), ck = Cc * (jitter ? 0.4 + 1.2 * r2() : 1);
+        // producer: reserve_back waits for slot k-N to be popped
+        ps[k] = Math.max(k > 0 ? pe[k - 1] : 0, k - N >= 0 ? ce[k - N] : 0);
+        pe[k] = ps[k] + pk;                     // push at pe[k]
+        cs[k] = Math.max(k > 0 ? ce[k - 1] : 0, pe[k]);   // wait_front satisfied
+        ce[k] = cs[k] + ck;                     // pop at ce[k]
+      }
+      events = [];
+      for (k = 0; k < K; k++) events.push(ps[k], pe[k], cs[k], ce[k]);
+      events.sort(function (a, b) { return a - b; });
+    }
+    function countLE(arr, x) { var c = 0; for (var i = 0; i < arr.length; i++) if (arr[i] <= x + 1e-9) c++; return c; }
+    function busyUpTo(s, e, x) { var b = 0; for (var i = 0; i < s.length; i++) { if (s[i] >= x) break; b += Math.min(e[i], x) - s[i]; } return b; }
+    var cx = 190, cy = 200, R1 = 116, R0 = 62;
+    function slotAngle(i) { return -Math.PI / 2 + (2 * Math.PI * i) / N; }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var received = countLE(pe, t), acked = countLE(ce, t);
+      var wr = received % N, rd = acked % N;
+      // slot states
+      for (var s = 0; s < N; s++) {
+        var state = "free", prog = 0, tile = -1;
+        for (var k = s; k < K; k += N) {
+          if (ps[k] <= t + 1e-9) {
+            tile = k;
+            if (t < pe[k]) { state = "fill"; prog = (t - ps[k]) / (pe[k] - ps[k]); }
+            else if (t < cs[k]) state = "ready";
+            else if (t < ce[k]) { state = "use"; prog = (t - cs[k]) / (ce[k] - cs[k]); }
+            else state = "free";
+          }
+        }
+        var a0 = slotAngle(s) + 0.03, a1 = slotAngle(s + 1) - 0.03;
+        if (N === 1) { a0 = -Math.PI / 2 + 0.001; a1 = a0 + 2 * Math.PI - 0.002; }
+        var col = state === "fill" ? C.blue : state === "ready" ? C.green : state === "use" ? C.orange : C.bg3;
+        ctx.beginPath(); ctx.arc(cx, cy, R1, a0, a1); ctx.arc(cx, cy, R0, a1, a0, true); ctx.closePath();
+        ctx.fillStyle = state === "free" ? C.bg3 : col; ctx.globalAlpha = state === "free" ? 1 : 0.35; ctx.fill(); ctx.globalAlpha = 1;
+        ctx.strokeStyle = state === "free" ? C.border : col; ctx.lineWidth = 2; ctx.stroke();
+        if (state === "fill" || state === "use") { // progress arc
+          var ap = a0 + (a1 - a0) * prog;
+          ctx.beginPath(); ctx.arc(cx, cy, R1 - 6, a0, ap); ctx.strokeStyle = col; ctx.lineWidth = 7; ctx.stroke();
+        }
+        var am = (a0 + a1) / 2, rm = (R0 + R1) / 2;
+        if (N === 1) am = Math.PI / 2;
+        TT.text(ctx, "page " + s, cx + Math.cos(am) * rm, cy + Math.sin(am) * rm - (N === 1 ? 0 : 8), { align: "center", font: "12px", color: C.muted });
+        if (tile >= 0 && state !== "free") TT.text(ctx, "tile " + tile, cx + Math.cos(am) * rm, cy + Math.sin(am) * rm + (N === 1 ? 16 : 8), { align: "center", font: "bold 12px", color: C.fg });
+      }
+      // pointers
+      function ptr(idx, label, color, rOut, dy) {
+        var a = N === 1 ? (label === "rd" ? Math.PI / 2 : -Math.PI / 2) : slotAngle(idx) + 0.12;
+        var x2 = cx + Math.cos(a) * (R1 + 4), y2 = cy + Math.sin(a) * (R1 + 4);
+        var x1 = cx + Math.cos(a) * rOut, y1 = cy + Math.sin(a) * rOut;
+        TT.arrow(ctx, x1, y1, x2, y2, { color: color, lw: 2 });
+        TT.text(ctx, label, x1 + (Math.cos(a) >= 0 ? 4 : -4), y1 + dy, { align: Math.cos(a) >= 0 ? "left" : "right", font: "bold 12px", color: color, mono: true });
+      }
+      ptr(wr, "wr", C.blue, R1 + 34, -8);
+      ptr(rd, "rd", C.orange, R1 + 18, 10);
+      TT.text(ctx, "CB in L1: " + N + " page" + (N > 1 ? "s" : "") + " \u00d7 2048 B", 12, 16, { font: "bold 13px", color: C.yellow });
+      // right panel
+      var x0 = 400;
+      var nextP = countLE(ps, t), nextC = countLE(cs, t);
+      var pFill = nextP > received, cUse = nextC > acked;
+      var pDone = received >= K, cDone = acked >= K;
+      TT.text(ctx, "producer (reader, BRISC)", x0, 26, { font: "bold 13px", color: C.blue });
+      TT.text(ctx, pDone ? "done" : pFill ? "filling tile " + received + " at wr  (NoC read + barrier)" : "cb_reserve_back: spinning (CRBW)", x0, 46, { font: "13px", mono: true, color: pFill || pDone ? C.fg : C.red });
+      TT.text(ctx, "consumer (compute, TRISCs)", x0, 74, { font: "bold 13px", color: C.orange });
+      TT.text(ctx, cDone ? "done" : cUse ? "using tile " + acked + " at rd" : "cb_wait_front: spinning", x0, 94, { font: "13px", mono: true, color: cUse || cDone ? C.fg : C.red });
+      TT.text(ctx, "shared counters (stream registers)", x0, 126, { font: "bold 13px", color: C.yellow });
+      TT.text(ctx, "received = " + received + "    acked = " + acked, x0, 146, { font: "13px", mono: true });
+      TT.text(ctx, "full = received\u2212acked = " + (received - acked) + "    free = N\u2212full = " + (N - received + acked), x0, 166, { font: "13px", mono: true });
+      TT.text(ctx, "private pointers: wr = page " + wr + ", rd = page " + rd, x0, 186, { font: "12px", mono: true, color: C.muted });
+      // timeline strips
+      var W = 60, tx0 = x0, tw = 380, ty = 230;
+      var t0 = Math.max(0, t - W);
+      function sx(v) { return tx0 + ((v - t0) / W) * tw; }
+      TT.text(ctx, "last " + W + " time units", tx0, ty - 12, { font: "12px", color: C.muted });
+      [["reader", ps, pe, C.blue, ty], ["compute", cs, ce, C.orange, ty + 40]].forEach(function (r) {
+        var y = r[4];
+        ctx.fillStyle = C.red; ctx.globalAlpha = 0.45; ctx.fillRect(sx(t0), y, Math.max(0, sx(t) - sx(t0)), 22); ctx.globalAlpha = 1;
+        for (var i = 0; i < K; i++) {
+          var a = Math.max(r[1][i], t0), b = Math.min(r[2][i], t);
+          if (b > a) { ctx.fillStyle = r[3]; ctx.fillRect(sx(a), y, sx(b) - sx(a), 22); ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.strokeRect(sx(a), y, sx(b) - sx(a), 22); }
+        }
+        ctx.strokeStyle = C.border; ctx.strokeRect(tx0, y, tw, 22);
+        TT.text(ctx, r[0], tx0 - 6, y + 11, { align: "right", font: "12px", color: C.muted });
+      });
+      var pb = busyUpTo(ps, pe, t), cb = busyUpTo(cs, ce, t);
+      var tt = Math.max(t, 1e-9);
+      TT.text(ctx, "busy so far: reader " + (t > 0 ? Math.round(100 * pb / tt) : 0) + "%   compute " + (t > 0 ? Math.round(100 * cb / tt) : 0) + "%", x0, ty + 90, { font: "bold 13px", mono: true, color: C.fg });
+      var fin = ce[K - 1];
+      TT.text(ctx, "t = " + t.toFixed(1) + "   all " + K + " tiles done at t = " + fin.toFixed(1), x0, ty + 114, { font: "12px", mono: true, color: C.muted });
+      TT.text(ctx, "(lower bound \u2248 " + K + "\u00b7max(P,C) = " + (Math.max(P, Cc) * K) + (jitter ? " nominal" : "") + ")", x0, ty + 134, { font: "12px", mono: true, color: C.muted });
+      // legend
+      var ly = 388, lx = 12;
+      [["free", C.bg3], ["being filled", C.blue], ["pushed, waiting", C.green], ["being used", C.orange], ["spinning", C.red]].forEach(function (l) {
+        TT.box(ctx, lx, ly - 7, 14, 14, { fill: l[1], alpha: 0.7, r: 2 }); TT.text(ctx, l[0], lx + 20, ly, { font: "12px", color: C.muted }); lx += 30 + ctx.measureText(l[0]).width + 6;
+      });
+      document.getElementById("rgInfo").textContent = playing ? "playing" : "paused";
+      document.getElementById("rgPlay").textContent = playing ? "Pause" : "Play";
+      var msg;
+      if (N === 1) msg = "<b>One page:</b> the reader cannot start tile k+1 until compute pops tile k, and compute cannot start until the reader pushes. They take turns, so each is idle while the other works. This is Attempt 1, the flag.";
+      else if (N === 2) msg = "<b>Two pages (double buffering):</b> while compute uses one page, the reader fills the other. With equal, steady speeds the red disappears after the first tile. Try jitter: a slow read now and then still stalls compute, because there is only one page of slack.";
+      else msg = "<b>Four pages:</b> more slack. With jitter, a slow read is absorbed by tiles already waiting in the ring. Deeper rings cannot beat the slower side, though: set P &gt; C and compute stays partly red however many pages you add.";
+      narr.innerHTML = msg;
+    }
+    function frame(now) {
+      if (!playing) return;
+      var dt = (now - last) / 1000; last = now;
+      t += dt * 12;
+      var end = ce[K - 1];
+      if (t >= end) { t = end; playing = false; }
+      draw();
+      if (playing) requestAnimationFrame(frame);
+    }
+    function reset() { playing = false; t = 0; build(); draw(); }
+    bar.querySelectorAll("button[data-n]").forEach(function (b) {
+      b.onclick = function () { bar.querySelectorAll("button[data-n]").forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); N = +b.dataset.n; reset(); };
+    });
+    document.getElementById("rgP").oninput = function (e) { P = +e.target.value; document.getElementById("rgPv").textContent = P; reset(); };
+    document.getElementById("rgC").oninput = function (e) { Cc = +e.target.value; document.getElementById("rgCv").textContent = Cc; reset(); };
+    document.getElementById("rgJ").onchange = function (e) { jitter = e.target.checked; reset(); };
+    document.getElementById("rgPlay").onclick = function () {
+      if (!playing && t >= ce[K - 1]) t = 0;
+      playing = !playing; last = performance.now(); draw(); if (playing) requestAnimationFrame(frame);
+    };
+    document.getElementById("rgStep").onclick = function () {
+      playing = false;
+      for (var i = 0; i < events.length; i++) if (events[i] > t + 1e-6) { t = events[i]; break; }
+      draw();
+    };
+    document.getElementById("rgReset").onclick = reset;
+    reset();
+  })();
+  </script>
+  <p>This figure is a model: one page per step, fixed or jittered durations, and the producer and consumer loops above. It is not a measurement. ttsim has no timing model (see <a href="#sim">below</a>), and the real compute kernel is itself a three-CPU pipeline (A12). The model gets the protocol right, though. The producer may start page <i>k</i> only when page <i>k</i>&minus;N has been popped, and the consumer only when page <i>k</i> has been pushed. With 1 page and P = C = 4, 40 tiles take 320 units, because the two sides strictly alternate. With 2 pages they take 164 units, close to the ideal of 160.</p>
+
+  <h3>The real pointers</h3>
+  <p>Here is the same protocol on the real stack. I put a copy of <code>eltwise_binary</code>'s reader in the kernel overlay with a DPRINT before each reserve and after each push of <code>c_0</code>, printing the write pointer and both hardware counters. The run on ttsim (Wormhole) printed:</p>
+<pre><code>0:0-0:BR: cb0 fifo_addr=0x19e60 size=4096 limit=0x1ae60 page=2048
+0:0-0:BR: i=0 before reserve: wr=0x19e60 received=0 acked=0
+0:0-0:BR: i=0 after push:     wr=0x1a660 received=1 acked=0
+0:0-0:BR: i=1 before reserve: wr=0x1a660 received=1 acked=1
+0:0-0:BR: i=1 after push:     wr=0x19e60 received=2 acked=1
+0:0-0:BR: i=2 before reserve: wr=0x19e60 received=2 acked=2
+0:0-0:BR: i=2 after push:     wr=0x1a660 received=3 acked=2
+...
+Test Passed</code></pre>
+  <p>Read it against the table. The CB is two 2048-byte pages starting at <code>0x19e60</code>, the bottom of L1's unreserved region (A09). Each push adds one to <code>received</code> and moves <code>wr</code> by <code>0x800</code>. Every second push, <code>wr</code> reaches <code>limit = 0x1ae60</code> and snaps back to the base. <code>acked</code> is written by the compute kernel on another CPU, and here it has always caught up by the next reserve. A matching overlay of the writer showed the consumer side of <code>c_16</code>: <code>rd</code> alternating between <code>0x1c660</code> and <code>0x1be60</code>, with <code>received</code> and <code>acked</code> equal after each pop.</p>
+  <div class="callout warn">One more rule carries over from A10. A push is a hand-off, just like a NoC write. If a data-movement CPU fills a CB page with <em>its own stores</em> (not a NoC read), those stores may still be in its store queue when <code>received</code> ticks. Force them into L1 first (A10's <code>load_blocking</code>), and only then push. ttsim will not catch you if you forget.</div>
+
+  <h2 id="rules">Two rules the counters cannot enforce</h2>
+  <p>The counters keep the producer from overrunning the consumer. They know nothing about addresses, so two rules are left to you.</p>
+  <h3>Rule 1: pushes in one lap must add up to exactly the CB size</h3>
+  <p>The doc comment states it with numbers: "on a CB of size 12, <code>cb_push_back(5)</code> followed by <code>cb_push_back(7)</code> is correct (total 12 = CB size). However, <code>cb_push_back(7)</code> followed by <code>cb_push_back(7)</code> on the same CB is incorrect (total 14 != 12)" (<code>dataflow_api.h:190-197</code>; pops have the same rule). Step through both to see why. The key moment is step 4 of the bad pattern: the counters say 12 pages are free, so the reserve succeeds, but only 5 pages are left before the end of the ring, and the pointer cannot wrap in the middle of a reservation.</p>
+
+  <div class="viz" id="figWrap"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figWrap");
+    var g = TT.canvas(root, 800, 250), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>pattern <select id="wpSel"><option value="good">push(5) + push(7): sums to 12</option><option value="bad">push(7) + push(7): sums to 14</option></select></label>';
+    root.appendChild(bar);
+    var NP = 12;
+    // each state: wr, rd, received, acked, region [start,len] reserved/being written, ready pages, msg
+    var modes = {
+      good: [
+        { wr: 0, rd: 0, rc: 0, ak: 0, res: null, ready: [], text: "<b>Start.</b> A 12-page CB. Both pointers are at page 0 (the base) and both counters are 0." },
+        { wr: 0, rd: 0, rc: 0, ak: 0, res: [0, 5], ready: [], text: "<b>cb_reserve_back(5).</b> free = 12 \u2212 (0 \u2212 0) = 12 \u2265 5, so it returns at once. Nothing moves. The producer fills pages 0\u20134 starting at get_write_ptr()." },
+        { wr: 5, rd: 0, rc: 5, ak: 0, res: null, ready: [0, 5], text: "<b>cb_push_back(5).</b> received = 5. wr moves 5 pages to page 5. It is not at the limit, so there is no wrap." },
+        { wr: 5, rd: 5, rc: 5, ak: 5, res: null, ready: [], text: "<b>Consumer: wait_front(5), pop_front(5).</b> acked = 5, rd moves to page 5." },
+        { wr: 5, rd: 5, rc: 5, ak: 5, res: [5, 7], ready: [], text: "<b>cb_reserve_back(7).</b> free = 12 \u2212 (5 \u2212 5) = 12. The 7 pages from page 5 run to page 11, exactly the end of the ring." },
+        { wr: 0, rd: 5, rc: 12, ak: 5, res: null, ready: [5, 7], wrapW: true, text: "<b>cb_push_back(7).</b> received = 12. wr = page 12 = fifo_limit, so the <code>==</code> check fires and wr snaps back to page 0. The lap summed to 12, so the wrap lands on the boundary." },
+        { wr: 0, rd: 0, rc: 12, ak: 12, res: null, ready: [], wrapR: true, text: "<b>Consumer pops 7.</b> rd also lands exactly on the limit and wraps. Both sides are back at page 0, in step, ready for the next lap." }
+      ],
+      bad: [
+        { wr: 0, rd: 0, rc: 0, ak: 0, res: null, ready: [], text: "<b>Start.</b> The same 12-page CB." },
+        { wr: 0, rd: 0, rc: 0, ak: 0, res: [0, 7], ready: [], text: "<b>cb_reserve_back(7).</b> free = 12, so it returns. The producer fills pages 0\u20136." },
+        { wr: 7, rd: 0, rc: 7, ak: 0, res: null, ready: [0, 7], text: "<b>cb_push_back(7).</b> received = 7, wr moves to page 7." },
+        { wr: 7, rd: 7, rc: 7, ak: 7, res: null, ready: [], text: "<b>Consumer pops 7.</b> acked = 7, rd moves to page 7. The ring is empty again." },
+        { wr: 7, rd: 7, rc: 7, ak: 7, res: [7, 7], ready: [], text: "<b>cb_reserve_back(7).</b> free = 12 \u2212 (7 \u2212 7) = 12 \u2265 7, so it <em>succeeds</em>. The counters cannot know that only pages 7\u201311 remain before the end. A 7-page NoC read into get_write_ptr() writes pages 12 and 13 <b>past the end of the CB</b>, into whatever L1 holds next (often the next CB)." },
+        { wr: 14, rd: 7, rc: 14, ak: 7, res: null, ready: [7, 7], bad: true, text: "<b>cb_push_back(7).</b> wr = page 14, past fifo_limit (page 12). With Watcher on, the <code>ASSERT(wr &lt;= limit)</code> trips. Without it, the <code>==</code> check never fires, so wr never wraps, and the producer keeps writing further and further outside its CB." }
+      ]
+    };
+    var mode = "good";
+    var x0 = 60, pw = 48, y0 = 90, ph = 56;
+    function px(i) { return x0 + i * pw; }
+    function drawFn(i, t, step) {
+        var S = modes[mode][Math.min(i, modes[mode].length - 1)];
+        TT.clear(ctx, g.W, g.H);
+        // overflow area
+        ctx.setLineDash([4, 4]);
+        TT.box(ctx, px(NP), y0, pw * 2.5, ph, { stroke: C.border, r: 2 });
+        ctx.setLineDash([]);
+        TT.text(ctx, "next thing in L1", px(NP) + pw * 1.25, y0 + ph + 30, { align: "center", font: "11px", color: C.muted });
+        for (var p = 0; p < NP; p++) {
+          var fill = C.bg3, al = 1;
+          if (S.ready && S.ready.length && p >= S.ready[0] && p < S.ready[0] + S.ready[1]) { fill = C.green; al = 0.45; }
+          if (S.res && p >= S.res[0] && p < S.res[0] + S.res[1]) { fill = C.blue; al = 0.5; }
+          TT.box(ctx, px(p) + 2, y0, pw - 4, ph, { fill: fill, alpha: al, stroke: C.border, r: 3 });
+          TT.text(ctx, String(p), px(p) + pw / 2, y0 + ph + 14, { align: "center", font: "12px", mono: true, color: C.muted });
+        }
+        // spill
+        function spill(st, len) {
+          for (var q = st; q < st + len; q++) if (q >= NP) {
+            TT.box(ctx, px(q) + 2, y0, pw - 4, ph, { fill: C.red, alpha: 0.55, stroke: C.red, r: 3 });
+            TT.text(ctx, String(q), px(q) + pw / 2, y0 + ph + 14, { align: "center", font: "12px", mono: true, color: C.red });
+          }
+        }
+        if (S.res) spill(S.res[0], S.res[1]);
+        if (S.ready && S.ready.length) spill(S.ready[0], S.ready[1]);
+        // limit marker
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(px(NP), y0 - 26); ctx.lineTo(px(NP), y0 + ph + 4); ctx.stroke();
+        TT.text(ctx, "fifo_limit", px(NP) + 4, y0 - 30, { font: "11px", mono: true, color: C.yellow });
+        TT.text(ctx, "base", px(0) - 4, y0 + ph / 2, { font: "11px", mono: true, color: C.muted, align: "right" });
+        // pointers
+        function ptr(pg, label, color, up) {
+          var x = px(pg) + 6, y = up ? y0 - 4 : y0 + ph + 26;
+          if (up) { TT.arrow(ctx, x, y0 - 44, x, y0 - 4, { color: color }); TT.text(ctx, label, pg >= NP ? x - 6 : x + 6, y0 - 50, { font: "bold 13px", mono: true, color: color, align: pg >= NP ? "right" : "left" }); }
+          else { TT.arrow(ctx, x, y0 + ph + 52, x, y0 + ph + 22, { color: color }); TT.text(ctx, label, x + 6, y0 + ph + 56, { font: "bold 13px", mono: true, color: color }); }
+        }
+        ptr(S.wr, "wr" + (S.bad ? " = 14 > limit!" : ""), S.bad ? C.red : C.blue, true);
+        ptr(S.rd, "rd", C.orange, false);
+        if (S.wrapW) { ctx.strokeStyle = C.blue; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(px(NP), y0 - 40); ctx.quadraticCurveTo(px(6), y0 - 80, px(0) + 6, y0 - 44); ctx.stroke(); ctx.setLineDash([]); TT.text(ctx, "wrap", px(6), y0 - 70, { align: "center", font: "11px", color: C.blue }); }
+        if (S.wrapR) { ctx.strokeStyle = C.orange; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(px(NP), y0 + ph + 62); ctx.quadraticCurveTo(px(6), y0 + ph + 98, px(0) + 14, y0 + ph + 62); ctx.stroke(); ctx.setLineDash([]); }
+        TT.text(ctx, "received = " + S.rc + "   acked = " + S.ak + "   free = " + (NP - (S.rc - S.ak)), 400, 22, { align: "center", font: "bold 13px", mono: true, color: C.yellow });
+    }
+    var stepper = TT.stepper({ root: root, steps: modes.good, draw: drawFn });
+    document.getElementById("wpSel").onchange = function (e) {
+      mode = e.target.value;
+      root.querySelectorAll(".controls, .narration").forEach(function (el) { if (el !== bar) el.remove(); });
+      stepper = TT.stepper({ root: root, steps: modes[mode], draw: drawFn });
+    };
+  })();
+  </script>
+  <p>To try it for real without a new host program, I used <code>eltwise_binary</code>'s 2-page CB and an overlay whose reader pushes 1 page and then 2 pages (a lap of 3 on a ring of 2). With <code>TT_METAL_WATCHER=1</code> the run stopped in 10.7&nbsp;s:</p>
+<pre><code>Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): BRISC tripped an assert on line 219.
+Note that file name reporting is not yet implemented, and the reported line number for the
+assert may be from a different file. Current kernel:
+tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp.
+TT_THROW: Watcher detected tripped assert and stopped device.</code></pre>
+  <p>Line 219 of <code>dataflow_api.h</code> is exactly the <code>ASSERT(fifo_wr_ptr &lt;= fifo_limit)</code> in <code>cb_push_back</code> shown above. Without Watcher the same kernel did not hang and did not crash. It "finished" in about a second, and the host's check reported 62,293 wrong values out of 65,536, starting at index 2048, the first element of tile&nbsp;2. That is silent corruption from one wrong push count.</p>
+  <div class="callout key">Counters decide <em>when</em>; pointers decide <em>where</em>. The counters never let you overrun the consumer, but only the exact-equality wrap keeps the pointers inside the ring. Choose push and pop sizes that tile the CB exactly, usually by making the CB size a multiple of the chunk you move.</div>
+
+  <h3>Rule 2: repeated waits are cumulative</h3>
+  <p><code>cb_wait_front(n)</code> asks "are at least <i>n</i> pages visible?", not "have <i>n</i> more pages arrived?". The doc comment gives the trap: "4 calls of <code>cb_wait_front(8)</code> followed by a <code>cb_pop_front(32)</code> would produce incorrect behavior. Instead 4 calls of <code>cb_wait_front()</code> waiting on 8, 16, 24, 32 tiles should be issued" (<code>dataflow_api.h:457-461</code>). After the first wait, 8 pages are visible, so the next three <code>wait_front(8)</code> calls return at once. The kernel then works on, and pops, pages 8&ndash;31 before they have been pushed. The counter value it compares against is <code>received &minus; acked</code>, and <code>acked</code> only moves on a pop.</p>
+
+  <h2 id="host">Circular buffers on the host</h2>
+  <p>A CB is created by the host, per program and per core range. Here is one of <code>eltwise_binary</code>'s three:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/eltwise_binary/eltwise_binary.cpp:90-98 @7aad8aac (comments trimmed)</div>
+<pre><code>constexpr uint32_t tiles_per_cb = 2;
+tt::CBIndex src0_cb_index = tt::CBIndex::c_0;
+CreateCircularBuffer(program, core, CircularBufferConfig(
+    /*total_size=*/tiles_per_cb * tile_size_bytes,                    // The total size of the circular buffer in bytes
+    /*data_format_spec=*/{{src0_cb_index, tt::DataFormat::Float16_b}})// The circular buffer index and data format it'll hold
+    .set_page_size(src0_cb_index, tile_size_bytes));</code></pre>
+  <ul>
+    <li><b>Index.</b> <code>tt::CBIndex::c_0</code> &hellip; <code>c_31</code> on Wormhole, up to <code>c_63</code> on Blackhole (<code>hostdevcommon/api/hostdevcommon/kernel_structs.h:12-76</code>). The kernel names a CB only by this number, and the same number reaches the stream registers. The examples use low indices for inputs and <code>c_16</code> for the output. That is a convention, not a rule.</li>
+    <li><b>Total size and page size.</b> <code>fifo_num_pages</code> = total / page. The page is the unit of every push, pop, reserve and wait. Here it is one bf16 tile, 2048&nbsp;B, two pages per CB.</li>
+    <li><b>Data format.</b> Data-movement kernels see it only through <code>get_tile_size(cb)</code>. The compute kernel's unpacker and packer are configured from it (A12), which is why a CB has a format at all.</li>
+    <li><b>Where it lives.</b> At launch the host writes four words per CB into the kernel-config region: base address, size, number of pages and page size. Each CPU's firmware copies them into its own <code>LocalCBInterface</code> (<code>circular_buffer_init.h:41-60</code>), and BRISC has TRISC0 zero the stream-register counters at boot and again after every run, so each launch starts from 0 (<code>brisc.cc:391, 559</code> trigger <code>init_sync_registers</code>, <code>trisc.cc:97-106, 136-139</code>). The addresses come from the program, which packs CBs upward from the bottom of the unreserved region. The DPRINT overlays showed <code>c_0</code> at <code>0x19e60</code>, <code>c_1</code> at <code>0x1ae60</code> and <code>c_16</code> at <code>0x1be60</code>, each 4&nbsp;KiB after the last. Index 16 comes straight after index 1 in memory, because unused indices take no space.</li>
+  </ul>
+  <div class="callout warn"><b>"Up to 32 CBs" is true on Wormhole only.</b> The example's comment says "The hardware supports up to 32 circular buffers" (<code>eltwise_binary.cpp:89</code>). The device header gives 32 on Wormhole and 64 on Blackhole, and the host header says the count is "architecture-specific" (<code>host_api.hpp:175</code>), pointing new code at <code>hal::get_num_dataflow_buffers()</code> (<code>tt-metalium/circular_buffer_constants.h:15-27</code>). The header also notes that CBs are "TEMPORARY code structure", eventually to be replaced by Dataflow Buffers.</div>
+  <p>A CB can also be laid over an existing L1 buffer with <code>.set_globally_allocated_address(*buffer)</code>. That is how A09's <code>vecadd_sharding</code> ran without readers: the sharded tensor already <em>was</em> the CB. Nobody pushes those input pages, so its compute kernel deliberately never calls <code>cb_wait_front</code> on them. The comment warns that doing so "will hang forever as no one is producing data to the circular buffers" (<code>vecadd_sharding/kernels/add_sharding.cpp:12-16</code>). A waiting kernel watches the counters, not the bytes.</p>
+
+  <h2 id="pipeline">Double buffering and the pipeline</h2>
+  <p>The ring figure had one producer and one consumer. A real program chains them: reader &rarr; <code>c_0</code>/<code>c_1</code> &rarr; compute &rarr; <code>c_16</code> &rarr; writer. Compute is a consumer of one CB and a producer of another, and its order matters. <code>tiles_add.cpp</code> waits for its inputs, does the math, and only then calls <code>cb_reserve_back(c_16)</code>. It pushes the output and only <em>after that</em> pops the inputs (<code>tiles_add.cpp:34-57</code>). So a full output CB stalls compute while it still holds its input pages, and that in turn stalls the reader. Back-pressure propagates upstream one CB at a time.</p>
+  <p>The Gantt chart below uses exactly those orderings. Each stage has a per-tile time (R, C, W). The CB depth applies to all three CBs. Set all three to 4 and compare depth 1 with depth 2.</p>
+
+  <div class="viz" id="figGantt"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figGantt");
+    var g = TT.canvas(root, 800, 300), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<span style="color:#9aa4b2">CB depth</span><button data-d="1">1</button><button data-d="2" class="on">2</button><button data-d="4">4</button>' +
+      '<label>R <input type="range" id="gR" min="1" max="8" value="4"><span id="gRv">4</span></label>' +
+      '<label>C <input type="range" id="gC" min="1" max="8" value="4"><span id="gCv">4</span></label>' +
+      '<label>W <input type="range" id="gW" min="1" max="8" value="4"><span id="gWv">4</span></label>' +
+      '<label><input type="checkbox" id="gJ"> jitter</label><button id="gPlay">Play</button><button id="gReset">Restart</button>';
+    root.appendChild(bar);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    var D = 2, R = 4, Cm = 4, W = 4, jit = false, NT = 8, cursor = Infinity, playing = false, last = 0;
+    var S;
+    function rng(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+    function sim() {
+      var r = rng(99), rs = [], re = [], cs = [], cw = [], cend = [], ws = [], we = [];
+      for (var k = 0; k < NT; k++) {
+        var f = function (v) { return jit ? v * (0.5 + r()) : v; };
+        var Rk = f(R), Ck = f(Cm), Wk = f(W);
+        rs[k] = Math.max(k ? re[k - 1] : 0, k - D >= 0 ? cend[k - D] : 0);   // reserve_back(in): slot k-D popped by compute
+        re[k] = rs[k] + Rk;                                                 // read + barrier, then push(in)
+        cs[k] = Math.max(k ? cend[k - 1] : 0, re[k]);                       // wait_front(in)
+        cw[k] = cs[k] + Ck;                                                 // unpack + math + pack work
+        cend[k] = Math.max(cw[k], k - D >= 0 ? we[k - D] : 0);              // reserve_back(out), then push(out), pop(in)
+        ws[k] = Math.max(k ? we[k - 1] : 0, cend[k]);                       // wait_front(out)
+        we[k] = ws[k] + Wk;                                                 // write + barrier, then pop(out)
+      }
+      S = { rs: rs, re: re, cs: cs, cw: cw, cend: cend, ws: ws, we: we, end: we[NT - 1] };
+    }
+    var cols = [C.blue, C.teal, C.purple, C.orange, C.pink, C.green, C.yellow, C.red];
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var x0 = 150, x1 = 780, tmax = Math.max(S.end, 1);
+      var sc = (x1 - x0) / tmax;
+      function X(v) { return x0 + v * sc; }
+      var rows = [["reader (BRISC)", "rs", "re", null, 50], ["compute (TRISCs)", "cs", "cw", "cend", 115], ["writer (NCRISC)", "ws", "we", null, 180]];
+      var cut = Math.min(cursor, tmax);
+      rows.forEach(function (row) {
+        var y = row[4];
+        TT.text(ctx, row[0], x0 - 10, y + 18, { align: "right", font: "13px", color: C.fg });
+        ctx.fillStyle = C.red; ctx.globalAlpha = 0.25; ctx.fillRect(X(0), y + 6, X(cut) - X(0), 24); ctx.globalAlpha = 1;
+        for (var k = 0; k < NT; k++) {
+          var a = S[row[1]][k], b = Math.min(S[row[2]][k], cut);
+          if (b > a) { TT.box(ctx, X(a), y, X(b) - X(a), 36, { fill: cols[k], alpha: 0.85, stroke: "#000", r: 3 }); if (X(b) - X(a) > 14) TT.text(ctx, String(k), (X(a) + X(b)) / 2, y + 18, { align: "center", font: "bold 12px", color: "#000" }); }
+          if (row[3]) { var a2 = S[row[2]][k], b2 = Math.min(S[row[3]][k], cut);
+            if (b2 > a2 + 1e-6) { ctx.fillStyle = C.yellow; ctx.globalAlpha = 0.6; ctx.fillRect(X(a2), y + 12, X(b2) - X(a2), 12); ctx.globalAlpha = 1; } }
+        }
+      });
+      // axis
+      ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(x0, 230); ctx.lineTo(x1, 230); ctx.stroke();
+      var stepT = tmax > 60 ? 10 : 5;
+      for (var v = 0; v <= tmax + 1e-6; v += stepT) { ctx.beginPath(); ctx.moveTo(X(v), 226); ctx.lineTo(X(v), 234); ctx.stroke(); TT.text(ctx, String(v), X(v), 244, { align: "center", font: "11px", color: C.muted }); }
+      if (cursor < Infinity) { ctx.strokeStyle = C.fg; ctx.beginPath(); ctx.moveTo(X(cut), 40); ctx.lineTo(X(cut), 230); ctx.stroke(); }
+      var busyC = 0; for (var k = 0; k < NT; k++) busyC += S.cw[k] - S.cs[k];
+      var period = (S.we[NT - 1] - S.we[0]) / (NT - 1);
+      TT.text(ctx, NT + " tiles: done at t = " + S.end.toFixed(1) + "    steady state \u2248 " + period.toFixed(2) + " per tile    compute busy " + Math.round(100 * busyC / S.end) + "%", 400, 270, { align: "center", font: "bold 13px", mono: true, color: C.yellow });
+      TT.text(ctx, "coloured = working on tile k   red = spinning in reserve/wait   yellow = compute holding its inputs, blocked in reserve_back(c_16)", 400, 290, { align: "center", font: "11px", color: C.muted });
+      TT.text(ctx, "time units (model, not measured)", 780, 18, { align: "right", font: "11px", color: C.muted });
+      var m;
+      if (D === 1) m = "<b>Depth 1.</b> Each stage waits for its neighbour to hand back the only slot, so the stages serialise in pairs. With R = C = W = 4 the steady state is 8 units per tile, the sum of two stages, not the max.";
+      else m = "<b>Depth " + D + ".</b> Each CB can hold one page while another is being refilled, so all three stages overlap. The steady state approaches the slowest stage, max(R, C, W) = " + Math.max(R, Cm, W) + (jit ? " (nominal; jitter adds stalls that deeper CBs absorb)" : "") + ". Raise one slider: that stage becomes the bottleneck, and the others turn red waiting for it.";
+      narr.innerHTML = m;
+    }
+    function frame(now) {
+      if (!playing) return;
+      cursor += (now - last) / 1000 * 10; last = now;
+      if (cursor >= S.end) { cursor = Infinity; playing = false; document.getElementById("gPlay").textContent = "Play"; }
+      draw(); if (playing) requestAnimationFrame(frame);
+    }
+    function upd() { sim(); cursor = Infinity; playing = false; document.getElementById("gPlay").textContent = "Play"; draw(); }
+    bar.querySelectorAll("button[data-d]").forEach(function (b) { b.onclick = function () { bar.querySelectorAll("button[data-d]").forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); D = +b.dataset.d; upd(); }; });
+    [["gR", function (v) { R = v; }], ["gC", function (v) { Cm = v; }], ["gW", function (v) { W = v; }]].forEach(function (p) {
+      document.getElementById(p[0]).oninput = function (e) { p[1](+e.target.value); document.getElementById(p[0] + "v").textContent = e.target.value; upd(); };
+    });
+    document.getElementById("gJ").onchange = function (e) { jit = e.target.checked; upd(); };
+    document.getElementById("gPlay").onclick = function () {
+      if (playing) { playing = false; this.textContent = "Play"; return; }
+      if (cursor === Infinity) cursor = 0;
+      playing = true; this.textContent = "Pause"; last = performance.now(); requestAnimationFrame(frame);
+    };
+    document.getElementById("gReset").onclick = function () { playing = false; cursor = 0; document.getElementById("gPlay").textContent = "Play"; draw(); };
+    upd();
+  })();
+  </script>
+  <p>The arithmetic behind the picture: with depth 1 a stage can only start tile <i>k</i>+1 after its downstream neighbour has released tile <i>k</i>, so neighbouring stages cannot overlap, and the period is the sum of two adjacent stages (8 here). With depth 2, every stage has somewhere to put its next tile while the previous one is still in use, and the period drops to the slowest stage (4). In this model, 8 tiles at R = C = W = 4 take 68 units at depth 1 and 40 at depth 2: 12 for the first tile to pass through all three stages, then 7 &times; 4. Depth 4 does not improve on depth 2 here, because nothing varies. Turn jitter on to see where it helps.</p>
+  <p>The price is L1. <code>eltwise_binary</code>'s three 2-page CBs cost 3 &times; 2 &times; 2&nbsp;KiB = 12&nbsp;KiB out of the 1360&nbsp;KiB A09 measured as free, so double buffering is nearly free here. It stops being free in A15, where matmul CBs hold whole blocks of tiles.</p>
+  <div class="callout key">Double buffering means a CB of (at least) two chunks: the producer fills one while the consumer drains the other. With one chunk the stages take turns. With two, the pipeline runs at the speed of its slowest stage. Extra depth only absorbs <em>variation</em>. It cannot make the slowest stage faster.</div>
+
+  <h2 id="dialects">Two dialects: free functions and Device 2.0 objects</h2>
+  <p>You may have noticed that <code>eltwise_binary</code>'s writer called <code>cb_out.wait_front(1)</code> and <code>noc.async_write(...)</code>, not <code>cb_wait_front</code> and <code>noc_async_write_page</code>. tt-metal currently has two kernel-API styles:</p>
+  <ul>
+    <li>The <b>classic free functions</b> in <code>api/dataflow/dataflow_api.h</code>: <code>cb_reserve_back(id, n)</code>, <code>get_write_ptr(id)</code>, <code>noc_async_read_page(i, accessor, addr)</code> and so on. These are what everything so far has quoted.</li>
+    <li>The <b>Device 2.0</b> objects in <code>api/dataflow/noc.h</code> and <code>api/dataflow/circular_buffer.h</code>: <code>Noc noc; CircularBuffer cb(id); noc.async_read(src, dst, size, src_args, dst_args)</code>. Sources and destinations are typed objects (a <code>TensorAccessor</code>, a <code>CircularBuffer</code>, a <code>UnicastEndpoint</code>, a <code>CoreLocalMem</code>), and a traits system works out the addresses. The migration guide sells it as "Type Safety: Template-based traits system prevents common errors at compile time" (<code>device_api_migration_guide.md:26-31</code>).</li>
+  </ul>
+  <p>Here is the guide's own example, the same tile reader in both dialects:</p>
+  <div class="grid2">
+  <div>
+  <div class="filename">device_api_migration_guide.md:717-734 @7aad8aac (legacy, condensed)</div>
+<pre><code>constexpr auto tensor_args = TensorAccessorArgs&lt;0&gt;();
+uint32_t tile_size = get_tile_size(cb_id);
+const auto accessor =
+    TensorAccessor(tensor_args, src_addr, tile_size);
+
+for (uint32_t tile_id = 0; tile_id &lt; num_tiles; tile_id++) {
+    cb_reserve_back(cb_id, 1);
+    uint32_t l1_write_addr = get_write_ptr(cb_id);
+    noc_async_read_tile(tile_id, accessor, l1_write_addr);
+    noc_async_read_barrier();
+    cb_push_back(cb_id, 1);
+}</code></pre>
+  </div>
+  <div>
+  <div class="filename">device_api_migration_guide.md:739-767 @7aad8aac (Device 2.0, condensed)</div>
+<pre><code>constexpr auto tensor_args = TensorAccessorArgs&lt;0&gt;();
+uint32_t tile_size = get_tile_size(cb_id);
+const auto accessor =
+    TensorAccessor(tensor_args, src_addr, tile_size);
+Noc noc;
+CircularBuffer cb(cb_id);
+for (uint32_t tile_id = 0; tile_id &lt; num_tiles; tile_id++) {
+    cb.reserve_back(1);
+    noc.async_read(accessor, cb, tile_size,
+                   {.page_id = tile_id}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    cb.push_back(1);
+}</code></pre>
+  </div>
+  </div>
+  <p>(<code>num_tiles</code> is undeclared in the guide's snippet. Read it as a runtime arg.) The object version drops the <code>get_write_ptr</code> line, because passing the <code>CircularBuffer</code> as a destination means "its write pointer". Underneath, it is the same code:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/circular_buffer.h:31-41 @7aad8aac</div>
+<pre><code>void reserve_back(int32_t num_pages) {
+#ifdef COMPILE_FOR_TRISC
+#ifndef ARCH_QUASAR
+    PACK((llk_wait_for_free_tiles&lt;false, false, false&gt;(cb_id_, num_pages)));
+#else
+    PACK((llk_wait_for_free_tiles(cb_id_, num_pages)));
+#endif
+#else
+    cb_reserve_back(cb_id_, num_pages);
+#endif
+}</code></pre>
+  <p>On a data-movement CPU, <code>cb.reserve_back</code> <em>is</em> <code>cb_reserve_back</code>. On a TRISC the same class turns into the packer's LLK call, a preview of A12's "one source, three CPUs". The destination-address trait just returns <code>dst.get_write_ptr() + args.offset_bytes</code> (<code>circular_buffer.h:193-197</code>).</p>
+  <p><b>Which this series uses.</b> The series teaches and writes kernels in the <b>classic free-function style</b> and shows Device 2.0 when we quote code that uses it, such as <code>eltwise_binary</code>. There are three reasons. The free functions are the layer the objects call, so they are what you see in Watcher waypoints and LLK code. They map one-to-one onto the protocol table above. And most programming examples at this commit still use them. A rough grep at 7aad8aac counts about 50 kernel files under <code>programming_examples</code> using the free CB functions against 4 constructing <code>CircularBuffer</code> objects. In <code>ttnn</code>'s kernel directories it is the other way round: roughly 380 files construct <code>CircularBuffer</code> objects against under 60 that call the free functions (the exact numbers depend on the regex). So expect to read both, and expect new library code to be Device 2.0.</p>
+
+  <h2 id="watcher">Debugging hangs with Watcher</h2>
+  <p>Get a CB protocol wrong and the usual symptom is not a crash but silence. Some CPU spins forever in <code>cb_wait_front</code> or <code>cb_reserve_back</code>, the host blocks in <code>Finish</code>, and nothing prints. DPRINT needs you to guess where to print. <b>Watcher</b> needs no guess. With <code>TT_METAL_WATCHER=&lt;seconds&gt;</code> set, tt-metal compiles debug code into firmware and kernels, and a host thread periodically dumps every core's state to <code>$TT_METAL_LOGS_PATH/generated/watcher/watcher.log</code>. Its features, from <code>docs/source/tt-metalium/tools/watcher.rst:15-21</code>:</p>
+  <ul>
+    <li><b>Waypoints</b>: the last 4-character marker each of the five CPUs passed. By convention a trailing <code>W</code> means "waiting at the top of a loop" and <code>D</code> "done waiting" (lines 94-97).</li>
+    <li><b>NoC sanitizing</b>: every transaction is checked for bad coordinates, addresses and alignment before it reaches the hardware.</li>
+    <li><b>CB out-of-bounds checks</b> on NoC transactions that touch an active CB.</li>
+    <li><b>Asserts</b> such as the one in <code>cb_push_back</code>, which are compiled out when Watcher is off.</li>
+  </ul>
+  <p>The waypoints you will meet most often are already in the code we read:</p>
+  <table>
+    <tr><th>Waypoint</th><th>Where</th><th>Meaning when stuck</th></tr>
+    <tr><td><code>CRBW</code></td><td><code>cb_reserve_back</code></td><td>Producer waiting for free pages. The consumer is not popping.</td></tr>
+    <tr><td><code>CWFW</code></td><td><code>cb_wait_front</code></td><td>Consumer waiting for pages. The producer is not pushing.</td></tr>
+    <tr><td><code>NRBW</code>, <code>NWBW</code>, <code>NWFW</code></td><td>read barrier, write barrier, writes_flushed</td><td>Waiting on the NoC. A transfer never completes (bad address, dead endpoint).</td></tr>
+    <tr><td><code>NARW</code>/<code>NARD</code>, <code>NAWW</code>/<code>NAWD</code></td><td>inside <code>noc_async_read/write</code>, around the sanitizer and the issue (<code>dataflow_api_raw.h:71-74, 167-171</code>)</td><td>Issuing a transfer.</td></tr>
+    <tr><td><code>UABW</code>/<code>UABD</code>, <code>MWDW</code>/<code>MWDD</code></td><td>compute: unpack A+B; math waiting for Dst (A12)</td><td>The compute side's last landmark. Its CB waits have no waypoint of their own.</td></tr>
+    <tr><td><code>K</code>, <code>NTW</code>, <code>R</code>, <code>GW</code></td><td>firmware</td><td>In a kernel; BRISC finished and waiting for the other four CPUs (<code>brisc.cc:325-336</code>); running; idle, waiting for "go".</td></tr>
+  </table>
+  <h3>A healthy run</h3>
+  <p>Unmodified <code>eltwise_binary</code> under Watcher on ttsim. Successive dumps of core (0,0), de-duplicated and trimmed (the five fields are BRISC, NCRISC, TRISC0, TRISC1, TRISC2):</p>
+<pre><code>Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18):   GW,   W,   W,   W,   W  rmsg:H0D|bnt h_id:  0 smsg:DSDD
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18):    R,   R,   R,   R,   R  rmsg:H0G|BNT h_id:  0 smsg:WGGG
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18):    R,   R,   K,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): NARW,CWFW,   K,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): NARW,NAWW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): NARW,NWBD,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): NARW,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+...
+Test Passed</code></pre>
+  <p>First everything idles (<code>GW</code>, with no kernels enabled: <code>bnt</code>). Then the launch arrives (<code>rmsg:H0G|BNT</code>: host-dispatched, NoC 0, Go, all three kernel types enabled) and every CPU enters its kernel. After that the fields keep changing: the reader issuing reads, the writer alternating between waiting for compute (<code>CWFW</code>), writing (<code>NAWW</code>) and finishing a barrier (<code>NWBD</code>), and the unpacker passing <code>UABD</code>. Changing waypoints are what progress looks like.</p>
+  <h3>A hung run</h3>
+  <p>Now a classic bug: the reader processes the wrong number of tiles. My overlay hard-codes <code>n_tiles = 2</code> in the reader, while compute and the writer still expect the 64 tiles the host passed them. Compute takes tiles 0 and 1, then waits in <code>cb_wait_front(c_0, 1)</code> for a third tile that will never be pushed. I ran it under <code>timeout 75</code> so the hang could not last forever. Of the 74 dumps of core (0,0), the last 60 were identical (59 on a re-run):</p>
+<pre><code>Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18):  NTW,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+k_ids:  1|  2|  3|  3|  3
+...
+k_id[  1]: tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp
+k_id[  2]: tt_metal/programming_examples/eltwise_binary/kernels/dataflow/write_tile.cpp
+k_id[  3]: tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp</code></pre>
+  <p>Read it field by field, as you would on a real chip:</p>
+  <ul>
+    <li><b>BRISC <code>NTW</code></b>: the reader (k_id 1) has <em>returned</em>, and the firmware is waiting for the other CPUs to finish. So the producer is done, and whoever is waiting on its CBs will wait forever.</li>
+    <li><b>NCRISC <code>CWFW</code></b>: the writer (k_id 2) is in <code>cb_wait_front</code>. It is waiting on <code>c_16</code>, the only CB it reads.</li>
+    <li><b>TRISC0 <code>UABD</code></b>: the unpacker's last landmark is the end of an unpack. Its CB wait has no waypoint, so a TRISC stuck after <code>UABD</code> with the writer in <code>CWFW</code> points at compute waiting for <em>input</em>.</li>
+    <li><b>Nothing changes</b> across about 60 dumps, so this is a hang, not slowness.</li>
+  </ul>
+  <p>Conclusion: the producer stopped early, and the fix belongs in the reader's loop bound. If instead you saw <code>CRBW</code> on BRISC, the jam would be downstream: a consumer that never pops.</p>
+  <h3 id="sanitizer">The NoC sanitizer, and a CB overflow</h3>
+  <p>The sanitizer checks each transaction before it is issued, at the <code>NARW</code>/<code>NAWW</code> points above. To see its CB check fire, I made the reader request 2 tiles' worth of bytes on its second iteration, when the write pointer is at the CB's second (last) page:</p>
+<pre><code>Watcher detected NOC error and stopped device:
+Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): BRISC using noc0 tried to unicast read 4096 bytes to
+local L1[0x01a660] from DRAM core w/ virtual coords 0-1 DRAM[addr=0x402d4c40] (NOC transaction overflows a
+circular buffer).</code></pre>
+  <p>Everything in it is checkable. <code>0x1a660</code> is <code>c_0</code>'s second page (from the DPRINT run), and 4096 bytes from there run 2048 bytes past <code>fifo_limit = 0x1ae60</code>. The source is page 1 of input A, which A09's interleaving puts in bank 1, served by DRAM tile (0,1) at the +1&nbsp;GiB view, hence <code>0x40000000 + 0x2d4c40</code>. The <code>TensorAccessor</code> computed exactly the address A09's arithmetic predicts.</p>
+  <div class="callout warn">Watcher is not free. The healthy run above took 2&nbsp;min&nbsp;2&nbsp;s of wall time under Watcher on ttsim (with a cold JIT cache for the instrumented build), against 0.43&nbsp;s without it, and its log grew to 22,190 lines. It is a debugging mode. It also cannot see what has no waypoint: the compute side's CB waits are invisible, so infer them from their neighbours as above.</div>
+
+  <h2 id="sim">In the simulator</h2>
+  <p>Every output on this page came from the Wormhole build of ttsim in this orb, through the workbench (<a href="../sim-labs/b00-workbench.html">B00</a>). Setup, and the stock runs:</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/a11
+source tenstorrent-from-zero/sim-labs/workbench/env.sh wh      # cds into $LAB_HOME/run
+$EX/metal_example_loopback                  # Test Passed            [7313]
+$EX/metal_example_eltwise_binary            # Test Passed            [7959]
+$EX/metal_example_add_2_integers_in_compute # Success: Result matches expected value!  [4682]</code></pre>
+  <p>The overlays sit in <code>$LAB_HOME/kernels/</code> under the path the host asks for. <code>eltwise_binary.cpp</code> requests <code>OVERRIDE_KERNEL_PREFIX "eltwise_binary/kernels/dataflow/read_tiles.cpp"</code>, and the prefix is <code>"tt_metal/programming_examples/"</code> (<code>programming_examples/CMakeLists.txt:8</code>). The full overlay files used on this page are in <code>sim-labs/overlays/a11/</code>, one directory per experiment, each already laid out under that path:</p>
+  <ul>
+    <li><a href="../sim-labs/overlays/a11/dprint/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>dprint/</code></a>: the reader and <a href="../sim-labs/overlays/a11/dprint/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/write_tile.cpp">writer</a> with the DPRINTs (pointer trace, compile-time args)</li>
+    <li><a href="../sim-labs/overlays/a11/hang/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>hang/</code></a>: <code>n_tiles = 2</code> in the reader</li>
+    <li><a href="../sim-labs/overlays/a11/wrap/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>wrap/</code></a>: <code>c_0</code> reserve and push of <code>i == 1 ? 2 : 1</code> pages (wrap-rule assert)</li>
+    <li><a href="../sim-labs/overlays/a11/cb-overflow/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>cb-overflow/</code></a>: a <code>(i == 1 ? 2 : 1) * tile_size_bytes</code> read into <code>c_0</code></li>
+    <li><a href="../sim-labs/overlays/a11/no-barrier/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp"><code>no-barrier/</code></a>: <code>loopback_dram_copy.cpp</code> with both barriers commented out</li>
+  </ul>
+<pre><code>OV=/path/to/tenstorrent-from-zero/sim-labs/overlays/a11
+rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/dprint/. $LAB_HOME/kernels/
+TT_METAL_DPRINT_CORES=0,0 TT_METAL_DPRINT_RISCVS=BR $EX/metal_example_eltwise_binary   # pointer trace above
+                                                         # (RISCVS=NC for the writer's trace)
+rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/hang/. $LAB_HOME/kernels/   # or wrap/, cb-overflow/
+timeout 75 env TT_METAL_WATCHER=1 $EX/metal_example_eltwise_binary   # exit 124 for the hang
+grep "worker core(x= 0,y= 0)" $LAB_HOME/logs/generated/watcher/watcher.log | uniq -c
+
+rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/no-barrier/. $LAB_HOME/kernels/
+$EX/metal_example_loopback                  # Test Passed            [7113]</code></pre>
+  <p>Delete the overlay directory afterwards (<code>rm -rf $LAB_HOME/kernels/tt_metal</code>), or every later run will pick it up.</p>
+  <h3>What ttsim does not show you</h3>
+  <ul>
+    <li><b>ttsim has no CB concept.</b> The "received" and "acked" registers are ordinary storage in its model of the overlay stream registers. A write stores the value, masked to 17 bits, and a read returns it (<code>ttsim/src/tile.cpp:1767-1815</code> @b3620244). The whole protocol on this page is tt-metal software running on simulated RISC-Vs, which is also why it runs faithfully: ttsim only has to get the loads and stores right.</li>
+    <li><b>A missing barrier usually goes unnoticed.</b> A08 showed that ttsim completes each NoC transfer inside the store that starts it. I commented out <em>both</em> barriers in <code>loopback_dram_copy.cpp</code>, so the kernel writes each tile back to DRAM without waiting for it to arrive. Three runs, three <code>Test Passed</code>, each at <code>[7113]</code> clocks. On silicon that kernel races. Lab <a href="../sim-labs/b05-noc-and-dram.html">B05</a> digs into this.</li>
+    <li><b>No timing.</b> The bracketed clock counts are host-driven simulator steps, not cycles, so ttsim cannot tell you how much double buffering buys on real hardware; A20's profiler can.</li>
+  </ul>
+  <div class="callout sim">The hands-on version is <a href="../sim-labs/b06-cbs-and-semaphores.html">B06 · Circular buffers and semaphores</a>. It watches CB pointers with DPRINT, traces the compute side's handshake, and has you write your own reader/compute/writer kernel trio.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A single-core program is a pipeline: a <b>reader</b> (BRISC, NoC&nbsp;0) &rarr; CB &rarr; <b>compute</b> (TRISCs) &rarr; CB &rarr; <b>writer</b> (NCRISC, NoC&nbsp;1). Each data-movement loop is reserve/wait, get pointer, async NoC copy, barrier, push/pop.</li>
+    <li><code>noc_async_*</code> only starts a copy. <code>noc_async_read_barrier</code> waits for read responses, <code>noc_async_write_barrier</code> for write acks (landed), and <code>noc_async_writes_flushed</code> only for departure. Push only after the read barrier. Free a CB slot after a write barrier, or after writes_flushed if you accept the caveat, and always end with a real barrier.</li>
+    <li>A NoC address on Wormhole is y:6 | x:6 | local:36 bits. <code>TensorAccessor</code> builds it from compile-time args the host appends with <code>TensorAccessorArgs(buf).append_to(...)</code>: 2 words for an interleaved buffer, more for sharded. Chain them with <code>next_compile_time_args_offset()</code>.</li>
+    <li>A CB is an SPSC ring in L1. Two monotonically increasing 16-bit counters, <b>received</b> (written only by the producer) and <b>acked</b> (written only by the consumer), live in per-CB stream registers visible to all five CPUs. Private <b>wr</b> and <b>rd</b> pointers live in each CPU's own memory.</li>
+    <li>reserve_back and wait_front only spin. push_back and pop_front bump a counter, then advance a pointer, which wraps only on <em>exact</em> equality with the limit. So pushes and pops per lap must sum to the CB size, and repeated waits without pops must be cumulative.</li>
+    <li>The host creates CBs with <code>CreateCircularBuffer(program, cores, CircularBufferConfig(total, {{idx, format}}).set_page_size(idx, page))</code>: 32 indices on Wormhole, 64 on Blackhole, packed upward from the bottom of free L1.</li>
+    <li>One page means the stages take turns. Two pages let the pipeline run at its slowest stage. More depth only absorbs jitter.</li>
+    <li>Kernels come in two dialects: the classic free functions (used in this series) and Device 2.0 <code>Noc</code>/<code>CircularBuffer</code> objects, which are thin typed wrappers over them.</li>
+    <li>Watcher turns a silent hang into a diagnosis (<code>CRBW</code> = consumer not popping; <code>CWFW</code> = producer not pushing; <code>NTW</code> = BRISC done), sanitizes NoC transactions, and checks CB bounds and asserts. ttsim runs the protocol faithfully but has no timing, so it will not expose missing barriers.</li>
+  </ul>
+  <p>Next, A12 opens the box in the middle. The compute kernel's <code>cb_wait_front</code> runs on the unpacker's CPU and its <code>cb_reserve_back</code> on the packer's, and a second handshake moves tiles between them.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>A reader calls <code>cb_push_back</code> immediately after <code>noc_async_read_page</code>, and calls <code>noc_async_read_barrier</code> after the push. What can go wrong, and would ttsim show it?</summary>
+  <p>The push increments <code>received</code>, which tells compute the page is ready, but the NoC read may not have finished writing the page into L1. The unpacker can then read stale or partly written data. In ttsim the read completes inside the store that issues it, so the data is already there and the test passes. On silicon it is a race. The barrier must come before the push.</p></details>
+  <details class="quiz"><summary>A CB has 8 pages. The producer always pushes 3 at a time. What happens, and what are two fixes?</summary>
+  <p>The write pointer moves 3, 6, then 9 pages, which is past the 8-page limit. The wrap check is exact equality, so it never fires. The third reservation's data spills one page past the CB, and the pointer keeps running off the end. With Watcher on, the <code>ASSERT(wr &lt;= limit)</code> in <code>cb_push_back</code> trips. Without it you get silent corruption, as in the 62,293 wrong values above. Fixes: make the CB a multiple of the chunk (6 or 9 pages), or push in chunk sizes whose sequence sums to 8 per lap (for example 3, 3, 2).</p></details>
+  <details class="quiz"><summary>Why can <code>cb_reserve_back</code> read <code>received</code> once outside its spin loop but must re-read <code>acked</code> every iteration?</summary>
+  <p>Each counter has exactly one writer. <code>received</code> is written only by the producer, which is the CPU now spinning, so it cannot change during the wait. <code>acked</code> is written by the consumer on another CPU, and it is the value the producer is waiting for. The single-writer rule is also why no lock is needed: a stale read of <code>acked</code> can only under-estimate free space, which delays the producer but never lets it overwrite unconsumed data.</p></details>
+  <details class="quiz"><summary>A kernel reads two interleaved DRAM tensors and one height-sharded L1 tensor, in that order, through TensorAccessors. Where does each one's compile-time-arg block start?</summary>
+  <p>The first interleaved accessor uses 2 words (flags and page size), so it is at offset 0 and the second starts at 2. The second also uses 2 words, so the sharded one starts at 4. Its block is longer (rank, bank count, shapes, bank coordinates). Write each as <code>TensorAccessorArgs&lt;prev.next_compile_time_args_offset()&gt;()</code> rather than hard-coding 0, 2, 4, so that a layout change on the host cannot shift one tensor's words into another's.</p></details>
+  <details class="quiz"><summary>The Watcher log shows <code>CRBW,CWFW,UABD,MWDD,   K</code> for core (0,0), unchanged for a minute. Which CB is jammed and who is at fault?</summary>
+  <p>BRISC (the reader) is in <code>cb_reserve_back</code>, so an input CB is full and compute is not popping it. NCRISC (the writer) is in <code>cb_wait_front</code>, so the output CB is empty and compute is not pushing to it. Both point at the compute kernel, which has stopped consuming and producing. The TRISC fields (last landmarks <code>UABD</code>/<code>MWDD</code>) say it got past its last unpack and math waits. The usual causes are a compute loop count that does not match the reader's and writer's, or a compute kernel blocked in its own <code>cb_reserve_back</code> on the wrong CB index. Compare the three kernels' tile counts and CB indices.</p></details>
+  <details class="quiz"><summary>Your three stages take R = 6, C = 2, W = 2 per tile. You go from 2-page CBs to 8-page CBs. How much faster does it get?</summary>
+  <p>In steady state, not at all. With two pages the pipeline already runs at its slowest stage, the reader at 6 per tile, and compute and the writer just spend more time waiting. Deeper CBs absorb <em>variation</em> in stage times; they cannot make the reader faster. The fix is to make the reader faster: more cores reading in parallel (A15), better placement and NoC choice (A08, A09), or bigger transfers.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html">Circular Buffer APIs</a>: the official reference pages for the six CB calls.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/inc/api/dataflow/dataflow_api.h">dataflow_api.h</a>: the source of the CB functions, NoC calls and barriers. The doc comments include the wrap and cumulative-wait rules.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/device_api_migration_guide.html">Device 2.0 Data Movement API Migration Guide</a>: the classic&rarr;object mapping for NoC, CB, semaphore and memory calls, with complete examples.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_accessor/tensor_accessor.md">Tensor Accessor Guide</a>: host and device setup, compile-time versus runtime arguments, and sharded addressing.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_accessor/tensor_accessor_iterator.md">Tensor Accessor iterators</a>: page and shard iterators, including <code>noc_async_writes_flushed</code> in copy loops.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/eltwise_binary.html">Eltwise binary example</a>: the official walkthrough of the reader/compute/writer program used here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/dram_loopback.html">DRAM Loopback example</a>: the simplest TensorAccessor-based data-movement kernel.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">Watcher docs</a>: every Watcher variable and feature, with log examples, asserts, pauses, ring buffer and debug delays.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/ordering.html">Ordering (NOC, CMD_BUF, VC)</a>: the programmer's summary of what is and is not ordered on the NoC.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Counters.md">Wormhole NIU counters</a>: exactly when each counter behind the barriers moves.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix</a>: how CBs feed the unpackers and packers, the bridge to A12.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Circular_buffer">Circular buffer (Wikipedia)</a>: the general data structure, including the full/empty ambiguity that counting totals avoids.</li>
+  </ul>
+
+  <div class="pager"><a href="a10-first-program.html">&larr; 10 Your first TT-Metalium program</a><a class="next" href="a12-compute-kernels.html">12 Compute kernels: one source, three cores &rarr;</a></div>
+</main>
+</body>
+</html>
