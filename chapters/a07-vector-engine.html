@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A07 · The vector engine (SFPU) · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a06-matrix-engine.html">&larr; Prev</a>
+  <a href="a08-noc.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 07</span><span class="tag">Prerequisites: A04, A05, A06</span>
+  <h1><span class="num">07.</span> The vector engine (SFPU)</h1>
+  <p class="subtitle">Why a Tensix core has a second, much slower math engine, how its 32 lanes reach into Dst, how it runs <code>if</code>/<code>else</code> without branching, and why its peak is exactly 64× below the matrix engine's.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question: why is exp() so much slower than matmul?</a></li>
+      <li><a href="#where">A second engine on the same registers</a></li>
+      <li><a href="#lanes">32 lanes of 32 bits: the LRegs</a></li>
+      <li><a href="#load">From Dst to lanes: SFPLOAD and SFPSTORE</a></li>
+      <li><a href="#isa">What the lanes can do</a></li>
+      <li><a href="#pred">If/else without branches: predication</a></li>
+      <li><a href="#approx">Building exp() from multiply-adds</a></li>
+      <li><a href="#ratio">The 64× gap, derived</a></li>
+      <li><a href="#fma">Not quite IEEE: the FMA that ttsim copies bit for bit</a></li>
+      <li><a href="#whbh">Wormhole vs Blackhole</a></li>
+      <li><a href="#sim">Running it in ttsim</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question: why is exp() so much slower than matmul?</h2>
+  <p>Take one Wormhole Tensix core and give it two jobs.</p>
+  <p><b>Job 1:</b> multiply two 32×32 tiles at the lowest fidelity. In <a href="a06-matrix-engine.html">A06</a> you saw that the matrix engine (FPU) does an 8×16 by 16×16 block per <code>MVMUL</code>, which is 2048 multiply-accumulates per cycle. A 32×32×32 tile product is 32,768 multiply-accumulates, so it takes 16 cycles.</p>
+  <p><b>Job 2:</b> compute <code>exp(x)</code> for every element of one 32×32 tile. That is only 1024 numbers, with no reduction and nothing to share between them. It should be easy. Yet when I compiled the stock <code>exp_tile</code> kernel in this orb and disassembled it (shown <a href="#approx">later</a>), the vector engine issues <b>20 instructions for every 32 elements</b>. A tile is 32 groups of 32 elements, so that is 640 issue slots.</p>
+  <p>So one core spends 16 cycles on a job with 32,768 multiplies and about 640 cycles on a job with 1024 exponentials. Same core, same clock. The rest of this chapter explains where those numbers come from. In short, there are two separate gaps:</p>
+  <ol>
+    <li>The vector engine's peak is 64× lower than the matrix engine's. That is a design decision, and we will derive it exactly.</li>
+    <li><code>exp</code> is not one instruction. It is a small program of multiply-adds, exponent tricks and clamps, and every one of its instructions occupies the whole vector engine for a cycle.</li>
+  </ol>
+
+  <div class="callout key">A Tensix core has two math engines. The <b>FPU</b> is a huge, narrow-precision engine built for one job: tile matrix multiply. The <b>SFPU</b> is a small, general-purpose 32-lane FP32 SIMD unit for everything else (exp, sqrt, comparisons, integer tricks). Both work on the same Dst register file.</div>
+
+  <h2 id="where">A second engine on the same registers</h2>
+  <p>Recall the picture from <a href="a04-inside-tensix.html">A04</a>. Three baby RISC-V cores (TRISC0, TRISC1 and TRISC2) push instructions into the Tensix coprocessor, which has several backend units. The ISA documentation lists them as Sync, Unpack, Matrix (FPU), Pack, <b>Vector (SFPU)</b>, Scalar (ThCon), Config, Mover and Misc. Whatever the "S" once stood for, the ISA manual titles its page "Vector Unit (SFPU)", and that is what it is.</p>
+  <p>The data path matters more than the name:</p>
+  <ul>
+    <li>The <b>unpackers</b> move tiles from L1 into SrcA and SrcB (for the FPU) or directly into Dst.</li>
+    <li>The <b>FPU</b> reads SrcA and SrcB and writes or accumulates into <b>Dst</b>.</li>
+    <li>The <b>SFPU</b> never sees SrcA, SrcB or L1. It reads Dst into its own registers, the <b>LRegs</b>, computes there, and writes back to Dst. The ISA's register-access table lists exactly two ways to write an LReg from outside: <code>SFPLOAD</code> and <code>SFPLOADMACRO</code>. Only one instruction writes Dst from an LReg: <code>SFPSTORE</code>.</li>
+    <li>The <b>packers</b> move Dst back to L1.</li>
+  </ul>
+  <p>This is why every SFPU operation in a compute kernel starts with <code>copy_tile</code>: the tile must first be unpacked into Dst. It is also why SFPU work chains well. Once a tile is in Dst you can apply exp, then a multiply, then a clamp, without touching L1. <a href="a12-compute-kernels.html">A12</a> covers the kernel-side mechanics (<code>tile_regs_acquire</code> and the rest). This chapter stays with the hardware.</p>
+  <p>The SFPU's instructions travel through the coprocessor like any other Tensix instruction. In Metalium's compute kernels they come from the <b>math</b> thread, TRISC1. You will see real <code>sfpload</code>, <code>sfpadd</code> and <code>sfpstore</code> instructions in the <code>trisc1.elf</code> disassembly below.</p>
+
+  <div class="callout gpu">On a GPU, the tensor cores and the ordinary FP32 CUDA cores share the same register file, and a warp can switch between them freely. Tenstorrent has the same idea at a different scale: the FPU and the SFPU share <b>Dst</b>. But the SFPU cannot read the FPU's input registers (SrcA/SrcB), and neither engine reads memory directly. Unpackers and packers do that.</div>
+
+  <h2 id="lanes">32 lanes of 32 bits: the LRegs</h2>
+  <p>The Wormhole ISA manual opens its Vector Unit page with one sentence that sums it up: the SFPU "can be considered as a general-purpose SIMD engine, consisting of 32 lanes of 32 bits." The register file is declared like this:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/LReg.md:6 @be833101</div>
+<pre><code>union {uint32_t u32; int32_t i32; float f32;} LReg[17][32];</code></pre>
+  <p>So there are 17 vector registers, each holding 32 lanes, and each lane holds 32 bits that you may read as an FP32 value, an unsigned integer, a two's-complement integer, or a sign-magnitude integer. Software is allowed to reinterpret the bits freely. The 17 registers are not all alike:</p>
+  <table>
+    <tr><th>LReg</th><th>What it holds</th></tr>
+    <tr><td>0–7</td><td>General purpose. This is all you get for live values: 8 vectors of 32 lanes.</td></tr>
+    <tr><td>8</td><td>Read-only constant <code>0.8373</code> in every lane. SFPI names it <code>CREG_IDX_0P837300003</code>. You will meet this odd number again in the exp section.</td></tr>
+    <tr><td>9</td><td>Read-only zero.</td></tr>
+    <tr><td>10</td><td>Read-only <code>1.0</code>.</td></tr>
+    <tr><td>11–14</td><td>Programmable constants, written only through <code>SFPCONFIG</code>. The SFPI compiler reserves LReg 11 for <code>-1.0</code>.</td></tr>
+    <tr><td>15</td><td>Read-only lane index ×2 (0, 2, 4, …, 62).</td></tr>
+    <tr><td>16</td><td>Only reachable from <code>SFPLOADMACRO</code> sequences.</td></tr>
+  </table>
+  <p>The constants are cheap tricks with real payoffs: a comparison <code>a &lt; 0.5</code> can be computed as <code>a + (−1.0)×0.5</code> using LReg 11, with no instruction spent loading −1. You will see the compiler do exactly that later.</p>
+  <p>The 32 lanes are often drawn as a 4×8 grid (lanes 0–7 in the first row, 8–15 in the second, and so on). Purely lane-wise instructions do not care about this shape. The few cross-lane instructions (<code>SFPTRANSP</code>, <code>SFPSHFT2</code>) move data horizontally or vertically in it, and, as you will see next, the grid matches how lanes map onto Dst.</p>
+
+  <div class="callout warn">A 32×32-bit register is 1024 bits, but it is <b>not</b> a byte-flexible SIMD register like AVX-512. The Metalium docs make this point too: an int8 tensor still occupies one lane per element, 32 elements per vector, and not 128. Narrow data types buy you nothing in SFPU throughput.</div>
+
+  <h2 id="load">From Dst to lanes: SFPLOAD and SFPSTORE</h2>
+  <p>Dst is 1024 rows × 16 columns of 16-bit data (or 512 × 16 of 32-bit data). A 32×32 tile is four 16×16 faces (<a href="a05-tiles-and-formats.html">A05</a>), and a face occupies 16 consecutive Dst rows, one face row per Dst row. An LReg holds 32 values. So how do 256 face elements get into 32-lane registers?</p>
+  <p>The ISA manual gives the exact rule. Here is the core of <code>SFPLOAD</code>'s functional model:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/SFPLOAD.md:72-89 @be833101</div>
+<pre><code>// The top 8 bits of Addr end up selecting an aligned group of four rows of Dst, the
+// next bit selects between even and odd columns, and the low bit goes unused.
+uint10_t Addr = Imm10 + ThreadConfig[CurrentThread].DEST_TARGET_REG_CFG_MATH_Offset;
+...
+    uint10_t Row = (Addr &amp; ~3) + (Lane / 8);
+    uint4_t Column = (Lane &amp; 7) * 2;
+    if ((Addr &amp; 2) || LaneConfig[Lane &amp; 7].DEST_RD_COL_EXCHANGE) {
+      Column += 1;
+    }</code></pre>
+  <p>Read it with small numbers. Lane 0 takes row 0, column 0. Lane 1 takes row 0, column 2. Lane 7 takes row 0, column 14. Lane 8 starts the next row. So one <code>SFPLOAD</code> takes <b>four Dst rows and every other column</b>: a 4×8 patch, which is exactly the LReg's 4×8 lane grid. Address bit 1 switches to the odd columns. One face therefore needs 4 row groups × 2 column parities = <b>8 loads</b>.</p>
+
+  <div class="viz" id="fig-face"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-face");
+    var g = TT.canvas(root, 860, 400), ctx = g.ctx, C = TT.C;
+    var pal = [C.blue, C.yellow, C.green, C.red, C.purple, C.orange, C.teal, C.pink];
+    var DX = 50, DY = 70, CS = 17;          // Dst face grid
+    var LX = 470, LY = 110, LW = 44, LH = 40, LG = 4; // LReg lane grid
+    function src(i, lane) {                 // Dst (row, col) feeding a lane for vector i
+      var addr = 2 * i;
+      return { r: (addr & ~3) + Math.floor(lane / 8), c: (lane & 7) * 2 + ((addr & 2) ? 1 : 0) };
+    }
+    function cellXY(r, c) { return { x: DX + c * CS, y: DY + r * CS }; }
+    function laneXY(l) { return { x: LX + (l & 7) * (LW + LG), y: LY + Math.floor(l / 8) * (LH + LG) }; }
+    var steps = [{ dur: 1.2, text: "<b>One face in Dst.</b> A 16×16 face sits in 16 consecutive Dst rows, 16 columns each (left). The SFPU's register LReg has 32 lanes, drawn as a 4×8 grid (right). How do 256 elements go through 32 lanes?" }];
+    for (var i = 0; i < 8; i++) {
+      var r0 = 4 * Math.floor(i / 2);
+      steps.push({ dur: 1.6, text: "<b>Vector " + i + ": <code>dst_reg[" + i + "]</code> → <code>SFPLOAD</code> with address " + (2 * i) + ".</b> Address bits above bit 1 pick rows " + r0 + "–" + (r0 + 3) + "; bit 1 is " + ((2 * i) & 2 ? "1, so the <b>odd</b>" : "0, so the <b>even</b>") + " columns. Lane <i>L</i> gets row " + r0 + " + L/8, column 2·(L mod 8)" + ((2 * i) & 2 ? " + 1" : "") + ". " + (32 * (i + 1)) + " of 256 face elements visited." });
+    }
+    steps.push({ dur: 1.5, text: "<b>8 loads = 1 face.</b> The LLK wrapper then moves the Dst base 16 rows forward (two <code>inc_dst_addr&lt;8&gt;</code>) and runs the same 8-vector function on the next face. 4 faces × 8 = <b>32 vectors per tile</b>, which is why the SFPI example uses <code>n_vector_in_tile = 32</code>." });
+    function draw(k, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "Dst: one 16×16 face (rows 0–15 of the face)", DX, 28, { color: C.muted, font: "13px" });
+      TT.text(ctx, "LReg: 32 lanes as a 4×8 grid", LX, 28, { color: C.muted, font: "13px" });
+      for (var c = 0; c < 16; c++) TT.text(ctx, String(c), DX + c * CS + CS / 2, DY - 10, { color: C.muted, font: "9px", align: "center" });
+      for (var r = 0; r < 16; r++) TT.text(ctx, String(r), DX - 8, DY + r * CS + CS / 2, { color: C.muted, font: "9px", align: "right" });
+      var done = k === 9 ? 8 : Math.max(0, k - 1);
+      var owner = {};
+      for (var v = 0; v < done; v++) for (var l = 0; l < 32; l++) { var s = src(v, l); owner[s.r + "," + s.c] = v; }
+      for (r = 0; r < 16; r++) for (c = 0; c < 16; c++) {
+        var p = cellXY(r, c), o = owner[r + "," + c];
+        TT.box(ctx, p.x + 1, p.y + 1, CS - 2, CS - 2, { r: 2, fill: o == null ? C.bg3 : pal[o], alpha: o == null ? 1 : 0.45 });
+      }
+      for (var l2 = 0; l2 < 32; l2++) {
+        var q = laneXY(l2);
+        TT.box(ctx, q.x, q.y, LW, LH, { r: 4, fill: C.bg2, stroke: C.border, lw: 1 });
+        TT.text(ctx, String(l2), q.x + 3, q.y + 8, { color: C.muted, font: "9px" });
+      }
+      if (k >= 1 && k <= 8) {
+        var i = k - 1, col = pal[i];
+        for (var l = 0; l < 32; l++) {
+          var s = src(i, l), a = cellXY(s.r, s.c), b = laneXY(l);
+          TT.box(ctx, a.x, a.y, CS, CS, { r: 2, stroke: col, lw: 2 });
+          var x = TT.lerp(a.x, b.x + (LW - CS) / 2, t), y = TT.lerp(a.y, b.y + (LH - CS) / 2 + 4, t);
+          if (t < 1) TT.box(ctx, x, y, CS, CS, { r: 2, fill: col, alpha: 0.85 });
+          else {
+            TT.box(ctx, b.x, b.y, LW, LH, { r: 4, fill: col, alpha: 0.3, stroke: col, lw: 1.5 });
+            TT.text(ctx, s.r + "," + s.c, b.x + LW / 2, b.y + LH / 2 + 5, { color: C.fg, font: "11px", mono: true, align: "center" });
+          }
+        }
+        TT.text(ctx, "SFPLOAD imm=" + (2 * i) + " · rows " + (4 * Math.floor(i / 2)) + "–" + (4 * Math.floor(i / 2) + 3) + " · " + (i % 2 ? "odd" : "even") + " cols", LX, LY + 4 * (LH + LG) + 20, { color: col, font: "14px", mono: true });
+        TT.text(ctx, "lane label = Dst row, column", LX, LY + 4 * (LH + LG) + 44, { color: C.muted, font: "12px" });
+      }
+      if (k === 9) {
+        TT.text(ctx, "8 vectors/face × 4 faces = 32/tile", LX, LY + 4 * (LH + LG) + 20, { color: C.yellow, font: "14px", mono: true });
+        TT.text(ctx, "between faces: SETRWC +8, +8", LX, LY + 4 * (LH + LG) + 44, { color: C.muted, font: "13px", mono: true });
+        TT.text(ctx, "(Dst base moves 16 rows)", LX, LY + 4 * (LH + LG) + 64, { color: C.muted, font: "13px", mono: true });
+      }
+      var n = k === 0 ? 0 : (k === 9 ? 8 : k);
+      TT.text(ctx, "vectors loaded: " + n + " / 8     elements: " + (32 * n) + " / 256", DX, DY + 16 * CS + 26, { color: C.fg, font: "13px", mono: true });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>In SFPI, the C++ dialect for the SFPU, this all hides behind <code>dst_reg[i]</code>. The index is multiplied by a stride of 2 to form the <code>SFPLOAD</code> address, which is why vector <i>i</i> lands on address 2<i>i</i>:</p>
+  <div class="filename">sfpi 7.92.0 (bundled with tt-metal @7aad8aac) runtime/sfpi/include/sfpi_classes.h:398-400, sfpi_constants.h:16</div>
+<pre><code>sfpi_inline constexpr vReg&lt;&gt; operator[] (int ix) const {
+  return vReg&lt;&gt; (ix * SFP_DESTREG_STRIDE);
+}
+constexpr unsigned int SFP_DESTREG_STRIDE = 2;</code></pre>
+  <p>The low-level kernel library (LLK) wraps a per-face function in a loop over the four faces, moving the Dst base 16 rows forward after each one:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_sfpu_common.h:32-36, 51-58 @7aad8aac</div>
+<pre><code>inline void _llk_math_eltwise_sfpu_inc_dst_face_addr_()
+{
+    math::inc_dst_addr&lt;8&gt;();
+    math::inc_dst_addr&lt;8&gt;();
+}
+...
+    if (vector_mode == VectorMode::RC)
+    {
+        // Do all four faces, and iterate through all 4 blocks of 4 rows each
+#pragma GCC unroll 0
+        for (int face = 0; face &lt; 4; face++)
+        {
+            sfpu_func(args...);
+            _llk_math_eltwise_sfpu_inc_dst_face_addr_();
+        }
+    }</code></pre>
+  <p>You do not have to take this on faith. Here is the disassembled math-thread binary that tt-metal JIT-compiled in this orb for <code>metal_example_custom_sfpi_add</code> on Wormhole. That example adds Dst tile 1 to Dst tile 0, one face at a time. Look at the address operand (the second field): 0, 2, 4, … 14 for tile 0, and 64, 66, … 78 for tile 1. One tile is 32 vectors × stride 2 = 64.</p>
+  <div class="filename">output: riscv-tt-elf-objdump -d …/kernels/tiles_add/…/trisc1/trisc1.elf (Wormhole build, this orb)</div>
+<pre><code>sfpload   L0,0,0,3        # a = dst_reg[0]        (tile 0, rows 0-3, even cols)
+sfpload   L1,64,0,3       # b = dst_reg[32]       (tile 1, same position)
+sfpadd    L0,L0,L1,0      # a + b, 32 lanes at once
+sfpnop                    # WH: next instruction must not read an SFPADD result 1 cycle later
+sfpstore  L0,0,0,3
+sfpload   L0,2,0,3        # dst_reg[1]: rows 0-3, odd cols
+sfpload   L1,66,0,3
+...
+sfpstore  L0,14,0,3       # dst_reg[7]: rows 12-15, odd cols -&gt; face done</code></pre>
+  <p>This matches the SFPI source, where a face is just a loop of 8:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/experimental/llk_sfpu/ckernel_sfpu_custom_add.h:14-26 @7aad8aac</div>
+<pre><code>inline void my_add_tile_face(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
+    constexpr uint32_t n_vector_in_tile = 32;
+    const uint32_t in0_base_idx = dst_index_in0 * n_vector_in_tile;
+    ...
+    for (size_t i = 0; i &lt; 8; i++) {
+        sfpi::vFloat a = sfpi::dst_reg[in0_base_idx + i];
+        sfpi::vFloat b = sfpi::dst_reg[in1_base_idx + i];
+        sfpi::dst_reg[out_base_idx + i] = a + b;
+    }
+}</code></pre>
+
+  <div class="callout warn"><b>The sources disagree here.</b> The Metalium guide <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">"Compute Engines and Data Flow within Tensix"</a> says that "<code>dst_reg[0:3]</code> typically contains the first face of the tile, <code>dst_reg[4:7]</code> contains the second face". The ISA's <code>SFPLOAD</code> model, the SFPI stride of 2, the smoothstep example's <code>vectors_per_face = 8</code>, and the compiled binary above all say that <b>one face is <code>dst_reg[0:7]</code></b> (8 × 32 = 256 elements). Four vectors could only hold 128 elements, half a face. Trust the ISA and the binary.</div>
+
+  <p>The load also converts formats. <code>SFPLOAD</code> turns a BF16 Dst value into FP32 by shifting it into the high 16 bits, rebiases FP16 exponents, and passes FP32 or 32-bit integers through. Everything inside the SFPU is 32-bit. The way back is less forgiving: <code>SFPSTORE</code> to a BF16 Dst <b>truncates</b> the mantissa toward zero (SFPSTORE.md:38). That is why tt-metal's bf16 exp path ends with an explicit round-to-nearest (<code>SFP_STOCH_RND</code>) before storing. The source comment gives the reason: "9**2 = 80.8 gets round to 80.5 rather than 81" (ckernel_sfpu_exp.h:156-158).</p>
+
+  <h2 id="isa">What the lanes can do</h2>
+  <p>The SFPU can issue one instruction per cycle. Most instructions take 1 cycle; the floating-point multiply/add family takes 2. Grouped by purpose, the Wormhole instruction set looks like this (from the instruction table in VectorUnit.md):</p>
+  <table>
+    <tr><th>Family</th><th>Instructions</th><th>What it is for</th></tr>
+    <tr><td>FP32 arithmetic</td><td><code>SFPMAD</code> (<i>a·b+c</i>), <code>SFPADD</code>, <code>SFPMUL</code>, <code>SFPADDI</code>, <code>SFPMULI</code></td><td>Everything numeric. <code>SFPADD</code> and <code>SFPMUL</code> are the same multiply-add datapath with a 1.0 or a 0 plugged in.</td></tr>
+    <tr><td>Lookup / piecewise</td><td><code>SFPLUT</code>, <code>SFPLUTFP32</code></td><td>Multiply-add with coefficients picked from LRegs 0–2 according to the magnitude of LReg 3, for piecewise-linear and polynomial approximations.</td></tr>
+    <tr><td>FP field surgery</td><td><code>SFPEXEXP</code>, <code>SFPEXMAN</code>, <code>SFPSETEXP</code>, <code>SFPSETMAN</code>, <code>SFPSETSGN</code>, <code>SFPDIVP2</code></td><td>Pull out or overwrite the exponent, mantissa or sign. This is how exp, log, and division by powers of two get cheap.</td></tr>
+    <tr><td>Integer and bits</td><td><code>SFPIADD</code>, <code>SFPAND</code>, <code>SFPOR</code>, <code>SFPXOR</code>, <code>SFPNOT</code>, <code>SFPSHFT</code>, <code>SFPLZ</code></td><td>Integer ops, masks, shifts, leading-zero count.</td></tr>
+    <tr><td>Conversions</td><td><code>SFPCAST</code>, <code>SFPSTOCHRND</code>, <code>SFPLOADI</code></td><td>Int↔float, FP32→BF16/TF32 rounding (nearest or stochastic, using a per-lane PRNG), immediates.</td></tr>
+    <tr><td>Movement</td><td><code>SFPLOAD</code>, <code>SFPSTORE</code>, <code>SFPMOV</code>, <code>SFPSWAP</code>, <code>SFPTRANSP</code>, <code>SFPSHFT2</code>, <code>SFPCONFIG</code></td><td>Dst↔LReg, min/max swaps (used for clamps and sorting), transposes and lane shifts.</td></tr>
+    <tr><td>Predication</td><td><code>SFPSETCC</code>, <code>SFPENCC</code>, <code>SFPPUSHC</code>, <code>SFPPOPC</code>, <code>SFPCOMPC</code></td><td>Per-lane enable masks and a mask stack (next section).</td></tr>
+  </table>
+  <p>Notice what is missing: there is no divide, no square root, no exp or log instruction on Wormhole. Every transcendental is built from the rows above. Blackhole adds a hardware approximate reciprocal and exp (<a href="#whbh">below</a>).</p>
+  <p>Two hardware facts shape real SFPU code:</p>
+  <ul>
+    <li><b>Latency hazards are the programmer's problem on Wormhole.</b> <code>SFPMAD</code> takes 2 cycles, and the WH manual says "software must ensure that on the next cycle, the Vector Unit (SFPU) does not execute an instruction which reads from any location written to by the <code>SFPMAD</code>". That is the <code>sfpnop</code> after the <code>sfpadd</code> in the disassembly above. Blackhole stalls automatically, and its build of the same kernel has no <code>sfpnop</code>.</li>
+    <li><b>Four fifths of the unit idle by default.</b> Internally the SFPU has five sub-units: load, simple, MAD, round and store. In the manual's words, it "can only accept one instruction per cycle from the outside world, so by default four fifths of the Vector Unit (SFPU) is always idle". <code>SFPLOADMACRO</code> lets one load schedule up to four more instructions on the other sub-units, overlapping data movement with math. That is how fast kernels approach peak.</li>
+  </ul>
+  <div class="callout warn"><b>ttsim does not implement <code>SFPLOADMACRO</code></b> (tensix.cpp:5138 raises <code>UnsupportedFunctionality</code>), so the workbench sets <code>TT_METAL_DISABLE_SFPLOADMACRO=1</code>. LLK kernels then take their <code>#ifdef DISABLE_SFPLOADMACRO</code> paths (for example in <code>calculate_exponential</code>'s approximate mode). The results should be the same, but the simulator then runs a different instruction sequence from the one silicon would normally run, and the fallback forgoes the sub-unit overlap that <code>SFPLOADMACRO</code> exists to provide.</div>
+
+  <h2 id="pred">If/else without branches: predication</h2>
+  <p>Now the central idea of the chapter. In SFPI you can write:</p>
+<pre><code>v_if (x &lt; 0.0f) { y = x * x;    }
+v_else          { y = x + 1.0f; }
+v_endif;</code></pre>
+  <p>Thirty-two lanes, each with its own <code>x</code>. Some are negative and some are not. But there is only <b>one</b> instruction stream, pushed by a RISC-V core that cannot see lane values (and has usually run far ahead of the coprocessor anyway, as <a href="a04-inside-tensix.html">A04</a> showed). So the hardware cannot jump. What it can do is <i>switch lanes off</i>.</p>
+  <p>Step through it. Use <b>All x ≥ 0</b> to see the case where no lane wants the <code>if</code> branch.</p>
+
+  <div class="viz" id="fig-vif"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-vif");
+    var g = TT.canvas(root, 860, 440), ctx = g.ctx, C = TT.C;
+    var xs = [];
+    function randomize(allPos) {
+      xs = [];
+      for (var i = 0; i < 32; i++) {
+        var v; do { v = Math.round(Math.random() * 18 - 9); } while (v === 0);
+        xs.push(allPos ? Math.abs(v) : v);
+      }
+    }
+    randomize(false);
+    var prog = [
+      ["SFPLOAD ", "x = dst_reg[i]"],
+      ["SFPSETCC", "LaneFlags = (x < 0)"],
+      ["SFPMUL  ", "y = x * x"],
+      ["SFPCOMPC", "LaneFlags = !LaneFlags"],
+      ["SFPADD  ", "y = x + 1.0   (LReg10)"],
+      ["SFPENCC ", "all lanes on again"],
+      ["SFPSTORE", "dst_reg[i] = y"]
+    ];
+    var srcMap = [-1, 0, 1, 2, 3, 4, -1];
+    var src = ["v_if (x < 0.0f) {", "    y = x * x;", "} v_else {", "    y = x + 1.0f;", "} v_endif;"];
+    function nNeg() { var n = 0; xs.forEach(function (v) { if (v < 0) n++; }); return n; }
+    var steps = [];
+    function texts() {
+      var n = nNeg();
+      var t = [
+        "<b>SFPLOAD.</b> All 32 lanes load their own <code>x</code> from Dst in one instruction. The lane-flag machinery is already enabled (<code>SFPENCC</code>), and every lane's flag is true.",
+        "<b>SFPSETCC.</b> Each lane tests its own <code>x &lt; 0</code> and writes the result to its <i>LaneFlags</i> bit. " + n + " lanes stay lit; the other " + (32 - n) + " are now <b>disabled</b>.",
+        "<b>The if-branch: SFPMUL.</b> The instruction goes to all 32 lanes, but only the " + n + " enabled lanes write <code>y</code>. The " + (32 - n) + " greyed lanes do nothing, <b>and they still spend the cycle</b>." + (n === 0 ? " Here <i>no</i> lane wanted this branch, yet it was issued anyway: the RISC-V that pushed it never saw the flags." : ""),
+        "<b>SFPCOMPC</b> ('complement') inverts the flags inside the enclosing context. This is the <code>v_else</code>: lanes that were off turn on, and lanes that ran the if-branch turn off.",
+        "<b>The else-branch: SFPADD.</b> Now the other " + (32 - n) + " lanes compute <code>y = x + 1</code> while the first " + n + " sit idle. Across both branches the SFPU issued <b>64 lane-slots to do 32 lane-results</b>: the cost doubled.",
+        "<b>SFPENCC</b> re-enables every lane (<code>v_endif</code>). With nested <code>v_if</code>s the compiler would use the per-lane flag stack instead: <code>SFPPUSHC</code> on entry and <code>SFPPOPC</code> on exit, up to 8 levels.",
+        "<b>SFPSTORE.</b> All 32 results go back to Dst. Every lane got the right answer, but the branch region cost the sum of both sides, not the maximum. A lane only ever needed 1 instruction there; the vector paid 2."
+      ];
+      for (var i = 0; i < t.length; i++) { if (!steps[i]) steps[i] = { dur: 1.6 }; steps[i].text = t[i]; }
+    }
+    texts();
+    function active(l, k) {
+      var neg = xs[l] < 0;
+      if (k <= 1) return k === 0 ? true : true;
+      if (k === 2) return neg;
+      if (k === 3) return !neg;
+      if (k === 4) return !neg;
+      return true;
+    }
+    function draw(k, t) {
+      TT.clear(ctx, g.W, g.H);
+      var n = nNeg();
+      // source code panel
+      TT.text(ctx, "SFPI source", 20, 22, { color: C.muted, font: "12px" });
+      for (var s = 0; s < src.length; s++) {
+        var on = srcMap[k] === s || (k === 1 && s === 0) || (k === 3 && s === 2) || (k === 5 && s === 4);
+        if (on) TT.box(ctx, 14, 34 + s * 20, 320, 19, { r: 3, fill: C.yellow, alpha: 0.15 });
+        TT.text(ctx, src[s], 20, 44 + s * 20, { color: on ? C.yellow : C.fg, font: "13px", mono: true });
+      }
+      TT.text(ctx, "SFPU instruction stream (schematic)", 20, 158, { color: C.muted, font: "12px" });
+      for (var p = 0; p < prog.length; p++) {
+        var y = 170 + p * 21;
+        if (p === k) TT.box(ctx, 14, y - 2, 330, 20, { r: 3, fill: C.blue, alpha: 0.2 * (0.3 + 0.7 * t) + 0.05 });
+        TT.text(ctx, prog[p][0], 20, y + 8, { color: p <= k ? C.blue : C.muted, font: "13px", mono: true });
+        TT.text(ctx, prog[p][1], 104, y + 8, { color: p <= k ? C.fg : C.muted, font: "13px", mono: true });
+      }
+      // lane grid
+      var GX = 370, GY = 34, W = 54, H = 58, G = 4;
+      TT.text(ctx, "32 lanes (LReg lane layout, 4×8)", GX, 22, { color: C.muted, font: "12px" });
+      for (var l = 0; l < 32; l++) {
+        var x = GX + (l & 7) * (W + G), yy = GY + Math.floor(l / 8) * (H + G);
+        var act = active(l, k), neg = xs[l] < 0;
+        var computing = (k === 2 && neg) || (k === 4 && !neg);
+        var fill = !act ? C.bg3 : (computing ? (neg ? C.blue : C.orange) : C.bg2);
+        var alpha = !act ? 1 : (computing ? 0.25 + 0.35 * t : 1);
+        TT.box(ctx, x, yy, W, H, { r: 5, fill: fill, alpha: alpha, stroke: act ? (neg && k >= 1 ? C.blue : (k >= 1 ? C.orange : C.border)) : C.border, lw: act ? 1.5 : 1 });
+        if (!act) {           // hatch masked lanes
+          ctx.save(); ctx.beginPath(); ctx.rect(x, yy, W, H); ctx.clip();
+          ctx.strokeStyle = "#3a4350"; ctx.lineWidth = 1;
+          for (var h = -H; h < W; h += 8) { ctx.beginPath(); ctx.moveTo(x + h, yy + H); ctx.lineTo(x + h + H, yy); ctx.stroke(); }
+          ctx.restore();
+        }
+        TT.text(ctx, String(l), x + 4, yy + 9, { color: C.muted, font: "9px" });
+        TT.text(ctx, "x=" + xs[l], x + W / 2, yy + 24, { color: act ? C.fg : C.muted, font: "13px", mono: true, align: "center" });
+        var yv = null;
+        if ((k > 2 || (k === 2 && t > 0.5)) && neg) yv = xs[l] * xs[l];
+        if ((k > 4 || (k === 4 && t > 0.5)) && !neg) yv = xs[l] + 1;
+        if (yv !== null) TT.text(ctx, "y=" + yv, x + W / 2, yy + 44, { color: act ? C.green : C.muted, font: "12px", mono: true, align: "center" });
+      }
+      // counters
+      var issued = k + 1;
+      var slots = (k >= 2 ? 32 : 0) + (k >= 4 ? 32 : 0);
+      var useful = (k >= 2 ? n : 0) + (k >= 4 ? 32 - n : 0);
+      var BX = 370, BY = 300, BW = 460;
+      TT.text(ctx, "issue cycles so far: " + issued, BX, BY, { color: C.fg, font: "13px", mono: true });
+      TT.text(ctx, "(1 instruction per cycle, latency ignored)", BX + 200, BY, { color: C.muted, font: "11px" });
+      TT.text(ctx, "branch region, lane-slots issued", BX, BY + 28, { color: C.muted, font: "12px" });
+      TT.box(ctx, BX, BY + 38, BW, 20, { r: 3, fill: C.bg3 });
+      if (slots) TT.box(ctx, BX, BY + 38, BW * slots / 64, 20, { r: 3, fill: C.red, alpha: 0.6, label: slots + " slots", font: "12px" });
+      TT.text(ctx, "lane-slots that produced a result", BX, BY + 74, { color: C.muted, font: "12px" });
+      TT.box(ctx, BX, BY + 84, BW, 20, { r: 3, fill: C.bg3 });
+      if (useful) TT.box(ctx, BX, BY + 84, BW * useful / 64, 20, { r: 3, fill: C.green, alpha: 0.6, label: useful + " results", font: "12px" });
+      TT.text(ctx, "scale: 64 = both branches × 32 lanes", BX, BY + 122, { color: C.muted, font: "11px" });
+      TT.text(ctx, n + " lanes negative, " + (32 - n) + " non-negative", 20, 330, { color: C.fg, font: "13px" });
+      TT.text(ctx, "blue = if-branch lanes, orange = else-branch lanes,", 20, 354, { color: C.muted, font: "12px" });
+      TT.text(ctx, "hatched grey = disabled (LaneFlags false)", 20, 372, { color: C.muted, font: "12px" });
+    }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    var bar = root.querySelector(".controls");
+    function addBtn(label, fn) { var b = document.createElement("button"); b.textContent = label; b.onclick = fn; bar.insertBefore(b, bar.lastChild); }
+    addBtn("New inputs", function () { randomize(false); texts(); api.render(); });
+    addBtn("All x ≥ 0", function () { randomize(true); texts(); api.render(); });
+  })();
+  </script>
+
+  <div class="callout key">The SFPU has no branches, only masks. <code>v_if</code>/<code>v_else</code> issues <b>both</b> branches to all 32 lanes, and a per-lane flag decides which lanes are allowed to write. Divergent code costs the <b>sum</b> of its branches, even if no lane takes one of them.</div>
+
+  <h3>The machinery</h3>
+  <p>The ISA defines it precisely. Each lane has a <code>LaneFlags</code> bit, a <code>UseLaneFlagsForLaneEnable</code> bit, and its own 8-entry <code>FlagStack</code>. A lane is enabled if flags are in use and its flag is set:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/VectorUnit.md:144-152 @be833101</div>
+<pre><code>bool IsLaneEnabled(unsigned Lane) {
+  if (LaneConfig[Lane &amp; 7].ROW_MASK.Bit[Lane / 8]) {
+    return false;
+  } else if (UseLaneFlagsForLaneEnable[Lane]) {
+    return LaneFlags[Lane];
+  } else {
+    return true;
+  }
+}</code></pre>
+  <ul>
+    <li><code>SFPENCC</code> turns flag-based enabling on or off and can set all flags.</li>
+    <li><code>SFPSETCC</code> sets each lane's flag from a test on its value: <code>&lt; 0</code>, <code>!= 0</code>, <code>&gt;= 0</code> or <code>== 0</code>. <code>SFPIADD</code>, <code>SFPLZ</code> and <code>SFPEXEXP</code> can also set flags as a side effect.</li>
+    <li><code>SFPPUSHC</code>/<code>SFPPOPC</code> save and restore the flags on a per-lane stack, so <code>v_if</code>s can nest. The manual says compilers "are encouraged to map SIMT <code>if</code> / <code>else</code> onto this stack".</li>
+    <li><code>SFPCOMPC</code> is the <code>else</code>: <code>LaneFlags = Top.LaneFlags &amp;&amp; !LaneFlags</code>. It inverts only the lanes that were enabled when the <code>if</code> began.</li>
+  </ul>
+  <p>Notice that only a comparison <i>against zero</i> exists on Wormhole. To test <code>a &lt; 0.5</code>, the compiler first computes <code>a − 0.5</code>. I overlaid the <code>custom_sfpi_add</code> compute kernel with a version whose face function contains a <code>v_if</code>. It computes the same sum both ways (<code>v_if (a &lt; 0.5f) { s = a + b; } v_else { s = b + a; }</code>), so the example's own check still applies, and it passed on both architectures (output in <a href="#sim">the simulator section</a>). The SFPI compiler turned it into:</p>
+  <div class="grid2">
+  <div>
+  <div class="filename">output: objdump of overlay trisc1.elf, <b>Wormhole</b></div>
+<pre><code>sfpload   L1,0,0,3        # a
+sfpload   L2,64,0,3       # b
+sfploadi  L0,16128,0      # 0.5 (bf16 0x3F00)
+sfpmad    L0,L11,L0,L1,0  # a + (-1.0)*0.5
+sfpnop                    # MAD latency
+sfpsetcc  L0,0x000,0      # flag = (a-0.5 &lt; 0)
+sfpadd    L0,L1,L2,0      # then: a + b
+sfpcompc                  # else
+sfpadd    L0,L2,L1,0      # else: b + a
+sfpencc   0x003,10        # all lanes on
+sfpstore  L0,0,0,3</code></pre>
+  </div>
+  <div>
+  <div class="filename">output: same source, <b>Blackhole</b></div>
+<pre><code>sfpload   L1,0,0,7
+sfpload   L2,64,0,7
+sfploadi  L0,16128,0      # 0.5
+sfpgt     L0,L1,0,1       # flag = (0.5 &gt; a)
+sfpadd    L0,L1,L2,0      # then
+sfpcompc
+sfpadd    L0,L2,L1,0      # else
+sfpencc   0x003,10
+sfpstore  L0,0,0,7
+
+
+</code></pre>
+  </div>
+  </div>
+  <p>Both branches are there, back to back. On Wormhole, <code>LReg 11</code> (the reserved −1.0) turns a comparison into a multiply-add plus a sign test, and the mandatory <code>sfpnop</code> follows. Blackhole's new <code>SFPGT</code> compares two registers directly, so the predicated body is 6 instructions instead of 8. (The compiler also put the body in the Tensix <b>replay buffer</b> and replays it for vectors 1–7. <a href="a13-llk-mops-jit.html">A13</a> covers replay.)</p>
+  <p>ttsim implements all of this with a single 32-bit mask. Every lane-wise instruction computes it the same way and loops over its set bits:</p>
+  <div class="filename">ttsim/src/tensix.cpp:3947-3953, 4731-4759 (trimmed) @b3620244</div>
+<pre><code>template&lt;typename Func&gt;
+static inline void for_each_lane(uint32_t mask, Func f) {
+    for (; mask; mask &amp;= mask - 1) {
+        uint32_t lane = __builtin_ctz(mask);
+        f(lane);
+    }
+}
+...
+TENSIX_EXECUTE_SFPMAD() {
+    ...
+    uint32_t mask = p_tensix-&gt;cc_en ? p_tensix-&gt;cc : 0xFFFFFFFF;
+    ...
+    for_each_lane(mask, [=](uint32_t lane) {
+        uint32_t a = p_tensix-&gt;l_regs[lreg_a][lane];
+        uint32_t b = p_tensix-&gt;l_regs[lreg_b][lane];
+        uint32_t c = p_tensix-&gt;l_regs[lreg_c][lane];
+        ...
+        p_tensix-&gt;l_regs[lreg_dest][lane] = sfpu_mad(a, b, c);
+    });</code></pre>
+  <p><code>cc</code> holds the 32 <code>LaneFlags</code> as a bitmask, and <code>cc_en</code> is the "use flags" switch (ttsim keeps one switch for the whole unit rather than one per lane). <code>SFPCOMPC</code> becomes <code>cc = cc_stack[top] &amp; ~cc</code> (tensix.cpp:4883-4895), the same formula as the ISA. A masked lane is skipped by the simulator's loop. In hardware it is simply not written, but the instruction still occupies its cycle.</p>
+
+  <div class="callout gpu">This is exactly <b>SIMT branch divergence</b>. A GPU warp is also 32 lanes, and when its threads disagree on a branch, it runs both paths with lanes masked off. Classic GPUs even used a similar per-warp reconvergence stack. Two differences matter:
+  <ul>
+    <li>A GPU checks whether <i>any</i> thread takes a branch and skips the path when none does. The SFPU cannot, because its instruction stream was decided by a RISC-V core that never sees the flags. Press <b>All x ≥ 0</b> above: the if-branch is still issued.</li>
+    <li>A GPU hides latency by switching among many warps. The SFPU runs one in-order stream with no other "warps" to switch to, so the compiler has to insert <code>sfpnop</code>s or find independent work itself.</li>
+  </ul></div>
+
+  <h2 id="approx">Building exp() from multiply-adds</h2>
+  <p>With multiply-add, exponent surgery and masks, you can build any function. The oldest exp routine in tt-metal shows all three in a dozen lines, and it is still called by the binary <code>pow</code> kernel (ckernel_sfpu_binary.h:61), on |x| only:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_exp.h:470-492 @7aad8aac</div>
+<pre><code>sfpi_inline sfpi::vFloat _sfpu_exp_(sfpi::vFloat val) {
+    // If exponent is &gt; -1 extract it and replace with -1
+    sfpi::vInt exp = exexp(val);
+    v_if(exp &gt;= 0) { val = setexp(val, 126); }
+    v_endif;
+
+    // Run series in Horner form
+    sfpi::vFloat tmp = val * 0.8373f + sfpi::sFloat16b(0.863281f);
+    val = val * tmp + 1.0f;
+
+    v_if(exp &gt;= 0) {
+        val = val * val;
+        for (int s_iter = 0; s_iter &lt; 7; s_iter++) {
+            exp = exp - 1;
+            // Narrow predication on each loop
+            v_and(exp &gt;= 0);
+            val = val * val;
+        }
+    }
+    v_endif;
+
+    return val;
+}</code></pre>
+  <p>The idea, before any code: <i>e</i><sup><i>x</i></sup> for large <i>x</i> is hard, but for <i>x</i> in [0, 1) a quadratic is decent. Write <i>x</i> = 1.<i>f</i>·2<sup><i>k</i></sup> as usual, so <i>x</i> = <i>m</i>·2<sup><i>k</i>+1</sup> with <i>m</i> in [0.5, 1). Then <i>e</i><sup><i>x</i></sup> = (<i>e</i><sup><i>m</i></sup>)<sup>2<sup><i>k</i>+1</sup></sup>, and raising to the power 2<sup><i>k</i>+1</sup> is just <i>k</i>+1 squarings. So:</p>
+  <ol>
+    <li><code>exexp</code> reads the exponent <i>k</i> straight out of the FP32 bits. No arithmetic is needed.</li>
+    <li><code>setexp(val, 126)</code> overwrites the exponent field so the value becomes <i>m</i> in [0.5, 1). This happens only in lanes with <i>k</i> ≥ 0, under a mask.</li>
+    <li>Two multiply-adds evaluate <i>e</i><sup><i>m</i></sup> ≈ 1 + <i>m</i>(0.863281 + 0.8373·<i>m</i>). The 0.8373 is the value hard-wired into LReg 8. The ISA does not say why that constant exists, but this polynomial is a plausible reason.</li>
+    <li>Square <i>k</i>+1 times, using a <b>narrowing mask</b>: each loop round turns off the lanes that have finished.</li>
+  </ol>
+
+  <div class="viz" id="fig-exp"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-exp");
+    var g = TT.canvas(root, 860, 430), ctx = g.ctx, C = TT.C;
+    var f = Math.fround;
+    var X = [0.25, 0.7, 1.0, 1.5, 2.2, 3.0, 5.0, 7.5];
+    var L = X.map(function (x) {
+      var xf = f(x), e = Math.floor(Math.log2(xf));
+      var m = e >= 0 ? f(xf / Math.pow(2, e + 1)) : xf;
+      var tmp = f(m * f(0.8373) + 0.863281);
+      var p = f(m * tmp + 1);
+      var sq = [p];
+      for (var s = 0; s < 8; s++) sq.push(f(sq[sq.length - 1] * sq[sq.length - 1]));
+      return { x: xf, e: e, m: m, tmp: tmp, p: p, sq: sq, truth: Math.exp(xf) };
+    });
+    // number of squarings done by the end of step k
+    function nsq(l, k) {
+      if (L[l].e < 0) return 0;
+      if (k < 5) return 0;
+      if (k === 5) return 1;
+      if (k === 6) return Math.min(L[l].e + 1, 2);
+      return Math.min(L[l].e + 1, 3 + 5);   // k >= 7: rounds 2..7 done
+    }
+    function activeAt(l, k) {
+      var e = L[l].e;
+      if (k === 2 || k === 5) return e >= 0;
+      if (k === 6) return e >= 1;
+      if (k === 7) return e >= 2;
+      if (k === 8) return e >= 3;
+      return true;
+    }
+    function fmt(v) { return Math.abs(v) >= 100 ? v.toFixed(1) : v.toPrecision(4); }
+    var steps = [
+      { dur: 1.2, text: "<b>Load.</b> Eight of the 32 lanes, each with its own positive <code>x</code> (callers pass |x| and take a reciprocal for negative inputs). Every row below is one vector register, read lane by lane." },
+      { dur: 1.2, text: "<b><code>exp = exexp(val)</code></b> copies each lane's unbiased exponent <i>k</i> out of the FP32 bits: x = 1.<i>f</i> × 2<sup>k</sup>. One instruction, no arithmetic." },
+      { dur: 1.4, text: "<b><code>v_if(exp &gt;= 0) val = setexp(val, 126)</code>.</b> Lanes with x ≥ 1 get their exponent field overwritten, so val becomes x/2<sup>k+1</sup>, which lies in [0.5, 1). Lanes with x &lt; 1 are masked (grey) and keep x." },
+      { dur: 1.2, text: "<b><code>tmp = val*0.8373 + 0.863281</code></b>: first Horner step, all lanes (one <code>SFPMAD</code>)." },
+      { dur: 1.2, text: "<b><code>val = val*tmp + 1.0</code></b>: second Horner step. Now val ≈ e<sup>val</sup> for the reduced input, with roughly 0.04% to 1.2% error on these lanes. Lanes with x &lt; 1 are done." },
+      { dur: 1.4, text: "<b><code>v_if(exp &gt;= 0) val = val*val</code>.</b> First squaring, only in lanes with k ≥ 0. Each squaring <i>doubles</i> the relative error." },
+      { dur: 1.4, text: "<b>Loop round 1:</b> <code>exp = exp − 1; v_and(exp &gt;= 0); val = val*val</code>. The mask narrows: only lanes with k ≥ 1 square again." },
+      { dur: 1.4, text: "<b>Loop round 2:</b> the mask narrows to k ≥ 2 (x ≥ 4): x = 5.0 and x = 7.5 square a third time and are now done." },
+      { dur: 1.8, text: "<b>Loop rounds 3–7:</b> every lane is masked. The loop has a fixed 7 rounds because the instruction stream cannot depend on lane data, so 5 more rounds of decrement, compare and square are issued to an <b>all-grey</b> vector." },
+      { dur: 1.5, text: "<b>Result vs the true e<sup>x</sup>.</b> The polynomial alone was within about 1.2% on these inputs, and mostly far better. Lane 7 (x = 7.5) started at −0.33% and was squared three times, so its error grew roughly 2<sup>3</sup>×, to about −2.6%. This is why tt-metal's default exp now uses a different algorithm (next)." }
+    ];
+    var rows = ["x", "k = exexp(x)", "val (reduced)", "tmp", "val", "squarings", "true eˣ", "error"];
+    function draw(k, t) {
+      TT.clear(ctx, g.W, g.H);
+      var X0 = 150, CW = 86, Y0 = 46, RH = 36;
+      for (var l = 0; l < 8; l++) TT.text(ctx, "lane " + l, X0 + l * CW + CW / 2, 24, { color: C.muted, font: "12px", align: "center" });
+      var curRow = [0, 1, 2, 3, 4, 5, 5, 5, 5, 7][k];
+      for (var r = 0; r < rows.length; r++) {
+        var y = Y0 + r * RH;
+        if (r === curRow) TT.box(ctx, 6, y - 2, 846, RH - 4, { r: 4, fill: C.yellow, alpha: 0.08 * (0.4 + 0.6 * t) });
+        TT.text(ctx, rows[r], 14, y + RH / 2 - 2, { color: r === curRow ? C.yellow : C.muted, font: "13px", mono: true });
+        for (l = 0; l < 8; l++) {
+          var d = L[l], s = "", col = C.fg;
+          var act = activeAt(l, k);
+          if (r === 0) s = String(X[l]);
+          if (r === 1 && k >= 1) s = String(d.e);
+          if (r === 2 && k >= 2) s = (k === 2 && d.e >= 0 && t < 0.5) ? String(X[l]) : fmt(d.m);
+          if (r === 3 && k >= 3) s = d.tmp.toFixed(4);
+          if (r === 4 && k >= 4) { var n = nsq(l, k); s = fmt(n ? d.sq[n] : d.p); }
+          if (r === 5 && k >= 5) s = String(nsq(l, k));
+          if (r === 6 && k >= 9) s = fmt(d.truth);
+          if (r === 7 && k >= 9) { var v = d.sq[nsq(l, k)]; var err = (v / d.truth - 1) * 100; s = (err >= 0 ? "+" : "") + err.toFixed(2) + "%"; col = Math.abs(err) > 1 ? C.red : C.green; }
+          var bx = X0 + l * CW + 4, by = y;
+          var masked = !act && r === curRow;
+          TT.box(ctx, bx, by, CW - 8, RH - 6, { r: 4, fill: masked ? C.bg3 : C.bg2, stroke: (r === curRow && act && k > 0) ? C.blue : C.border, lw: (r === curRow && act) ? 1.5 : 1 });
+          if (masked) {
+            ctx.save(); ctx.beginPath(); ctx.rect(bx, by, CW - 8, RH - 6); ctx.clip();
+            ctx.strokeStyle = "#3a4350"; ctx.lineWidth = 1;
+            for (var h = -RH; h < CW; h += 8) { ctx.beginPath(); ctx.moveTo(bx + h, by + RH); ctx.lineTo(bx + h + RH, by); ctx.stroke(); }
+            ctx.restore();
+          }
+          if (s) TT.text(ctx, s, bx + (CW - 8) / 2, by + (RH - 6) / 2, { color: masked ? C.muted : col, font: "13px", mono: true, align: "center" });
+        }
+      }
+      var rounds = k < 6 ? 0 : (k === 6 ? 1 : (k === 7 ? 2 : 7));
+      var nAct = 0; for (l = 0; l < 8; l++) if (activeAt(l, k)) nAct++;
+      TT.text(ctx, "loop rounds issued: " + rounds + " / 7", 14, Y0 + 8 * RH + 18, { color: C.fg, font: "13px", mono: true });
+      if (k < 9) TT.text(ctx, "lanes doing useful work this step: " + nAct + " / 8 shown", 300, Y0 + 8 * RH + 18, { color: nAct ? C.green : C.red, font: "13px", mono: true });
+      else TT.text(ctx, "true eˣ and error: computed by this page for comparison", 300, Y0 + 8 * RH + 18, { color: C.muted, font: "13px", mono: true });
+      TT.text(ctx, "Values are computed in this page with JavaScript Math.fround (FP32 rounding per step), not the bit-exact SFPU model.", 14, Y0 + 8 * RH + 46, { color: C.muted, font: "11px" });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>Today's default bf16 exp on Wormhole (<code>exp_tile</code> with <code>math_approx_mode = false</code> and a 16-bit Dst) is a different algorithm. It computes <code>x/ln2 + 127</code>, clamps that to [0, 255], splits it into integer and fraction parts with exponent and mantissa instructions, evaluates a quadratic for 2<sup>frac</sup>, and stitches the result back together with <code>SFPSETEXP</code>. Its comments credit Moroz et al. 2022. It is hand-written with raw <code>TTI_</code> instruction macros so that every slot is accounted for:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_exp.h:520-524 and 347-354 @7aad8aac</div>
+<pre><code>void calculate_exponential(const std::uint32_t exp_base_scale_factor = p_sfpu::kCONST_1_FP16B) {
+    if constexpr (!APPROXIMATION_MODE) {
+        if constexpr (!is_fp32_dest_acc_en) {
+            // bfloat16-accurate path: hand-tuned TTI exp_21f kernel.
+            _sfpu_exp_21f_bf16_tti_&lt;SCALE_EN, is_fp32_dest_acc_en, CLAMP_NEGATIVE, ITERATIONS&gt;(exp_base_scale_factor);
+...
+    //   Base body:                                                17
+    //     SFPLOAD, SFPMAD, SFPNOP, SFPSWAP, SFPNOP,
+    //     SFPEXEXP, SFPEXMAN8, SFPSHFT, SFPEXMAN9, SFPCAST,
+    //     SFPMAD poly1, SFPNOP, SFPMAD poly2,
+    //     SFPLOADI, SFPSETEXP, SFPSTORE. INCRWC
+    //   + SCALE_EN ? 1 : 0                  (SFPMULI scale + SFPNOP)
+    //   + is_fp32_dest_acc_en ? 0 : 1       (SFP_STOCH_RND fp32→bf16)
+    //   + CLAMP_NEGATIVE ? 2 : 0            (SFPSWAP + SFPNOP)</code></pre>
+  <p>So the body is 17 + 1 (round to bf16) + 2 (negative clamp) = 20 instructions. That is the count from the opening question, and the binary confirms it. From the <code>metal_example_eltwise_sfpu</code> build in this orb:</p>
+  <div class="filename">output: objdump of …/kernels/eltwise_sfpu/…/trisc1/trisc1.elf (Wormhole, this orb), one face</div>
+<pre><code>ttreplay    0,20,1,1        # record the next 20 instructions while executing them
+sfpload     L0,0,0,3        # x
+sfpmad      L0,L0,L12,L3,0  # x * (1/ln2) + 127      (L12 = 1/ln2, L3 = 127.0)
+sfpmov      L1,L9,0         # 0.0
+sfpswap     L1,L0,1         # clamp below at 0
+sfpnop
+sfpswap     L0,L2,1         # clamp above at 255
+sfpnop
+sfpexexp    L1,L0,0         # integer part ...
+sfpexman    L0,L0,0
+sfpshft     L0,L1,0x000,0
+sfpexman    L1,L0,1         # ... and fraction
+sfpcast     L1,L1,0
+sfpmad      L2,L1,L13,L5,0  # quadratic for 2^frac
+sfpnop
+sfpmad      L1,L2,L1,L6,0
+sfploadi    L2,17279,0      # reload 255.0
+sfpsetexp   L0,L1,0x000,2   # 2^int * 2^frac
+sfpstochrnd L0,L9,L0,0,1,0  # round FP32 -&gt; bf16 (nearest)
+sfpstore    L0,0,0,3
+ttincrwc    0,2,0,0         # dst_reg++
+ttreplay    0,20,0,0        # vectors 1..7: replay the 20
+... (6 more ttreplay) ...
+ttsetrwc    0,4,8,0,0,4     # next face: +8 rows
+ttsetrwc    0,4,8,0,0,4     #            +8 rows</code></pre>
+  <p>Twenty issue slots per vector, eight vectors per face, four faces per tile: <b>640 slots per tile</b>, three of them <code>sfpnop</code>s per vector just waiting out MAD latency. This is an instruction count from the binary, not a measured cycle count. ttsim cannot measure cycles (see <a href="#sim">below</a>).</p>
+
+  <h2 id="ratio">The 64× gap, derived</h2>
+  <p>Now the peak numbers. Count FLOPs per cycle, counting a multiply-add as 2:</p>
+  <table>
+    <tr><th></th><th>Matrix engine (FPU), <code>MVMUL</code></th><th>Vector engine (SFPU), <code>SFPMAD</code></th></tr>
+    <tr><td>Work per instruction</td><td>Dst(8×16) += SrcB(8×16) · SrcA(16×16) = 8·16·16 = 2048 MACs</td><td>32 lanes × 1 FMA = 32 MACs</td></tr>
+    <tr><td>Instructions per cycle</td><td>1 (per fidelity phase)</td><td>1</td></tr>
+    <tr><td>FLOP per cycle</td><td><b>4096</b></td><td><b>64</b></td></tr>
+    <tr><td>Wormhole, 1 GHz, per core</td><td>4.096 TFLOP/s (LoFi)</td><td>0.064 TFLOP/s</td></tr>
+    <tr><td>Blackhole, 1.35 GHz, per core</td><td>5.53 TFLOP/s (LoFi, derived)</td><td>0.0864 TFLOP/s</td></tr>
+  </table>
+  <p>4096 / 64 = <b>64</b>, independent of clock. The WH figures are straight from the ISA's MatrixUnit.md performance table and SFPMAD.md ("0.064 TFLOP/s (per Vector Unit)"). The BH SFPMAD page gives 0.0864 at 1.35 GHz. The BH FPU figure is my 4096 × 1.35 GHz, since the ISA notes that matrix-unit ratios "broadly apply to Blackhole".</p>
+  <p>Two honest qualifications:</p>
+  <ul>
+    <li><b>Apples to oranges in precision.</b> LoFi <code>MVMUL</code> multiplies 5-bit by 7-bit mantissas (<a href="a06-matrix-engine.html">A06</a>). The SFPU does full FP32. At HiFi4 the FPU drops to 1.024 TFLOP/s, and the gap is 16×.</li>
+    <li><b>Peak is <code>SFPMAD</code> on every cycle.</b> Real kernels also spend slots on loads, stores, nops, clamps and bit tricks. The exp above does 3 multiply-adds in 20 slots, and without <code>SFPLOADMACRO</code> the load and store sub-units cannot overlap with the MAD.</li>
+  </ul>
+  <h3>Why build it this way?</h3>
+  <p>Compare the work per <i>output element</i>. A matmul output element with inner dimension <i>K</i> costs <i>K</i> multiply-adds, often thousands. An elementwise op costs a fixed handful per element. Since matrix multiplies dominate the FLOPs (<a href="a01-why-new-hardware.html">A01</a>), it makes sense to spend nearly all the area on the FPU and give the SFPU just enough to keep up with an output stream that arrives once per <i>K</i> MACs. The FPU's narrow multipliers are also what make 2048 of them per core affordable, and a general FP32 FMA lane is far larger than a 5×7-bit multiplier. (That last point is engineering inference, not a figure from the docs.)</p>
+  <p>The design bites when <i>K</i> is small. Here is my own arithmetic, using the counts above. Attention scores with head dimension 128 cost 4 tiles of <i>K</i>, so 4 × 16 = 64 LoFi cycles per 32×32 output tile, and then softmax needs an exp of that same tile, about 640 issue slots. The exponential, not the matmul, becomes the bottleneck. That is why kernels like SDPA have their own hand-tuned exp variants (on Blackhole, the <code>ckernel_sfpu_sdpa_exp_unclamped.h</code> and <code>softmax_k</code> files under <code>tt-llk/tt_llk_blackhole/…/experimental</code>; at this commit the Wormhole tree has no counterpart).</p>
+  <div class="callout gpu">GPUs face the same imbalance. On recent NVIDIA parts, tensor-core throughput exceeds the special-function and FP32 units by a large factor, and attention kernels such as FlashAttention go to great lengths to hide or reduce exponentials. The SFPU's 64× ratio is a vivid local instance of a universal trend.</div>
+
+  <h2 id="fma">Not quite IEEE: the FMA that ttsim copies bit for bit</h2>
+  <p><code>SFPMAD</code> computes <code>a*b + c</code> in FP32, but not to the letter of IEEE 754. The ISA lists the differences:</p>
+  <ul>
+    <li>Denormal inputs are treated as zero, and denormal outputs are flushed.</li>
+    <li>The multiply and add are "<i>partially</i> fused". The product keeps more than FP32 precision but not infinite precision, then there is one round-to-nearest-even step.</li>
+    <li>On Wormhole, a negative-zero result becomes +0, and NaN payloads are not canonical.</li>
+  </ul>
+  <p>The ISA ships a bit-exact C model, <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/Miscellaneous/FMA/README.md"><code>fma_model_wh</code> and <code>fma_model_bh</code></a>. Its list of WH-vs-BH differences contains this item: "If <code>r_m = (r_m &gt;&gt; n) | (r_m &amp; 1)</code> ends up doing a shift right by two bits, the higher of those two gets dropped rather than contributing to the sticky bit (this is a hardware bug rather than anything intentional)."</p>
+  <p>ttsim does not call the host's <code>fmaf</code>. It reimplements the datapath in integer arithmetic, in <code>sfpu_mad</code> (tensix.cpp:4232-4331), with <code>TT_ARCH_VERSION</code> 0 for Wormhole and 1 for Blackhole. Here is the Wormhole rounding tail, bug included:</p>
+  <div class="filename">ttsim/src/tensix.cpp:4313-4321 @b3620244</div>
+<pre><code>#else
+    uint32_t magnitude = uint32_t((sum &lt; 0) ? -sum : sum);
+    uint32_t rounded = std::bit_cast&lt;uint32_t&gt;(float(sum));
+    uint32_t sign = rounded &amp; 0x80000000;
+    rounded &amp;= 0x7FFFFFFF;
+    // WH's two-bit normalization loses bit 1 instead of jamming it: an even tie can round down.
+    if ((magnitude &gt;= 0x10000000) &amp;&amp; ((magnitude &amp; 63) == 18)) {
+        --rounded;
+    }</code></pre>
+  <p>Read it with small numbers. When the aligned integer sum has 29 bits (≥ 2<sup>28</sup>), converting to FP32's 24-bit significand drops the low 5 bits. If those bits are <code>10010</code> (18), the true value is above the halfway point (16), so IEEE rounds <b>up</b>. Wormhole's normalizer drops bit 1 (the "2") instead of folding it into the sticky bit, sees <code>10000</code>, which looks like an exact tie, and rounds to even. If the kept bit is even (bit 5 of the pattern 18 = <code>010010</code> is 0), that means rounding <b>down</b>. Hence <code>--rounded</code>.</p>
+  <p>To find a real instance, I compiled ttsim's <code>sfpu_mad</code> into a scratch program twice (once per <code>TT_ARCH_VERSION</code>) and searched random integer-valued inputs for a WH/BH disagreement. Then I cross-checked the hit against the ISA's own C model:</p>
+<pre><code>a=4086.0 b=65391.0 c=11176552.0
+exact     = 278364178     (= 8698880·32 + 18: low 5 bits are 10010)
+IEEE fmaf = 278364192     (round up, correct)
+ttsim BH  = 278364192     fma_model_bh = 278364192
+ttsim WH  = 278364160     fma_model_wh = 278364160   &lt;- one ULP low</code></pre>
+  <p>The low 5 bits of the exact result are 18, exactly the pattern in the code. Wormhole lands one ULP (32 at this magnitude) low; Blackhole and IEEE agree. Two independent implementations, the ISA's model and ttsim's, give the same answer. This is what "bit-exact simulator" means in practice: if your SFPU kernel's last bit differs between WH and BH on silicon, it should differ in ttsim the same way.</p>
+  <div class="callout warn">Do not expect SFPU results to match <code>torch</code> or NumPy to the last bit, even for a single <code>a*b+c</code>. Partial fusion can also produce results that differ from IEEE on <b>both</b> architectures: my search found cases such as 21441·32913 + 8802433, where WH and BH agree with each other but not with <code>fmaf</code>. Validate SFPU kernels with tolerances or PCC (<a href="a05-tiles-and-formats.html">A05</a>), not bit equality with a CPU.</div>
+  <div class="callout sim">Lab <a href="../sim-labs/b08-formats-and-sfpu.html">B08 · Data formats and SFPU numerics</a> runs this further: you write your own SFPI kernel, push edge-case values through Dst on WH and BH, and compare the bits with the ISA's FMA model.</div>
+
+  <h2 id="whbh">Wormhole vs Blackhole</h2>
+  <p>The Blackhole ISA page sums it up in one sentence: the SFPU "gains new <code>SFPARECIP</code>, <code>SFPGT</code>, <code>SFPLE</code>, <code>SFPMUL24</code> instructions, new modes of the existing <code>SFPCAST</code>, <code>SFPPUSHC</code>, and <code>SFPSTOCHRND</code> instructions, small enhancements to the existing <code>SFPAND</code>, <code>SFPMAD</code>, <code>SFPOR</code>, and <code>SFPSHFT</code> instructions, small changes to the existing <code>SFPLOAD</code> and <code>SFPSTORE</code> instructions, and bugfixes to the existing <code>SFPPOPC</code> and <code>SFPSHFT2</code> instructions. It also clocks at 1.35 GHz rather than 1 GHz."</p>
+  <table>
+    <tr><th>Aspect</th><th>Wormhole B0</th><th>Blackhole A0</th></tr>
+    <tr><td>Lanes × width</td><td>32 × 32 bit</td><td>32 × 32 bit (unchanged)</td></tr>
+    <tr><td>Clock / SFPMAD peak</td><td>1 GHz / 0.064 TFLOP/s</td><td>1.35 GHz / 0.0864 TFLOP/s</td></tr>
+    <tr><td>Reciprocal, exp</td><td>Software only (Newton–Raphson, polynomials)</td><td><code>SFPARECIP</code>: 1-cycle approximate 1/x, conditional 1/x, or e<sup>x</sup> from a lookup table</td></tr>
+    <tr><td>Compare two vectors</td><td>Subtract, then <code>SFPSETCC</code> on the sign</td><td><code>SFPGT</code>, <code>SFPLE</code> set flags directly (some modes also mutate the flag stack)</td></tr>
+    <tr><td>Multiply-add forms</td><td><code>VA*VB+VC</code></td><td><code>VA*±VB±VC</code> (sign-flip modifiers)</td></tr>
+    <tr><td>Integer multiply</td><td>None</td><td><code>SFPMUL24</code> (low 23 bits of a product, or the bits above 23 of a 23×23-bit product)</td></tr>
+    <tr><td><code>SFPAND</code>/<code>SFPOR</code></td><td><code>VD &amp;= VC</code> (2-operand)</td><td><code>VD = VB &amp; VC</code> (3-operand)</td></tr>
+    <tr><td>MAD read-after-write</td><td>Software must insert a gap (<code>SFPNOP</code>)</td><td>Hardware stalls automatically</td></tr>
+    <tr><td>FMA numerics</td><td>Zero results always +0; non-canonical NaNs; tie-rounding bug</td><td>Signed zeros; canonical NaN 0x7fc00000; bug fixed</td></tr>
+  </table>
+  <p><code>SFPARECIP</code> is an approximation, and the ISA states its accuracy: for 2<sup>−126</sup> ≤ <i>x</i> &lt; 2<sup>126</sup>, <code>0.9944 · 1/x &lt; ApproxRecip(x) &lt; 1.0054 · 1/x</code>, from a 128-entry table that supplies 7 mantissa bits. The exp mode is only accurate for 0 ≤ <i>x</i> &lt; 2. Software refines the result. Blackhole's reciprocal starts from the hardware guess and adds Newton–Raphson steps:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_recip.h:22-33 @7aad8aac</div>
+<pre><code>template &lt;int max_iter = 2, bool normalized = false&gt;
+sfpi_inline sfpi::vFloat sfpu_reciprocal_iter(const sfpi::vFloat x) {
+    // sfpi::approx_recip(x) will return ±0 for x = ±inf or x ≥ ±2**126, and ±inf for x = ±0.
+    sfpi::vFloat y = sfpi::approx_recip(x);
+
+    // Optionally improve the approximation using Newton-Raphson.
+    if constexpr (max_iter &gt; 0) {
+        // Normally, t = 2.0 - x * y, but we negate this (and negate again using y = y * -t later).
+        ...
+        sfpi::vFloat t = x * y - sfpi::vConstFloatPrgm0;</code></pre>
+  <p>Each Newton step roughly doubles the correct bits: 7, then about 14, then about 28, more than FP32's 24.</p>
+  <div class="callout warn"><b>Two notes on the sources.</b> A comment inside this excerpt (line 32, elided above) says "SFPI doesn't support SFPLE/SFPGT at the moment". The SFPI 7.92 compiler in this orb did emit <code>sfpgt</code> for an ordinary <code>v_if (a &lt; 0.5f)</code> on Blackhole (shown above), so that comment appears to be stale. Separately, ttsim implements only the plain reciprocal mode of <code>SFPARECIP</code> on Blackhole (tensix.cpp:5343-5347 rejects other modes as <code>UnsupportedFunctionality</code>), so a kernel using the hardware exp mode will not run in the simulator.</div>
+
+  <h2 id="sim">Running it in ttsim</h2>
+  <p>All runs below were made in this orb with the workbench (<a href="../sim-labs/b00-workbench.html">B00</a>), on both architectures. As always: <b>ttsim is a functional, bit-exact model, not a timing model.</b> The bracketed number is a simulated clock driven by host polling, not a performance figure. Do not compare it across examples or architectures.</p>
+<pre><code>$ export LAB_HOME=$HOME/ttlab/a07
+$ source tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+$ $EX/metal_example_eltwise_sfpu          # exp() of 64 bf16 tiles, checked against std::exp
+UMD | Creating TopologyDiscovery for architecture: wormhole_b0
+EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0x401e
+Test Passed
+[4718] 0.2 seconds (23.2 KHz)
+
+$ $EX/metal_example_custom_sfpi_add       # the SFPI a+b kernel shown above, 64 tiles
+UMD | Creating TopologyDiscovery for architecture: wormhole_b0
+Test Passed
+[4797] 0.2 seconds (22.8 KHz)
+
+$ source tenstorrent-from-zero/sim-labs/workbench/env.sh bh
+$ $EX/metal_example_eltwise_sfpu
+UMD | Creating TopologyDiscovery for architecture: blackhole
+EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0xb140
+Test Passed
+[6714] 0.3 seconds (23.5 KHz)
+
+$ $EX/metal_example_custom_sfpi_add
+UMD | Creating TopologyDiscovery for architecture: blackhole
+Test Passed
+[6846] 0.3 seconds (22.6 KHz)</code></pre>
+  <p>Then the <code>v_if</code> overlay. I placed a copy of the compute kernel at <code>$LAB_HOME/kernels/tt_metal/programming_examples/custom_sfpi_add/kernels/compute/tiles_add.cpp</code> with the face function replaced by the predicated version, and reran with no rebuild:</p>
+<pre><code>$ $EX/metal_example_custom_sfpi_add       # WH, overlay with v_if/v_else
+Test Passed
+[4800] 0.3 seconds (15.2 KHz)
+$ $EX/metal_example_custom_sfpi_add       # BH, same overlay
+Test Passed
+[6848] 0.3 seconds (22.4 KHz)</code></pre>
+  <p>The host check (|expected − actual| ≤ 0.01 for every element, with <code>a</code> uniform in [0, 1) and <code>b</code> = −1) passed on both. That means about half the lanes in each vector took each branch and the masks combined correctly. The disassembly earlier in the chapter comes from these runs' JIT build directories under <code>~/.cache/tt-metal-cache/</code>.</p>
+  <div class="callout sim">Do it yourself in <a href="../sim-labs/b08-formats-and-sfpu.html">B08</a>. You will write a custom SFPI kernel, look at its <code>trisc1.elf</code> disassembly to count the instructions behind each line, and check the WH vs BH numerics differences from this chapter bit by bit.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>The <b>SFPU</b> is a 32-lane × 32-bit SIMD unit next to the FPU. It works only on <b>LRegs</b> (8 general registers plus constants such as 0.8373, 0, 1.0, −1.0 and lane index ×2) and reaches data only through <b>Dst</b>.</li>
+    <li><code>SFPLOAD</code>/<code>SFPSTORE</code> move a 4-row × 8-column patch (even or odd columns) between Dst and an LReg. One 16×16 face = <b>8 vectors</b>, and one tile = 32. SFPI's <code>dst_reg[i]</code> uses address 2<i>i</i>. Stores to BF16 truncate.</li>
+    <li>The instruction set is multiply-add plus bit surgery (exponent, mantissa, sign), integer ops, conversions, swaps and lookups. Transcendentals are small programs, such as the 20-instruction-per-vector bf16 exp.</li>
+    <li><b>Predication:</b> per-lane flags (<code>SFPSETCC</code>, <code>SFPENCC</code>), an 8-deep flag stack (<code>SFPPUSHC</code>/<code>SFPPOPC</code>) and <code>SFPCOMPC</code> for else. Both branches are always issued, and masked lanes still cost their cycle.</li>
+    <li><b>64×:</b> <code>MVMUL</code> = 2048 MACs = 4096 FLOP per cycle; <code>SFPMAD</code> = 32 FMAs = 64 FLOP per cycle. WH: 4.096 vs 0.064 TFLOP/s per core. BH: 0.0864 for the SFPU at 1.35 GHz. The gap shrinks to 16× against HiFi4.</li>
+    <li><code>SFPMAD</code> is partially fused, flushes denormals, and on WH has a tie-rounding bug. ttsim's <code>sfpu_mad</code> reproduces it bit for bit, and agrees with the ISA's C model.</li>
+    <li>Blackhole adds <code>SFPARECIP</code> (approximate 1/x and e<sup>x</sup>), <code>SFPGT</code>/<code>SFPLE</code>, <code>SFPMUL24</code>, 3-operand AND/OR, automatic MAD stalls, and IEEE-like zero and NaN handling.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A kernel calls <code>dst_reg[5]</code> on Wormhole with the Dst base at the start of a face. Which Dst rows and columns does the load read?</summary>
+  <p>The SFPI index 5 becomes <code>SFPLOAD</code> address 10. The top bits give <code>10 &amp; ~3 = 8</code>, so rows 8–11. Bit 1 of 10 is set, so the <b>odd</b> columns 1, 3, …, 15. Lane <i>L</i> reads row 8 + L/8, column 2·(L mod 8) + 1.</p></details>
+  <details class="quiz"><summary>2. In a <code>v_if/v_else</code> where every lane's condition is false, how many cycles does the if-branch cost compared with a version with no <code>v_if</code> at all?</summary>
+  <p>It costs its full instruction count. The SFPU has no "skip if no lane is active". The TRISC pushed the branch's instructions without seeing the flags, and all lanes being disabled only stops them from writing. A GPU warp could skip the path; the SFPU cannot. Only the programmer (or a compile-time constant) can remove it.</p></details>
+  <details class="quiz"><summary>3. Derive the 64× ratio between the FPU and SFPU peaks. Why does it become 16× for HiFi4 matmul?</summary>
+  <p><code>MVMUL</code>: 8×16×16 = 2048 MACs per instruction, 1 instruction per cycle, so 4096 FLOP per cycle. <code>SFPMAD</code>: 32 lanes × 1 FMA = 64 FLOP per cycle. 4096/64 = 64. HiFi4 needs 4 fidelity phases, each a separate <code>MVMUL</code>, so the FPU's effective rate drops to 1024 FLOP per cycle, and 1024/64 = 16.</p></details>
+  <details class="quiz"><summary>4. Why does tt-metal's bf16 exp end with <code>SFP_STOCH_RND</code> before <code>SFPSTORE</code>, rather than just storing?</summary>
+  <p>LRegs hold FP32. <code>SFPSTORE</code> to a 16-bit BF16 Dst truncates the mantissa toward zero (SFPSTORE.md:38), which biases results downward. The tt-metal comment gives 9² = 80.8 → 80.5 instead of 81. Rounding to nearest explicitly first gives the correctly rounded bf16, at the cost of one more instruction per vector.</p></details>
+  <details class="quiz"><summary>5. Wormhole's <code>SFPMAD</code> computes 4086 × 65391 + 11176552 as 278364160, while IEEE gives 278364192. Is ttsim wrong?</summary>
+  <p>No, ttsim is right. The exact value 278364178 has low bits <code>10010</code> below FP32 precision at this magnitude. Wormhole's normalizer drops bit 1 instead of making it sticky, treats the remainder as an exact tie and rounds to even (down). The ISA's own <code>fma_model_wh</code> gives the same 278364160, and Blackhole (and ttsim in BH mode) gives the IEEE answer. A bit-exact simulator must reproduce hardware quirks, not fix them.</p></details>
+  <details class="quiz"><summary>6. You need <code>1/x</code> to FP32 accuracy on Blackhole. Is <code>SFPARECIP</code> enough on its own? What would you add?</summary>
+  <p>No. It gives about 7 correct mantissa bits (error within about ±0.5%). Add Newton–Raphson steps <code>y ← y·(2 − x·y)</code>, each two multiply-adds and roughly doubling the correct bits (7 → 14 → 28). Two steps reach FP32's 24 bits, which is what <code>sfpu_reciprocal_iter&lt;2&gt;</code> does. On Wormhole the starting guess has to come from software as well.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/VectorUnit.md">Wormhole Vector Unit (SFPU)</a>: the authoritative instruction table, sub-units, lane predication and PRNG.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/LReg.md">LReg</a>: the 17 vector registers, constants, data types and the 4×8 lane layout.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SFPLOAD.md">SFPLOAD</a>: the Dst→LReg addressing model and format conversions used in this chapter's face animation.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/TensixCoprocessor/VectorUnit.md">Blackhole Vector Unit</a>: the same page for Blackhole, with the summary of what changed.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/TensixCoprocessor/SFPARECIP.md">SFPARECIP</a>: Blackhole's approximate reciprocal/exp, with its lookup tables and stated accuracy bounds.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/Miscellaneous/FMA/README.md">FMA models</a>: bit-exact C models of IEEE, BH and WH multiply-add, with a line-by-line correctness argument.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MatrixUnit.md">Matrix Unit (FPU)</a>: the throughput table that the 64× comparison is based on.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/sfpu/llk.html">SFPI programming guide (Low Level Kernels)</a>: the official reference for <code>vFloat</code>, <code>v_if</code>, <code>dst_reg</code> and the SFPI library.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix</a>: Metalium's overview of FPU, SFPU, Dst and LRegs (note the face-indexing discrepancy discussed above).</li>
+    <li><a href="https://github.com/tenstorrent/sfpi">tenstorrent/sfpi</a>: the SFPI compiler and headers that turn <code>v_if</code> into <code>SFPSETCC</code>/<code>SFPCOMPC</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/programming_examples/custom_sfpi_add/kernels/compute/tiles_add.cpp">custom_sfpi_add example</a>: the kernel run and overlaid in this chapter.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Tenstorrent at Hot Chips 2024</a>: architecture slides for Wormhole and Blackhole.</li>
+  </ul>
+
+  <div class="pager"><a href="a06-matrix-engine.html">&larr; 06 The matrix engine and math fidelity</a><a class="next" href="a08-noc.html">08 The Network-on-Chip &rarr;</a></div>
+</main>
+</body>
+</html>
