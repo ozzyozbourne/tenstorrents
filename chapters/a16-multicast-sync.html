@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A16 · Multicast and cross-core synchronization · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  .vs { border: 1px solid var(--border); border-radius: 8px; padding: .8rem 1rem; background: var(--bg2); font-size: 15px; }
+  .vs h4 { margin: 0 0 .5rem 0; color: var(--yellow); font-size: 16px; }
+  .vs ul { margin: .3rem 0 0 1.1rem; padding: 0; }
+  .vs li { margin: .25rem 0; }
+  .vs.metal h4 { color: var(--blue); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a15-matmul-one-to-many.html">&larr; Prev</a>
+  <a href="a17-dispatch-host.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 16</span><span class="tag">Prerequisites: A04, A08, A11, A15</span>
+  <h1><span class="num">16.</span> Multicast and cross-core synchronization</h1>
+  <p class="subtitle">How one core hands the same data to many cores with a single packet, how cores that share no memory agree on when that data is safe to use, and how the multicast matmul uses four roles and four semaphores to do both.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#two-sems">Two things called &ldquo;semaphore&rdquo;</a></li>
+      <li><a href="#unicast">Core to core: one tile, one counter</a></li>
+      <li><a href="#coords">Logical cores on the host, NoC coordinates in the kernel</a></li>
+      <li><a href="#mcast">Multicast: one packet, a rectangle of receivers</a></li>
+      <li><a href="#handshake">The sender/receiver handshake</a></li>
+      <li><a href="#ordering">Why the flag cannot overtake the data</a></li>
+      <li><a href="#matmul">The multicast matmul: four roles, four semaphores</a></li>
+      <li><a href="#sim">Watching it in ttsim</a></li>
+      <li><a href="#break">Breaking the handshake on purpose</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <!-- ===================================================================== -->
+  <h2 id="question">The question</h2>
+  <p>In <a href="a15-matmul-one-to-many.html">A15</a> we spread a matmul over a grid of cores. Each core computes one block of the output C = A&middot;B. To do that it needs a band of rows of A and a band of columns of B. Look at a row of cores in that grid: every core in it computes a different set of output columns, but all of them need <em>the same</em> rows of A. In the simple multi-core version, every core fetches its own copy from DRAM.</p>
+  <div class="callout key">Sixty-four cores need the same row of A. Must it be read sixty-four times?</div>
+  <p>No. One core can read it once and hand it to the others over the Network-on-Chip. That raises two new problems. The first is cost: sending 63 separate copies over the NoC is cheaper than 63 DRAM reads, but it still loads the links near the sender heavily. The second is trust. The receivers share no memory with the sender and have no common clock. How does a receiver know that the bytes in its L1 are the new block and not the old one? And how does the sender know that a receiver has finished with the previous block, so that overwriting its buffer is safe?</p>
+  <p>The figure below shows both answers on an 8&times;8 block of cores. Press Play and watch the counters on the right.</p>
+
+  <!-- ====== FIG 1: the aha ====== -->
+  <div class="viz" id="fig1"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig1");
+    var g = TT.canvas(root, 860, 485), ctx = g.ctx, C = TT.C;
+    var N = 8, cell = 38, gap = 13, X0 = 40, Y0 = 40;
+    function cx(x) { return X0 + x * (cell + gap) + cell / 2; }
+    function cy(y) { return Y0 + y * (cell + gap) + cell / 2; }
+    // destinations in send order: row-major, skipping the sender at (0,0)
+    var dests = [];
+    for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) if (x || y) dests.push([x, y]);
+    // NoC 0 unicast route from (0,0): X first (east along row 0), then Y (south down column x)
+    function uniLinks(d) {
+      var L = [];
+      for (var i = 0; i < d[0]; i++) L.push("h" + i + "," + 0);
+      for (var j = 0; j < d[1]; j++) L.push("v" + d[0] + "," + j);
+      return L;
+    }
+    // multicast tree, X major, source at the rectangle corner: down column 0, fork east on every row
+    var tree = [];
+    for (var j = 0; j < N - 1; j++) tree.push({ id: "v0," + j, d: j + 1 });
+    for (var r = 0; r < N; r++) for (var i = 0; i < N - 1; i++) tree.push({ id: "h" + i + "," + r, d: r + i + 1 });
+    var steps = [
+      { dur: 1.0, text: "<b>The setup.</b> 64 cores in an 8&times;8 block. The yellow core in the corner has one 2 KiB tile (on Wormhole, 64 data flits of 32 B plus a header flit, as in A08). The other 63 need it. Data moves on NoC&nbsp;0, which only flows right and down. We ignore the torus wrap and any non-Tensix columns." },
+      { dur: 4.0, text: "<b>Plan A: 63 unicasts.</b> The sender writes the tile to each core in turn. NoC&nbsp;0 routes X first, then Y, so every packet to columns 1&ndash;7 leaves through the same link east of the sender. Link colour shows how many copies of the tile each link has carried." },
+      { dur: 1.2, text: "<b>Plan A, totals.</b> 448 tile-sized link traversals (the sum of x + y over all destinations), and the busiest link, the one leaving the sender, carried the tile 56 times. Every copy was a separate packet that had to queue for that link." },
+      { dur: 3.0, text: "<b>Plan B, part 1: who is ready?</b> Before a multicast the sender must know that every receiver has a free buffer. Each receiver sends one <b>atomic increment</b> (a single-flit packet) to a counter word in the sender's L1. The counter climbs. The sender does nothing until it reads 63." },
+      { dur: 3.0, text: "<b>Plan B, part 2: one multicast.</b> The counter has reached N&nbsp;=&nbsp;63, so the sender issues <i>one</i> packet addressed to the whole rectangle. The routers copy flits where the tree forks: down column 0, then east along every row. Each link carries the tile exactly once: 63 traversals, the minimum for 64 nodes." },
+      { dur: 1.6, text: "<b>Plan B, part 3: the flag.</b> Right behind the data, on the same NoC and the same virtual channel, the sender multicasts a 4-byte <b>VALID</b> flag to the same rectangle. A receiver that sees VALID knows the tile in front of it has landed (the <a href='#ordering'>ordering section</a> says why). The receivers turn green." },
+      { dur: 1.0, text: "<b>Compare.</b> Tile traffic on links: 448 &rarr; 63 (7&times; less), busiest link: 56 &rarr; 1. The price is 63 single-flit atomic increments, one 2-flit flag multicast, and some waiting. Counted in flit-hops on Wormhole (acks left out): Plan A is 448 &times; 65 = 29,120. Plan B is 63 &times; 65 for the data + 448 for the increments (each travels x + y hops back to the sender on NoC&nbsp;1, which flows left and up) + 63 &times; 2 for the flag &asymp; 4,670." }
+    ];
+    function linkPos(id) {
+      var h = id[0] === "h", p = id.slice(1).split(","), a = +p[0], b = +p[1];
+      if (h) return { x1: cx(a) + cell / 2, y1: cy(b), x2: cx(a + 1) - cell / 2, y2: cy(b) };
+      return { x1: cx(a), y1: cy(b) + cell / 2, x2: cx(a), y2: cy(b + 1) - cell / 2 };
+    }
+    function allLinks() {
+      var L = [];
+      for (var y = 0; y < N; y++) for (var x = 0; x < N - 1; x++) L.push("h" + x + "," + y);
+      for (var x2 = 0; x2 < N; x2++) for (var y2 = 0; y2 < N - 1; y2++) L.push("v" + x2 + "," + y2);
+      return L;
+    }
+    var LINKS = allLinks();
+    function heat(v, max) {
+      if (!v) return C.border;
+      var f = Math.min(1, v / max);
+      return f > 0.66 ? C.red : f > 0.25 ? C.orange : f > 0.05 ? C.yellow : C.green;
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var load = {}, trav = 0, maxL = 0, sem = 0, sent = 0, recv = {}, valid = false, mode = "";
+      if (i === 0) mode = "";
+      if (i === 1 || i === 2) {
+        mode = "uni";
+        sent = i === 1 ? Math.floor(t * 63) : 63;
+        for (var k = 0; k < sent; k++) {
+          uniLinks(dests[k]).forEach(function (id) { load[id] = (load[id] || 0) + 1; trav++; });
+          recv[dests[k]] = true;
+        }
+      }
+      if (i >= 3) {
+        mode = "mc";
+        sem = i === 3 ? Math.floor(t * 63) : 63;
+        var front = i === 3 ? -1 : (i === 4 ? t * 15 : 99);
+        tree.forEach(function (e) { if (e.d <= front) { load[e.id] = 1; trav++; } });
+        if (i >= 4) dests.forEach(function (d) { if (d[0] + d[1] <= front) recv[d] = true; });
+        if (i >= 5) valid = true;
+      }
+      for (var id in load) maxL = Math.max(maxL, load[id]);
+      // links
+      LINKS.forEach(function (id) {
+        var p = linkPos(id), v = load[id] || 0;
+        ctx.strokeStyle = mode === "mc" && v ? C.green : heat(v, 56);
+        ctx.lineWidth = v ? 2 + Math.min(6, v / 8) : 1.5;
+        ctx.beginPath(); ctx.moveTo(p.x1, p.y1); ctx.lineTo(p.x2, p.y2); ctx.stroke();
+      });
+      // cores
+      for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
+        var isS = !x && !y, got = recv[[x, y]];
+        var readyIdx = (y * N + x) - 1, ready = mode === "mc" && !isS && readyIdx < sem;
+        var fill = isS ? C.yellow : (valid && got ? C.green : (got ? C.blue : (ready ? C.purple : C.bg3)));
+        TT.box(ctx, cx(x) - cell / 2, cy(y) - cell / 2, cell, cell, { fill: fill, alpha: isS ? 0.9 : (got || ready ? 0.75 : 1), stroke: isS ? C.yellow : C.border, r: 5 });
+        if (isS) TT.text(ctx, "send", cx(x), cy(y), { align: "center", font: "bold 12px", color: "#000" });
+      }
+      // in-flight packet for unicast
+      if (i === 1 && sent < 63) {
+        var d = dests[sent], f = (t * 63) % 1, L = uniLinks(d), n = L.length, seg = Math.min(n - 1, Math.floor(f * n)), q = f * n - seg;
+        var p = linkPos(L[seg]);
+        TT.box(ctx, TT.lerp(p.x1, p.x2, q) - 6, TT.lerp(p.y1, p.y2, q) - 6, 12, 12, { fill: C.fg, r: 6 });
+      }
+      // atomic increments in flight (multicast part 1): draw a few dots heading to the sender
+      if (i === 3 && sem < 63) {
+        for (var a = 0; a < 3; a++) {
+          var kk = Math.min(62, sem + a), dd = dests[kk], ff = ((t * 63) % 1 + a / 3) % 1;
+          var px = TT.lerp(cx(dd[0]), cx(0), ff), py = TT.lerp(cy(dd[1]), cy(0), ff);
+          TT.box(ctx, px - 4, py - 4, 8, 8, { fill: C.purple, r: 4 });
+        }
+      }
+      // panel
+      var PX = 500;
+      TT.text(ctx, mode === "uni" ? "Plan A: 63 unicasts" : mode === "mc" ? "Plan B: count, multicast, flag" : "One tile, 63 receivers", PX, 36, { font: "bold 16px", color: C.yellow });
+      var rows = [
+        ["receivers holding the tile", String(Object.keys(recv).length) + " / 63", C.blue],
+        ["tile copies carried by links", String(trav), C.fg],
+        ["busiest link carried", maxL ? maxL + (maxL === 1 ? " copy" : " copies") : "0", maxL > 8 ? C.red : C.green]
+      ];
+      rows.forEach(function (r, j) {
+        TT.text(ctx, r[0], PX, 80 + j * 34, { font: "14px", color: C.muted });
+        TT.text(ctx, r[1], PX + 330, 80 + j * 34, { font: "bold 16px", mono: true, align: "right", color: r[2] });
+      });
+      // semaphore gauge
+      TT.text(ctx, "sender's counter word (an L1 semaphore)", PX, 200, { font: "14px", color: C.muted });
+      TT.box(ctx, PX, 214, 330, 26, { stroke: C.border, r: 4 });
+      if (sem) TT.box(ctx, PX + 1, 215, 328 * sem / 63, 24, { fill: sem === 63 ? C.green : C.purple, alpha: 0.8, r: 4 });
+      TT.text(ctx, mode === "mc" ? sem + " / 63" : "not used", PX + 165, 227, { align: "center", font: "bold 14px", mono: true, color: C.fg });
+      TT.text(ctx, i >= 4 ? "== 63: wait passes, multicast fires" : (i === 3 ? "noc_semaphore_wait(sem, 63) spinning" : ""), PX, 256, { font: "13px", mono: true, color: i >= 4 ? C.green : C.purple });
+      // comparison bars
+      if (i === 2 || i >= 6) {
+        TT.text(ctx, "tile traversals", PX, 300, { font: "13px", color: C.muted });
+        var w = 330;
+        TT.box(ctx, PX, 312, w, 18, { fill: C.red, alpha: 0.7, r: 3, label: "unicast 448", font: "12px", color: "#000" });
+        if (i >= 6) TT.box(ctx, PX, 336, w * 63 / 448, 18, { fill: C.green, alpha: 0.8, r: 3 });
+        if (i >= 6) TT.text(ctx, "multicast 63", PX + w * 63 / 448 + 8, 345, { font: "12px", color: C.green });
+        TT.text(ctx, "busiest link", PX, 378, { font: "13px", color: C.muted });
+        TT.box(ctx, PX, 390, w, 18, { fill: C.red, alpha: 0.7, r: 3, label: "unicast 56", font: "12px", color: "#000" });
+        if (i >= 6) { TT.box(ctx, PX, 414, Math.max(6, w / 56), 18, { fill: C.green, alpha: 0.8, r: 3 }); TT.text(ctx, "multicast 1", PX + w / 56 + 10, 423, { font: "12px", color: C.green }); }
+      }
+      // legend
+      var ly = 466;
+      [[C.yellow, "sender"], [C.purple, "ready (incremented)"], [C.blue, "has tile"], [C.green, "has tile + VALID"]].forEach(function (l, j) {
+        TT.box(ctx, X0 + j * 170, ly - 7, 14, 14, { fill: l[0], r: 3 });
+        TT.text(ctx, l[1], X0 + j * 170 + 20, ly, { font: "12px", color: C.muted });
+      });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>So multicast fixes the cost: the routers copy flits at the forks of a tree, so every link carries the data once (<a href="a08-noc.html#transactions">A08</a> covered the routing). The counter that climbs to 63 and the flag that follows the data fix the trust problem. The counter and the flag are both plain 32-bit words in L1, and Metalium calls them <b>semaphores</b>. This chapter is about those words: what they are, how kernels use them, why the protocol is shaped the way it is, and what happens in the simulator when you get it wrong.</p>
+  <div class="callout gpu">On a GPU, threads in a block synchronize with <code>__syncthreads()</code>, and blocks share data through L2 and global memory, usually with a kernel boundary in between. Tensix cores share no cache and no memory, and there is no grid-wide barrier instruction. Every cross-core handoff is written by hand as explicit messages: a write of data and a write (or atomic increment) of a word that someone else polls. Multicast is closer to a hardware broadcast in a distributed-memory machine than to anything inside a GPU.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="two-sems">Two things called &ldquo;semaphore&rdquo;</h2>
+  <p>You have met a semaphore already. In <a href="a04-inside-tensix.html#sync">A04</a> the Sync unit's <code>MATH_PACK</code> semaphore stopped the packer from reading Dst before the math thread had finished writing it, and <a href="a12-compute-kernels.html">A12</a> wraps that in <code>tile_regs_commit</code> and <code>tile_regs_wait</code>. The word &ldquo;semaphore&rdquo; in this chapter means something else. Keep them apart:</p>
+  <div class="grid2">
+    <div class="vs">
+      <h4>Tensix Sync-unit semaphore (A04, A12)</h4>
+      <ul>
+        <li><b>Where:</b> a hardware register inside one Tensix tile's coprocessor. There are 8, each a 4-bit value with a 4-bit max.</li>
+        <li><b>Who can touch it:</b> only that tile's three Tensix threads (with <code>SEMPOST</code>, <code>SEMGET</code>, <code>SEMWAIT</code>) and its TRISCs (by load and store).</li>
+        <li><b>What waits:</b> an instruction in a Tensix thread stalls in hardware at its wait gate until the condition holds.</li>
+        <li><b>Purpose:</b> ordering the unpack, math and pack threads on the <em>same</em> core, for example the Dst handoff.</li>
+        <li><b>Set up by:</b> the LLK init code. A kernel author normally never names one.</li>
+      </ul>
+    </div>
+    <div class="vs metal">
+      <h4>Metalium semaphore (this chapter)</h4>
+      <ul>
+        <li><b>Where:</b> a 32-bit word in each core's L1, in the kernel-config area, one 16-byte-aligned slot per ID (<code>get_semaphore(id)</code> = base + id &times; L1_ALIGNMENT, and L1_ALIGNMENT is 16 on Wormhole and Blackhole).</li>
+        <li><b>Who can touch it:</b> the local RISC-Vs with ordinary loads and stores, and <em>any other core</em> through the NoC: an atomic increment, a 4-byte write, or a 4-byte multicast.</li>
+        <li><b>What waits:</b> software. <code>noc_semaphore_wait</code> is a spin loop on a load.</li>
+        <li><b>Purpose:</b> handshakes <em>between</em> cores: &ldquo;I am ready&rdquo;, &ldquo;your data has landed&rdquo;.</li>
+        <li><b>Set up by:</b> the host, with <code>CreateSemaphore(program, cores, initial_value)</code>. Every core in the range gets its own copy at the same L1 address.</li>
+      </ul>
+    </div>
+  </div>
+  <p>The second kind is really just a convention. Nothing in the hardware marks that L1 word as special. What makes it work is that the NoC can perform an <b>atomic increment</b> on a word in another core's L1. An atomic is a single-flit request, and the receiving NIU performs the read-modify-write on its own L1, so increments from many cores never lose a count (MemoryMap.md:79; <a href="a08-noc.html#transactions">A08</a>).</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1688-1691 @7aad8aac</div>
+<pre><code>template &lt;ProgrammableCoreType type = ProgrammableCoreType::TENSIX&gt;
+FORCE_INLINE uintptr_t get_semaphore(uint32_t semaphore_id) {
+    return (uintptr_t)sem_l1_base[static_cast&lt;int&gt;(type)] + semaphore_id * L1_ALIGNMENT;
+}</code></pre>
+  <p>On the host, <code>CreateSemaphore</code> picks the lowest ID that is free on every core in the range and records the initial value. Before the kernels start, the runtime writes that value into each core's slot at <code>KERNEL_CONFIG</code> base + semaphore offset + 16 &times; ID (<code>program.cpp:2672-2688</code>, <code>semaphore.cpp:36</code>). The kernel gets only the ID, usually as a runtime argument, and turns it into an address with <code>get_semaphore</code>.</p>
+  <div class="callout warn">The docstring for <code>CreateSemaphore</code> says &ldquo;each core can have up to eight 4B semaphores&rdquo; (<code>host_api.hpp:283</code>). The code at the same commit allows 16: <code>NUM_SEMAPHORES = 16</code> (<code>impl/buffers/semaphore.hpp:16</code>), and <code>create_semaphore</code> throws only when a core already has 16 (<code>program.cpp:2732-2736</code>). The code is what runs, so the limit is 16 at 7aad8aac. Every example in this chapter uses 4 or fewer.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="unicast">Core to core: one tile, one counter</h2>
+  <p>Start with the smallest version: two cores, one tile. The <code>NoC_tile_transfer</code> example reads a tile of 16-bit integers (all equal to 14) from DRAM into core&nbsp;0, sends it to core&nbsp;1 over the NoC, and core&nbsp;1 writes it back to DRAM. Each core runs a reader kernel and a writer kernel, and one semaphore ID is created on both cores with initial value 0:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/NoC_tile_transfer/noc_tile_transfer.cpp:30-35,57,108-109 @7aad8aac</div>
+<pre><code>constexpr CoreCoord core0 = {0, 0};
+constexpr CoreCoord core1 = {0, 1};
+const auto core0_physical_coord = mesh_device-&gt;worker_core_from_logical_core(core0);
+const auto core1_physical_coord = mesh_device-&gt;worker_core_from_logical_core(core1);
+
+CoreRange sem_core_range = CoreRange(core0, core1);
+...
+const uint32_t sem_id = CreateSemaphore(program, sem_core_range, 0);
+...
+SetRuntimeArgs(program, core0_writer_kernel_id, core0, {core1_physical_coord.x, core1_physical_coord.y, sem_id});
+SetRuntimeArgs(program, core1_reader_kernel_id, core1, {core0_physical_coord.x, core0_physical_coord.y, sem_id});</code></pre>
+  <p>Each core gets the <em>other</em> core's NoC coordinates and the same semaphore ID. Since every core has its own copy of semaphore <code>sem_id</code> at the same address, one ID names two words: &ldquo;my counter&rdquo; and &ldquo;your counter&rdquo;. Here is core&nbsp;1's side. It reserves room for the incoming tile, tells core&nbsp;0 it is ready, then waits:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/NoC_tile_transfer/kernels/dataflow/reader1.cpp:30-39 @7aad8aac</div>
+<pre><code>cb_reserve_back(src1_cb_index, one_tile);  // Reserve space for incoming tile
+
+// Indicate readiness for data transfer to core 0
+uint64_t sem_addr = get_noc_addr(core_0_x, core_0_y, semaphore);
+noc_semaphore_inc(sem_addr, 1);
+noc_async_atomic_barrier();
+
+// Wait until core 0 will finish data transfer
+noc_semaphore_wait(sem_ptr, 1);  // Wait to get tile from core 0
+noc_semaphore_set(sem_ptr, 0);   // Reset semaphore</code></pre>
+  <ul>
+    <li><code>get_noc_addr(x, y, semaphore)</code> builds a 64-bit NoC address: core&nbsp;0's coordinates plus the L1 address of the semaphore, which is the same on both cores.</li>
+    <li><code>noc_semaphore_inc</code> sends an atomic increment through the atomic command buffer (<code>write_at_cmd_buf</code>, buffer 3), non-posted by default, with a 32-bit wrap (<code>dataflow_api.h:2396-2416</code>).</li>
+    <li><code>noc_async_atomic_barrier</code> spins until the atomic's response has come back, the same counter idea as the write barrier in <a href="a08-noc.html#ordering">A08</a>.</li>
+    <li><code>noc_semaphore_wait(sem_ptr, 1)</code> polls core&nbsp;1's <em>own</em> copy until core&nbsp;0 bumps it. Then core&nbsp;1 resets it to 0 so the word can be used again.</li>
+  </ul>
+  <p>Core&nbsp;0's writer mirrors it: wait for core&nbsp;1's increment, write the tile, wait for the write to be acknowledged, then increment core&nbsp;1's semaphore.</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/NoC_tile_transfer/kernels/dataflow/writer0.cpp:31-46 @7aad8aac</div>
+<pre><code>// Wait for core 1 to be ready
+noc_semaphore_wait(sem_ptr, 1);
+...
+// Send data to core 1
+noc_async_write(data_l1_ptr, core1_noc_addr, input_data_tile_size_bytes);
+noc_async_write_barrier();
+
+// Indicate finish writing to core 1
+noc_semaphore_inc(sem_addr, 1);
+noc_async_atomic_barrier();
+noc_semaphore_set(sem_ptr, 0);  // Reset semaphore</code></pre>
+  <p>The <code>noc_async_write_barrier()</code> between the data and the increment is the important line. The write and the atomic go out through different command buffers and different VCs. The barrier waits for the write's acknowledgement, which the receiving NIU sends once the data is in L1. So when the increment arrives, the tile is already there. This is the &ldquo;request, wait for the response, then issue the next request&rdquo; approach, which the ISA calls the only way to order requests that travel on different NoCs or VCs (Ordering.md:32). It costs one round trip per handoff. Multicast will let us avoid it.</p>
+  <p>Here is the run in ttsim, with the DPRINT lines from both cores (<code>TT_METAL_DPRINT_CORES='(0,0),(0,1)'</code>; the prefix is <code>device:x-y:RISC</code>, and on these cores <code>NC</code> runs the reader and <code>BR</code> the writer):</p>
+<pre><code>$ export TT_METAL_DPRINT_CORES='(0,0),(0,1)'
+$ $EX/metal_example_noc_tile_transfer
+... DPRINT enabled on device 0, worker core 0-0 (virtual 18-18).
+... DPRINT enabled on device 0, worker core 0-1 (virtual 18-19).
+0:0-0:NC: 1. READER 0: Reading input data to L1 src0 CB
+0:0-1:NC: 5. READER 1: Preparing for data transfer
+0:0-0:NC:  &gt; Data in buffer: 14
+0:0-0:BR: 3. WRITER 0: Data available in src0 CB
+0:0-0:NC: 2. READER 0: Data in src0 CB pushed from reader0
+0:0-1:NC: 6. READER 1: Data received and stored in src1
+0:0-0:BR: 4. WRITER 0: Data sent to core 1 from core 0
+0:0-1:BR: 7. WRITER 1: Received data
+0:0-1:BR:  &gt; Received data from src1: 14
+0:0-1:BR: 8. WRITER 1: Data saved
+Result = 14 : Expected = 14
+[7424] 0.4 seconds (17.0 KHz)</code></pre>
+  <p>The step numbers are the order the author intended. The printed order shows the cores interleaving: core&nbsp;1 prints step 5 before core&nbsp;0 has printed step 2, because core&nbsp;1 can reserve space and announce itself while core&nbsp;0 is still reading DRAM. Step 6 cannot come before step 3, because core&nbsp;0's increment is what releases core&nbsp;1. The <a href="#sim">ttsim section</a> shows the same run at the level of NoC commands.</p>
+
+  <!-- ===================================================================== -->
+  <h2 id="coords">Logical cores on the host, NoC coordinates in the kernel</h2>
+  <p>Look again at that DPRINT banner: &ldquo;worker core 0-0 (virtual 18-18)&rdquo;. The host program names cores in <b>logical</b> coordinates, where (0,0) is the first usable worker, whatever its position on the die. A kernel that builds a NoC address needs the coordinates the NIU understands. <code>worker_core_from_logical_core</code> does the conversion on the host. On Wormhole it returns <b>translated</b> coordinates (<a href="a08-noc.html#coords">A08</a>): the Tensix columns become X&nbsp;18 and up, and the rows Y&nbsp;18 and up. So logical (0,0) is (18,18) and logical (0,1) is (18,19). On NoC&nbsp;0 the NIU maps those back to physical (1,1) and (1,2), as the ttsim log below shows.</p>
+  <p>Two rules follow:</p>
+  <ul>
+    <li><b>APIs that place things take logical coordinates:</b> <code>CreateKernel</code>, <code>CreateCircularBuffer</code>, <code>CreateSemaphore</code>, <code>SetRuntimeArgs</code>.</li>
+    <li><b>Anything a kernel puts in a NoC address takes NoC coordinates:</b> <code>get_noc_addr(x, y, addr)</code>, <code>get_noc_multicast_addr(x0, y0, x1, y1, addr)</code>. So the host converts and passes them as runtime arguments.</li>
+  </ul>
+  <p>Translation buys portability. Harvested rows (fused off for yield) move out of the numbering, so the same program works on every chip. It also means the same numbers address the same core on NoC&nbsp;0 and NoC&nbsp;1, which matters below because senders and receivers in the matmul use different NoCs.</p>
+  <div class="callout warn">Passing a logical coordinate straight into <code>get_noc_addr</code> is a classic bug. On Wormhole, (0,1) is not a translated Tensix coordinate (those start at 18). The ISA passes coordinates 0&ndash;15 through untranslated, so (0,1) on NoC&nbsp;0 is the physical position x&nbsp;0, y&nbsp;1, which is a DRAM tile, not the core you meant (<a href="a08-noc.html#coords">A08</a>). The A08 loopback log shows real traffic to D(0,1). The write would land in DRAM, and the receiver would wait forever for a flag that went somewhere else.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="mcast">Multicast: one packet, a rectangle of receivers</h2>
+  <p>Now give the sender three receivers instead of one. The <code>contributed/multicast</code> example puts a sender (it calls it the coordinator) on logical core (0,0) and receivers on (1,0)&ndash;(3,0). The host converts the receiver range's two corners to NoC coordinates and counts the receivers:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/contributed/multicast/multicast.cpp:176-194 @7aad8aac</div>
+<pre><code>CoreRange all_cores_logical = CoreRange({0, 0}, {3, 0});
+CoreCoord sender_core_logical = {0, 0};
+CoreRange receiver_cores_logical = CoreRange({1, 0}, {3, 0});
+// Convert logical coordinates to physical coordinates (necessary for multicasting).
+CoreCoord sender_core_physical = mesh_device-&gt;worker_core_from_logical_core(sender_core_logical);
+CoreRange receiver_cores_physical = CoreRange(
+    mesh_device-&gt;worker_core_from_logical_core(receiver_cores_logical.start_coord),
+    mesh_device-&gt;worker_core_from_logical_core(receiver_cores_logical.end_coord));
+...
+size_t num_dests = receiver_cores_logical.size();
+
+uint32_t sender = CreateSemaphore(program, all_cores_logical, 0);
+uint32_t receiver = CreateSemaphore(program, all_cores_logical, 0);</code></pre>
+  <p>Three parameters define a multicast write, and each one has a trap.</p>
+  <h3>The rectangle</h3>
+  <p><code>get_noc_multicast_addr(x_start, y_start, x_end, y_end, addr)</code> packs a rectangle of NoC coordinates and one L1 address into the 64-bit destination. The data lands at the <em>same</em> L1 address on every receiver. That is why the example allocates the same circular buffers on all cores and why the sender multicasts from its own CB's write pointer: the address is valid everywhere only because every core's L1 is laid out identically. Destinations must be Tensix cores; any other tile inside the rectangle opts out of receiving (MemoryMap.md:114). The rectangle can't be an arbitrary shape (Blackhole adds an exclude register, which ttsim doesn't implement: <code>tile.cpp:1701-1705</code>).</p>
+  <p>The corner order depends on the NoC. A NoC&nbsp;1 packet travels left and up, so the ISA says that for broadcasts &ldquo;StartX &harr; EndX need to be swapped by software&rdquo; (Coordinates.md:25). ttsim enforces it: on NoC&nbsp;1 it requires start &ge; end, on NoC&nbsp;0 start &le; end (<code>tile.cpp:1489-1497</code>). The matmul kernels below do this swap by passing the corners in a different order depending on which NoC the kernel runs on.</p>
+  <h3>num_dests</h3>
+  <p>The hardware doesn't need to be told how many cores are in the rectangle. Firmware does, because a non-posted multicast produces one acknowledgement <em>per receiver</em>, and the write barrier waits until the ack counter reaches the expected total. <code>ncrisc_noc_fast_write</code> adds <code>num_dests</code> to that expected total for every packet it issues (<code>wormhole/noc_nonblocking_api.h:513-518</code>). If you pass the wrong number, the barrier waits for acks that will never come (too high), or exits before all receivers have their data (too low).</p>
+  <h3>Including or excluding the sender</h3>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:917-924 @7aad8aac</div>
+<pre><code> * With this API (non-loopback multicast), the multicast sender can be part
+ * of the multicast destination range, but data will NOT be written to self.
+ * The num_dests argument should NOT count self. For example, when mcasting to
+ * an 8x8 grid that includes self, num_dests should be 63.
+ * The destination range must not be just self (i.e. at least one other core
+ * must be in the range). If the multicast sender also needs to receive the
+ * data (i.e. must perform a local L1 write), the other API variant
+ * *noc_async_write_multicast_loopback_src* can be used.</code></pre>
+  <p>The difference is one bit in <code>NOC_CTRL</code>. <code>NOC_CMD_BRCST_SRC_INCLUDE</code> (bit 17) decides whether an initiating NIU inside its own rectangle receives its own packet (MemoryMap.md:68). The plain <code>ncrisc_noc_fast_write</code> leaves it clear (<code>noc_nonblocking_api.h:496-499</code>). The loopback variant, <code>ncrisc_noc_fast_write_loopback_src</code>, sets it (<code>noc_nonblocking_api.h:538-541</code>), and then <code>num_dests</code> must count the sender too, 64 for the 8&times;8 grid. There are matching <code>noc_semaphore_set_multicast</code> and <code>noc_semaphore_set_multicast_loopback_src</code> calls for 4-byte flags. ttsim models the bit exactly: when it walks the rectangle it skips the source tile unless bit 17 is set (<code>tile.cpp:1507-1508</code>).</p>
+  <div class="callout key">A multicast is described by three things that must agree: a rectangle of NoC coordinates (corners ordered for the NoC in use), one L1 address valid on all receivers, and <code>num_dests</code>, which is bookkeeping for the barrier. <code>num_dests</code> counts the source only if you use the <code>_loopback_src</code> variant.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="handshake">The sender/receiver handshake</h2>
+  <p>With one sender and many receivers, the protocol uses two semaphores, and the step-through below follows it. The <b>sender semaphore</b> lives on the sender and counts &ldquo;I'm ready&rdquo; messages. The <b>receiver semaphore</b> lives on each receiver and holds a flag: <code>INVALID</code> (0) or <code>VALID</code> (1), defined in <code>hostdevcommon/common_values.hpp:13-14</code>.</p>
+  <ol>
+    <li>A receiver frees space in its buffer (<code>cb_reserve_back</code>), sets its own receiver semaphore to <b>INVALID</b>, and atomically increments the sender's semaphore.</li>
+    <li>The sender reads the data from DRAM, then waits until its semaphore equals <b>N</b>, the number of receivers. It resets the semaphore to 0 for next time.</li>
+    <li>The sender multicasts the data, then multicasts the 4-byte value <b>VALID</b> into every receiver's receiver semaphore.</li>
+    <li>Each receiver waits until its receiver semaphore reads VALID, then hands the buffer to compute (<code>cb_push_back</code>).</li>
+  </ol>
+  <p>The figure has two receivers. Use the selector to see what each rule protects against.</p>
+
+  <!-- ====== FIG 2: sequence diagram ====== -->
+  <div class="viz" id="fig2"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig2");
+    var g = TT.canvas(root, 860, 490), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>scenario <select id="f2m"><option value="ok">correct protocol</option><option value="noinv">receiver R2 skips setting INVALID</option><option value="nm1">sender waits for N&minus;1</option></select></label>';
+    root.appendChild(bar);
+    var LX = { S: 170, R1: 470, R2: 720 }, TOP = 112, ROW = 37;
+    // event: {who, to, kind: note|inc|data|flag|wait, label, st:{S,R1,R2 values after}, col}
+    // st: S = sender_sem, R1/R2 = receiver_sem; cb: buffer contents
+    var scen = {
+      ok: [
+        { who: "S", kind: "note", label: "CreateSemaphore(..., INVALID): every word = 0", st: { S: 0, R1: 0, R2: 0 }, text: "<b>Start.</b> The host created both semaphores on all three cores with initial value INVALID = 0. The sender also writes VALID into <i>its own</i> copy of the receiver semaphore: that word is the source it will multicast later." },
+        { who: "R1", kind: "note", label: "cb_reserve_back; set receiver_sem = INVALID", st: { S: 0, R1: 0, R2: 0 }, text: "<b>R1 gets ready.</b> It frees a slot in its in0 buffer and marks its flag INVALID: &ldquo;whatever is in my buffer is not the next block yet&rdquo;." },
+        { who: "R1", to: "S", kind: "inc", label: "noc_semaphore_inc(sender_sem, 1)", st: { S: 1, R1: 0, R2: 0 }, text: "<b>R1 reports.</b> One atomic increment, a single flit, travels to the sender. The sender's counter goes 0 &rarr; 1." },
+        { who: "R2", kind: "note", label: "cb_reserve_back; set receiver_sem = INVALID", st: { S: 1, R1: 0, R2: 0 }, text: "<b>R2 gets ready</b> the same way. Receivers don't wait for each other. They report whenever they're ready, in any order." },
+        { who: "R2", to: "S", kind: "inc", label: "noc_semaphore_inc(sender_sem, 1)", st: { S: 2, R1: 0, R2: 0 }, text: "<b>R2 reports.</b> Counter 1 &rarr; 2 = N. Atomics from different cores never lose an update: the receiving NIU does each read-modify-write itself." },
+        { who: "S", kind: "wait", label: "noc_semaphore_wait(sender_sem, 2) ✓ ; set sender_sem = 0", st: { S: 0, R1: 0, R2: 0 }, text: "<b>The sender's wait passes.</b> It had already read its block from DRAM (and waited for the read barrier). It resets its counter to 0 so it can count the next block." },
+        { who: "S", to: "R*", kind: "data", label: "noc_async_write_multicast(block, num_dests = 2)", st: { S: 0, R1: 0, R2: 0 }, cb: "new", text: "<b>One multicast write.</b> The block goes out as packets of up to 8 KiB on VC&nbsp;4 (the multicast VC), through command buffer 0. Both receivers' buffers fill. Their flags still read INVALID, so they don't touch the data yet." },
+        { who: "S", to: "R*", kind: "flag", label: "noc_semaphore_set_multicast(VALID)  [BH: writes_flushed first]", st: { S: 0, R1: 1, R2: 1 }, cb: "new", text: "<b>The flag follows the data.</b> A 4-byte multicast of VALID, through command buffer 2, also on VC&nbsp;4, same NoC, same rectangle. It can't overtake the data (see <a href='#ordering'>ordering</a>). On Blackhole the kernel first calls <code>noc_async_writes_flushed()</code>." },
+        { who: "R*", kind: "wait", label: "noc_semaphore_wait(receiver_sem, VALID) ✓ ; cb_push_back", st: { S: 0, R1: 1, R2: 1 }, cb: "new", text: "<b>Receivers proceed.</b> Each sees VALID and pushes the block to its compute kernel. Each receiver had to wait for exactly one message, and no barrier round trip was needed." },
+        { who: "R1", kind: "note", label: "next block: cb_reserve_back; set INVALID; inc", st: { S: 1, R1: 0, R2: 1 }, cb: "new", text: "<b>The cycle repeats.</b> For the next block each receiver sets its flag back to INVALID <i>before</i> it increments the sender. The order matters: the sender can't send the next VALID until it has seen this increment, so the old VALID is gone before a new one can arrive." }
+      ],
+      noinv: [
+        { who: "S", kind: "note", label: "block k done: everyone saw VALID", st: { S: 0, R1: 1, R2: 1 }, cb: "new", text: "<b>Block k has finished</b> normally. Both receivers' flags read VALID, both buffers hold block k." },
+        { who: "R1", kind: "note", label: "cb_reserve_back; set receiver_sem = INVALID", st: { S: 0, R1: 0, R2: 1 }, cb: "new", text: "<b>R1 does it right</b> and resets its flag to INVALID." },
+        { who: "R1", to: "S", kind: "inc", label: "noc_semaphore_inc(sender_sem, 1)", st: { S: 1, R1: 0, R2: 1 }, cb: "new", text: "R1 reports ready: counter 1." },
+        { who: "R2", kind: "note", label: "cb_reserve_back; (skips set INVALID!)", st: { S: 1, R1: 0, R2: 1 }, cb: "new", col: "red", text: "<b>R2 skips the reset.</b> Its flag still says VALID, left over from block k." },
+        { who: "R2", to: "S", kind: "inc", label: "noc_semaphore_inc(sender_sem, 1)", st: { S: 2, R1: 0, R2: 1 }, cb: "new", text: "R2 reports ready: counter 2." },
+        { who: "R2", kind: "wait", label: "noc_semaphore_wait(receiver_sem, VALID) passes at once!", st: { S: 2, R1: 0, R2: 1 }, cb: "stale2", col: "red", text: "<b>R2's wait passes immediately</b>, on the stale VALID. It pushes a buffer slot that does not hold block k+1 yet. Compute will multiply whatever is in it: wrong data, unless the sender happens to win the race." },
+        { who: "R2", to: "S", kind: "inc", label: "races to block k+2: inc again", st: { S: 3, R1: 0, R2: 1 }, cb: "stale2", col: "red", text: "<b>R2 runs ahead</b> to the next block and increments again before the sender has polled. The counter is now 3." },
+        { who: "S", kind: "wait", label: "noc_semaphore_wait(sender_sem, 2): sees 3, spins forever", st: { S: 3, R1: 0, R2: 1 }, cb: "stale2", col: "red", text: "<b>The sender hangs.</b> <code>noc_semaphore_wait</code> tests for <i>equality</i>. The counter jumped past 2 and will never come back down. In ttsim this exact pattern hung the matmul with the in0 sender's counter at 14 instead of 7 (<a href='#break'>below</a>)." }
+      ],
+      nm1: [
+        { who: "S", kind: "note", label: "sender will wait for N-1 = 1 (bug)", st: { S: 0, R1: 0, R2: 0 }, text: "<b>The bug:</b> the sender waits for N&minus;1 increments. There are two ways it can go wrong, and which one happens depends on timing." },
+        { who: "R1", to: "S", kind: "inc", label: "set INVALID; noc_semaphore_inc", st: { S: 1, R1: 0, R2: 0 }, text: "R1 gets ready and reports. Counter = 1 = N&minus;1." },
+        { who: "S", kind: "wait", label: "wait(sender_sem, 1) ✓ ; set 0", st: { S: 0, R1: 0, R2: 0 }, col: "red", text: "<b>The sender proceeds too early.</b> R2 has not reported. It may still be using its buffer for the previous block." },
+        { who: "S", to: "R*", kind: "data", label: "multicast block", st: { S: 0, R1: 0, R2: 0 }, cb: "new", col: "red", text: "The data overwrites R2's buffer. If R2's compute was still reading the previous block from that slot, that block is now corrupted." },
+        { who: "S", to: "R*", kind: "flag", label: "multicast VALID", st: { S: 0, R1: 1, R2: 1 }, cb: "new", text: "VALID lands on both receivers." },
+        { who: "R2", kind: "note", label: "now runs: set receiver_sem = INVALID", st: { S: 0, R1: 1, R2: 0 }, cb: "new", col: "red", text: "<b>R2 finally gets ready</b> and does the right thing: it sets INVALID. But that erases the VALID that already arrived." },
+        { who: "R2", to: "S", kind: "inc", label: "inc (late)", st: { S: 1, R1: 1, R2: 0 }, cb: "new", text: "Its late increment leaves the sender's counter at 1, a stale credit that will confuse the next block." },
+        { who: "R2", kind: "wait", label: "wait(receiver_sem, VALID): spins forever", st: { S: 1, R1: 1, R2: 0 }, cb: "new", col: "red", text: "<b>R2 hangs</b>, waiting for a VALID that has already come and gone. The other way to fail: if both increments arrive before the sender's first poll, the counter is 2 and the sender, waiting for exactly 1, hangs instead. ttsim showed that version, and also runs where the bug passed unnoticed (<a href='#break'>below</a>)." }
+      ]
+    };
+    var mode = "ok", steps = [];
+    function build() {
+      steps.length = 0;
+      scen[mode].forEach(function (e) { steps.push({ dur: e.kind === "data" ? 1.4 : 1.0, text: e.text }); });
+    }
+    build();
+    function lane(name, x) {
+      TT.box(ctx, x - 95, 14, 190, 62, { fill: C.bg2, stroke: name === "S" ? C.yellow : C.blue, r: 8 });
+      TT.text(ctx, name === "S" ? "Sender S" : "Receiver " + name, x, 30, { align: "center", font: "bold 14px", color: name === "S" ? C.yellow : C.blue });
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(x, 78); ctx.lineTo(x, g.H - 10); ctx.stroke(); ctx.setLineDash([]);
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var ev = scen[mode];
+      lane("S", LX.S); lane("R1", LX.R1); lane("R2", LX.R2);
+      var st = ev[i].st, cb = ev[i].cb || "old";
+      // state boxes
+      function stateBox(x, label, val, hot) {
+        TT.text(ctx, label, x - 80, 54, { font: "12px", mono: true, color: C.muted });
+        TT.text(ctx, String(val), x + 80, 54, { font: "bold 14px", mono: true, align: "right", color: hot ? C.red : C.green });
+      }
+      stateBox(LX.S, "sender_sem", st.S, mode !== "ok" && i === ev.length - 1 && (st.S !== 0 && mode === "noinv"));
+      ["R1", "R2"].forEach(function (r) {
+        var v = st[r];
+        TT.text(ctx, "receiver_sem", LX[r] - 80, 54, { font: "12px", mono: true, color: C.muted });
+        TT.text(ctx, v ? "VALID" : "INVALID", LX[r] + 80, 54, { font: "bold 13px", mono: true, align: "right", color: v ? C.green : C.orange });
+        var stale = (cb === "stale2" && r === "R2");
+        var bt = stale ? "buffer: STALE" : (cb === "new" ? "buffer: new block" : "buffer: free");
+        TT.text(ctx, bt, LX[r] - 80, 68, { font: "11px", color: stale ? C.red : (cb === "new" ? C.blue : C.muted) });
+      });
+      TT.text(ctx, "N = 2", LX.S - 80, 68, { font: "11px", color: C.muted });
+      for (var k = 0; k <= i; k++) {
+        var e = ev[k], y = TOP + k * ROW + 10, p = k === i ? t : 1;
+        var col = e.col === "red" ? C.red : (e.kind === "data" ? C.blue : e.kind === "flag" ? C.green : e.kind === "inc" ? C.purple : C.fg);
+        var alpha = k === i ? 1 : 0.75;
+        ctx.globalAlpha = alpha;
+        if (e.kind === "inc") {
+          var x1 = LX[e.who], x2 = LX[e.to];
+          TT.arrow(ctx, x1, y, TT.lerp(x1, x2 + 8, p), y + 6 * p, { color: col, lw: 2 });
+          TT.text(ctx, e.label, (x1 + x2) / 2, y - 9, { align: "center", font: "12px", mono: true, color: col });
+        } else if (e.kind === "data" || e.kind === "flag") {
+          var x0 = LX.S;
+          ["R1", "R2"].forEach(function (r) { TT.arrow(ctx, x0, y, TT.lerp(x0, LX[r] - 6, p), y + 8 * p, { color: col, lw: e.kind === "data" ? 5 : 2 }); });
+          TT.text(ctx, e.label, x0 + 10, y - 10, { font: "12px", mono: true, color: col });
+        } else {
+          var xs = e.who === "R*" ? [LX.R1, LX.R2] : [LX[e.who]];
+          xs.forEach(function (xx) { TT.box(ctx, xx - 7, y - 7, 14, 14, { fill: col, r: 7, alpha: 0.9 }); });
+          var isS = e.who === "S", tx = isS ? LX.S + 14 : (e.who === "R*" ? LX.R1 : LX[e.who]) - 14;
+          TT.text(ctx, e.label, tx, y, { font: "12px", mono: true, color: col, align: isS ? "left" : "right" });
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    bar.querySelector("#f2m").addEventListener("change", function (e) { mode = e.target.value; build(); root.querySelectorAll(".controls button")[3].click(); });
+  })();
+  </script>
+
+  <p>Every rule in the protocol earns its place:</p>
+  <ul>
+    <li><b>Receivers set INVALID before they increment.</b> The receiver semaphore is a one-shot flag. If a stale VALID is left over from the previous block, the next wait passes before the new data has arrived. Setting INVALID before the increment is safe because the sender can't send the next VALID until that increment has arrived.</li>
+    <li><b>The sender waits for exactly N, then resets to 0.</b> Waiting for all N means every receiver has a free buffer, so the multicast overwrites nothing that is still in use. Note that <code>noc_semaphore_wait</code> spins while <code>*sem_addr != val</code> (<code>dataflow_api.h:2118-2120</code>). It tests for equality, not &ldquo;at least&rdquo;. If the counter ever passes N, the sender hangs. (<code>noc_semaphore_wait_min</code> is the &ldquo;at least&rdquo; version.)</li>
+    <li><b>The sender writes VALID into its own copy first.</b> <code>noc_semaphore_set_multicast(src, dst, n)</code> sends 4 bytes <em>from an L1 address</em>, so the value has to live somewhere in the sender's L1. The matmul kernels store VALID in the sender's own receiver-semaphore slot once at start-up (<code>reader_bmm_tile_layout_in0_sender_in1_sender.cpp:77-84</code>).</li>
+    <li><b>Receivers wait on their own L1.</b> Polling local L1 costs no NoC traffic. All the NoC traffic is one increment per receiver and one flag per receiver per block.</li>
+  </ul>
+  <p>Here is the real sender, the coordinator kernel. Each line maps onto a row of the diagram:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp:44-66 @7aad8aac</div>
+<pre><code>////////// WAIT FOR WORKER CORES' READINESS //////////
+noc_semaphore_wait(sender_addr_ptr, num_dests);
+
+////////// RESET SEMAPHORE //////////
+noc_semaphore_set(sender_addr_ptr, 0); // set to 0 rather than INVALID because sender_addr_ptr can take on a value &gt; 1
+...
+////////// MULTICAST TILE TO RECEIVERS //////////
+uint64_t identity_tile_global_multicast_addr =
+        get_noc_multicast_addr(start_x, start_y, end_x, end_y, tile_l1_addr);
+noc_async_write_multicast(tile_l1_addr, identity_tile_global_multicast_addr, single_tile_size, num_dests);
+
+////////// MULTICAST 'VALID' STATE TO RECEIVERS //////////
+*(receiver_addr_ptr) = VALID;
+uint64_t validity_global_multicast_addr =
+        get_noc_multicast_addr(start_x, start_y, end_x, end_y, receiver_addr);
+noc_semaphore_set_multicast(receiver_addr, validity_global_multicast_addr, num_dests);
+
+noc_async_write_barrier();</code></pre>
+  <p>And the receiver (the inbound kernel):</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/inbound_kernel.cpp:42-50 @7aad8aac</div>
+<pre><code>cb_reserve_back(cb_id_in0, 1);
+noc_semaphore_set(receiver_addr_ptr, INVALID);
+uint64_t remote_sender_semaphore_noc_addr = get_noc_addr(start_x, start_y, sender_addr);
+
+////////// NOTIFY COORDINATOR CORE OF READINESS //////////
+noc_semaphore_inc(remote_sender_semaphore_noc_addr, 1);
+
+////////// WAIT UNTIL COORDINATOR CORE MULTICASTS TILE TO RECEIVER CORES //////////
+noc_semaphore_wait(receiver_addr_ptr, VALID);</code></pre>
+  <p>Its run in ttsim (trimmed DPRINT; the tile slice prints every 8th row and column of the 32&times;32 identity tile):</p>
+<pre><code>$ export TT_METAL_DPRINT_CORES='(0,0)-(3,0)'
+$ $EX/contributed/multicast
+Launching program
+Hello, Core (0, 0) on Device 0, please multicast the tile to your neighbors.
+0:0-0:BR: Tile slice:
+0:0-0:BR: 1 0 0 0
+0:0-0:BR: 0 1 0 0
+0:0-0:BR: 0 0 1 0
+0:0-0:BR: 0 0 0 1
+0:0-0:BR: CORE (0,0): Tile ready for multicast. I am starting all inbound kernels in cores in given range.
+0:3-0:BR: Tile slice:
+0:3-0:BR: 1 0 0 0
+...
+0:3-0:BR: CORE (3,0): Inbound kernel has received and acknowledged its tile.
+0:1-0:BR: CORE (1,0): Inbound kernel has received and acknowledged its tile.
+0:2-0:BR: CORE (2,0): Inbound kernel has received and acknowledged its tile.
+0:1-0:NC: Core (1,0): Outbound kernel has written tile to DRAM index 0.
+0:2-0:NC: Core (2,0): Outbound kernel has written tile to DRAM index 1.
+0:3-0:NC: Core (3,0): Outbound kernel has written tile to DRAM index 2.
+Thank you, Core (0, 0) on Device 0, for the multicast.
+=========== MULTICASTED TILE VERIFICATION ===========
+[✅ PASS] Receiver tile 1 matches the golden tile.
+[✅ PASS] Receiver tile 2 matches the golden tile.
+[✅ PASS] Receiver tile 3 matches the golden tile.
+[✅ PASS] All 3 receiver tiles match the golden tile.
+[16338] 0.8 seconds (20.8 KHz)</code></pre>
+  <div class="callout warn">The tech report for this example says VALID and INVALID are &ldquo;0xFFFFFFFF&rdquo; and &ldquo;0x0&rdquo; (<code>tech_reports/prog_examples/multicast/multicast.md:108</code>). The code at 7aad8aac defines <code>INVALID = 0</code> and <code>VALID = 1</code> (<code>tt_metal/hostdevcommon/api/hostdevcommon/common_values.hpp:13-14</code>), and ttsim's log below shows the flag multicast carrying the value 1. Trust the header.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="ordering">Why the flag cannot overtake the data</h2>
+  <p>In the two-core example the writer put a full <code>noc_async_write_barrier()</code> between the data and the &ldquo;done&rdquo; increment. The multicast sender doesn't. It issues the data multicast and the flag multicast back to back. A08 showed that the NoC reorders packets freely, so why is that safe?</p>
+  <p>Because of the one ordering guarantee the NoC gives. Two packets that share a route and get the same virtual channel number at every hop can't overtake or interleave each other (Ordering.md:13). A broadcast tree is fixed by its source, its rectangle and its <code>NOC_CMD_BRCST_XY</code> bit (Ordering.md:11). tt-metal's ordering page puts the rule for writes in three lines:</p>
+  <div class="filename">tt-metal/docs/source/tt-metalium/tt_metal/apis/kernel_apis/data_movement/ordering.rst:24-28 @7aad8aac</div>
+<pre><code>* If writes are on different NoCs, there is no ordering guarantees.
+
+* If writes are on the same NoC but different VCs, there's also no ordering guarantees. You might as well use different CMD_BUFs to avoid serialization.
+
+* If writes are on the same NoC and same VC, they will be ordered based on program order, regardless whether you use the same CMD_BUF or different ones.</code></pre>
+  <p>The data and the flag satisfy every condition:</p>
+  <ul>
+    <li><b>Same NoC:</b> both calls use the kernel's default <code>noc_index</code>.</li>
+    <li><b>Same VC, set statically:</b> both use <code>NOC_MULTICAST_WRITE_VC</code> = 4 (<code>dataflow_api_common.h:63</code>), and every write sets <code>NOC_CMD_VC_STATIC</code> (<code>noc_nonblocking_api.h:496</code>). With a static VC, routers may only flip the dateline bit, and they flip it at the same places for packets on the same route (Ordering.md:14).</li>
+    <li><b>Same tree:</b> same source, same rectangle, same X-major default.</li>
+    <li><b>Same program order out of the NIU:</b> on Wormhole &ldquo;the order in which software writes to <code>NOC_CMD_CTRL</code> determines the order in which those requests leave the NIU&rdquo; when they have the same VC number (Ordering.md:16), even though the data goes through command buffer 0 and the flag through command buffer 2 (<code>write_reg_cmd_buf</code>, <code>dataflow_api.h:1771-1806</code>).</li>
+  </ul>
+  <p>At the receiving NIU, both requests arrive on the same VC, one after the other. The flag is a 4-byte write to a different address, though. Is there a guarantee that the data's writes into L1 have <em>committed</em> before the flag's write does? The ISA lists receiver-side guarantees for same-VC packets: write then read, overlapping writes, MMIO writes (Ordering.md:20-26). Two non-overlapping L1 writes are not on that list. tt-metal relies on the same-VC property, and the matmul kernel states the assumption in a comment, quoted below. Flag this as an assumption the software makes, not a sentence you can point to in the ISA.</p>
+  <p>The matmul's in0 sender spells this out, including the one place where it needs more:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_sender.cpp:139-161 @7aad8aac</div>
+<pre><code>// num_dests must not include source, since we are NOT really doing a local copy!
+noc_async_write_multicast(
+    in0_start_address, in0_multicast_data_addr, in0_block_size_bytes, in0_mcast_num_dests);
+
+// Note: no need for write barrier, since these two multicasts are done on the same noc id and same vc even
+// though cmd bufs are different Also, this only works because we are setting VCs statically (using
+// NOC_CMD_STATIC_VC).
+#ifdef ARCH_BLACKHOLE
+// On Blackhole the flush is needed because the commands go into separate cmd buffer FIFOs and may not be
+// sent in order they are issued
+noc_async_writes_flushed();
+#endif
+
+// We should also multicast the flag to destinations
+...
+noc_semaphore_set_multicast(
+    in0_mcast_receiver_semaphore_addr, in0_mcast_receiver_semaphore_noc_addr, in0_mcast_num_dests);</code></pre>
+  <p>On Blackhole, according to that comment, the program-order guarantee across command buffers no longer holds: each command buffer has its own FIFO, so a later request in buffer 2 can leave the NIU before an earlier one in buffer 0. <code>noc_async_writes_flushed()</code> spins until the NIU's <code>NIU_MST_NONPOSTED_WR_REQ_SENT</code> counter matches the number of non-posted writes issued (<code>blackhole/noc_nonblocking_api.h:728-730</code>; <code>dataflow_api.h:1978-1990</code>). That means every data packet has <em>left</em> the NIU. It doesn't wait for acks, so it's much cheaper than a barrier. Once the data is ahead of the flag on the wire, the same-VC rule keeps it ahead. The ISA's Blackhole ordering page just says the behaviour is &ldquo;similar, but not identical&rdquo; to Wormhole (BlackholeA0/NoC/Ordering.md:3), so the kernel comment is the most specific source on this difference.</p>
+  <div class="callout warn">The <code>contributed/multicast</code> coordinator kernel sends data then flag with no <code>noc_async_writes_flushed()</code> on any architecture (<code>coordinator_kernel.cpp:56-64</code>). By the matmul kernel's own comment, that is a race on Blackhole silicon. ttsim can't show it, because it completes every transfer inside the store that starts it (A08). It passed on ttsim's Blackhole model too, and that pass proves nothing about this race.</div>
+  <div class="callout key">Data then flag, with no barrier, is correct only if both packets use the same NoC, the same statically assigned VC and the same route, and (on Blackhole) the data has been flushed out of the NIU before the flag is issued. Break any of these and you need <code>noc_async_write_barrier()</code> between them, which costs a full round trip.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="matmul">The multicast matmul: four roles, four semaphores</h2>
+  <p>Now scale the idea up to <code>matmul_multicore_reuse_mcast</code>. As in A15, every core owns a <code>per_core_M</code> &times; <code>per_core_N</code> block of output tiles and loops over K in steps of <code>in0_block_w</code> = 2 tiles. In each step it needs an in0 block (its rows of A, <code>per_core_M</code> &times; 2 tiles) and an in1 block (its columns of B, 2 &times; <code>per_core_N</code> tiles).</p>
+  <p>The reuse pattern is the whole point:</p>
+  <ul>
+    <li>All cores in one <b>row</b> of the grid compute the same output rows, so they need the <b>same in0 block</b>.</li>
+    <li>All cores in one <b>column</b> compute the same output columns, so they need the <b>same in1 block</b>.</li>
+  </ul>
+  <p>So only the left column reads in0 from DRAM and multicasts it east along its row, and only the top row reads in1 from DRAM and multicasts it down its column. That gives every core one of four roles, each with its own reader kernel:</p>
+  <table class="t">
+    <tr><th>Cores (logical)</th><th>Reader kernel</th><th>in0 (rows of A)</th><th>in1 (columns of B)</th><th>Reader NoC</th></tr>
+    <tr><td>(0,0)</td><td><code>..._in0_sender_in1_sender.cpp</code></td><td>reads from DRAM, multicasts along row 0</td><td>reads from DRAM, multicasts down column 0</td><td>NoC&nbsp;0</td></tr>
+    <tr><td>(0, 1..R&minus;1): left column</td><td><code>..._in0_sender_in1_receiver.cpp</code></td><td>reads, multicasts along its row</td><td>receives from (0,0)</td><td>NoC&nbsp;0</td></tr>
+    <tr><td>(1..C&minus;1, 0): top row</td><td><code>..._in0_receiver_in1_sender.cpp</code></td><td>receives from (0,0)</td><td>reads, multicasts down its column</td><td>NoC&nbsp;1</td></tr>
+    <tr><td>everything else</td><td><code>..._in0_receiver_in1_receiver.cpp</code></td><td>receives from its row's left core</td><td>receives from its column's top core</td><td>NoC&nbsp;1</td></tr>
+  </table>
+  <p>(<code>matmul_multicore_reuse_mcast.cpp:191-204, 267-304</code>.) The writer kernel, which streams finished output subblocks to DRAM, is the same on every core: on NoC&nbsp;1 in the left column and NoC&nbsp;0 elsewhere (<code>matmul_multicore_reuse_mcast.cpp:306-322</code>). That's always the other NoC from the core's reader. The host creates four semaphores on all cores, each starting at INVALID = 0:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_multicore_reuse_mcast/matmul_multicore_reuse_mcast.cpp:331-334 @7aad8aac</div>
+<pre><code>auto in0_mcast_sender_semaphore_id = tt_metal::CreateSemaphore(program, all_cores, INVALID);
+auto in0_mcast_receiver_semaphore_id = tt_metal::CreateSemaphore(program, all_cores, INVALID);
+auto in1_mcast_sender_semaphore_id = tt_metal::CreateSemaphore(program, all_cores, INVALID);
+auto in1_mcast_receiver_semaphore_id = tt_metal::CreateSemaphore(program, all_cores, INVALID);</code></pre>
+  <p>They are two copies of the handshake above, one per operand. On a left-column core, the in0 <em>sender</em> semaphore is the counter its row's receivers increment. On an interior core the same ID is unused. Its in0 <em>receiver</em> semaphore is the flag its row's sender multicasts VALID into. The host computes each core's rectangles in NoC coordinates:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_multicore_reuse_mcast/matmul_multicore_reuse_mcast.cpp:380-398 @7aad8aac (condensed)</div>
+<pre><code>(std::uint32_t)right_core_physical.x,          // in0_mcast_dest_noc_start_x
+(std::uint32_t)right_core_physical.y,          // in0_mcast_dest_noc_start_y
+(std::uint32_t)left_core_plus_one_physical.x,  // in0_mcast_dest_noc_end_x
+(std::uint32_t)left_core_plus_one_physical.y,  // in0_mcast_dest_noc_end_y
+(std::uint32_t)(num_cores_c - 1),              // in0_mcast_num_dests
+(std::uint32_t)left_core_physical.x,           // in0_mcast_sender_noc_x
+(std::uint32_t)left_core_physical.y,           // in0_mcast_sender_noc_y
+...
+(std::uint32_t)bottom_core_physical.x,        // in0_mcast_dest_noc_start_x  (the in1 rectangle;
+(std::uint32_t)top_core_plus_one_physical.x,  // in0_mcast_dest_noc_end_x     the comments say in0)
+(std::uint32_t)(num_cores_r - 1),             // in0_mcast_num_dests</code></pre>
+  <p>Three details are worth reading closely. The in0 rectangle starts one core to the right of the sender, so the sender isn't in it, and <code>num_dests</code> = C&nbsp;&minus;&nbsp;1. The host passes the in0 corners as (right, left+1), and the NoC&nbsp;0 sender kernel swaps them back when it builds the address: <code>get_noc_multicast_addr(end_x, end_y, start_x, start_y, ...)</code> (<code>in0_sender_in1_sender.cpp:133-138</code>). The top-row in1 senders run on NoC&nbsp;1 and pass (bottom, top+1) unswapped (<code>in0_receiver_in1_sender.cpp:137-142</code>), which is the corner order NoC&nbsp;1 needs. And the copy-pasted comments label the in1 arguments &ldquo;in0&rdquo;. The kernel reads them as in1 (args 26-34).</p>
+  <p>The interior receiver is the simplest of the four. It owns no data, and per block it just runs the receiver half of the handshake twice:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_receiver_in1_receiver.cpp:74-89 @7aad8aac</div>
+<pre><code>for (uint32_t block = 0; block &lt; num_blocks; block++) {
+    // Operand 0
+    cb_reserve_back(cb_id_in0, in0_block_num_tiles);
+
+    // Set in0 semaphore value to INVALID
+    noc_semaphore_set(in0_mcast_receiver_semaphore_addr_ptr, INVALID);
+
+    // Atomic increment source core counter
+    uint64_t in0_mcast_sender_semaphore_noc_addr =
+        get_noc_addr(in0_mcast_sender_noc_x, in0_mcast_sender_noc_y, in0_mcast_sender_semaphore_addr);
+    noc_semaphore_inc(in0_mcast_sender_semaphore_noc_addr, 1);
+
+    // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
+    noc_semaphore_wait(in0_mcast_receiver_semaphore_addr_ptr, VALID);
+
+    cb_push_back(cb_id_in0, in0_block_num_tiles);
+    // ... the same four steps again for operand 1 (in1) ...</code></pre>
+  <p>Notice that the receiver never touches the data. The bytes arrive in its circular buffer by multicast, at the address the sender computed from <em>its own</em> CB write pointer. This works only because every core's CBs are created identically and every core advances through them in lockstep, one block per handshake. The in0 and in1 CBs hold two blocks each (<code>in0_CB_tiles = in0_block_tiles * 2</code>, line 124), so the next block can arrive while compute works on the current one.</p>
+
+  <!-- ====== FIG 3: the mcast matmul grid ====== -->
+  <div class="viz" id="fig3"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig3");
+    var g = TT.canvas(root, 860, 470), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "controls";
+    bar.innerHTML = '<label>grid <select id="f3g"><option value="real">the run below: 8 &times; 2 cores (M=2048, N=1024, K=512)</option><option value="big">illustrative: 8 &times; 8 cores, same per-core blocks</option></select></label>';
+    root.appendChild(bar);
+    var cfg = { real: { c: 8, r: 2 }, big: { c: 8, r: 8 } }, cur = cfg.real;
+    var PM = 32, PN = 4, W = 2, NB = 8;  // per_core_M, per_core_N, in0_block_w, num_blocks (from the ttsim run)
+    var steps = [
+      { dur: 1.0, text: "<b>Four roles.</b> Purple (0,0) sends both operands. Orange (left column) sends in0 and receives in1. Teal (top row) receives in0 and sends in1. Blue (the rest) receives both. Each core will compute a 32 &times; 4-tile block of C." },
+      { dur: 1.5, text: "<b>Block 1, DRAM reads.</b> Only the senders read DRAM. Each left-column core reads its in0 block: 32 rows &times; 2 tiles = 64 tiles (128 KiB). Each top-row core reads its in1 block: 2 &times; 4 = 8 tiles (16 KiB)." },
+      { dur: 1.5, text: "<b>Block 1, &ldquo;ready&rdquo;.</b> Every receiver sets its two flags INVALID and sends one atomic increment to its row's in0 sender and one to its column's in1 sender. The in0 counters climb to C&minus;1, the in1 counters to R&minus;1." },
+      { dur: 2.0, text: "<b>Block 1, multicast.</b> in0 goes east along every row, in1 goes south down every column, each followed by its VALID flag. The 128 KiB in0 block travels as 16 packets of 8 KiB, and the in1 block as 2." },
+      { dur: 1.2, text: "<b>Block 1, compute.</b> Each core multiplies its (32 &times; 2) in0 block by its (2 &times; 4) in1 block and adds the result into its 32 &times; 4 partial sums. Meanwhile the second half of each double-buffered CB can already take block 2." },
+      { dur: 2.0, text: "<b>Blocks 2&ndash;8.</b> The same handshake runs 8 times in total, once per 2-tile step of K (K = 512 = 16 tiles). The DRAM counter shows the result. Each core then writes its output tiles with the shared writer kernel." }
+    ];
+    function counts() {
+      var perIn0 = PM * W, perIn1 = PN * W;
+      return { mc: cur.r * perIn0 + cur.c * perIn1, uni: cur.r * cur.c * (perIn0 + perIn1) };
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var Cn = cur.c, Rn = cur.r, cell = Rn > 2 ? 38 : 44, gp = Rn > 2 ? 8 : 10;
+      var gx = 90, gy = Rn > 2 ? 52 : 130;
+      function cx(x) { return gx + x * (cell + gp) + cell / 2; }
+      function cy(y) { return gy + y * (cell + gp) + cell / 2; }
+      // DRAM labels
+      TT.text(ctx, "A (in0)", 14, cy(0) - cell / 2 - 6, { font: "12px", color: C.orange });
+      TT.text(ctx, "B (in1) from DRAM", gx, gy - 40, { font: "12px", color: C.teal });
+      var blk = i < 1 ? 0 : (i < 5 ? 1 : (i === 5 ? 1 + Math.floor(t * 7.999) : 1));
+      if (i === 5 && t >= 1) blk = 8;
+      // reads
+      if (i === 1 || i === 5) {
+        for (var y = 0; y < Rn; y++) TT.arrow(ctx, 20, cy(y), TT.lerp(20, cx(0) - cell / 2 - 2, i === 1 ? t : 1), cy(y), { color: C.orange, lw: 3 });
+        for (var x = 0; x < Cn; x++) TT.arrow(ctx, cx(x), gy - 30, cx(x), TT.lerp(gy - 30, gy - 2, i === 1 ? t : 1), { color: C.teal, lw: 3 });
+      }
+      // multicast arrows
+      if (i === 3 || i === 5) {
+        var p = i === 3 ? t : 1;
+        for (var y2 = 0; y2 < Rn; y2++) TT.arrow(ctx, cx(0) + cell / 2, cy(y2) - 8, TT.lerp(cx(0) + cell / 2, cx(Cn - 1) + cell / 2, p), cy(y2) - 8, { color: C.orange, lw: 3 });
+        for (var x2 = 0; x2 < Cn; x2++) TT.arrow(ctx, cx(x2) + 8, cy(0) + cell / 2, cx(x2) + 8, TT.lerp(cy(0) + cell / 2, cy(Rn - 1) + cell / 2, p), { color: C.teal, lw: 3 });
+      }
+      for (var yy = 0; yy < Rn; yy++) for (var xx = 0; xx < Cn; xx++) {
+        var role = (!xx && !yy) ? C.purple : (!xx ? C.orange : (!yy ? C.teal : C.blue));
+        var lit = i === 4 || i === 5;
+        TT.box(ctx, cx(xx) - cell / 2, cy(yy) - cell / 2, cell, cell, { fill: role, alpha: lit ? 0.85 : 0.55, stroke: role, r: 5 });
+        if (i === 2 && (xx === 0 || yy === 0)) {
+          var lab = [];
+          if (xx === 0) lab.push(Math.round((Cn - 1) * t));
+          if (yy === 0) lab.push(Math.round((Rn - 1) * t));
+          TT.text(ctx, lab.join("|"), cx(xx), cy(yy), { align: "center", font: "bold 12px", mono: true, color: "#000" });
+        }
+        if (lit && Rn <= 2) TT.text(ctx, "+=", cx(xx), cy(yy), { align: "center", font: "bold 13px", color: "#000" });
+      }
+      if (i === 2) TT.text(ctx, "numbers on senders: in0 counter | in1 counter (wait for " + (Cn - 1) + " | " + (Rn - 1) + ")", gx, cy(Rn - 1) + cell / 2 + 22, { font: "12px", color: C.muted });
+      // panel
+      var PX = 575, k = counts();
+      TT.text(ctx, "Grid " + Cn + " × " + Rn + " = " + (Cn * Rn) + " cores", PX, 40, { font: "bold 15px", color: C.yellow });
+      TT.text(ctx, "K block " + (blk ? blk : "–") + " of " + NB, PX, 66, { font: "14px", mono: true });
+      var done = i === 0 ? 0 : (i < 5 ? 1 : blk);
+      var rows = [
+        ["DRAM tile reads, multicast", done * k.mc, C.green],
+        ["same, if every core read its own", done * k.uni, C.red],
+        ["in0 multicasts (17 per send)", done * Rn * 17, C.orange],
+        ["in1 multicasts (3 per send)", done * Cn * 3, C.teal],
+        ["atomic increments", done * (Rn * (Cn - 1) + Cn * (Rn - 1)), C.purple]
+      ];
+      rows.forEach(function (r, j) {
+        TT.text(ctx, r[0], PX, 100 + j * 30, { font: "13px", color: C.muted });
+        TT.text(ctx, String(r[1]), PX + 268, 100 + j * 30, { font: "bold 15px", mono: true, align: "right", color: r[2] });
+      });
+      if (done === NB) TT.text(ctx, "reads saved: " + (k.uni / k.mc).toFixed(1) + "×", PX, 260, { font: "bold 15px", color: C.green });
+      if (cur === cfg.real && done === NB) TT.text(ctx, "ttsim: 1536 READ, 464 MCAST, 176 ATOMIC", PX, 286, { font: "12px", mono: true, color: C.fg });
+      // legend
+      var ly = g.H - 22;
+      [[C.purple, "in0+in1 sender"], [C.orange, "in0 sender / in1 recv"], [C.teal, "in0 recv / in1 sender"], [C.blue, "receiver of both"]].forEach(function (l, j) {
+        TT.box(ctx, 20 + j * 200, ly - 7, 14, 14, { fill: l[0], r: 3 });
+        TT.text(ctx, l[1], 40 + j * 200, ly, { font: "12px", color: C.muted });
+      });
+    }
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    bar.querySelector("#f3g").addEventListener("change", function (e) { cur = cfg[e.target.value]; st.render(); });
+  })();
+  </script>
+
+  <p>The arithmetic, for the configuration the prebuilt example uses (its CMake file defines <code>TT_METAL_CI_MODE</code>, which selects M&nbsp;=&nbsp;2048, N&nbsp;=&nbsp;1024, K&nbsp;=&nbsp;512: <code>CMakeLists.txt:17</code>, <code>matmul_multicore_reuse_mcast.cpp:470-473</code>). In tiles that is Mt&nbsp;=&nbsp;64, Nt&nbsp;=&nbsp;32, Kt&nbsp;=&nbsp;16. The host picks <code>per_core_M</code>&nbsp;=&nbsp;32 and <code>per_core_N</code>&nbsp;=&nbsp;4 (printed in the run below), so the grid is Nt/4&nbsp;=&nbsp;8 columns by Mt/32&nbsp;=&nbsp;2 rows, and there are Kt/2&nbsp;=&nbsp;8 K-blocks.</p>
+  <ul>
+    <li><b>Per block, with multicast:</b> 2 in0 senders &times; 64 tiles + 8 in1 senders &times; 8 tiles = 192 DRAM tile reads. Over 8 blocks: <b>1,536</b>.</li>
+    <li><b>Without multicast</b> (every core reads its own in0 and in1 blocks): 16 &times; (64 + 8) &times; 8 = <b>9,216</b>. That is 6&times; more.</li>
+    <li><b>Multicasts:</b> each in0 send is 128 KiB = 16 packets of 8 KiB plus 1 flag = 17, so 2 &times; 17 &times; 8 = 272. Each in1 send is 16 KiB = 2 packets plus 1 flag = 3, so 8 &times; 3 &times; 8 = 192. Total <b>464</b>.</li>
+    <li><b>Atomic increments:</b> in0: 2 rows &times; 7 receivers; in1: 8 columns &times; 1 receiver. That's 22 per block, <b>176</b> in all.</li>
+  </ul>
+  <p>The next section checks every one of those numbers against the simulator. Two things the grid shape makes visible: on a 2-row grid, each in1 &ldquo;multicast&rdquo; reaches a single core, so it could just as well be a unicast; and in0 dominates the traffic because each in0 block is 8&times; bigger than an in1 block. On the 8&times;8 illustrative grid the savings rise to 8&times;.</p>
+  <div class="callout gpu">The GPU analogue of this pattern is a thread block loading a tile of A and a tile of B into shared memory once and reusing them across the block's threads. Here the &ldquo;shared memory&rdquo; is distributed: each core holds a copy, and the copies are made by the NoC, in hardware, at the forks of a broadcast tree.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="sim">Watching it in ttsim</h2>
+  <p>To see the handshake as it happens, I copied the A08 instrumented simulator (<code>~/ttlab/a08/ttsim-noclog</code>, which prints one line per NoC command from <code>noc_cmd_ctrl</code>) into this chapter's lab directory and added four more prints in <code>src/tile.cpp</code>. Both sets of changes are in <code>sim-labs/patches/a16-noclog.patch</code>.</p>
+  <ul>
+    <li>For each multicast, the VC fields of <code>NOC_CTRL</code>: <code>NOC_CMD_VC_STATIC</code> (bit 7), the static VC (bits 13-15), <code>BRCST_SRC_INCLUDE</code> (bit 17) and <code>PATH_RESERVE</code> (bit 8).</li>
+    <li>How many tiles a multicast was actually delivered to, counted in ttsim's rectangle walk (<code>tile.cpp:1498-1516</code>).</li>
+    <li>For 4-byte multicasts, the value carried.</li>
+    <li>For atomics, the semaphore's value before and after the increment (inserted after the read-modify-write at <code>tile.cpp:1540-1544</code>).</li>
+  </ul>
+  <div class="filename">$LAB_HOME/ttsim-noclog/src/tile.cpp (A16 additions to the A08 copy, inside noc_cmd_ctrl; ttsim b3620244)</div>
+<pre><code>// in the multicast branch, after the rectangle walk (a16_delivered++ next to each tile_wr_bytes)
+if (noc_at_len_be == 4) ttsim_printf("      A16 mcast flag value=%u delivered to %u tiles\n",
+                                     mem_rd&lt;uint32_t&gt;(&amp;p_tile-&gt;sram[src_addr]), a16_delivered);
+else ttsim_printf("      A16 mcast data delivered to %u tiles\n", a16_delivered);
+...
+// in the atomic branch, right after tile_wr_bytes(src_coordinate, src_addr, &amp;data, 4)
+ttsim_printf("      A16 atomic inc at (%u,%u):0x%llx  %u -&gt; %u\n", src_coordinate &amp; 63, src_coordinate &gt;&gt; 6,
+             (unsigned long long)src_addr, old_data, data);</code></pre>
+<pre><code>export LAB_HOME=$HOME/ttlab/a16
+source sim-labs/workbench/env.sh wh
+sim-labs/workbench/build_ttsim.sh noclog wh               # first run copies ttsim to $LAB_HOME/ttsim-noclog
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; ~/workspace/tenstorrent-from-zero/sim-labs/patches/a16-noclog.patch)
+sim-labs/workbench/build_ttsim.sh noclog wh               # rebuild with the A08 + A16 prints (~4 s)
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
+  <p>Coordinates in the log are NoC&nbsp;0 positions, with what the kernel wrote in <code>[asked …]</code>. For atomics, ttsim calls the remote end &ldquo;src&rdquo;, so the semaphore being incremented is the &ldquo;src&rdquo; address. The bracketed number is the ttsim clock, which isn't silicon time.</p>
+  <h3>NoC_tile_transfer: seven commands</h3>
+  <p>(This log was taken with the DPRINT setting from above still exported. Without DPRINT the same seven commands appear about 500 clocks earlier, starting at <code>[4421]</code>.)</p>
+<pre><code>[4952] NOC0 T0 buf1 READ      ack   src D(0,11)[asked 0,11]:0x2d4c40 -&gt; dst T(1,1)[asked 1,1]:0x19e60 len=2048
+[4992] NOC0 T8 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8a70 -&gt; dst T(1,2)[asked 1,2]:0x4 len=4220
+[4992]       A16 atomic inc at (1,1):0x8a70  0 -&gt; 1
+[5240] NOC1 T0 buf0 WRITE     ack   src T(1,1)[asked 8,10]:0x19e60 -&gt; dst T(1,2)[asked 18,19]:0x1a660 len=2048
+[5263] NOC1 T0 buf3 ATOMIC    ack   src T(1,2)[asked 18,19]:0x8a70 -&gt; dst T(1,1)[asked 8,10]:0x4 len=4220
+[5263]       A16 atomic inc at (1,2):0x8a70  0 -&gt; 1
+[5643] NOC1 T8 buf0 WRITE     ack   src T(1,2)[asked 8,9]:0x1a660 -&gt; dst D(0,11)[asked 9,0]:0x2d5440 len=2048
+Result = 14 : Expected = 14</code></pre>
+  <ul>
+    <li>Logical (0,0) is NoC&nbsp;0 position (1,1), and logical (0,1) is (1,2). The kernels asked for the translated (18,18) and (18,19), exactly what <code>worker_core_from_logical_core</code> returned.</li>
+    <li>The semaphore is the same address, <code>0x8a70</code>, on both cores. Core&nbsp;1's reader increments core&nbsp;0's copy (line 2). Core&nbsp;0's writer, on NoC&nbsp;1, writes the tile (line 4) and only then increments core&nbsp;1's copy (line 5), with the write barrier between them.</li>
+    <li>Atomics go through command buffer 3 and writes through buffer 0, the assignments in <code>ordering.rst:11-13</code>.</li>
+  </ul>
+  <h3>contributed/multicast: the handshake, line by line</h3>
+<pre><code>[4487] NOC0 T0 buf1 READ      ack   src D(0,11)[asked 0,11]:0x3ffff800 -&gt; dst T(1,1)[asked 1,1]:0x19e60 len=2048
+[4531] NOC0 T3 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8a90 -&gt; dst T(4,1)[asked 4,1]:0x4 len=4220
+[4531]       A16 atomic inc at (1,1):0x8a90  0 -&gt; 1
+[4532] NOC0 T2 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8a90 -&gt; dst T(3,1)[asked 3,1]:0x4 len=4220
+[4532]       A16 atomic inc at (1,1):0x8a90  1 -&gt; 2
+[4546] NOC0 T1 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8a90 -&gt; dst T(2,1)[asked 2,1]:0x4 len=4220
+[4546]       A16 atomic inc at (1,1):0x8a90  2 -&gt; 3
+[4573] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x19e60 -&gt; dst T(4,1)[asked 21,18]:0x19e60 len=2048
+[4573]       mcast rectangle start (2,1) end (4,1) [asked start 19,18] static_vc=1 vc=4 src_include=0 path_reserve=1
+[4573]       A16 mcast data delivered to 3 tiles
+[4593] NOC0 T0 buf2 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x8aa0 -&gt; dst T(4,1)[asked 21,18]:0x8aa0 len=4
+[4593]       mcast rectangle start (2,1) end (4,1) [asked start 19,18] static_vc=1 vc=4 src_include=0 path_reserve=1
+[4593]       A16 mcast flag value=1 delivered to 3 tiles
+[7238] NOC1 T3 buf0 WRITE     ack   src T(4,1)[asked 5,10]:0x1a660 -&gt; dst D(0,5)[asked 9,6]:0x3ffff000 len=2048
+...
+[✅ PASS] All 3 receiver tiles match the golden tile.</code></pre>
+  <p>This is the sequence diagram, recorded. The receivers report in the order (4,1), (3,1), (2,1), not in coordinate order, and the sender's counter at <code>0x8a90</code> climbs 0&nbsp;&rarr;&nbsp;3. Only then does the 2 KiB multicast go out on command buffer 0, followed by the 4-byte flag carrying the value 1 (VALID) to <code>0x8aa0</code>, the next semaphore slot, 16 bytes up. Both carry <code>static_vc=1 vc=4</code>: same NoC, same static VC 4, different command buffers. That is precisely the condition from the ordering section. <code>src_include=0</code> and &ldquo;delivered to 3&rdquo; confirm that the sender isn't a receiver, and <code>path_reserve=1</code> is the multicast deadlock protection from A08.</p>
+  <h3>matmul_multicore_reuse_mcast: one block of the real thing</h3>
+<pre><code>$ $EX/metal_example_matmul_multicore_reuse_mcast
+ -- Metalium Core Sizing --
+ -- per_core_M= 32 -- per_core_N= 4 -- out_subblock_h= 4 -- out_subblock_w= 2 --
+Output vector of size 2097152
+Metalium vs Golden -- PCC = 0.99988306
+Test Passed
+[23424] 20.8 seconds (1.1 KHz)</code></pre>
+  <p>The same run with the logging simulator, filtered to the in0 handshake of row 1 (NoC&nbsp;0 y&nbsp;=&nbsp;1) in block 1:</p>
+<pre><code>[4633] NOC1 T3 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8b30 -&gt; dst T(4,1)[asked 5,10]:0x4 len=4220
+[4633]       A16 atomic inc at (1,1):0x8b30  0 -&gt; 1
+[4634]       A16 atomic inc at (1,1):0x8b30  1 -&gt; 2
+[4636]       A16 atomic inc at (1,1):0x8b30  2 -&gt; 3
+[4637]       A16 atomic inc at (1,1):0x8b30  3 -&gt; 4
+[4646]       A16 atomic inc at (1,1):0x8b30  4 -&gt; 5
+[4648]       A16 atomic inc at (1,1):0x8b30  5 -&gt; 6
+[4649]       A16 atomic inc at (1,1):0x8b30  6 -&gt; 7
+[7768] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x19e60 -&gt; dst T(9,1)[asked 25,18]:0x19e60 len=8192
+[7768]       mcast rectangle start (2,1) end (9,1) [asked start 19,18] static_vc=1 vc=4 src_include=0 path_reserve=1
+[7768]       A16 mcast data delivered to 7 tiles
+[7790] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x1be60 -&gt; dst T(9,1)[asked 25,18]:0x1be60 len=8192
+   ... 14 more 8 KiB packets, 0x1de60 ... 0x37e60 ...
+[8132] NOC0 T0 buf2 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x8b40 -&gt; dst T(9,1)[asked 25,18]:0x8b40 len=4
+[8132]       A16 mcast flag value=1 delivered to 7 tiles</code></pre>
+  <ul>
+    <li><b>The increments arrive on NoC&nbsp;1</b>, because the receivers' reader kernels run on <code>RISCV_1_default</code>. The <b>multicast leaves on NoC&nbsp;0</b>, the sender's NoC. The semaphore protocol doesn't care which NoC each message uses. Only the data and its flag must share one.</li>
+    <li><b>The counter reaches 7 = <code>num_cores_c - 1</code> before the first packet.</b> The gap from 4649 to 7768 is the sender reading 64 tiles from DRAM.</li>
+    <li><b>The rectangle (2,1)&ndash;(9,1) spans 8 grid positions but delivers to 7 tiles.</b> Column x&nbsp;=&nbsp;5 on Wormhole holds DRAM and other non-Tensix tiles, which are opted out of broadcasts, so <code>num_dests</code> = 7 is right even though the rectangle is 8 wide.</li>
+    <li><b>16 packets &times; 8 KiB = 128 KiB = 64 tiles</b>, at consecutive L1 addresses (step <code>0x2000</code>), then a single flag on buffer 2 to the in0 receiver semaphore at <code>0x8b40</code>.</li>
+  </ul>
+  <p>And the whole-run totals, counted with <code>grep -c</code> on the log:</p>
+<pre><code>MCAST_WR   464      (rectangles (2,1)-(9,1) and (2,2)-(9,2): 136 each; 8 single-core columns: 24 each)
+ATOMIC     176
+READ      1536      (all from DRAM tiles)
+mcast data delivered to 7 tiles: 256 lines;  mcast data delivered to 1 tiles: 128 lines</code></pre>
+  <p>All four predictions from the previous section match: 464 multicasts, 176 atomics, 1,536 DRAM tile reads, and 7 receivers per in0 multicast. The example also passes on the Blackhole model (<code>source env.sh bh</code>: same per-core sizing, <code>PCC = 0.99988306</code>, <code>Test Passed</code>), where the kernels compile the extra <code>noc_async_writes_flushed()</code>.</p>
+  <div class="callout sim">The lab <a href="../sim-labs/b05-noc-and-dram.html">B05: NoC transactions, DRAM and the alignment trap</a> builds this NoC-logging simulator step by step, logs loopback and multicast transfers, and shows why a missing barrier passes in ttsim. The experiments in the next section are good extensions to it.</div>
+
+  <!-- ===================================================================== -->
+  <h2 id="break">Breaking the handshake on purpose</h2>
+  <p>Each break below is a small kernel overlay in <code>$LAB_HOME/kernels/</code> (no rebuild needed), laid out under the path the host asks for, as in <a href="a11-dataflow-and-cbs.html">A11</a>. The full files are in <code>sim-labs/overlays/a16/</code>, one directory per experiment:</p>
+  <ul>
+    <li><a href="../sim-labs/overlays/a16/skip-invalid/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_receiver_in1_receiver.cpp"><code>skip-invalid/</code></a>: the interior receiver without its in0 <code>noc_semaphore_set(..., INVALID)</code></li>
+    <li><a href="../sim-labs/overlays/a16/slow-sender/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_receiver.cpp"><code>slow-sender/</code></a>: the control, a 20,000-iteration busy loop before the left-column in0 sender's wait</li>
+    <li><a href="../sim-labs/overlays/a16/skip-invalid-slow/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_receiver_in1_receiver.cpp"><code>skip-invalid-slow/</code></a>: both of the above together</li>
+    <li><a href="../sim-labs/overlays/a16/sender-n-minus-1/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp"><code>sender-n-minus-1/</code></a>: the coordinator waits for <code>num_dests - 1</code></li>
+    <li><a href="../sim-labs/overlays/a16/matmul-n-minus-1/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_sender.cpp"><code>matmul-n-minus-1/</code></a>: both in0 sender kernels wait for <code>in0_mcast_num_dests - 1</code></li>
+    <li><a href="../sim-labs/overlays/a16/flag-first/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp"><code>flag-first/</code></a>: the coordinator multicasts VALID before the tile</li>
+    <li><a href="../sim-labs/overlays/a16/num-dests-plus-1/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp"><code>num-dests-plus-1/</code></a>: the data multicast passes <code>num_dests + 1</code></li>
+  </ul>
+<pre><code>OV=/path/to/tenstorrent-from-zero/sim-labs/overlays/a16
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so   # the logging build from above
+rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/skip-invalid/. $LAB_HOME/kernels/   # or any directory above
+timeout 300 stdbuf -oL $EX/metal_example_matmul_multicore_reuse_mcast &gt; mm.log 2&gt;&amp;1; echo exit $?
+grep 'atomic inc at (1,2):0x8b30' mm.log | tail          # the row-2 in0 sender's counter
+
+rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/sender-n-minus-1/. $LAB_HOME/kernels/   # or flag-first/, num-dests-plus-1/
+timeout 90 stdbuf -oL $EX/contributed/multicast &gt; mc.log 2&gt;&amp;1; echo exit $?   # exit 124 = hang
+grep -E 'A16|MCAST_WR|PASS' mc.log</code></pre>
+  <p>Delete the overlay directory afterwards (<code>rm -rf $LAB_HOME/kernels/tt_metal</code>), or every later run will pick it up. Each run uses <code>timeout</code>, because a broken handshake usually means the host's <code>Finish</code> waits forever, and <code>stdbuf -oL</code>, so the log is not lost in a buffer when <code>timeout</code> kills the process. Here is what actually happened. Some of it is not what you would guess. ttsim is deterministic for a given binary and settings, so each outcome below came out the same when rerun in this orb. But every one of them depends on timing, so treat it as what one interleaving did, not as a property of the bug.</p>
+  <h3>1. The receiver skips setting INVALID</h3>
+  <p>Comment out <code>noc_semaphore_set(in0_mcast_receiver_semaphore_addr_ptr, INVALID)</code> in the interior receiver (<code>in0_receiver_in1_receiver.cpp:79</code>) and run the matmul:</p>
+<pre><code>Metalium vs Golden -- PCC = 0.99988306
+Test Passed
+[23422] 21.4 seconds (1.1 KHz)</code></pre>
+  <p><b>It passes, with the identical PCC.</b> The clock count changed by 2, so the modified kernel did run. In ttsim's fixed interleaving, the in0 sender always multicasts block k+1 before the receiver's compute gets to the stale slot. The stale VALID opens the gate early, but nothing reads the buffer before the right data lands. That's a race that happens to be won every time.</p>
+  <p>To make the race visible I perturbed the timing. I added a busy loop of 20,000 iterations before the in0 sender's wait (<code>in0_sender_in1_receiver.cpp:115</code>), pretending its DRAM read was slow. First I ran a control, with the correct receiver and only the delay:</p>
+<pre><code>Metalium vs Golden -- PCC = 0.99988306
+Test Passed
+[702376] 29.9 seconds (23.5 KHz)</code></pre>
+  <p>Then the delay together with the missing INVALID: it <b>hung</b>, killed by <code>timeout</code> after 300 s. The logging simulator shows why, at row 2's in0 sender, whose counter should stop at 7:</p>
+<pre><code>[108316]       A16 atomic inc at (1,2):0x8b30  0 -&gt; 1
+   ...
+[108319]       A16 atomic inc at (1,2):0x8b30  6 -&gt; 7
+[108908]       A16 atomic inc at (1,2):0x8b30  7 -&gt; 8
+[108909]       A16 atomic inc at (1,2):0x8b30  8 -&gt; 9
+[108909]       A16 atomic inc at (1,2):0x8b30  9 -&gt; 10
+[108911]       A16 atomic inc at (1,2):0x8b30  10 -&gt; 11
+[108911]       A16 atomic inc at (1,2):0x8b30  11 -&gt; 12
+[108911]       A16 atomic inc at (1,2):0x8b30  12 -&gt; 13
+[108912]       A16 atomic inc at (1,2):0x8b30  13 -&gt; 14</code></pre>
+  <p>(The <code>0 -&gt; 1</code> at the top is a later block, after the sender's reset. A run without <code>stdbuf -oL</code> loses the last lines in the output buffer when <code>timeout</code> kills it, and can seem to stop at 12.) The receivers passed their waits on the stale VALID, pushed buffers the sender hadn't filled, and raced on to the next block, incrementing again: all seven of them, so the counter reached 14. The sender, still in its delay, came back to find 14. <code>noc_semaphore_wait</code> tests for equality with 7, so it spins forever. The sequence diagram's &ldquo;receiver skips INVALID&rdquo; scenario is this run, scaled down.</p>
+  <h3>2. The sender waits for N&minus;1</h3>
+  <p>In the <code>contributed/multicast</code> coordinator, <code>noc_semaphore_wait(sender_addr_ptr, num_dests - 1)</code>. The outcome depended on which debug tools were switched on, because those change the interleaving:</p>
+  <table class="t">
+    <tr><th>Run</th><th>What the log shows</th><th>Result</th></tr>
+    <tr><td>DPRINT on (<code>TT_METAL_DPRINT_CORES='(0,0)-(3,0)'</code>)</td><td>counter 0&rarr;1&rarr;2&rarr;3 before the coordinator's first poll (it was busy printing the tile slice). No multicast is ever issued.</td><td><b>hang</b> (timeout): the counter passed 2</td></tr>
+    <tr><td>no DPRINT</td><td>0&rarr;1&rarr;2, then <code>0 -&gt; 1</code>: the coordinator saw 2 and reset to 0 before the third increment arrived. That receiver had already set INVALID, so it still got the data.</td><td><b>passes</b>, leaving a stale count of 1</td></tr>
+    <tr><td>Watcher on (<code>TT_METAL_WATCHER=1</code>)</td><td>0&rarr;1&rarr;2&rarr;3, with the coordinator's poll landing between the 2nd and 3rd</td><td><b>passes</b> (17 s instead of 3 s)</td></tr>
+  </table>
+  <p>The same bug in the matmul (both in0 sender kernels waiting for 6 instead of 7) <b>hung</b> every time. Both in0 senders' counters reached 7 within about 30 clocks (row 2 from 4562 to 4594, row 1 from 4633 to 4649), long before the senders finished their 64-tile DRAM reads, so a wait for exactly 6 could never succeed. Zero multicasts were issued.</p>
+  <h3>3. The flag sent before the data</h3>
+  <p>One more, to show what ttsim cannot catch. I swapped the coordinator's two multicasts so VALID goes first:</p>
+<pre><code>[4571] NOC0 T0 buf2 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x8aa0 -&gt; dst T(4,1)[asked 21,18]:0x8aa0 len=4
+[4571]       A16 mcast flag value=1 delivered to 3 tiles
+[4594] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x19e60 -&gt; dst T(4,1)[asked 21,18]:0x19e60 len=2048
+[4594]       A16 mcast data delivered to 3 tiles
+[✅ PASS] All 3 receiver tiles match the golden tile.</code></pre>
+  <p>The flag landed 23 clocks before the data, and the test still passed: the receivers took longer than that to get from their wait to their first read of the tile. On silicon the gap would be the data's transit time, and nothing would stop a receiver reading old bytes.</p>
+  <h3>4. num_dests off by one</h3>
+  <p>Finally, the bookkeeping: <code>noc_async_write_multicast(..., num_dests + 1)</code> in the coordinator. (The run used <code>stdbuf -oL</code>, so the log survives the <code>timeout</code> kill.)</p>
+<pre><code>[4574] NOC0 T0 buf0 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x19e60 -&gt; dst T(4,1)[asked 21,18]:0x19e60 len=2048
+[4574]       A16 mcast data delivered to 3 tiles
+[4594] NOC0 T0 buf2 MCAST_WR  ack   src T(1,1)[asked 1,1]:0x8aa0 -&gt; dst T(4,1)[asked 21,18]:0x8aa0 len=4
+[4594]       A16 mcast flag value=1 delivered to 3 tiles
+[7239] NOC1 T2 buf0 WRITE     ack   src T(3,1)[asked 6,10]:0x1a660 -&gt; dst D(0,1)[asked 9,10]:0x7ffff000 len=2048
+[7241] NOC1 T1 buf0 WRITE     ack   src T(2,1)[asked 7,10]:0x1a660 -&gt; dst D(0,11)[asked 9,0]:0x3ffff000 len=2048
+[7242] NOC1 T3 buf0 WRITE     ack   src T(4,1)[asked 5,10]:0x1a660 -&gt; dst D(0,5)[asked 9,6]:0x3ffff000 len=2048
+(no further output; killed by timeout)</code></pre>
+  <p>The hardware ignored the wrong count. The rectangle still reached exactly 3 tiles, all three receivers got the tile and wrote it to DRAM. Only the sender hung: its <code>noc_async_write_barrier()</code> expects 4 + 3 = 7 acknowledgements, and ttsim delivers one per real receiver, 6. That is the <code>num_dests</code> section in one log. The number is never sent to the network. It exists only to tell the barrier how many acks to wait for.</p>
+  <div class="callout warn">What these runs show about the simulator: ttsim catches synchronization bugs only when they turn into a <b>hang</b>, and whether they do depends on an interleaving that DPRINT and Watcher change. A pass in ttsim means &ldquo;correct for this one interleaving, with instant transfers&rdquo;. It doesn't mean the protocol is right. Reason about the protocol directly (every wait has exactly one matching message, every flag is reset before it is re-armed, data and flag share a NoC and VC), and use ttsim plus deliberate timing changes, like the busy loop above or Watcher's <code>TT_METAL_WATCHER_DEBUG_DELAY</code>, to shake out the cases you missed.</div>
+  <p>When a ttsim run hangs, the Watcher's waypoints tell you where. <code>noc_semaphore_wait</code> marks itself <code>NSW</code> on entry and <code>NSD</code> on exit (<code>dataflow_api.h:2115,2122</code>), so a core stuck on <code>NSW</code> in <code>watcher.log</code> is waiting for a semaphore that will never arrive. Remember, though, that turning Watcher on can make the hang go away, as the table shows.</p>
+
+  <!-- ===================================================================== -->
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>&ldquo;Semaphore&rdquo; means two things. The <b>Tensix Sync-unit semaphore</b> is a 4-bit hardware counter that orders the three Tensix threads inside one core. The <b>Metalium semaphore</b> is a 32-bit word in L1, created by the host with <code>CreateSemaphore</code>, one copy per core at the same address, and updated over the NoC by other cores.</li>
+    <li>Cross-core sync is built from three NoC operations: <b>atomic increment</b> (<code>noc_semaphore_inc</code>), <b>4-byte write or multicast</b> (<code>noc_semaphore_set_remote</code>, <code>noc_semaphore_set_multicast</code>), and a <b>local spin</b> (<code>noc_semaphore_wait</code>, which tests for equality).</li>
+    <li>Host APIs take <b>logical</b> cores. Kernel NoC addresses need <b>NoC coordinates</b> from <code>worker_core_from_logical_core</code>, passed as runtime args (translated (18,18) for logical (0,0) on Wormhole).</li>
+    <li>A <b>multicast</b> is a rectangle (corners ordered for its NoC), one L1 address valid on every receiver, and <code>num_dests</code>, which is barrier bookkeeping. The sender is excluded unless you use <code>_loopback_src</code>, which sets <code>BRCST_SRC_INCLUDE</code> and counts the sender in <code>num_dests</code>.</li>
+    <li>The <b>handshake:</b> receivers set INVALID, then increment the sender. The sender waits for exactly N, resets to 0, multicasts the data, then multicasts VALID. Receivers wait for VALID.</li>
+    <li>Data then flag needs no barrier <b>only</b> because both use the same NoC, the same static VC (4) and the same tree. On Blackhole the sender must also call <code>noc_async_writes_flushed()</code> between them, because separate command-buffer FIFOs may issue out of order.</li>
+    <li>The <b>multicast matmul</b> gives each core one of four roles. The left column multicasts in0 along rows, the top row multicasts in1 down columns, with two handshakes (four semaphores) per block. In the ttsim run that took DRAM reads from 9,216 to 1,536 tiles, with 464 multicasts and 176 atomics, all matching the arithmetic.</li>
+    <li>ttsim shows protocol bugs only as hangs, and only for some interleavings. Missing INVALID passed until a delay exposed it, N&minus;1 passed or hung depending on DPRINT and Watcher, and a flag sent before its data passed.</li>
+  </ul>
+
+  <!-- ===================================================================== -->
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A colleague's compute kernel uses <code>tile_regs_wait()</code>, and their reader uses <code>noc_semaphore_wait()</code>. They say both use &ldquo;the semaphore&rdquo;. What is different about them?</summary>
+  <p><code>tile_regs_wait</code> ends up as a Tensix <code>SEMWAIT</code> on a 4-bit Sync-unit semaphore (<code>MATH_PACK</code>). It is a hardware stall that orders the MATH and PACK threads on the same core, and no other core can touch it. <code>noc_semaphore_wait</code> is a software loop that reads a 32-bit L1 word created by <code>CreateSemaphore</code>. Other cores update that word by NoC atomic increments or writes. Different storage, different waiting mechanism, different scope.</p></details>
+  <details class="quiz"><summary>2. You multicast from core (0,0) to an 8&times;8 grid that includes it, using <code>noc_async_write_multicast</code> with <code>num_dests = 64</code>. What goes wrong, and what are the two possible fixes?</summary>
+  <p>The plain call leaves <code>BRCST_SRC_INCLUDE</code> clear, so only 63 cores receive and 63 acks come back. But the firmware added 64 to its expected-ack count, so the next <code>noc_async_write_barrier()</code> waits forever for the 64th. Fix it either by passing 63, or by using <code>noc_async_write_multicast_loopback_src</code> with 64 if the sender also needs the data in its own L1 at that address.</p></details>
+  <details class="quiz"><summary>3. Why must a receiver set its flag to INVALID <em>before</em> incrementing the sender's counter, not after?</summary>
+  <p>The increment is what allows the sender to send the next data and VALID. If the receiver incremented first, the sender could multicast VALID before the receiver's &ldquo;set INVALID&rdquo; store, which would then wipe out the new VALID and leave the receiver waiting forever. The ttsim N&minus;1 run shows this order of events. If it never sets INVALID at all, the stale VALID from the previous block lets the wait pass before the new data arrives.</p></details>
+  <details class="quiz"><summary>4. The sender multicasts data then the VALID flag with no barrier on Wormhole. You change the flag to go out on NoC&nbsp;1 while the data goes on NoC&nbsp;0. Is it still correct?</summary>
+  <p>No. The ordering guarantee holds only for packets on the same NoC and the same VC along the same route. On different NoCs the flag can arrive first, and a receiver would read stale data. You would need <code>noc_async_write_barrier()</code> after the data, which waits for every receiver's ack, before sending the flag. Note that ttsim would very likely still pass, because its transfers complete instantly.</p></details>
+  <details class="quiz"><summary>5. In the 8&times;2 run, why does each in0 multicast report &ldquo;delivered to 7 tiles&rdquo; when its rectangle (2,1)&ndash;(9,1) is 8 positions wide?</summary>
+  <p>The 8-wide span of NoC x positions includes x&nbsp;=&nbsp;5, a non-Tensix column on Wormhole. Only Tensix NIUs receive broadcasts; the others are opted out (MemoryMap.md:114). The 8 logical columns map to x&nbsp;=&nbsp;1-4 and 6-9, the sender is at x&nbsp;=&nbsp;1, so there are 7 receivers, matching <code>num_dests = num_cores_c - 1 = 7</code>.</p></details>
+  <details class="quiz"><summary>6. How many DRAM tile reads would the 8&times;8 illustrative grid need per K-block with and without multicast, using the same per-core blocks (in0 64 tiles, in1 8 tiles)?</summary>
+  <p>With multicast, only the 8 left-column cores read in0 (8 &times; 64 = 512) and the 8 top-row cores read in1 (8 &times; 8 = 64): 576. Without it, all 64 cores read both: 64 &times; 72 = 4,608. That's 8&times; fewer. In general the saving is the grid size divided by the number of senders, weighted by block sizes. It grows with the grid, which is why multicast matters more on bigger chips.</p></details>
+
+  <!-- ===================================================================== -->
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/prog_examples/multicast/multicast.md">Tech report: Data Multicasting</a>: the official walkthrough of <code>contributed/multicast</code>, with a flowchart. Note its VALID = 0xFFFFFFFF claim, which disagrees with the code.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/prog_examples/matmul_multi_core_optimized/data_mcast.md">Tech report: Data Multicasting in matmul_multicore_reuse_mcast</a>: the core ranges and kernel roles. It is dated: it says &ldquo;only works on Grayskull&rdquo;, names a fused-bias compute kernel the current example doesn't use, and describes the in1 multicast as horizontal when the code sends it down columns.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/prog_examples/NoC_tile_transfer/NoC_tile_transfer.md">Tech report: NoC Tile Transfer</a>: the two-core example used at the start of this chapter.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/ordering.html">TT-Metalium docs: Ordering (NOC, CMD_BUF, VC)</a>: command buffers, the six VCs and the three write-ordering rules.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/noc_semaphore_wait.html">TT-Metalium docs: noc_semaphore_wait</a>, with links to the rest of the semaphore and multicast kernel APIs.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/noc_async_write_multicast.html">TT-Metalium docs: noc_async_write_multicast</a>: the num_dests and self-exclusion rules.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/host_apis/buffers/CreateSemaphore.html">TT-Metalium docs: CreateSemaphore</a>: the host-side call.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Ordering.md">tt-isa-documentation: Wormhole NoC ordering</a>: the authoritative rules that make data-then-flag work.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Atomics.md">tt-isa-documentation: NoC atomics</a>: what the NIU does for an atomic increment, and on what memory.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/MemoryMap.md">tt-isa-documentation: NoC memory map</a>: <code>NOC_CTRL</code> bits, including <code>BRCST_SRC_INCLUDE</code>, <code>PATH_RESERVE</code> and the static VC field.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">tt-isa-documentation: Sync Unit</a>: the <em>other</em> semaphore, for contrast.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/programming_examples/matmul/matmul_multicore_reuse_mcast/matmul_multicore_reuse_mcast.cpp">matmul_multicore_reuse_mcast.cpp on GitHub</a>: the host program for the four-role matmul.</li>
+  </ul>
+
+  <div class="pager"><a href="a15-matmul-one-to-many.html">&larr; 15 Matmul on one core, then many</a><a class="next" href="a17-dispatch-host.html">17 Dispatch, command queues and the host &rarr;</a></div>
+</main>
+</body>
+</html>

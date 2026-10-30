@@ -1,0 +1,59 @@
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -1458,12 +1458,23 @@
+     TTSIM_VERIFY(src_coordinate <= 0xFFF, UnsupportedFunctionality, "src_coordinate=0x%x", src_coordinate);
+     TTSIM_VERIFY(dst_coordinate <= 0xFFF, UnsupportedFunctionality, "dst_coordinate=0x%x", dst_coordinate);
+     TTSIM_VERIFY(dst_coordinate_start <= 0xFFF, UnsupportedFunctionality, "dst_coordinate_start=0x%x", dst_coordinate_start);
++    uint32_t raw_src = src_coordinate, raw_dst = dst_coordinate, raw_start = dst_coordinate_start; // A08
+     src_coordinate = remap_virtual_coordinate(&p_tile->base, noc_instance, src_coordinate);
+     dst_coordinate = remap_virtual_coordinate(&p_tile->base, noc_instance, dst_coordinate);
+     dst_coordinate_start = remap_virtual_coordinate(&p_tile->base, noc_instance, dst_coordinate_start);
+     // XXX Apparently on WH, this writes the translated coords back to the ADDR_MID registers -- not the most straightforward
+     auto [src_tile_type, src_tile_id] = coord_to_tile(src_coordinate);
+     auto [dst_tile_type, dst_tile_id] = coord_to_tile(dst_coordinate);
++    { // A08 instrumentation: log every NoC command
++        const char *kind = bits<5,5>(noc_ctrl) ? "MCAST_WR" : bits<0,0>(noc_ctrl) ? "ATOMIC" : bits<3,3>(noc_ctrl) ? "INLINE_WR" : bits<1,1>(noc_ctrl) ? "WRITE" : "READ";
++        ttsim_printf("NOC%u %c%u buf%u %-9s %s  src %c(%u,%u)[asked %u,%u]:0x%llx -> dst %c(%u,%u)[asked %u,%u]:0x%llx len=%u\n",
++            noc_instance, tile_type, tile_id, cmd_buf, kind, bits<4,4>(noc_ctrl) ? "ack " : "post",
++            src_tile_type, src_coordinate & 63, src_coordinate >> 6, raw_src & 63, raw_src >> 6, (unsigned long long)src_addr,
++            dst_tile_type, dst_coordinate & 63, dst_coordinate >> 6, raw_dst & 63, raw_dst >> 6, (unsigned long long)dst_addr, noc_at_len_be);
++    }
++    if (bits<5,5>(noc_ctrl)) ttsim_printf("      mcast rectangle start (%u,%u) end (%u,%u) [asked start %u,%u] static_vc=%u vc=%u src_include=%u path_reserve=%u\n",
++        dst_coordinate_start & 63, dst_coordinate_start >> 6, dst_coordinate & 63, dst_coordinate >> 6, raw_start & 63, raw_start >> 6,
++        (unsigned)bits<7,7>(noc_ctrl), (unsigned)bits<15,13>(noc_ctrl), (unsigned)bits<17,17>(noc_ctrl), (unsigned)bits<8,8>(noc_ctrl)); // A16 adds VC fields
+ 
+     if (bits<5,5>(noc_ctrl)) { // multicast
+         TTSIM_VERIFY((noc_at_len_be >= 1) && (noc_at_len_be <= NOC_MAX_PACKET_SIZE), UnsupportedFunctionality, "multicast: noc_at_len_be=%d", noc_at_len_be);
+@@ -1495,6 +1506,7 @@
+             TTSIM_VERIFY(dst_start_x <= dst_end_x, UnimplementedFunctionality, "dst_start_x=%d dst_end_x=%d", dst_start_x, dst_end_x);
+             TTSIM_VERIFY(dst_start_y <= dst_end_y, UnimplementedFunctionality, "dst_start_y=%d dst_end_y=%d", dst_start_y, dst_end_y);
+         }
++        uint32_t a16_delivered = 0; // A16
+         for (uint32_t dst_y = dst_start_y; dst_y <= dst_end_y; dst_y++) {
+             for (uint32_t dst_x = dst_start_x; dst_x <= dst_end_x; dst_x++) {
+                 if ((p_tile->base.router_cfg_1[noc_instance] & (1ull << dst_x)) ||
+@@ -1508,6 +1520,7 @@
+                     continue;
+                 }
+                 tile_wr_bytes(dst_coordinate, dst_addr, &p_tile->sram[src_addr], noc_at_len_be);
++                a16_delivered++; // A16
+                 if (bits<4,4>(noc_ctrl)) { // nonposted
+                     p_tile->niu_mst_wr_ack_received[noc_instance]++;
+                     // NIU_MST_REQS_OUTSTANDING_ID is decremented once per response
+@@ -1515,6 +1528,8 @@
+                 }
+             }
+         }
++        if (noc_at_len_be == 4) ttsim_printf("      A16 mcast flag value=%u delivered to %u tiles\n", mem_rd<uint32_t>(&p_tile->sram[src_addr]), a16_delivered);
++        else ttsim_printf("      A16 mcast data delivered to %u tiles\n", a16_delivered);
+         if (bits<4,4>(noc_ctrl)) { // nonposted
+             p_tile->niu_mst_nonposted_wr_req_sent[noc_instance]++;
+             // NIU_MST_REQS_OUTSTANDING_ID is incremented once per request
+@@ -1541,6 +1556,7 @@
+         uint32_t data = old_data + noc_at_data;
+         tile_wr_bytes(src_coordinate, src_addr, &data, 4);
+         mem_wr<uint32_t>(&p_tile->sram[dst_addr], old_data);
++        ttsim_printf("      A16 atomic inc at (%u,%u):0x%llx  %u -> %u\n", src_coordinate & 63, src_coordinate >> 6, (unsigned long long)src_addr, old_data, data);
+ 
+         if (bits<4,4>(noc_ctrl)) { // nonposted
+             p_tile->niu_mst_atomic_resp_received[noc_instance]++;
