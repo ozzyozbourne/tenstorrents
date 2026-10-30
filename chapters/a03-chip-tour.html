@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A03 · A tour of the chip · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; padding: .5rem .9rem; font-size: 13px; color: var(--muted); background: var(--bg2); border-top: 1px solid var(--border); }
+  .legend span::before { content: ""; display: inline-block; width: .8em; height: .8em; border-radius: 2px; margin-right: .35em; vertical-align: -1px; background: var(--sw); }
+  .tileinfo { padding: .7rem .9rem; min-height: 6.5em; background: var(--bg2); border-top: 1px solid var(--border); font-size: 15px; }
+  .tileinfo b { color: var(--yellow); }
+  .tileinfo code { font-size: 13px; }
+  td.warn { color: var(--red); }
+  .num-r td:not(:first-child) { text-align: right; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a02-gpu-vs-tenstorrent.html">&larr; Prev</a>
+  <a href="a04-inside-tensix.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 03</span><span class="tag">Prerequisites: A01, A02</span>
+  <h1><span class="num">03.</span> A tour of the chip</h1>
+  <p class="subtitle">Walk across a real Wormhole and a real Blackhole die, tile by tile. Learn what each tile does, why some tiles get switched off at the factory, and why the same core can have three different addresses.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#city">The chip as a city grid</a></li>
+      <li><a href="#tiles">Meet the tiles</a></li>
+      <li><a href="#harvest">Harvesting: selling imperfect chips</a></li>
+      <li><a href="#map">The map, with real coordinates</a></li>
+      <li><a href="#coords">Three ways to name one core</a></li>
+      <li><a href="#blackhole">What changes on Blackhole</a></li>
+      <li><a href="#riscv">How many RISC-V cores?</a></li>
+      <li><a href="#generations">Generations and products</a></li>
+      <li><a href="#ttsim">What ttsim builds</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>On the Wormhole spec page, the chip has 80 Tensix cores. Buy the single-chip card, the <b>n150</b>, and you get 72. Buy the dual-chip <b>n300</b> and each chip gives you 64. The 32-chip Galaxy server gives you all 80 on every chip. It is the same silicon in every case. So:</p>
+  <blockquote><b>Why does an 80-core chip sell as 72 or 64?</b></blockquote>
+  <p>You can't answer that without a map of the chip, so this chapter draws one. We use the real coordinates from the SoC descriptor files that tt-metal ships, not a marketing diagram. Once you can read that map, three other questions get easy too: what the non-compute tiles are for, why a program sees a tidy 8×8 grid on a chip that physically has holes in it, and why the simulator calls one core <code>(18,18)</code> while the descriptor calls it <code>(1,1)</code>.</p>
+  <p>Chapter <a href="a02-gpu-vs-tenstorrent.html">A02</a> described a Tenstorrent chip as "a grid of independent cores with software-managed SRAM". Here we make that sentence concrete. What goes on inside one core waits until <a href="a04-inside-tensix.html">A04</a>, and how the network between cores works waits until <a href="a08-noc.html">A08</a>.</p>
+
+  <h2 id="city">The chip as a city grid</h2>
+  <p>Picture a city laid out as a perfect grid of blocks. Every block sits on a road intersection. Most blocks are factories, the places where the work happens. Down two avenues stand warehouses holding the raw materials. Along two streets are the docks, where shipments leave for other cities. One block is the airport, the link to the outside world, and one is city hall, which keeps the lights on.</p>
+  <p>Swap in the real names and you have a Wormhole die. Factories are <b>Tensix tiles</b>, warehouses are <b>DRAM tiles</b>, docks are <b>Ethernet tiles</b>, the airport is the <b>PCIe tile</b> to the host, and city hall is the <b>ARC tile</b>. The roads are the <b>NoC</b> (network-on-chip). Every tile has a NoC router, and that router is how the tile talks to any other tile. The ISA documentation says the NoCs "connect the various tiles to form a 2D torus", which it notes "is usually visualized as a 2D grid" (<code>tt-isa-documentation/WormholeB0/README.md</code>).</p>
+  <p>Step through the build below. Every square comes from <code>tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml</code>; nothing is drawn by hand.</p>
+
+  <div class="viz" id="fig-build"></div>
+
+  <p>The final count is <b>80 + 18 + 16 + 1 + 1 + 4 = 120 = 10 × 12</b>. Every grid position is accounted for. The four "router-only" positions are intersections with no building on them: a router that forwards traffic, but nothing a program can address.</p>
+  <p>Where the analogy breaks: in a real city, trucks from a factory can drive straight to any warehouse. Here every tile reaches every other tile only by hopping router to router, and each hop takes cycles. A DRAM tile also isn't a passive shelf. It answers read and write requests that arrive over the NoC. The ISA docs say its NIUs "respond to requests from other tiles; they are not capable of emitting requests of their own" (<code>WormholeB0/DRAMTile/README.md</code>). Warehouses only answer; factories place the orders.</p>
+
+  <div class="callout gpu">On a GPU, the die layout is hidden behind the programming model. You launch thread blocks and the hardware scheduler picks an SM, and you never learn that SM 37 sits next to a memory controller. On Tenstorrent, the layout <i>is</i> part of the programming model. Kernels name the cores they talk to by coordinate, and how far apart two cores are on the grid affects how long their messages take.</div>
+
+  <h2 id="tiles">Meet the tiles</h2>
+  <p>Here is each tile type in turn, with the numbers that are worth remembering. Every number below is checked against the ISA documentation (Wormhole B0 / Blackhole A0) or the tt-metal descriptors.</p>
+
+  <h3>Tensix: the factory</h3>
+  <p>A Tensix tile has a block of SRAM called <b>L1</b>, five small "baby" RISC-V cores, a matrix engine and a vector engine, and two connections to the NoC. On Wormhole, L1 is <b>1464 KiB</b> per tile. That is the <code>worker_l1_size: 1499136</code> in the descriptor and <code>TENSIX_SRAM_SIZE = 1464*1024</code> in the ISA spec. On Blackhole it is <b>1536 KiB</b>. The ISA docs point out that the name is misleading: "This RAM is called 'L1', but this is somewhat of a misnomer, as it is suggestive of a hardware-managed cache, which is not the case - this is plain RAM" (<code>WormholeB0/TensixTile/L1.md:3</code>). Marketing pages round this to "1.5 MB per Tensix core". 1,499,136 bytes is indeed about 1.5 million bytes, but it is 1.43 MiB.</p>
+  <p>None of the five RISC-V cores does the heavy math. They issue instructions to the engines. In the ISA's words, "The RISCV cores are not intended to achieve high performance on their own; they are intended to oversee the other components that <i>actually</i> drive performance" (<code>WormholeB0/TensixTile/README.md:16</code>). <a href="a04-inside-tensix.html">A04</a> opens up this tile.</p>
+
+  <h3>DRAM: the warehouse</h3>
+  <p>Wormhole has 18 DRAM tiles that together expose <b>12 GiB of GDDR6</b>. They come in six groups of three, and "each 2 GiB is exposed identically on 3 tiles" (<code>WormholeB0/README.md</code>). The descriptor encodes this as six lists of three coordinates with <code>dram_bank_size: 2147483648</code>. Why put the same memory behind three NoC addresses? Three entry points spread the traffic, so all the requests don't pile up on one router. Inside each group, the ISA's DRAM page describes "12x 1 GiB channels of GDDR6", which is two channels per group. That is why tt-metal's <code>dram_views</code> split each 2 GiB bank into two 1 GiB views. Blackhole has 24 DRAM tiles in eight groups of three, each group holding 4 GiB, for 32 GiB in total.</p>
+
+  <h3>Ethernet: the docks</h3>
+  <p>Wormhole has 16 Ethernet tiles, "each one with bidirectional 100 GbE connectivity". Each one also has its own baby RISC-V core (one on Wormhole, two on Blackhole) and its own L1: <code>eth_l1_size: 262144</code> (256 KiB) on Wormhole and 524288 (512 KiB) on Blackhole. These tiles are how chips talk to each other. On products where some links are not wired to a connector, the ISA notes that the tiles "can still be used (for their RISCV and their L1), but they'll never receive any ethernet packets". Multi-chip systems are covered in <a href="a21-many-chips.html">A21</a>.</p>
+
+  <h3>PCIe: the airport</h3>
+  <p>This tile links the chip to the host: PCI Express 4.0 x16 on Wormhole and 5.0 x16 on Blackhole. Wormhole has one PCIe tile. On an n300, the second chip's PCIe tile isn't connected to anything; "an ASIC without PCIe connected is still reachable via ethernet". Blackhole has two PCIe tiles, but "One of these tiles will be in use; the other will be permanently idle (at least in current products)".</p>
+
+  <h3>ARC: city hall</h3>
+  <p>The ARC tile holds "a four-core ARC CPU for executing firmware". It handles clocks, telemetry, resets and firmware updates. "Customers can mostly ignore this tile, as it does not execute customer workloads" (<code>WormholeB0/ARCTile/README.md</code>). Note that ARC is a different CPU architecture, not RISC-V. Blackhole adds a separate <b>Security</b> tile beside it.</p>
+
+  <h3>L2CPU (Blackhole only): the office tower</h3>
+  <p>Blackhole adds four L2CPU tiles. Each one contains "a coherent cluster of four SiFive x280 CPUs (for an aggregate total of sixteen CPU cores)", with private L1 and L2 caches per core and a shared 2 MiB L3 per cluster (<code>BlackholeA0/README.md</code>). These are real 64-bit Linux-capable cores, very different from the baby RISC-Vs. One oddity to keep in mind: tt-metal's SoC descriptor lists their grid positions as <code>router_only</code>, because Metalium never schedules kernels onto them.</p>
+
+  <h3>Router-only: empty intersections</h3>
+  <p>These positions have a NoC router but no endpoint that software uses. Wormhole has four of them, all in column 0. In Blackhole's descriptor, all of row 0 apart from DRAM, PCIe and ARC is router-only, and so is all of column 8 below ARC. As noted above, that column actually holds the L2CPU and Security tiles; the descriptor just doesn't expose them.</p>
+
+  <div class="callout key">A Tenstorrent chip is a 2D grid of tiles on a NoC. Most tiles compute (Tensix), and the rest are memory (DRAM), chip-to-chip links (Ethernet), the host link (PCIe) and management (ARC, plus L2CPU and Security on Blackhole). Programs address tiles by grid coordinate.</div>
+
+  <h2 id="harvest">Harvesting: selling imperfect chips</h2>
+  <p>Back to the puzzle. A big die has many square millimetres of silicon, and every square millimetre has some chance of a manufacturing defect. If you only sold dies with zero defects, you would throw away a lot of them. The standard industry fix is <b>harvesting</b>: build in redundancy, test each die, and fuse off the broken part.</p>
+  <p>Wormhole harvests <b>whole rows</b> of Tensix tiles. The ISA documentation is explicit: "n150 boards have one fused-off row, and n300 boards have two fused-off rows per ASIC, and if any rows <i>are</i> fused off, then the <i>particular</i> fused-off rows will vary from ASIC to ASIC" (<code>WormholeB0/NoC/Coordinates.md:44</code>). With 8 Tensix tiles per row, the arithmetic falls out:</p>
+  <ul>
+    <li>80 − 0 × 8 = <b>80</b> (Galaxy modules)</li>
+    <li>80 − 1 × 8 = <b>72</b> (n150)</li>
+    <li>80 − 2 × 8 = <b>64</b> per chip (n300)</li>
+  </ul>
+  <p>Firmware stops a fused-off tile by setting a "tile clock disable" bit in its NIU configuration: "firmware will set this to <code>true</code> for fused-off tiles" (<code>WormholeB0/NoC/MemoryMap.md:226</code>). It also tells every NIU to leave that row out of broadcasts. tt-metal enforces the limit when it picks a core layout: more than two harvested rows or columns throws "At most two rows or cols can be harvested" (<code>tt_metal/llrt/core_descriptor.cpp:145-148</code>).</p>
+  <p>Why throw away a whole row when only one tile is bad? Partly because the remaining tiles still have to form a clean rectangle. NoC multicast targets rectangles of tiles (see <a href="a08-noc.html">A08</a>), and the coordinate remapping described below is set up per row and per column. A grid with one tile missing from the middle would break both. <i>That reasoning is ours; the docs state the policy, not the motive.</i></p>
+  <p>The figure below is a toy model meant to build intuition. It is <b>not</b> Tenstorrent yield data, which is not public. Assume each Tensix row independently has some probability of containing a fatal defect, then sort the dies into bins.</p>
+
+  <div class="viz" id="fig-yield"></div>
+
+  <p>Drag the slider. Even at modest defect rates, a large share of dies have exactly one or two bad rows. Without harvesting, those dies are scrap. With harvesting, they become n150s and n300s. A die with one bad row can also be sold as a 64-core part by fusing off one extra, healthy row. Binning is a business decision as much as a technical one.</p>
+
+  <div class="callout warn">You cannot tell <i>which</i> row is harvested from the product name. Two n150 cards can have different rows fused off. Code that hard-codes physical coordinates of Tensix tiles will work on one card and break on the next. That is the reason the coordinate systems in the next sections exist.</div>
+
+  <h2 id="map">The map, with real coordinates</h2>
+  <p>This is the main figure of the chapter. It draws Wormhole and Blackhole from their SoC descriptors. Click any tile to see what it is and its address in each coordinate system. Then press <b>Harvest a row</b> (on Blackhole the button says <b>Harvest a column</b>; the reason comes later) and watch two things. The physical coordinates of the surviving tiles keep their gaps. The translated and logical coordinates close the gap and stay contiguous. The ladder beside the grid draws the mapping from physical rows (or columns) to translated ones.</p>
+
+  <div class="viz" id="fig-map"></div>
+
+  <p><b>How the data was produced.</b> A short Python script parsed <code>wormhole_b0_80_arch.yaml</code> and <code>blackhole_140_arch.yaml</code> from tt-metal at commit <code>7aad8aac</code>. It read the <code>functional_workers</code>, <code>dram</code> (keeping the bank index), <code>eth</code> (keeping the list index as the Ethernet ID), <code>pcie</code>, <code>arc</code> and <code>router_only</code> lists and checked that the tile count equals <code>x_size × y_size</code> (120 and 204). The resulting JSON is embedded in this page as <code>SOC</code>. On Blackhole only, an overlay from <code>BlackholeA0/L2CPUTile/README.md:40-43</code> replaces router-only (8,3), (8,9), (8,5), (8,7) with L2CPU clusters for CPUs 0–3, 4–7, 8–11 and 12–15, and (8,2) with the Security tile, following the ISA's layout diagram. Tensix IDs follow descriptor order, which matches ttsim's <code>tile_id = tile_x + tile_y*8</code> (WH) or <code>*14</code> (BH) in <code>coord_to_tile</code>. The translated and logical mapping in the figure re-implements the algorithm from <code>Coordinates.md</code> and ttsim's <code>base_tile_init</code>, described next.</p>
+
+  <h2 id="coords">Three ways to name one core</h2>
+  <p>Take the first Tensix tile, top left. It has (at least) three names, and each one exists for a reason.</p>
+
+  <h3>1. Physical, or raw NoC coordinates</h3>
+  <p>This is where the tile actually sits. NoC 0 puts <code>(0,0)</code> at the top-left tile and counts "in the direction of data flow (rightwards and downwards)". NoC 1 runs the other way, so its <code>(0,0)</code> is the bottom-right tile (<code>Coordinates.md:7,13</code>). The same tile therefore has two raw addresses. In ttsim's code, the NoC 1 coordinate is <code>(9−x, 11−y)</code> on Wormhole and <code>(16−x, 11−y)</code> on Blackhole. The descriptor YAMLs use NoC 0 coordinates, and UMD calls this system <code>CoordSystem::NOC0</code>.</p>
+
+  <div class="filename">tt-metal/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml:104-122 @7aad8aac</div>
+<pre><code>eth:
+  [
+      9-0, 1-0, 8-0, 2-0, 7-0, 3-0, 6-0, 4-0,
+      9-6, 1-6, 8-6, 2-6, 7-6, 3-6, 6-6, 4-6,
+  ]
+
+functional_workers:
+  [
+   1-1,   2-1,   3-1,   4-1,   6-1,   7-1,   8-1,   9-1,
+   1-2,   2-2,   3-2,   4-2,   6-2,   7-2,   8-2,   9-2,
+   ...
+   1-11,  2-11,  3-11,  4-11,  6-11,  7-11,  8-11,  9-11,
+  ]</code></pre>
+  <p>Each entry is <code>x-y</code>. The worker list skips column 5 (DRAM) and rows 0 and 6 (Ethernet), so physical Tensix coordinates already have holes before any harvesting. The Ethernet list order defines the Ethernet IDs: E0 is at (9,0), E1 at (1,0), and so on. The IDs alternate from the outside in.</p>
+
+  <h3>2. Translated coordinates</h3>
+  <p>The NIU in every tile can rewrite coordinates on the way out. The ISA spec explains that firmware configures this "with the following aims in mind: Uniform coordinate system for both NoC #0 and NoC #1; Similar types of tile having a contiguous coordinate range; On products where one or two rows of Tensix tiles have been harvested… renumber rows so that harvested rows are always at the end; Still allow software to use raw NoC coordinates if it wants to" (<code>Coordinates.md:19-23</code>).</p>
+  <p>On Wormhole, X and Y are translated separately, using numbers above the raw range:</p>
+  <table>
+    <tr><th>Translated</th><th>Means (NoC 0)</th></tr>
+    <tr><td>0–15</td><td>Identity. Raw coordinates still work.</td></tr>
+    <tr><td>X = 16, 17</td><td>Physical column 0 (PCIe, ARC, DRAM D0/D1) and column 5 (DRAM D2–D5)</td></tr>
+    <tr><td>X = 18–25</td><td>The 8 Tensix columns 1, 2, 3, 4, 6, 7, 8, 9</td></tr>
+    <tr><td>Y = 16, 17</td><td>The Ethernet rows 0 and 6</td></tr>
+    <tr><td>Y = 18…</td><td>Good Tensix rows in top-to-bottom order, then harvested rows last, up to Y = 27</td></tr>
+  </table>
+  <p>The ISA's worked example assumes physical rows 7 and 10 are fused off. Translated rows 18–25 then map to physical 1, 2, 3, 4, 5, 8, 9, 11, and translated 26 and 27 map to the harvested rows 7 and 10 (<code>Coordinates.md:46-63</code>). The <i>ISA example</i> preset in the map reproduces exactly that table. ttsim configures the same tables when it boots a simulated chip:</p>
+
+  <div class="filename">ttsim/src/tile.cpp:157-168 @b3620244</div>
+<pre><code>        uint32_t translated_row = 0;
+        // Firmware assigns logical rows to active physical rows first, then appends harvested rows.
+        for (uint32_t harvested = 0; harvested &lt;= 1; harvested++) {
+            for (uint32_t physical_row = 0; physical_row &lt; std::size(TENSIX_ROWS); physical_row++) {
+                if (((logical_mask &gt;&gt; physical_row) &amp; 1) == harvested) {
+                    uint32_t physical_y = TENSIX_ROWS[physical_row];
+                    noc_translation_table_set(
+                        p_tile-&gt;noc_translation_y[noc], 18 + translated_row, noc ? (11 - physical_y) : physical_y);
+                    translated_row++;
+                }
+            }
+        }</code></pre>
+  <p>Read it as two passes over <code>TENSIX_ROWS = {1,2,3,4,5,7,8,9,10,11}</code> (<code>tile.cpp:63</code>). The first pass (<code>harvested == 0</code>) gives the good rows translated slots 18, 19, 20 and so on. The second pass appends the harvested rows. <code>noc ? (11 - physical_y) : physical_y</code> stores the NoC 1 version of the same row in NoC 1's table, so translated coordinates mean the same thing on both NoCs. That's the "uniform coordinate system" aim from the spec.</p>
+
+  <h3>3. Logical coordinates</h3>
+  <p>TT-Metalium goes one step further. A <b>logical</b> worker coordinate counts only the usable Tensix tiles, starting at <code>(0,0)</code>. On an n150 it runs from <code>(0,0)</code> to <code>(7,8)</code>, with no holes and no knowledge of which physical row was lost. Host code uses logical coordinates to place kernels, and the runtime converts them to translated coordinates for the device. The core descriptor YAMLs say so in their first line: "Anything using [[#, #]] is logical coordinates" (<code>tt_metal/core_descriptors/wormhole_b0_80_arch.yaml:1</code>).</p>
+  <p>To check this on the simulator, I wrote a short host program (about 20 lines), <code>gridinfo.cpp</code>, that opens one device and prints the grid sizes and <code>worker_core_from_logical_core()</code> for a few cores. Here is the real output from this orb, with UMD log lines trimmed:</p>
+
+  <div class="filename">$ source sim-labs/workbench/env.sh wh; ./gridinfo   (ttsim WH)</div>
+<pre><code>grid_size            = 10x12
+logical_grid_size    = 8x9
+compute grid         = 8x8
+dram_grid_size       = 12x1
+logical (0,0) -&gt; virtual/translated (18,18)
+logical (1,0) -&gt; virtual/translated (19,18)
+logical (0,1) -&gt; virtual/translated (18,19)
+logical (7,8) -&gt; virtual/translated (25,26)</code></pre>
+  <p>Several facts are visible at once. The full grid is 10×12. Only 8×9 = 72 workers are logical, so the simulated chip behaves like an n150 with one row harvested. Logical (0,0) is translated (18,18), which matches the table above. The last logical row, 8, lands on translated row 26, so translated row 27 is the harvested one. The "compute grid" is 8×8 because tt-metal reserves the last logical row for dispatch cores: <code>dispatch_cores: [[0, -1], [1, -1], ...]</code>, where −1 means "last row" in the core descriptor. And <code>dram_grid_size = 12</code> is the twelve 1 GiB views.</p>
+  <p>Which physical row did ttsim fuse off? ttsim hard-codes a harvesting mask for each topology:</p>
+
+  <div class="filename">ttsim/src/tile.cpp:27-37 @b3620244</div>
+<pre><code>static uint32_t logical_harvesting_mask(uint32_t chip_id) {
+    TTSIM_ASSERT(chip_id &lt; g_num_chips);
+#if TT_ARCH_VERSION == 0
+    static constexpr uint32_t N150[] = {0x40};
+    static constexpr uint32_t N300[] = {0x41, 0x05};
+    static constexpr uint32_t T3000[] = {0x220, 0x201, 0x280, 0x201, 0x240, 0x201, 0x201, 0x210};
+    switch (g_num_chips) {
+        case 1: return N150[chip_id];
+        case 2: return N300[chip_id];
+        case 8: return T3000[chip_id];
+        case 32: return 0; // WH Galaxy</code></pre>
+  <p>The mask's bits index <code>TENSIX_ROWS</code>. <code>0x40</code> is bit 6, and <code>TENSIX_ROWS[6]</code> is physical row <b>y = 8</b>. The <i>ttsim n150</i> preset in the map uses exactly this. The n300 masks <code>0x41</code> and <code>0x05</code> harvest two rows per chip, and the 32-chip Galaxy case harvests nothing, which matches the 80/72/64 arithmetic above.</p>
+  <p>tt-metal makes the same link from the other direction. It turns "how many rows are harvested" into a product name, then loads that product's core layout:</p>
+
+  <div class="filename">tt-metal/tt_metal/llrt/core_descriptor.hpp:22-29 @7aad8aac</div>
+<pre><code>inline const std::string&amp; get_product_name(tt::ARCH arch, uint32_t num_harvested_on_axis) {
+    const static std::map&lt;tt::ARCH, std::map&lt;uint32_t, std::string&gt;&gt; product_name = {
+        {tt::ARCH::WORMHOLE_B0, {{0, "galaxy"}, {1, "nebula_x1"}, {2, "nebula_x2"}}},
+        {tt::ARCH::BLACKHOLE, {{0, "unharvested"}, {1, "1xharvested"}, {2, "2xharvested"}}},
+        {tt::ARCH::QUASAR, {{0, "unharvested"}}}};
+
+    return product_name.at(arch).at(num_harvested_on_axis);
+}</code></pre>
+  <p>"nebula_x1" is the internal name used for the n150 layout (one harvested row) and "nebula_x2" for the n300 layout (two). Note the axis in the variable name, <code>num_harvested_on_axis</code>. On Wormhole the axis is rows. On Blackhole it is columns.</p>
+
+  <div class="callout warn">tt-metal APIs call translated coordinates "virtual" (see the output above: <code>virtual/translated</code>), UMD calls them <code>TRANSLATED</code>, and the ISA calls the feature "coordinate translation". These are three names for one idea. Also, the "logical" coordinate in Metalium is <i>not</i> the same as the ISA's internal <code>noc_id_logical</code> register, which ttsim fills with the translated value.</div>
+
+  <h2 id="blackhole">What changes on Blackhole</h2>
+  <p>Switch the map to Blackhole. The grid grows to 17×12 = 204 positions, and the layout changes:</p>
+  <ul>
+    <li><b>Tensix columns</b> x = 1–7 and 10–16 and <b>rows</b> y = 2–11: 14 × 10 = 140 tiles.</li>
+    <li><b>DRAM</b> fills columns 0 and 9 from top to bottom. That's 24 tiles in 8 banks of 3. Each bank's three tiles are scattered around the column, for example bank 1 at rows 2, 10 and 3.</li>
+    <li><b>Ethernet</b> takes most of row 1 (14 tiles). <b>PCIe</b> (2 tiles), <b>ARC</b> and many router-only positions make up row 0.</li>
+    <li><b>Column 8</b> holds ARC at the top, then Security and the four L2CPU clusters further down.</li>
+  </ul>
+  <p>The biggest change for programmers is that <b>Blackhole harvests columns, not rows</b>. The ISA says: "If any Tensix columns are fused off (as two columns are on p100 boards), then <code>X</code> is remapped to put the fused columns at maximal <code>X</code>" (<code>BlackholeA0/NoC/Coordinates.md:54</code>). Blackhole translation is also combined rather than split per axis. The Tensix rows keep their raw Y. Only Tensix X is remapped, and the gap at X = 8, 9 stays: "<code>X = 8</code> always refers to the column containing CPUs, and <code>X = 9</code> always refers to a column containing DRAM". The other tile types move into high, otherwise unused ranges:</p>
+  <table>
+    <tr><th>Translated (X, Y)</th><th>Contents (from <code>BlackholeA0/NoC/Coordinates.md:28-46</code>)</th></tr>
+    <tr><td>(1–7, 10–16; 2–11)</td><td>Tensix. On a 120-core part, the fused columns are pushed to X = 15, 16.</td></tr>
+    <tr><td>(17–18, 12–23)</td><td>DRAM, three translated rows per 4 GiB bank</td></tr>
+    <tr><td>(19, 24)</td><td>Whichever PCIe tile is connected to the host</td></tr>
+    <tr><td>(20–31, 25)</td><td>The 12 usable Ethernet tiles</td></tr>
+    <tr><td>(8, 26–29) and (8, 30)</td><td>The four L2CPU tiles and the Security tile</td></tr>
+  </table>
+  <p>Running the same <code>gridinfo</code> program against ttsim's Blackhole model:</p>
+
+  <div class="filename">$ source sim-labs/workbench/env.sh bh; ./gridinfo   (ttsim BH)</div>
+<pre><code>grid_size            = 17x12
+logical_grid_size    = 12x10
+compute grid         = 11x10
+dram_grid_size       = 8x1
+logical (0,0) -&gt; virtual/translated (1,2)
+logical (1,0) -&gt; virtual/translated (2,2)
+logical (0,1) -&gt; virtual/translated (1,3)
+logical (11,9) -&gt; virtual/translated (14,11)</code></pre>
+  <p>So the simulated Blackhole has <b>12 × 10 = 120</b> workers, not 140. ttsim's single-chip mask is <code>P150[] = {0xC0}</code> (<code>tile.cpp:41</code>). Bits 6 and 7 index <code>TENSIX_COLUMNS</code>, giving physical columns <b>7 and 10</b>, the two next to the centre spine. The last logical column, 11, lands on translated X = 14, so X = 15 and 16 are where the harvested columns went, just as the ISA table says. The compute grid is 11×10 because one column is reserved for dispatch (the "2xharvested" layout in <code>tt_metal/core_descriptors/blackhole_140_arch.yaml</code> ends at <code>[10, 9]</code>). Choose the <i>ttsim p150</i> preset in the map to see this layout.</p>
+
+  <div class="callout sim">In lab <a href="../sim-labs/b02-map-and-boot.html">B02 · Map the chip and watch it boot</a> you instrument ttsim's chip init, watch which of these tiles leave reset and at which PCs, and compare what you see with the SoC descriptor you just explored.</div>
+
+  <h2 id="riscv">How many RISC-V cores?</h2>
+  <p>Tenstorrent chips are often described as "RISC-V chips". Here is the count, built up from the tile inventory:</p>
+  <table class="num-r">
+    <tr><th>Source of cores</th><th>Wormhole (full die)</th><th>Blackhole (full die)</th></tr>
+    <tr><td>Tensix tiles × 5 baby RV32 cores</td><td>80 × 5 = 400</td><td>140 × 5 = 700</td></tr>
+    <tr><td>Ethernet tiles × baby cores per tile</td><td>16 × 1 = 16</td><td>14 × 2 = 28</td></tr>
+    <tr><td>SiFive x280 (64-bit) in L2CPU tiles</td><td>0</td><td>4 × 4 = 16</td></tr>
+    <tr><td><b>Total (documented)</b></td><td><b>416</b></td><td><b>744</b></td></tr>
+    <tr><td>DRAM-tile RISC-V ("DRISC")</td><td>none documented</td><td>yes, count unverified (see note)</td></tr>
+  </table>
+  <p>Sources: 5 baby cores per Tensix tile and 1 or 2 per Ethernet tile come from the ISA's <code>TensixTile/README.md</code> and <code>EthernetTile/README.md</code> for each chip, mirrored in ttsim's <code>RV32_CORES_PER_T_TILE 5</code> and <code>RV32_CORES_PER_E_TILE 1</code> or <code>2</code> (<code>src/config.h</code>). The 16 x280s are in <code>BlackholeA0/README.md</code>. ARC's four cores are not RISC-V and are not counted.</p>
+  <p>Blackhole's DRAM tiles also contain small RISC-V cores. tt-metal has a memory map for them ("DRISC has 128KB L1", <code>tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h:323-327</code>) and an optional "DRAM programmable cores" mode (<code>tt_metal/impl/context/metal_env.cpp:111-120</code>). The ISA docs have no Blackhole DRAM-tile page, so we could not confirm how many there are. Our research notes assume one per DRAM tile (24), which would make <b>768</b>. Treat that as an upper estimate. On products the counts drop with harvesting: a 72-core n150 has 72 × 5 + 16 = 376 RISC-V cores enabled.</p>
+
+  <div class="callout gpu">Counting "cores" across architectures is close to meaningless. An NVIDIA "CUDA core" is one FP32 lane. A baby RISC-V is a whole tiny in-order CPU that doesn't do the tensor math at all, and the matrix engine next to it does far more work per cycle than the RISC-V. Compare chips on FLOP/s, bytes per second and bytes of SRAM, not on core counts.</div>
+
+  <h2 id="generations">Generations and products</h2>
+  <p>Four Tensix generations so far. The sources are listed below the table. ⚠ marks a cell where two official sources disagree.</p>
+  <table>
+    <tr><th></th><th>Grayskull</th><th>Wormhole (B0)</th><th>Blackhole (A0)</th><th>Quasar</th></tr>
+    <tr><td>Status</td><td>Discontinued; last TT-Metalium v0.55 <sup>[g]</sup></td><td>Shipping</td><td>Shipping</td><td>Pre-silicon; tt-metal descriptors only <sup>[q]</sup></td></tr>
+    <tr><td>Tensix tiles per die</td><td>120 <sup>[g]</sup></td><td>80 <sup>[w][i]</sup></td><td>140 <sup>[i]</sup></td><td>32 in <code>quasar_32_arch.yaml</code> <sup>[q]</sup></td></tr>
+    <tr><td>Enabled in products</td><td>e75: 96, e150: 120</td><td>n150: 72; n300: 64 per chip; Galaxy: 80 per chip</td><td class="warn">p100a: 120; p150: <b>120</b> <sup>[b]</sup> vs <b>140</b> <sup>[i]</sup> ⚠</td><td>—</td></tr>
+    <tr><td>NoC grid</td><td>not covered here</td><td>10 × 12</td><td>17 × 12</td><td>11 × 8 <sup>[q]</sup></td></tr>
+    <tr><td>L1 per Tensix</td><td>1 MB</td><td>1464 KiB</td><td>1536 KiB</td><td>4 MiB <sup>[q]</sup></td></tr>
+    <tr><td>Off-chip memory</td><td>8 GB LPDDR4, 102–118 GB/s</td><td>12 GiB GDDR6, 192-bit, 288 GB/s at 12 GT/s <sup>[w]</sup></td><td>32 GiB GDDR6, 256-bit, 512 GB/s at 16 GT/s (p100a: 28 GB, 448 GB/s)</td><td>—</td></tr>
+    <tr><td>AI clock</td><td>1.0 GHz (e75), 1.2 GHz (e150)</td><td>1 GHz</td><td>up to 1.35 GHz</td><td>—</td></tr>
+    <tr><td>Chip-to-chip</td><td>none listed</td><td>16 Ethernet tiles × 100 GbE <sup>[i][x]</sup></td><td>14 Ethernet tiles × 400 GbE; ≤12 usable; 8 wired on p150 <sup>[i]</sup></td><td>—</td></tr>
+    <tr><td>Host link</td><td>PCIe 4.0 x16</td><td>PCIe 4.0 x16</td><td>PCIe 5.0 x16 (1 of 2 tiles used)</td><td>—</td></tr>
+    <tr><td>Big CPUs</td><td>—</td><td>— (ARC for management)</td><td>16 SiFive x280 in 4 L2CPU tiles</td><td>—</td></tr>
+    <tr><td>Per-tile cores</td><td>—</td><td>5 baby RV32IM</td><td>5 baby RISC-V (extended ISA)</td><td>8 data-movement cores + 4 engines × 4 math cores per node <sup>[q2]</sup></td></tr>
+  </table>
+  <p style="font-size:14px;color:var(--muted)">[g] docs.tenstorrent.com Grayskull specifications. [w] docs.tenstorrent.com Wormhole specifications. [b] docs.tenstorrent.com Blackhole specifications. [x] tenstorrent.com/hardware/galaxy. [i] tt-isa-documentation <code>WormholeB0/README.md</code>, <code>BlackholeA0/README.md</code>. [q] tt-metal <code>tt_metal/soc_descriptors/quasar_32_arch.yaml</code> (a 32-worker development descriptor, not necessarily the product). [q2] tt-metal <code>tt_metal/hw/inc/internal/tt-2xx/quasar/core_config.h:19-45</code> (DM0–DM7, E0_MATH0 … E3_MATH3).</p>
+
+  <h3>The conflicts, spelled out</h3>
+  <ul>
+    <li><b>p150 core count.</b> The ISA README's product table gives p150 140 Tensix tiles and p100 120. docs.tenstorrent.com gives 120 for p100a, p150a and p150b alike. Two pieces of evidence lean towards 120 for current p150 cards. First, the docs' 664 TFLOPS (BLOCKFP8) matches 120 × 4096 × 1.35 GHz = 663.6, using the 4096 FLOP/cycle per core that <a href="a06-matrix-engine.html">A06</a> derives, while 140 cores would give 774. Second, ttsim's p150 model harvests two columns (mask <code>0xC0</code>). The ISA table may describe the design intent or a different SKU. We can't settle this from public sources.</li>
+    <li><b>Wormhole FP8 peak.</b> The n150's quoted FP8 figure is 262 TFLOPS, but 72 × 4096 × 1 GHz = 295. The BLOCKFP8 (148) and FP16 (74) figures do fit 295 ÷ 2 and ÷ 4. We have no source for the 0.89 factor. The Galaxy page's 9.3 PFLOPS for 32 chips (about 292 per chip) shows the same ratio against 80 × 4096 = 328, though the current page labels that figure Block FP8 rather than FP8.</li>
+    <li><b>Galaxy per-chip numbers.</b> Earlier versions of the Galaxy page listed 14 GT/s memory and 16 × 200 Gbps Ethernet per chip. The current page (checked 2026-10-30) lists 384 GB at 9.2 TB/s, about 288 GB/s per chip, which fits 12 GT/s, and "up to 16× 100 GbE links per ASIC", which matches the ISA. Treat older per-chip figures you find quoted elsewhere with care.</li>
+    <li><b>Blackhole Ethernet.</b> The die has 14 tiles, and the descriptor lists all 14. The ISA says 12 are usable, 8 are wired to the p150's four QSFP-DD ports, and each port is a pair of tiles running at 800G. ttsim marks E12 and E13 as harvested (<code>ETH_LIVE_STATUS_MASK 0x0FFF</code>).</li>
+  </ul>
+
+  <h3>Products</h3>
+  <table>
+    <tr><th>Product</th><th>Chips</th><th>Tensix enabled</th><th>Memory</th><th>Notes</th></tr>
+    <tr><td><b>n150</b> (n150s / n150d)</td><td>1 Wormhole</td><td>72 (1 row harvested)</td><td>12 GB, 288 GB/s</td><td>160 W; 2× QSFP-DD 200G and 2× Warp 100 bridges. tt-metal layout "nebula_x1": 8×8 compute grid plus 1 dispatch row.</td></tr>
+    <tr><td><b>n300</b> (n300s / n300d)</td><td>2 Wormhole</td><td>128 (64 per chip, 2 rows harvested each)</td><td>24 GB, 576 GB/s</td><td>300 W; the two chips are linked on the board at 200G. Only one chip has PCIe; the other is reached over Ethernet.</td></tr>
+    <tr><td><b>p100a</b></td><td>1 Blackhole</td><td>120</td><td>28 GB, 448 GB/s</td><td>300 W; no QSFP ports (0 Ethernet tiles usable per the ISA table).</td></tr>
+    <tr><td><b>p150a / p150b</b></td><td>1 Blackhole</td><td class="warn">120 (docs) or 140 (ISA) ⚠</td><td>32 GB, 512 GB/s</td><td>300 W; 4× QSFP-DD 800G. "a" is actively cooled, "b" is passive for racks.</td></tr>
+    <tr><td><b>Galaxy</b> (Wormhole server)</td><td>32 Wormhole</td><td>2,560 (80 per chip, none harvested)</td><td>384 GB</td><td>An Ethernet mesh of 32 chips. tt-metal layout "galaxy" (0 harvested rows), and ttsim's 32-chip mask is 0.</td></tr>
+  </table>
+  <p>Product numbers come from the docs.tenstorrent.com spec pages and tenstorrent.com/hardware/galaxy, checked on 2026-10-30.</p>
+
+  <h2 id="ttsim">What ttsim builds</h2>
+  <p>The simulator hard-codes the same geometry. If you read <code>ttsim/src</code>, these are the constants that set up the map you just explored:</p>
+  <div class="filename">ttsim/src/sim.h:73-85 @b3620244</div>
+<pre><code>#if TT_ARCH_VERSION == 0
+#define NUM_TILE_COLS 10
+#define NUM_TILE_ROWS 12
+#define NONTENSIX_COL_MASK 0x21
+#define NONTENSIX_ROW_MASK 0x41
+#elif TT_ARCH_VERSION == 1
+#define NUM_TILE_COLS 17
+#define NUM_TILE_ROWS 12
+#define NONTENSIX_COL_MASK 0x301
+#define NONTENSIX_ROW_MASK 0x03
+#endif
+#define TENSIX_COL_MASK (((1ul &lt;&lt; NUM_TILE_COLS) - 1) &amp; ~NONTENSIX_COL_MASK)
+#define TENSIX_ROW_MASK (((1ul &lt;&lt; NUM_TILE_ROWS) - 1) &amp; ~NONTENSIX_ROW_MASK)</code></pre>
+  <p><code>TT_ARCH_VERSION</code> is 0 for Wormhole and 1 for Blackhole. <code>0x21</code> = bits 0 and 5, the two Wormhole DRAM columns. <code>0x41</code> = bits 0 and 6, the two Ethernet rows. On Blackhole, <code>0x301</code> = columns 0, 8 and 9 (DRAM, the CPU spine, DRAM) and <code>0x03</code> = rows 0 and 1. ttsim writes these masks, combined with any harvested rows or columns, into each NIU's <code>ROUTER_CFG_1</code> and <code>ROUTER_CFG_3</code> (<code>tile.cpp:141-142</code>). The ISA defines those registers as the "Broadcast opt-out mask for columns/rows" (<code>WormholeB0/NoC/MemoryMap.md:238-253</code>). So the simulator, like real firmware, makes sure a multicast never lands on a DRAM column, an Ethernet row, or a fused-off row.</p>
+  <p><code>src/config.h:13-16</code> and <code>:50-53</code> give the tile counts, <code>NUM_T_TILES 80</code> / <code>140</code> and <code>NUM_E_TILES 16</code> / <code>14</code>, and <code>NUM_DRAM_CHANNELS 6</code> / <code>8</code>. The comment on the Wormhole value says "technically it's 12 channels, 2 for each of the 6 DRAM tiles, but doesn't matter". The function <code>coord_to_tile</code> in <code>tile.cpp:723</code> is the inverse map. Give it a raw NoC coordinate and it returns <code>'T'</code>, <code>'E'</code>, <code>'D'</code>, <code>'P'</code> or <code>'A'</code> plus an index. For Wormhole Tensix tiles it computes <code>tile_x = x−1</code> (x ≤ 4) or <code>x−2</code> (x ≥ 6), and <code>tile_y = y−1</code> (y ≤ 5) or <code>y−2</code> (y ≥ 7), which squeezes out the DRAM column and the Ethernet row. ttsim does not model the L2CPU tiles: <code>#define ENABLED_L2CPU_MASK 0 // no L2 cpus modeled</code> (<code>tile.cpp:369</code>).</p>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A Tenstorrent die is a 2D grid of tiles on a NoC: Wormhole is 10×12 = 120 positions and Blackhole 17×12 = 204, both taken straight from tt-metal's SoC descriptors.</li>
+    <li>Tile types: <b>Tensix</b> (compute and L1), <b>DRAM</b> (each bank exposed on 3 tiles), <b>Ethernet</b> (chip-to-chip, with its own RISC-V and L1), <b>PCIe</b> (host), <b>ARC</b> (management firmware), plus <b>L2CPU</b> (16 x280s) and <b>Security</b> on Blackhole, and router-only gaps.</li>
+    <li><b>Harvesting</b> fuses off defective Tensix rows (Wormhole) or columns (Blackhole). That is why 80 becomes 72 (n150) or 64 (n300), and 140 becomes 120.</li>
+    <li>Every core has <b>physical</b> NoC 0 and NoC 1 coordinates, a firmware-configured <b>translated</b> coordinate that pushes harvested rows or columns to the end, and a Metalium <b>logical</b> coordinate counting only usable workers from (0,0).</li>
+    <li>On ttsim, Wormhole is modelled as an n150 (row y = 8 harvested, 8×9 logical, 8×8 compute) and Blackhole as a 120-core p150 (columns 7 and 10 harvested, 12×10 logical, 11×10 compute).</li>
+    <li>RISC-V count: 416 on a full Wormhole, 744 documented on a full Blackhole (more if the DRAM-tile cores are counted). None of them does the tensor math.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>A Wormhole chip has rows y = 3 and y = 9 fused off. What is the translated Y of the Tensix tile at physical (6, 10)?</summary>
+  <p>The good Tensix rows in order are 1, 2, 4, 5, 7, 8, 10, 11 (skipping 3 and 9; rows 0 and 6 are Ethernet). They take translated slots 18, 19, …, 25. Row 10 is the 7th good row, so it gets slot 18 + 6 = <b>24</b>. Its X: physical column 6 is the 5th Tensix column (1, 2, 3, 4, 6, …), so translated X = 18 + 4 = 22, and logical (4, 6). Rows 3 and 9 get slots 26 and 27. You can check this in the map: select a Tensix tile in row 3 and press <i>Harvest a row</i>, then do the same for row 9, with labels set to translated.</p></details>
+  <details class="quiz"><summary>Why does tt-metal show an 8×8 compute grid on an n150 when 72 Tensix cores are enabled?</summary>
+  <p>72 = 8 × 9 logical workers. The n150 core descriptor ("nebula_x1") reserves the last logical row, <code>[[0,-1] … [7,-1]]</code>, for dispatch cores that run the runtime's command-queue firmware. That leaves 8 × 8 = 64 for user compute. The ttsim run printed exactly this: <code>logical_grid_size = 8x9</code>, <code>compute grid = 8x8</code>.</p></details>
+  <details class="quiz"><summary>A DRAM bank on Wormhole appears at three NoC coordinates. If you write to (0,0) and read the same address from (0,11), what do you get?</summary>
+  <p>The same data. Both coordinates belong to bank D0, and the ISA says "each 2 GiB is exposed identically on 3 tiles". The three entry points exist so traffic from different parts of the grid can reach the bank through different routers. (Memory ordering across entry points is a separate question, covered in <a href="a08-noc.html">A08</a> and <a href="a09-memory.html">A09</a>.)</p></details>
+  <details class="quiz"><summary>Why can't Blackhole simply harvest rows, as Wormhole does?</summary>
+  <p>The docs state the policy, not the motive. The geometry suggests a reason, though. Blackhole has 14 Tensix columns and only 10 Tensix rows. Removing a row costs 14 tiles (10%), while removing a column costs 10 (7%). Columns are also how its translation hardware remaps Tensix tiles, with X = 8 and 9 kept fixed. What the sources do confirm: p100 has two columns fused off, translated Tensix X is remapped so fused columns sit at maximal X, and tt-metal's Blackhole layouts are named by harvested-column count.</p></details>
+  <details class="quiz"><summary>You hard-code physical NoC coordinate (9, 11) as the "last core" in a kernel. On which Wormhole products could this break?</summary>
+  <p>Any harvested part: n150 or n300. If row 11 is the fused-off row on that particular chip, (9, 11) is a disabled tile. Which row is fused off varies from chip to chip, so your code might work on your card and fail on a colleague's. Use logical coordinates on the host and let the runtime translate them, or use the translated scheme, where harvested rows are always at the end.</p></details>
+  <details class="quiz"><summary>How many baby RISC-V cores does an n300 card have enabled in total?</summary>
+  <p>Per chip: 64 Tensix × 5 = 320, plus 16 Ethernet tiles × 1 = 16, giving 336. Two chips: <b>672</b>. The Ethernet tiles count even when their link isn't connected, because the ISA says they "can still be used (for their RISCV and their L1)". ARC's cores are not RISC-V.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/README.md">tt-isa-documentation: Wormhole overview</a>: tile inventory and the NoC layout diagram for Wormhole B0.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/README.md">tt-isa-documentation: Blackhole overview</a>: tile inventory, the p100/p150 product table, and L2CPU and Ethernet notes.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Coordinates.md">Wormhole NoC coordinates</a>: NoC 0 and NoC 1 coordinates and the full translation tables with a harvesting example.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/NoC/Coordinates.md">Blackhole NoC coordinates</a>: combined X/Y translation, column harvesting, and the translation algorithm in pseudocode.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/L2CPUTile/README.md">Blackhole L2CPU tile</a>: the four x280 clusters, their caches, reset quirks and NoC locations.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml">wormhole_b0_80_arch.yaml</a>: the SoC descriptor this chapter's map is generated from (Blackhole's sits next to it).</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole card specifications</a>: official n150/n300 numbers.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole card specifications</a>: official p100a/p150a/p150b numbers (note the 120-core figure).</li>
+    <li><a href="https://tenstorrent.com/hardware/galaxy">Tenstorrent Galaxy</a>: the 32-chip servers; the Wormhole version is on the second tab of the specs table.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Hot Chips 2024: Tenstorrent Blackhole and TT-Metalium</a>: Tenstorrent's own architecture slides.</li>
+    <li><a href="https://riscv.epcc.ed.ac.uk/assets/files/hpcasia25/Tenstorrent.pdf">EPCC: Tenstorrent at HPC Asia 2025</a>: an outside HPC group's walkthrough of the architecture.</li>
+    <li><a href="https://github.com/tenstorrent/tt-bh-linux">tt-bh-linux</a>: boots Linux on Blackhole's x280 cores, a hands-on look at the L2CPU tiles.</li>
+  </ul>
+
+  <div class="pager"><a href="a02-gpu-vs-tenstorrent.html">&larr; 02 Two philosophies: GPU vs Tenstorrent</a><a class="next" href="a04-inside-tensix.html">04 Inside a Tensix core &rarr;</a></div>
+</main>
+
+<script>
+/* Parsed from tt-metal@7aad8aac tt_metal/soc_descriptors/{wormhole_b0_80_arch,blackhole_140_arch}.yaml.
+   Each tile: [x, y, type, id]. Types: T=Tensix (id = descriptor order), D=DRAM (id = bank index),
+   E=Ethernet (id = eth list index), P=PCIe, A=ARC, R=router_only. NoC0 coordinates. */
+var SOC = {"wh":{"w":10,"h":12,"tiles":[[0,0,"D",0],[1,0,"E",1],[2,0,"E",3],[3,0,"E",5],[4,0,"E",7],[5,0,"D",2],[6,0,"E",6],[7,0,"E",4],[8,0,"E",2],[9,0,"E",0],[0,1,"D",0],[1,1,"T",0],[2,1,"T",1],[3,1,"T",2],[4,1,"T",3],[5,1,"D",2],[6,1,"T",4],[7,1,"T",5],[8,1,"T",6],[9,1,"T",7],[0,2,"R",0],[1,2,"T",8],[2,2,"T",9],[3,2,"T",10],[4,2,"T",11],[5,2,"D",3],[6,2,"T",12],[7,2,"T",13],[8,2,"T",14],[9,2,"T",15],[0,3,"P",0],[1,3,"T",16],[2,3,"T",17],[3,3,"T",18],[4,3,"T",19],[5,3,"D",4],[6,3,"T",20],[7,3,"T",21],[8,3,"T",22],[9,3,"T",23],[0,4,"R",1],[1,4,"T",24],[2,4,"T",25],[3,4,"T",26],[4,4,"T",27],[5,4,"D",4],[6,4,"T",28],[7,4,"T",29],[8,4,"T",30],[9,4,"T",31],[0,5,"D",1],[1,5,"T",32],[2,5,"T",33],[3,5,"T",34],[4,5,"T",35],[5,5,"D",5],[6,5,"T",36],[7,5,"T",37],[8,5,"T",38],[9,5,"T",39],[0,6,"D",1],[1,6,"E",9],[2,6,"E",11],[3,6,"E",13],[4,6,"E",15],[5,6,"D",5],[6,6,"E",14],[7,6,"E",12],[8,6,"E",10],[9,6,"E",8],[0,7,"D",1],[1,7,"T",40],[2,7,"T",41],[3,7,"T",42],[4,7,"T",43],[5,7,"D",5],[6,7,"T",44],[7,7,"T",45],[8,7,"T",46],[9,7,"T",47],[0,8,"R",2],[1,8,"T",48],[2,8,"T",49],[3,8,"T",50],[4,8,"T",51],[5,8,"D",4],[6,8,"T",52],[7,8,"T",53],[8,8,"T",54],[9,8,"T",55],[0,9,"R",3],[1,9,"T",56],[2,9,"T",57],[3,9,"T",58],[4,9,"T",59],[5,9,"D",3],[6,9,"T",60],[7,9,"T",61],[8,9,"T",62],[9,9,"T",63],[0,10,"A",0],[1,10,"T",64],[2,10,"T",65],[3,10,"T",66],[4,10,"T",67],[5,10,"D",3],[6,10,"T",68],[7,10,"T",69],[8,10,"T",70],[9,10,"T",71],[0,11,"D",0],[1,11,"T",72],[2,11,"T",73],[3,11,"T",74],[4,11,"T",75],[5,11,"D",2],[6,11,"T",76],[7,11,"T",77],[8,11,"T",78],[9,11,"T",79]]},"bh":{"w":17,"h":12,"tiles":[[0,0,"D",0],[1,0,"R",0],[2,0,"P",0],[3,0,"R",1],[4,0,"R",2],[5,0,"R",3],[6,0,"R",4],[7,0,"R",5],[8,0,"A",0],[9,0,"D",4],[10,0,"R",6],[11,0,"P",1],[12,0,"R",7],[13,0,"R",8],[14,0,"R",9],[15,0,"R",10],[16,0,"R",11],[0,1,"D",0],[1,1,"E",0],[2,1,"E",2],[3,1,"E",4],[4,1,"E",6],[5,1,"E",8],[6,1,"E",10],[7,1,"E",12],[8,1,"R",12],[9,1,"D",4],[10,1,"E",13],[11,1,"E",11],[12,1,"E",9],[13,1,"E",7],[14,1,"E",5],[15,1,"E",3],[16,1,"E",1],[0,2,"D",1],[1,2,"T",0],[2,2,"T",1],[3,2,"T",2],[4,2,"T",3],[5,2,"T",4],[6,2,"T",5],[7,2,"T",6],[8,2,"R",13],[9,2,"D",5],[10,2,"T",7],[11,2,"T",8],[12,2,"T",9],[13,2,"T",10],[14,2,"T",11],[15,2,"T",12],[16,2,"T",13],[0,3,"D",1],[1,3,"T",14],[2,3,"T",15],[3,3,"T",16],[4,3,"T",17],[5,3,"T",18],[6,3,"T",19],[7,3,"T",20],[8,3,"R",14],[9,3,"D",5],[10,3,"T",21],[11,3,"T",22],[12,3,"T",23],[13,3,"T",24],[14,3,"T",25],[15,3,"T",26],[16,3,"T",27],[0,4,"D",2],[1,4,"T",28],[2,4,"T",29],[3,4,"T",30],[4,4,"T",31],[5,4,"T",32],[6,4,"T",33],[7,4,"T",34],[8,4,"R",15],[9,4,"D",6],[10,4,"T",35],[11,4,"T",36],[12,4,"T",37],[13,4,"T",38],[14,4,"T",39],[15,4,"T",40],[16,4,"T",41],[0,5,"D",3],[1,5,"T",42],[2,5,"T",43],[3,5,"T",44],[4,5,"T",45],[5,5,"T",46],[6,5,"T",47],[7,5,"T",48],[8,5,"R",16],[9,5,"D",7],[10,5,"T",49],[11,5,"T",50],[12,5,"T",51],[13,5,"T",52],[14,5,"T",53],[15,5,"T",54],[16,5,"T",55],[0,6,"D",3],[1,6,"T",56],[2,6,"T",57],[3,6,"T",58],[4,6,"T",59],[5,6,"T",60],[6,6,"T",61],[7,6,"T",62],[8,6,"R",17],[9,6,"D",7],[10,6,"T",63],[11,6,"T",64],[12,6,"T",65],[13,6,"T",66],[14,6,"T",67],[15,6,"T",68],[16,6,"T",69],[0,7,"D",3],[1,7,"T",70],[2,7,"T",71],[3,7,"T",72],[4,7,"T",73],[5,7,"T",74],[6,7,"T",75],[7,7,"T",76],[8,7,"R",18],[9,7,"D",7],[10,7,"T",77],[11,7,"T",78],[12,7,"T",79],[13,7,"T",80],[14,7,"T",81],[15,7,"T",82],[16,7,"T",83],[0,8,"D",2],[1,8,"T",84],[2,8,"T",85],[3,8,"T",86],[4,8,"T",87],[5,8,"T",88],[6,8,"T",89],[7,8,"T",90],[8,8,"R",19],[9,8,"D",6],[10,8,"T",91],[11,8,"T",92],[12,8,"T",93],[13,8,"T",94],[14,8,"T",95],[15,8,"T",96],[16,8,"T",97],[0,9,"D",2],[1,9,"T",98],[2,9,"T",99],[3,9,"T",100],[4,9,"T",101],[5,9,"T",102],[6,9,"T",103],[7,9,"T",104],[8,9,"R",20],[9,9,"D",6],[10,9,"T",105],[11,9,"T",106],[12,9,"T",107],[13,9,"T",108],[14,9,"T",109],[15,9,"T",110],[16,9,"T",111],[0,10,"D",1],[1,10,"T",112],[2,10,"T",113],[3,10,"T",114],[4,10,"T",115],[5,10,"T",116],[6,10,"T",117],[7,10,"T",118],[8,10,"R",21],[9,10,"D",5],[10,10,"T",119],[11,10,"T",120],[12,10,"T",121],[13,10,"T",122],[14,10,"T",123],[15,10,"T",124],[16,10,"T",125],[0,11,"D",0],[1,11,"T",126],[2,11,"T",127],[3,11,"T",128],[4,11,"T",129],[5,11,"T",130],[6,11,"T",131],[7,11,"T",132],[8,11,"R",22],[9,11,"D",4],[10,11,"T",133],[11,11,"T",134],[12,11,"T",135],[13,11,"T",136],[14,11,"T",137],[15,11,"T",138],[16,11,"T",139]]}};
+
+/* Blackhole column-8 overlay from tt-isa-documentation BlackholeA0/L2CPUTile/README.md:40-43
+   and the NoC_BH_Layout diagram: the descriptor lists these positions as router_only. */
+(function () {
+  var over = { "8,2": ["S", 0], "8,3": ["L", "0-3"], "8,9": ["L", "4-7"], "8,5": ["L", "8-11"], "8,7": ["L", "12-15"] };
+  SOC.bh.tiles.forEach(function (t) { var o = over[t[0] + "," + t[1]]; if (o) { t[2] = o[0]; t[3] = o[1]; } });
+  ["wh", "bh"].forEach(function (k) { var m = {}; SOC[k].tiles.forEach(function (t) { m[t[0] + "," + t[1]] = t; }); SOC[k].at = m; });
+})();
+
+var TILECOL = { T: TT.C.blue, D: TT.C.purple, E: TT.C.green, P: TT.C.yellow, A: TT.C.red, L: TT.C.pink, S: TT.C.orange, R: "#4a525e" };
+var TILENAME = { T: "Tensix", D: "DRAM", E: "Ethernet", P: "PCIe", A: "ARC", L: "L2CPU", S: "Security", R: "router-only" };
+function tileTag(t) {
+  if (t[2] === "T") return "T" + t[3];
+  if (t[2] === "D") return "D" + t[3];
+  if (t[2] === "E") return "E" + t[3];
+  if (t[2] === "P") return "PCIe";
+  if (t[2] === "A") return "ARC";
+  if (t[2] === "L") return "CPU";
+  if (t[2] === "S") return "SEC";
+  return "";
+}
+function legendHTML(types) {
+  return types.map(function (k) { return '<span style="--sw:' + TILECOL[k] + '">' + TILENAME[k] + "</span>"; }).join("");
+}
+</script>
+
+<script>
+/* Figure 1: build the Wormhole map category by category, then show Blackhole. */
+(function () {
+  var root = document.getElementById("fig-build");
+  var g = TT.canvas(root, 900, 440), ctx = g.ctx, C = TT.C;
+  var order = ["T", "D", "E", "P", "R"];
+  var steps = [
+    { dur: 1.2, text: "<b>The grid.</b> Wormhole's descriptor says <code>x_size: 10</code>, <code>y_size: 12</code>: 120 positions. Each one has a NoC router, the intersections of our city." },
+    { dur: 1.4, text: "<b>80 Tensix tiles</b> (<code>functional_workers</code>): columns 1–4 and 6–9, rows 1–5 and 7–11. These are the factories, where all the math happens." },
+    { dur: 1.4, text: "<b>18 DRAM tiles</b> in columns 0 and 5: six banks (D0–D5) of 2 GiB, each reachable through 3 tiles. 6 × 2 GiB = 12 GiB of GDDR6." },
+    { dur: 1.4, text: "<b>16 Ethernet tiles</b> in rows 0 and 6. Each has a 100 GbE link, a baby RISC-V and 256 KiB of L1. IDs alternate from the outside in (E0 at x=9, E1 at x=1, ...)." },
+    { dur: 1.2, text: "<b>PCIe at (0,3)</b> links to the host. <b>ARC at (0,10)</b> runs management firmware." },
+    { dur: 1.2, text: "<b>4 router-only positions</b> at (0,2), (0,4), (0,8), (0,9). Total: 80 + 18 + 16 + 1 + 1 + 4 = <b>120</b>. Every position is accounted for." },
+    { dur: 1.4, text: "<b>Blackhole</b> for comparison: 17 × 12 = 204 positions. 140 Tensix, 24 DRAM, 14 Ethernet, 2 PCIe, 1 ARC, 4 L2CPU, 1 Security, 18 router-only." }
+  ];
+  function drawGrid(arch, x0, y0, cell, upto, t) {
+    var S = SOC[arch];
+    S.tiles.forEach(function (tile) {
+      var x = x0 + tile[0] * cell, y = y0 + tile[1] * cell;
+      var k = tile[2] === "A" ? "P" : tile[2];
+      if (arch === "bh") k = "ALL";
+      var idx = k === "ALL" ? 0 : order.indexOf(k);
+      TT.box(ctx, x + 1, y + 1, cell - 2, cell - 2, { r: 3, stroke: C.border, lw: 1 });
+      if (idx < upto || (idx === upto && t > 0)) {
+        var a = idx < upto ? 0.85 : 0.85 * t;
+        TT.box(ctx, x + 2, y + 2, cell - 4, cell - 4, { r: 3, fill: TILECOL[tile[2]], alpha: a });
+        if (cell >= 30) TT.text(ctx, tileTag(tile), x + cell / 2, y + cell / 2, { font: "10px", align: "center", color: "#000", mono: true });
+      }
+    });
+    ctx.globalAlpha = 1;
+    for (var i = 0; i < S.w; i++) TT.text(ctx, String(i), x0 + i * cell + cell / 2, y0 - 9, { font: "10px", align: "center", color: C.muted, mono: true });
+    for (var j = 0; j < S.h; j++) TT.text(ctx, String(j), x0 - 10, y0 + j * cell + cell / 2, { font: "10px", align: "center", color: C.muted, mono: true });
+  }
+  TT.stepper({
+    root: root, steps: steps,
+    draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      if (i < 6) {
+        drawGrid("wh", 40, 30, 33, i - 1, i === 0 ? 0 : t);
+        var counts = [["Tensix", 80, "T"], ["DRAM", 18, "D"], ["Ethernet", 16, "E"], ["PCIe + ARC", 2, "P"], ["router-only", 4, "R"]];
+        TT.text(ctx, "Wormhole B0 · wormhole_b0_80_arch.yaml", 420, 40, { font: "bold 15px", color: C.yellow });
+        var sum = 0;
+        counts.forEach(function (c, k) {
+          var on = k < i;
+          if (on) sum += c[1];
+          var y = 85 + k * 38;
+          TT.box(ctx, 420, y - 11, 22, 22, { r: 3, fill: TILECOL[c[2]], alpha: on ? 0.85 : 0.15 });
+          TT.text(ctx, c[0], 455, y, { font: "15px", color: on ? C.fg : C.muted });
+          TT.text(ctx, on ? String(c[1]) : "·", 640, y, { font: "15px", align: "right", color: on ? C.fg : C.muted, mono: true });
+        });
+        ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(420, 280); ctx.lineTo(650, 280); ctx.stroke();
+        TT.text(ctx, "placed", 455, 300, { font: "15px", color: C.muted });
+        TT.text(ctx, sum + " / 120", 640, 300, { font: "bold 15px", align: "right", color: sum === 120 ? C.green : C.fg, mono: true });
+      } else {
+        drawGrid("bh", 40, 30, 23, 0, 1);
+        var bc = [["Tensix", 140, "T"], ["DRAM", 24, "D"], ["Ethernet", 14, "E"], ["PCIe", 2, "P"], ["ARC", 1, "A"], ["L2CPU", 4, "L"], ["Security", 1, "S"], ["router-only", 18, "R"]];
+        TT.text(ctx, "Blackhole · blackhole_140_arch.yaml", 470, 40, { font: "bold 15px", color: C.yellow });
+        bc.forEach(function (c, k) {
+          var y = 78 + k * 32;
+          TT.box(ctx, 470, y - 10, 20, 20, { r: 3, fill: TILECOL[c[2]], alpha: 0.85 * t + 0.15 });
+          TT.text(ctx, c[0], 502, y, { font: "14px" });
+          TT.text(ctx, String(c[1]), 680, y, { font: "14px", align: "right", mono: true });
+        });
+        TT.text(ctx, "total 204 = 17 × 12", 502, 345, { font: "bold 14px", color: C.green, mono: true });
+        TT.text(ctx, "L2CPU/Security: ISA docs; descriptor says router_only", 470, 375, { font: "12px", color: C.muted });
+      }
+    }
+  });
+})();
+</script>
+
+<script>
+/* Figure 2: toy yield model. Each of the 10 Tensix rows independently has a fatal defect with probability q.
+   Illustrative only: real defect rates are not public. */
+(function () {
+  var root = document.getElementById("fig-yield");
+  var g = TT.canvas(root, 900, 330), ctx = g.ctx, C = TT.C;
+  var ctrl = document.createElement("div"); ctrl.className = "controls";
+  ctrl.innerHTML = '<label>P(row has a fatal defect) <input type="range" min="0" max="30" step="0.5" value="6"></label><span class="qv" style="min-width:4em"></span><button>New wafer</button>';
+  root.appendChild(ctrl);
+  var cap = document.createElement("div"); cap.className = "caption"; root.appendChild(cap);
+  var slider = ctrl.querySelector("input"), qv = ctrl.querySelector(".qv"), btn = ctrl.querySelector("button");
+  var seed = 7;
+  function rng() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+  function binom(n, k, p) { var c = 1; for (var i = 0; i < k; i++) c = c * (n - i) / (i + 1); return c * Math.pow(p, k) * Math.pow(1 - p, n - k); }
+  var dies = [], NDIE = 48;
+  function roll() { var q = slider.value / 100; dies = []; for (var d = 0; d < NDIE; d++) { var rows = []; for (var r = 0; r < 10; r++) rows.push(rng() < q); dies.push(rows); } }
+  var BIN = [["80 cores (Galaxy)", C.green], ["72 cores (n150)", C.blue], ["64 cores (n300)", C.yellow], ["scrap (3+ bad rows)", C.red]];
+  function draw() {
+    var q = slider.value / 100;
+    qv.textContent = (q * 100).toFixed(1) + "%";
+    TT.clear(ctx, g.W, g.H);
+    TT.text(ctx, "Sampled wafer: 48 dies × 10 rows (bad rows red)", 20, 18, { font: "13px", color: C.muted });
+    var counts = [0, 0, 0, 0];
+    dies.forEach(function (rows, d) {
+      var bad = rows.filter(Boolean).length, bin = Math.min(bad, 3);
+      counts[bin]++;
+      var col = d % 8, row = Math.floor(d / 8), x = 20 + col * 50, y = 34 + row * 48;
+      TT.box(ctx, x, y, 44, 42, { r: 3, stroke: BIN[bin][1], lw: 2 });
+      for (var r = 0; r < 10; r++) {
+        ctx.fillStyle = rows[r] ? C.red : C.blue;
+        ctx.globalAlpha = rows[r] ? 0.95 : 0.35;
+        ctx.fillRect(x + 5, y + 4 + r * 3.5, 34, 2.5);
+      }
+      ctx.globalAlpha = 1;
+    });
+    var bx = 450, bw = 250;
+    TT.text(ctx, "Expected share of dies (binomial, n = 10 rows)", bx, 18, { font: "13px", color: C.muted });
+    for (var k = 0; k < 4; k++) {
+      var p = k < 3 ? binom(10, k, q) : 1 - binom(10, 0, q) - binom(10, 1, q) - binom(10, 2, q);
+      var y = 50 + k * 52;
+      TT.text(ctx, BIN[k][0], bx, y, { font: "14px" });
+      TT.box(ctx, bx, y + 10, bw, 16, { r: 3, fill: C.bg3 });
+      TT.box(ctx, bx, y + 10, Math.max(2, bw * p), 16, { r: 3, fill: BIN[k][1], alpha: 0.85 });
+      TT.text(ctx, (100 * p).toFixed(1) + "%", bx + bw + 10, y + 18, { font: "13px", mono: true });
+      TT.text(ctx, "sampled " + counts[k] + "/48", bx + bw + 68, y + 18, { font: "12px", color: C.muted, mono: true });
+    }
+    var noHarvest = binom(10, 0, q), withHarvest = 1 - (1 - binom(10, 0, q) - binom(10, 1, q) - binom(10, 2, q));
+    TT.text(ctx, "sellable without harvesting: " + (100 * noHarvest).toFixed(1) + "%", bx, 268, { font: "bold 14px", color: C.red });
+    TT.text(ctx, "sellable with up to 2 rows harvested: " + (100 * withHarvest).toFixed(1) + "%", bx, 292, { font: "bold 14px", color: C.green });
+    cap.innerHTML = "Toy model, not Tenstorrent data: rows fail independently with probability q, and defects outside Tensix rows are ignored. " +
+      "At q = " + (q * 100).toFixed(1) + "%, harvesting turns " + (100 * (withHarvest - noHarvest)).toFixed(0) + " extra dies out of every 100 into sellable parts.";
+  }
+  slider.oninput = function () { roll(); draw(); };
+  btn.onclick = function () { roll(); draw(); };
+  roll(); draw();
+})();
+</script>
+
+<script>
+/* Figure 3 (the aha figure): clickable WH/BH grid map with coordinate systems and a harvest toggle.
+   Translation follows tt-isa-documentation {WormholeB0,BlackholeA0}/NoC/Coordinates.md and
+   ttsim src/tile.cpp base_tile_init (TENSIX_ROWS, TENSIX_COLUMNS, TENSIX_HARVESTING_ORDER, GDDR_ROWS). */
+(function () {
+  var root = document.getElementById("fig-map");
+  var g = TT.canvas(root, 900, 680), ctx = g.ctx, C = TT.C;
+  var WH_ROWS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11], WH_COLS = [1, 2, 3, 4, 6, 7, 8, 9];
+  var BH_COLS = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
+  var BH_ORDER = [1, 16, 2, 15, 3, 14, 4, 13, 5, 12, 6, 11, 7, 10];
+  var GDDR_ROWS = [0, 1, 11, 2, 10, 3, 9, 4, 8, 5, 7, 6];
+  var PRESETS = {
+    wh: [["none (80 cores, Galaxy)", []], ["ttsim n150: y=8 (mask 0x40)", [8]], ["ttsim n300 chip 0: y=1, 8 (0x41)", [1, 8]], ["ISA example: y=7, 10", [7, 10]]],
+    bh: [["none (140 cores)", []], ["ttsim p150: x=7, 10 (mask 0xC0)", [7, 10]], ["ISA p100 example: x=5, 11", [5, 11]]]
+  };
+  var st = { arch: "wh", mode: "phys", harv: { wh: [], bh: [] }, sel: { wh: [1, 1], bh: [1, 2] }, anim: 1, prevMap: null };
+
+  // ---- controls ----
+  var ctrl = document.createElement("div"); ctrl.className = "controls";
+  ctrl.innerHTML =
+    '<button data-a="wh">Wormhole</button><button data-a="bh">Blackhole</button>' +
+    '<label>labels <select class="mode"><option value="phys">physical (NoC 0)</option><option value="noc1">physical (NoC 1)</option>' +
+    '<option value="trans">translated</option><option value="logical">logical (Metal)</option></select></label>' +
+    '<button class="hv">Harvest a row</button>' +
+    '<label>preset <select class="pre"></select></label>';
+  root.appendChild(ctrl);
+  var legend = document.createElement("div"); legend.className = "legend"; root.appendChild(legend);
+  var info = document.createElement("div"); info.className = "tileinfo"; root.appendChild(info);
+  var bA = ctrl.querySelectorAll("button[data-a]"), selMode = ctrl.querySelector(".mode"), bH = ctrl.querySelector(".hv"), selPre = ctrl.querySelector(".pre");
+
+  // ---- translation model ----
+  function whMap(harv) {
+    var good = WH_ROWS.filter(function (r) { return harv.indexOf(r) < 0; });
+    var bad = WH_ROWS.filter(function (r) { return harv.indexOf(r) >= 0; });
+    var ty = {}; good.concat(bad).forEach(function (r, i) { ty[r] = 18 + i; });
+    ty[0] = 16; ty[6] = 17;
+    return { ty: ty, good: good };
+  }
+  function bhMap(harv) {
+    var good = BH_COLS.filter(function (c) { return harv.indexOf(c) < 0; });
+    var tx = {}; good.forEach(function (c, i) { tx[c] = BH_COLS[i]; });
+    var k = BH_COLS.length;
+    BH_ORDER.forEach(function (c) { if (harv.indexOf(c) >= 0) tx[c] = BH_COLS[--k]; });
+    return { tx: tx, good: good };
+  }
+  function coordsOf(t) {
+    var a = st.arch, S = SOC[a], x = t[0], y = t[1], h = st.harv[a];
+    var r = { phys: "(" + x + "," + y + ")", noc1: "(" + (S.w - 1 - x) + "," + (S.h - 1 - y) + ")", trans: "—", logical: "—", dead: false, note: "" };
+    if (a === "wh") {
+      var m = whMap(h), cx = WH_COLS.indexOf(x);
+      if (t[2] === "T") {
+        r.trans = "(" + (18 + cx) + "," + m.ty[y] + ")";
+        if (h.indexOf(y) >= 0) { r.dead = true; r.logical = "none (fused off)"; }
+        else r.logical = "(" + cx + "," + m.good.indexOf(y) + ")";
+      } else if (t[2] === "E") { r.trans = "(" + (18 + cx) + "," + m.ty[y] + ")"; r.logical = "eth (" + t[3] + ")"; }
+      else if (t[2] === "R") { r.trans = "none (no endpoint)"; }
+      else { r.trans = "(" + (x === 0 ? 16 : 17) + "," + y + ")"; }
+    } else {
+      var mb = bhMap(h);
+      if (t[2] === "T") {
+        r.trans = "(" + mb.tx[x] + "," + y + ")";
+        if (h.indexOf(x) >= 0) { r.dead = true; r.logical = "none (fused off)"; }
+        else r.logical = "(" + mb.good.indexOf(x) + "," + (y - 2) + ")";
+      } else if (t[2] === "D") { r.trans = "(" + (x === 0 ? 17 : 18) + "," + (12 + GDDR_ROWS.indexOf(y)) + ")"; }
+      else if (t[2] === "E") { r.trans = t[3] < 12 ? "(" + (20 + t[3]) + ",25)" : "none (fused off in ttsim's p150 model)"; r.logical = "eth (" + t[3] + ")"; }
+      else if (t[2] === "P") { r.trans = t[3] === 0 ? "(19,24)" : "none (idle tile)"; }
+      else if (t[2] === "A") { r.trans = "(8,0) (raw X kept on rows 0–1)"; }
+      else if (t[2] === "L") { r.trans = "one of (8,26)…(8,29)"; }
+      else if (t[2] === "S") { r.trans = "(8,30)"; }
+      else r.trans = "none (no endpoint)";
+    }
+    return r;
+  }
+  function describe(t) {
+    var a = st.arch, wh = a === "wh";
+    switch (t[2]) {
+      case "T": return "<b>Tensix tile T" + t[3] + ".</b> 5 baby RISC-V cores, matrix and vector engines, " + (wh ? "1464" : "1536") + " KiB of L1 SRAM (not a cache). Two NoC connections. Opened up in A04.";
+      case "D": return "<b>DRAM tile, bank D" + t[3] + "</b> (tt-metal bank index). " + (wh ? "2 GiB of GDDR6 (two 1 GiB channels)" : "4 GiB of GDDR6 (tt-metal view: 4080 MiB)") + ", exposed identically on 3 tiles. It only answers NoC requests and never issues them.";
+      case "E": return "<b>Ethernet tile E" + t[3] + ".</b> " + (wh ? "100 GbE, 1 baby RISC-V, 256 KiB L1." : "400 GbE, 2 baby RISC-V, 512 KiB L1. Pairs of tiles feed one 800G QSFP-DD port.") + " Used for chip-to-chip traffic. It keeps its RISC-V and L1 even when no cable is attached.";
+      case "P": return "<b>PCIe tile" + (wh ? "" : " " + t[3]) + ".</b> Host link, " + (wh ? "PCI Express 4.0 x16." : "PCI Express 5.0 x16. Only one of the two PCIe tiles is used in current products" + (t[3] === 1 ? "; this one (PCIe 1) is idle." : "; on p150 it is this one (PCIe 0)."));
+      case "A": return "<b>ARC tile.</b> A four-core ARC CPU (not RISC-V) running board-management firmware: clocks, telemetry, resets, firmware updates. Not used for customer workloads.";
+      case "L": return "<b>L2CPU tile, CPUs " + t[3] + ".</b> A coherent cluster of four 64-bit SiFive x280 RISC-V cores with private L1/L2 and a shared 2 MiB L3. tt-metal's descriptor lists this position as <code>router_only</code>, and ttsim does not model it.";
+      case "S": return "<b>Security tile</b> (position from the ISA layout diagram; the descriptor lists it as <code>router_only</code>). Chip management, not customer workloads.";
+      default: return "<b>Router-only position.</b> A NoC router with no endpoint that software uses. Traffic passes through it.";
+    }
+  }
+
+  // ---- layout ----
+  function layout() {
+    var S = SOC[st.arch];
+    if (st.arch === "wh") return { cell: 44, x0: 50, y0: 40, S: S };
+    return { cell: 42, x0: 70, y0: 40, S: S };
+  }
+  function tileLabel(t, co) {
+    if (st.mode === "phys") return co.phys.replace(/[()]/g, "");
+    if (st.mode === "noc1") return co.noc1.replace(/[()]/g, "");
+    var s = st.mode === "trans" ? co.trans : co.logical;
+    return s.charAt(0) === "(" ? s.replace(/[()]/g, "").replace(/ .*/, "") : "";
+  }
+
+  function draw() {
+    var L = layout(), S = L.S, cell = L.cell, a = st.arch, h = st.harv[a];
+    TT.clear(ctx, g.W, g.H);
+    var title = a === "wh" ? "Wormhole B0: 10 × 12 NoC grid" : "Blackhole: 17 × 12 NoC grid";
+    var tens = S.tiles.filter(function (t) { return t[2] === "T"; }).length - h.length * (a === "wh" ? 8 : 10);
+    TT.text(ctx, title, L.x0, 16, { font: "bold 14px", color: C.yellow });
+    TT.text(ctx, "usable Tensix: " + tens, L.x0 + (a === "wh" ? 265 : 560), 16, { font: "bold 14px", color: h.length ? C.orange : C.green, mono: true });
+    for (var i = 0; i < S.w; i++) TT.text(ctx, String(i), L.x0 + i * cell + cell / 2, L.y0 - 9, { font: "10px", align: "center", color: C.muted, mono: true });
+    for (var j = 0; j < S.h; j++) TT.text(ctx, String(j), L.x0 - 12, L.y0 + j * cell + cell / 2, { font: "10px", align: "center", color: C.muted, mono: true });
+    S.tiles.forEach(function (t) {
+      var x = L.x0 + t[0] * cell, y = L.y0 + t[1] * cell, co = coordsOf(t);
+      var alpha = co.dead ? 0.12 : 0.8;
+      TT.box(ctx, x + 2, y + 2, cell - 4, cell - 4, { r: 4, fill: TILECOL[t[2]], alpha: alpha });
+      if (co.dead) {
+        ctx.globalAlpha = 0.5; ctx.strokeStyle = C.red; ctx.lineWidth = 1.5; ctx.beginPath();
+        ctx.moveTo(x + 8, y + 8); ctx.lineTo(x + cell - 8, y + cell - 8); ctx.moveTo(x + cell - 8, y + 8); ctx.lineTo(x + 8, y + cell - 8); ctx.stroke(); ctx.globalAlpha = 1;
+      }
+      var ink = co.dead ? C.muted : "#000";
+      TT.text(ctx, tileTag(t), x + cell / 2, y + 15, { font: "bold 10px", align: "center", color: ink, mono: true });
+      var lab = tileLabel(t, co);
+      if (lab) TT.text(ctx, lab, x + cell / 2, y + cell - 13, { font: "10px", align: "center", color: co.dead ? C.red : ink, mono: true });
+    });
+    var sl = st.sel[a];
+    TT.box(ctx, L.x0 + sl[0] * cell + 1, L.y0 + sl[1] * cell + 1, cell - 2, cell - 2, { r: 5, stroke: C.yellow, lw: 3 });
+    drawLadder(L);
+  }
+
+  // Ladder: physical Tensix rows (WH) or columns (BH) -> translated slot, animated on change.
+  function drawLadder(L) {
+    var a = st.arch, cell = L.cell, S = L.S, t = TT.smooth(st.anim);
+    var m = a === "wh" ? whMap(st.harv.wh) : bhMap(st.harv.bh);
+    var prev = st.prevMap && st.prevMap.arch === a ? st.prevMap.m : m;
+    if (a === "wh") {
+      var gx = L.x0 + S.w * cell, lx = gx + 150;
+      TT.text(ctx, "physical row", gx + 10, L.y0 - 22, { font: "12px", color: C.muted });
+      TT.text(ctx, "translated Y", lx + 6, L.y0 - 22, { font: "12px", color: C.muted });
+      TT.text(ctx, "logical y", lx + 100, L.y0 - 22, { font: "12px", color: C.muted });
+      for (var s = 16; s <= 27; s++) {
+        var sy = L.y0 + (s - 16) * cell + cell / 2;
+        TT.text(ctx, String(s), lx + 30, sy, { font: "12px", align: "center", mono: true, color: s < 18 ? C.green : C.blue });
+      }
+      [0, 6].concat(WH_ROWS).forEach(function (r) {
+        var y1 = L.y0 + r * cell + cell / 2;
+        var s0 = prev.ty[r], s1 = m.ty[r], s = TT.lerp(s0, s1, t);
+        var y2 = L.y0 + (s - 16) * cell + cell / 2;
+        var dead = st.harv.wh.indexOf(r) >= 0, eth = r === 0 || r === 6;
+        var col = dead ? C.red : eth ? C.green : C.blue;
+        ctx.globalAlpha = 0.85; ctx.strokeStyle = col; ctx.lineWidth = dead ? 2.5 : 1.5;
+        ctx.beginPath(); ctx.moveTo(gx + 4, y1); ctx.bezierCurveTo(gx + 70, y1, lx - 50, y2, lx + 12, y2); ctx.stroke(); ctx.globalAlpha = 1;
+        if (!eth && t >= 1) {
+          var lg = m.good.indexOf(r);
+          TT.text(ctx, lg >= 0 ? String(lg) : "✕", lx + 125, y2, { font: "12px", align: "center", mono: true, color: lg >= 0 ? C.fg : C.red });
+        }
+      });
+      TT.text(ctx, "Good rows fill 18, 19, …; harvested rows go last.", gx + 10, L.y0 + S.h * cell + 22, { font: "12px", color: C.muted });
+    } else {
+      var gy = L.y0 + S.h * cell, ly = gy + 70;
+      TT.text(ctx, "transl. X", 4, ly + 4, { font: "11px", color: C.muted });
+      TT.text(ctx, "logical x", 4, ly + 26, { font: "11px", color: C.muted });
+      BH_COLS.forEach(function (c) {
+        var x1 = L.x0 + c * cell + cell / 2;
+        var s0 = prev.tx[c], s1 = m.tx[c], sx = L.x0 + TT.lerp(s0, s1, t) * cell + cell / 2;
+        var dead = st.harv.bh.indexOf(c) >= 0, col = dead ? C.red : C.blue;
+        ctx.globalAlpha = 0.85; ctx.strokeStyle = col; ctx.lineWidth = dead ? 2.5 : 1.5;
+        ctx.beginPath(); ctx.moveTo(x1, gy + 2); ctx.bezierCurveTo(x1, gy + 40, sx, ly - 40, sx, ly - 10); ctx.stroke(); ctx.globalAlpha = 1;
+      });
+      BH_COLS.forEach(function (c, i) {
+        var x = L.x0 + c * cell + cell / 2;
+        TT.text(ctx, String(c), x, ly + 4, { font: "12px", align: "center", mono: true, color: C.blue });
+        if (t >= 1) {
+          var phys = null;
+          for (var k in m.tx) if (m.tx[k] === c) phys = +k;
+          var lg = m.good.indexOf(phys);
+          TT.text(ctx, lg >= 0 ? String(lg) : "✕", x, ly + 26, { font: "12px", align: "center", mono: true, color: lg >= 0 ? C.fg : C.red });
+        }
+      });
+      TT.text(ctx, "Translated X for Tensix rows 2–11. Good columns fill slots left to right; harvested columns go to the right end. X = 8, 9 are never Tensix.", L.x0, ly + 50, { font: "12px", color: C.muted });
+    }
+  }
+
+  function showInfo() {
+    var a = st.arch, sl = st.sel[a], t = SOC[a].at[sl[0] + "," + sl[1]], co = coordsOf(t);
+    info.innerHTML = describe(t) + "<br>" +
+      "physical NoC 0 <code>" + co.phys + "</code> · NoC 1 <code>" + co.noc1 + "</code> · translated <code>" + co.trans + "</code> · logical <code>" + co.logical + "</code>" +
+      (co.dead ? ' · <span class="c-red">fused off: tile clock disabled, no Metal logical coordinate</span>' : "");
+  }
+  function refreshControls() {
+    bA.forEach(function (b) { b.classList.toggle("on", b.dataset.a === st.arch); });
+    var a = st.arch, h = st.harv[a], sl = st.sel[a];
+    var key = a === "wh" ? sl[1] : sl[0];
+    var t = SOC[a].at[sl[0] + "," + sl[1]];
+    var unit = a === "wh" ? "row" : "column";
+    if (t[2] === "T" && h.indexOf(key) >= 0) bH.textContent = "Un-harvest " + unit + " " + (a === "wh" ? "y=" : "x=") + key;
+    else if (t[2] === "T") bH.textContent = "Harvest a " + unit + " (" + (a === "wh" ? "y=" : "x=") + key + ")";
+    else bH.textContent = "Harvest a " + unit + " (select a Tensix tile)";
+    bH.classList.toggle("on", h.length > 0);
+    selPre.innerHTML = PRESETS[a].map(function (p, i) { return '<option value="' + i + '">' + p[0] + "</option>"; }).join("");
+    var idx = PRESETS[a].findIndex(function (p) { return p[1].slice().sort().join() === h.slice().sort().join(); });
+    selPre.value = idx >= 0 ? String(idx) : "";
+    legend.innerHTML = legendHTML(a === "wh" ? ["T", "D", "E", "P", "A", "R"] : ["T", "D", "E", "P", "A", "L", "S", "R"]) +
+      '<span style="--sw:transparent;color:var(--red)">✕ harvested</span>';
+  }
+  function setHarvest(list) {
+    var a = st.arch;
+    st.prevMap = { arch: a, m: a === "wh" ? whMap(st.harv.wh) : bhMap(st.harv.bh) };
+    st.harv[a] = list.slice();
+    st.anim = 0;
+    var last = performance.now();
+    function step(now) {
+      st.anim = Math.min(1, st.anim + (now - last) / 900); last = now;
+      draw();
+      if (st.anim < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+    refreshControls(); showInfo();
+  }
+  function render() { draw(); refreshControls(); showInfo(); }
+
+  bA.forEach(function (b) { b.onclick = function () { st.arch = b.dataset.a; st.prevMap = null; st.anim = 1; render(); }; });
+  selMode.onchange = function () { st.mode = selMode.value; render(); };
+  selPre.onchange = function () { if (selPre.value !== "") setHarvest(PRESETS[st.arch][+selPre.value][1]); };
+  bH.onclick = function () {
+    var a = st.arch, sl = st.sel[a], t = SOC[a].at[sl[0] + "," + sl[1]];
+    var key = a === "wh" ? sl[1] : sl[0], h = st.harv[a].slice();
+    if (t[2] !== "T") {               // no Tensix selected: harvest the ttsim default
+      setHarvest(a === "wh" ? [8] : [7, 10]); return;
+    }
+    var i = h.indexOf(key);
+    if (i >= 0) h.splice(i, 1);
+    else { if (h.length >= 2) h.shift(); h.push(key); }   // tt-metal allows at most 2
+    setHarvest(h);
+  };
+  g.canvas.style.cursor = "pointer";
+  g.canvas.addEventListener("click", function (ev) {
+    var r = g.canvas.getBoundingClientRect(), L = layout();
+    var px = (ev.clientX - r.left) * g.W / r.width, py = (ev.clientY - r.top) * g.H / r.height;
+    var cx = Math.floor((px - L.x0) / L.cell), cy = Math.floor((py - L.y0) / L.cell);
+    if (cx < 0 || cy < 0 || cx >= L.S.w || cy >= L.S.h) return;
+    st.sel[st.arch] = [cx, cy]; render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>
