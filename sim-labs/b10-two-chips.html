@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B10 · Two chips · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  table.t td.n { text-align: right; font-family: var(--mono); }
+  td.ok { color: var(--green); } td.bad { color: var(--red); } td.fix { color: var(--yellow); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a21-many-chips.html">&larr; Prev</a>
+  <a href="../chapters/a22-llm-capstone.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B10</span><span class="tag">Prerequisites: A21, B00, B02</span>
+  <h1><span class="num">B10.</span> Two chips</h1>
+  <p class="subtitle">Boot a simulated n300 with two Wormhole chips, list what tt-metal finds, run one MeshWorkload with different data on each chip, and then move bytes over the Ethernet link between them three ways. Along the way you trace why TT-Fabric starves the host's link to chip 1 in the simulator to one early return in tt-metal, and use a kernel overlay that works around it.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model, <b>not a timing model</b>. An Ethernet send in ttsim is a <code>memcpy</code> into the peer core's L1, done inside the register write that starts it (<code>tile.cpp:2028-2034</code>). The bracketed clock numbers in this lab put events in order. They say nothing about link latency or bandwidth. The Ethernet firmware here is <b>ttsim's own mock</b> base firmware (<code>ttsim/fw/eth/eth_fw.c</code>), not Tenstorrent's production firmware. The TT-Fabric and all-gather results in section 4 need a <b>kernel overlay that changes the fabric router's yield interval</b>. It works around a simulator-only gap in tt-metal <code>7aad8aac</code> and is not a fix you would ship. Every output below was run in this orb with tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code> (v1.15.0).</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">0. Setup</a></li>
+      <li><a href="#inventory">1. Boot two chips and take inventory</a></li>
+      <li><a href="#dbrw">2. dbrw: 32 MiB through a 4 KiB keyhole</a></li>
+      <li><a href="#workload">3. One MeshWorkload, two programs</a></li>
+      <li><a href="#cross">4. Making data cross the link</a></li>
+      <li><a href="#stock">5. Why the stock distributed examples fail</a></li>
+      <li><a href="#matrix">6. What works and what does not</a></li>
+      <li><a href="#exercises">7. Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>An n300 card carries two Wormhole chips. Only one of them is wired to the PCIe slot. The other one has no path to the host at all except two Ethernet cables that run across the card to its sibling. The chips share no memory.</p>
+  <p>Yet the program you will run in section 2 writes 32 MiB into "one" buffer, reads it back, and prints <code>devices=2 match=true</code>. Half of those bytes live on the chip the host cannot reach. So who carried them? And once data is on both chips, how do you get a kernel on chip 0 to put bytes into chip 1's DRAM, with the host not involved at all?</p>
+  <p><a href="../chapters/a21-many-chips.html">A21</a> answers this in principle: Ethernet cores, MeshDevice, TT-Fabric and collectives. This lab answers it with a log. You will make ttsim print every packet that crosses the simulated link and read the exchange one header at a time. In the process you will hit a wall that A21 also hit: the fabric comes up, then the host loses chip 1. This lab traces that wall to a specific line of source code (with the evidence and its limits spelled out) and gets past it.</p>
+
+  <h2 id="setup">0. Setup</h2>
+  <p>Only one multichip configuration works in this orb: ttsim's <code>wh_x2</code> build, an n300 (two Wormholes, one with PCIe), with a 2×1 mesh. tt-metal does not probe ttsim for its topology. You hand it a cluster descriptor through <code>TT_METAL_MOCK_CLUSTER_DESC_PATH</code>, as ttsim's README instructs (<code>ttsim/README.md:243-252</code>).</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/b10
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
+SIM=$HOME/sim/wh_x2/libttsim_wh_x2.so source $W/env.sh wh
+export TT_METAL_MOCK_CLUSTER_DESC_PATH=$TT_METAL_HOME/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml
+mkdir -p $LAB_HOME/kernels/b10
+cp $W/../overlays/b10/b10/*.cpp $LAB_HOME/kernels/b10/      # this lab's own kernels</code></pre>
+  <p>B00 installs only <code>~/sim/wh</code> and <code>~/sim/bh</code>. If <code>env.sh</code> warns that there is no <code>soc_descriptor.yaml</code> next to <code>libttsim_wh_x2.so</code>, build the two multichip simulators this lab uses (<code>wh_x8</code> is only for section 5), then rerun the <code>source</code> line:</p>
+<pre><code>for c in wh_x2 wh_x8; do
+  $W/build_ttsim.sh stock $c &gt;/dev/null &amp;&amp; mkdir -p ~/sim/$c &amp;&amp;
+  cp $LAB_HOME/sim-stock-$c-release/soc_descriptor.yaml ~/sim/$c/ &amp;&amp;
+  cp $LAB_HOME/sim-stock-$c-release/libttsim.so ~/sim/$c/libttsim_$c.so
+done</code></pre>
+  <p>The descriptor is short enough to read whole. Keep the <code>ethernet_connections</code> pair in mind.</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml:1-27 @7aad8aac (trimmed)</div>
+<pre><code>chips: { 0: [0,0,0,0], 1: [1,0,0,0] }
+ethernet_connections: [
+   [{chip: 0, chan: 8}, {chip: 1, chan: 0}],
+   [{chip: 0, chan: 9}, {chip: 1, chan: 1}],
+]
+chips_with_mmio: [ 0: 0 ]
+harvesting: { 0: {noc_translation: true, harvest_mask: 65},
+              1: {noc_translation: true, harvest_mask: 5} }</code></pre>
+  <p>ttsim keeps its own copy of the same topology. Each row is (source chip, source Ethernet tile, destination chip, destination tile), and every link is listed in both directions:</p>
+  <div class="filename">ttsim/src/topology.h:17-19 @b3620244</div>
+<pre><code>static constexpr EthLink ETH_PEER_TABLE_N300[] = { // n300 = 2x Wormhole
+    {0, 8, 1, 0}, {0, 9, 1, 1}, {1, 0, 0, 8}, {1, 1, 0, 9},
+};</code></pre>
+  <p>The two files agree: channel 8 on chip 0 is wired to channel 0 on chip 1, and channel 9 to channel 1. The harvest masks agree too: ttsim hard-codes <code>N300[] = {0x41, 0x05}</code> (<code>tile.cpp:31</code>), which is 65 and 5 in decimal. If they ever disagreed, tt-metal would compute one topology and ttsim would deliver packets along another.</p>
+
+  <h2 id="inventory">1. Boot two chips and take inventory</h2>
+  <p>B02 built an inventory by patching ttsim. Here the question is what tt-metal believes, so the inventory is a host program. <code>b10_inventory.cpp</code> opens a <code>MeshShape(2, 1)</code> and asks each device for its Ethernet cores and their peers.</p>
+  <div class="filename">sim-labs/workbench/host/b10_inventory.cpp:19-35 (trimmed)</div>
+<pre><code>IDevice* d = mesh-&gt;get_device(r, c);
+...
+auto active_set = d-&gt;get_active_ethernet_cores();       // LOGICAL coords
+for (const CoreCoord&amp; l : active) {
+    auto [peer_chip, peer_core] = d-&gt;get_connected_ethernet_core(l);
+    fmt::print("  active eth  logical {} = NoC {}  &lt;-&gt;  {}\n", l.str(),
+        d-&gt;ethernet_core_from_logical_core(l).str(), peer);</code></pre>
+  <p>Build and run it (one-time build about 6 s, run 0.7 s):</p>
+<pre><code>cp $W/host/b10_inventory.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b10_inventory.cpp
+$LAB_HOME/b10_inventory 2&gt;&amp;1 | grep -v "| info"</code></pre>
+<pre><code>mesh shape 2x1, 2 devices
+mesh (0,0) -&gt; chip 0  mmio=true  worker grid 8x7  eth cores (logical) 16
+  active eth  logical 0-8 = NoC 25-17  &lt;-&gt;  chip 1 logical 0-0
+  active eth  logical 0-9 = NoC 18-17  &lt;-&gt;  chip 1 logical 0-1
+... critical | Always | TT_FATAL: Logical eth core 0-15 is not an active eth core on chip 0. (assert.hpp:104)
+  active eth  logical 0-15 = NoC 21-17  &lt;-&gt;  no trained link (TT_FATAL in get_connected_ethernet_core)
+  inactive eth cores: 13
+  ethernet sockets to chip 1: 0-8 0-9
+mesh (1,0) -&gt; chip 1  mmio=false  worker grid 8x7  eth cores (logical) 16
+  active eth  logical 0-0 = NoC 25-16  &lt;-&gt;  chip 0 logical 0-8
+  active eth  logical 0-1 = NoC 18-16  &lt;-&gt;  chip 0 logical 0-9
+  inactive eth cores: 14
+  ethernet sockets to chip 0: 0-0 0-1
+[34857] 0.7 seconds (53.0 KHz)</code></pre>
+  <p>Line by line:</p>
+  <ul>
+    <li><b>Two devices, one MMIO.</b> Chip 0 has <code>mmio=true</code> and chip 1 has <code>false</code>. UMD built chip 1 as a <i>remote</i> simulation chip because the descriptor declared it remote (<code>tt-umd-workload/src/cluster.cpp:305-306</code>). Every host access to chip 1 must therefore be relayed by chip 0's Ethernet cores.</li>
+    <li><b>The links match the descriptor.</b> Logical Ethernet core <code>0-8</code> is channel 8. On chip 0 it connects to chip 1's <code>0-0</code> (channel 0), and <code>0-9</code> connects to <code>0-1</code>. The "NoC" column holds translated coordinates. Physically these are tiles (9,6) and (1,6) on chip 0 and (9,0) and (1,0) on chip 1, which matches the soc descriptor's <code>eth:</code> list (<code>wormhole_b0_80_arch.yaml:104-108</code>: entry 8 is <code>9-6</code>, entry 9 is <code>1-6</code>).</li>
+    <li><b>A third "active" core on chip 0 has no link.</b> Channel 15 is reported active, but asking for its peer hits a <code>TT_FATAL</code>, so the program catches it. The reason is a special case in the control plane: on a Wormhole MMIO chip that tunnels to remote chips, channel 15 is always marked active because "channel 15 is used by syseng tools" (<code>control_plane.cpp:3145-3162</code>).</li>
+    <li><b>8×7 workers per chip.</b> Each chip has two harvested Tensix rows (masks 0x41 and 0x05 each have two bits set), which leaves 8 of 10 rows. One more row is set aside for dispatch cores, as on the single-chip model, where 9 rows show up as 8×8 (<a href="../chapters/a17-dispatch-host.html">A17</a>).</li>
+  </ul>
+  <div class="callout warn"><b>API trap.</b> <code>device.hpp:206</code> says <code>get_active_ethernet_cores()</code> returns <i>virtual</i> coordinates. The implementation returns <b>logical</b> ones (<code>control_plane.cpp:3134</code> asks for <code>CoordSystem::LOGICAL</code>). My first version of the program passed them to <code>logical_core_from_ethernet_core</code> and UMD threw <code>No core coordinate found for system LOGICAL at location: (0, 8, ROUTER_ONLY, TRANSLATED)</code>.</div>
+  <p>You can see ttsim's side of the same links with this lab's instrumented simulator (built in section 2). Its first lines come from the link-init code that fakes "link trained" status for UMD (<code>tile.cpp:496-525</code>):</p>
+<pre><code>[0] B10 LINK c0:E8(9,6) -&gt; c1:E0(9,0)
+[0] B10 LINK c0:E9(1,6) -&gt; c1:E1(1,0)
+[0] B10 LINK c1:E0(9,0) -&gt; c0:E8(9,6)
+[0] B10 LINK c1:E1(1,0) -&gt; c0:E9(1,6)</code></pre>
+  <p>The first figure puts all of this on two NoC grids. Step through it. The last step uses the fabric results from section 4.</p>
+
+  <div class="viz" id="figTopo"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figTopo");
+    var g = TT.canvas(root, 900, 500), ctx = g.ctx, C = TT.C;
+    // Wormhole NoC grid 10 x 12 (x 0..9, y 0..11). Eth channels per soc descriptor eth: list.
+    var ETH = [[9,0],[1,0],[8,0],[2,0],[7,0],[3,0],[6,0],[4,0],[9,6],[1,6],[8,6],[2,6],[7,6],[3,6],[6,6],[4,6]];
+    var cell = 26, oy = 95, chipX = [60, 520];
+    function pos(chip, x, y) { return [chipX[chip] + x * cell + cell / 2, oy + y * cell + cell / 2]; }
+    function drawChip(chip, i) {
+      var x0 = chipX[chip], w = 10 * cell, h = 12 * cell;
+      TT.box(ctx, x0 - 6, oy - 6, w + 12, h + 12, { stroke: C.border, r: 8 });
+      TT.text(ctx, "chip " + chip + (chip === 0 ? "  (MMIO, mesh (0,0))" : "  (remote, mesh (1,0))"), x0, oy - 22, { color: C.yellow, font: "15px" });
+      for (var x = 0; x < 10; x++) for (var y = 0; y < 12; y++) {
+        var p = pos(chip, x, y), col = C.bg3, a = 1;
+        var isEth = (y === 0 || y === 6) && x !== 0 && x !== 5;
+        if (x === 0 || x === 5) col = "#2a2f3a";
+        if (isEth) col = C.bg3;
+        TT.box(ctx, p[0] - cell / 2 + 2, p[1] - cell / 2 + 2, cell - 4, cell - 4, { fill: col, r: 3 });
+      }
+      // PCIe (0,3) and ARC (0,10)
+      var pc = pos(chip, 0, 3);
+      TT.box(ctx, pc[0] - 11, pc[1] - 11, 22, 22, { fill: chip === 0 ? C.green : C.bg2, stroke: chip === 0 ? C.green : C.border, r: 3, label: "P", font: "11px", color: chip === 0 ? "#000" : C.muted });
+      for (var c = 0; c < 16; c++) {
+        var e = ETH[c], q = pos(chip, e[0], e[1]);
+        var hot = (chip === 0 && (c === 8 || c === 9)) || (chip === 1 && (c === 0 || c === 1));
+        var fill = i >= 1 ? (hot && i >= 2 ? C.orange : C.purple) : C.bg3;
+        var alpha = i >= 1 ? (hot && i >= 2 ? 0.9 : 0.35) : 1;
+        if (chip === 0 && c === 15 && i >= 3) { fill = C.red; alpha = 0.7; }
+        TT.box(ctx, q[0] - 11, q[1] - 11, 22, 22, { fill: fill, alpha: alpha, r: 3 });
+        if (i >= 1) TT.text(ctx, "" + c, q[0], q[1], { color: C.fg, font: "10px", align: "center", mono: true });
+      }
+    }
+    function link(a, b, col, lw, label, lx, ly) {
+      ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+      ctx.moveTo(a[0], a[1]); ctx.bezierCurveTo(a[0] + 120, a[1] - 10, b[0] - 120, b[1] + 10, b[0], b[1]); ctx.stroke();
+      if (label) TT.text(ctx, label, lx, ly, { color: col, font: "12px", align: "center", mono: true });
+    }
+    var steps = [
+      { dur: 1.2, text: "<b>Two Wormhole NoC grids, 10&times;12 each.</b> Only chip 0 has a working PCIe tile (green P at (0,3)). The host reaches chip 1 only through chip 0. tt-metal reports <code>mmio=true</code> for chip 0 and <code>mmio=false</code> for chip 1." },
+      { dur: 1.2, text: "<b>16 Ethernet tiles per chip</b> (purple), in NoC rows 0 and 6. Each label is the channel number from the soc descriptor's <code>eth:</code> list: channel 8 is tile (9,6), channel 0 is tile (9,0)." },
+      { dur: 1.5, text: "<b>Two cables.</b> Channels 8 and 9 on chip 0 connect to channels 0 and 1 on chip 1, per <code>wormhole_N300.yaml</code> and ttsim's <code>ETH_PEER_TABLE_N300</code>. In ttsim these \"cables\" are a lookup table: a send is a <code>memcpy</code> into the peer tile's L1." },
+      { dur: 1.5, text: "<b>tt-metal's view.</b> Chip 0 reports 3 active Ethernet cores: 0-8 and 0-9 (linked) plus 0-15 (red), which is always active on a tunnelling WH MMIO chip \"for syseng tools\" but has no peer. Chip 1 reports 2." },
+      { dur: 1.8, text: "<b>Roles once TT-Fabric is on</b> (section 4, read from the JIT cache). The 8&harr;0 link carries the dispatch tunnel, so its routers yield every 16 idle checks. The 9&harr;1 link is the fabric plane available to user kernels (<code>get_number_of_available_routing_planes</code> = 1), and its routers yield only after 10000 idle checks." }
+    ];
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      drawChip(0, i); drawChip(1, i);
+      if (i >= 2) {
+        var a8 = pos(0, 9, 6), b0 = pos(1, 9, 0), a9 = pos(0, 1, 6), b1 = pos(1, 1, 0);
+        var al = i === 2 ? t : 1;
+        ctx.globalAlpha = al;
+        var c8 = i >= 4 ? C.blue : C.orange, c9 = i >= 4 ? C.yellow : C.orange;
+        link(a8, b0, c8, 3, i >= 4 ? "ch8 \u2194 ch0: dispatch tunnel, SWITCH_INTERVAL 16" : "ch8 \u2194 ch0", 450, 22);
+        // ch9 at x=1 goes under chip 0 then over to chip1 x=1
+        ctx.strokeStyle = c9; ctx.lineWidth = 3; ctx.beginPath();
+        ctx.moveTo(a9[0], a9[1]); ctx.lineTo(a9[0], 445); ctx.lineTo(b1[0] - 40, 445); ctx.lineTo(b1[0] - 40, b1[1]); ctx.lineTo(b1[0], b1[1]); ctx.stroke();
+        TT.text(ctx, i >= 4 ? "ch9 \u2194 ch1: fabric plane for kernels, SWITCH_INTERVAL 10000" : "ch9 \u2194 ch1", 450, 463, { color: c9, font: "12px", align: "center", mono: true });
+        ctx.globalAlpha = 1;
+      }
+      if (i >= 3) {
+        TT.text(ctx, "active: 0-8, 0-9, 0-15", chipX[0], 487, { color: C.muted, font: "12px", mono: true });
+        TT.text(ctx, "active: 0-0, 0-1", chipX[1], 487, { color: C.muted, font: "12px", mono: true });
+      }
+    }});
+  })();
+  </script>
+
+  <h2 id="dbrw">2. dbrw: 32 MiB through a 4 KiB keyhole</h2>
+  <p><code>dbrw.cpp</code> (in the workbench, see its README) is the stock <code>distributed_buffer_rw</code> example with the mesh shape changed from 2×4 to 2×1 and its final <code>assert</code> replaced by one line of output. It allocates a sharded L1 <code>MeshBuffer</code> across both chips, writes random data, reads it back and compares.</p>
+<pre><code>cp $W/host/dbrw.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/dbrw.cpp
+time $LAB_HOME/dbrw 2&gt;&amp;1 | grep -v "| info"</code></pre>
+<pre><code>devices=2 match=true bytes=33554432
+[372773] 8.0 seconds (46.4 KHz)
+real    0m7.705s</code></pre>
+  <p><code>bytes=33554432</code> is <code>64 * 128 * tile_size(UInt32)</code> = 8192 × 4096 bytes = 32 MiB, the <code>global_size</code> in <code>dbrw.cpp</code>. The global shape is 64×32 "datums" split into two 32×32 shards, so each chip holds 16 MiB. Chip 0's half goes straight over PCIe. Chip 1's half has to go through chip 0.</p>
+  <p>To see it go, build a ttsim that logs every Ethernet transfer. The patch adds one logging function, called from the two places where ttsim moves bytes between chips: the data send (<code>ETH_TXQ_CMD</code> = 2, an L1-to-L1 copy) and the remote register write (<code>ETH_TXQ_CMD</code> = 4). It also prints each link at init.</p>
+<pre><code>P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+$W/build_ttsim.sh ethlog wh_x2           # first run copies ttsim to $LAB_HOME/ttsim-ethlog
+(cd $LAB_HOME/ttsim-ethlog &amp;&amp; patch -p1 &lt; $P/b10-ethlog.patch)
+$W/build_ttsim.sh ethlog wh_x2           # prints: export TT_METAL_SIMULATOR=$LAB_HOME/sim-ethlog-wh_x2-release/libttsim.so
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-ethlog-wh_x2-release/libttsim.so
+B10_ETHLOG=1 $LAB_HOME/dbrw &gt; dbrw_eth.log 2&gt;&amp;1; grep -c "B10 ETH" dbrw_eth.log     # 27969</code></pre>
+  <div class="callout warn"><code>build_ttsim.sh</code> originally accepted only <code>wh</code> or <code>bh</code> when copying the soc descriptor. This lab extended it to accept the multichip config names (<code>wh_x2</code>, ...) from ttsim's <code>src/rules.py</code> <code>CONFIGS</code>, so that <code>build_ttsim.sh ethlog wh_x2</code> builds <code>_out/release_wh_x2/libttsim.so</code>.</div>
+  <p>27,969 transfers. Most are 32-byte headers of ttsim's mock firmware protocol, so the patch decodes those as <code>seq/op/addr/size/data</code>. The firmware's op codes are defined at <code>eth_fw.c:207-217</code>. Grouped by op:</p>
+  <table class="t">
+    <tr><th>Direction (chip:Ethernet tile)</th><th>op</th><th>count</th><th>what it is</th></tr>
+    <tr><td>c0:E9 → c1:E1</td><td>5 BLOCK_WRITE, 4096 B</td><td class="n">4096</td><td>chip 1's 16 MiB shard, in 4 KiB chunks (<code>ETH_BLOCK_CHUNK</code>, <code>eth_fw.c:145</code>), clocks 31,205–195,004</td></tr>
+    <tr><td>c0:E9 → c1:E1</td><td>6 BLOCK_READ, 4096 B</td><td class="n">4096</td><td>reading the shard back, clocks 199,139–369,075</td></tr>
+    <tr><td>c1:E1 → c0:E9</td><td>7 BLOCK_RESP</td><td class="n">4096</td><td>one per read; the 4 KiB block precedes the header</td></tr>
+    <tr><td>c1:E1/E0 → c0</td><td>3 ACK</td><td class="n">5247</td><td>every write is acknowledged before the next one is sent</td></tr>
+    <tr><td>c0 → c1</td><td>1 WRITE / 2 READ, 4 B</td><td class="n">844 / 392</td><td>single words: soft-reset registers (<code>0xffb121b0</code>), mailboxes, firmware handshakes</td></tr>
+    <tr><td>c0 → c1</td><td>5 BLOCK_WRITE, small</td><td class="n">278</td><td>firmware images for chip 1's cores (1136, 1572, 288 B, ...)</td></tr>
+    <tr><td>c0 → c1</td><td>8 BROADCAST</td><td class="n">29</td><td>a host broadcast forwarded to chip 1's whole Tensix grid</td></tr>
+  </table>
+  <p>Each chunk travels twice inside a stop-and-wait protocol. First the 4 KiB payload is shipped to the peer's <code>BLOCK_BUF</code> at L1 <code>0x15600</code>. Then a 32-byte header lands in its request inbox at <code>0x14900</code>. The sender spins until the peer's acknowledgement shows up in its own response inbox at <code>0x14A00</code>. The bulk chunks are sent by <code>dram_write_to_peer</code> (<code>eth_fw.c:391-410</code>); the single-request path, <code>single_hop</code>, shows the same pattern more compactly:</p>
+  <div class="filename">ttsim/fw/eth/eth_fw.c:433-454 @b3620244 (trimmed; end-of-line comments added)</div>
+<pre><code>static uint32_t single_hop(uint32_t op, uint32_t sys_lo, uint32_t sys_hi, uint32_t size, uint32_t data,
+                           uint32_t block_src, uint32_t *send_seq) {
+    uint32_t seq = ++(*send_seq);
+    if (op == OP_BLOCK_WRITE) {
+        eth_send_block(block_src, sys_lo, size);      // payload -&gt; peer BLOCK_BUF (0x15600)
+    }
+    PHYS_WR32(OUTBOX_ADDR + PKT_SEQ, seq);
+    PHYS_WR32(OUTBOX_ADDR + PKT_OP, op);
+    ...
+    eth_send(REQ_INBOX_ADDR, OUTBOX_ADDR, PKT_BYTES);  // 32-byte header -&gt; peer inbox (0x14900)
+    while (PHYS_RD32(RESP_INBOX_ADDR + PKT_SEQ) != seq) {
+    }                                                 // wait for the peer's ack
+    return PHYS_RD32(RESP_INBOX_ADDR + PKT_DATA);
+}</code></pre>
+  <p>And the "wire" itself is four lines of the simulator:</p>
+  <div class="filename">ttsim/src/tile.cpp:2028-2034 @b3620244</div>
+<pre><code>// eth_send_packet (ETH_TXQ_CMD_START_DATA): copy local L1 to the peer eth tile's L1
+uint32_t saved_chip_id = g_current_chip_id;
+ttsim_select_chip(remote_chip_id);
+eth_set_busy(&amp;g_e_tiles[remote_tile_id]);
+memcpy(&amp;g_e_tiles[remote_tile_id].sram[dest_addr], &amp;p_tile-&gt;sram[start_addr], size_bytes);
+ttsim_select_chip(saved_chip_id);
+p_tile-&gt;eth_txq_cmd[queue_id] = 0;</code></pre>
+  <p>The host side of this is the "legacy" remote queue. UMD writes a command into a request queue in chip 0's Ethernet-core L1 (<code>REQ_QUEUE_BASE 0x11080</code>, <code>eth_fw.c:59</code>), and the firmware drains it. That is the baseline data-movement service in tt-isa-documentation's <code>BaselineDataMovementService.md</code>: it is "how host software is expected to <i>initially</i> communicate with any ASICs which are only reachable via Ethernet". On real silicon, Tenstorrent's Ethernet firmware provides it. Here ttsim's mock firmware does. Nearly all the bulk traffic went over E9 rather than E8. The firmware comment says UMD "round-robins each remote-queue command over ALL of an MMIO chip's active eth cores" (<code>eth_fw.c:156-157</code>). Remember that sentence. It decides section 4.</p>
+  <div class="callout gpu"><b>GPU comparison.</b> Two GPUs on one board each sit on PCIe (or NVLink with a host-visible BAR). Here the second chip has <i>no</i> host-visible address space. Everything the host does to chip 1, from loading firmware and writing buffers to launching kernels and polling for completion, is a message that chip 0's Ethernet RISC-V cores relay. That is why moving chip 1's 16 MiB in and back out accounts for about 338,000 of the run's 372,773 simulated clocks (31,205 to 369,092): the cost is the relay protocol, not the copy.</div>
+
+  <h2 id="workload">3. One MeshWorkload, two programs</h2>
+  <p><code>dbrw</code> only moves data. Now run a kernel on both chips with different data and different arguments. A <code>MeshWorkload</code> maps device ranges to programs (<code>mesh_workload.hpp:41</code>: <code>add_program(const MeshCoordinateRange&amp;, Program&amp;&amp;)</code>). The stock examples add one program for the whole mesh. <code>b10_workload.cpp</code> adds one per chip instead:</p>
+  <div class="filename">sim-labs/workbench/host/b10_workload.cpp:21-46</div>
+<pre><code>DeviceLocalBufferConfig dram{.page_size = page, .buffer_type = BufferType::DRAM};
+distributed::ShardedBufferConfig cfg{.global_size = 2 * page, .global_buffer_shape = {2, n}, .shard_shape = {1, n}};
+auto in = MeshBuffer::create(cfg, dram, mesh.get());       // row r of the global buffer -&gt; mesh row r
+...
+const uint32_t mul[2] = {2, 3}, add[2] = {1000, 7};
+MeshWorkload workload;
+for (uint32_t r = 0; r &lt; 2; r++) {
+    Program program = CreateProgram();
+    ...
+    auto k = CreateKernel(program, "b10/add_const.cpp", core, DataMovementConfig{...});
+    SetRuntimeArgs(program, k, core, {in-&gt;address(), out-&gt;address(), n, mul[r], add[r]});
+    MeshCoordinate c(r, 0);
+    workload.add_program(MeshCoordinateRange(c, c), std::move(program));
+}</code></pre>
+  <p>The kernel (<code>overlays/b10/b10/add_const.cpp</code>) runs on BRISC. It reads one 4 KiB DRAM page into a circular-buffer slot, computes <code>p[i] = p[i] * mul + add</code> on 1024 words, and writes the page back. The buffers are allocated in lock step, so <code>in</code> and <code>out</code> have the same address on both chips. Only the data and the runtime arguments differ.</p>
+<pre><code>cp $W/host/b10_workload.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b10_workload.cpp
+$LAB_HOME/b10_workload 2&gt;&amp;1 | grep -v "| info"</code></pre>
+<pre><code>workload: 2 programs, in@0x2d4c40 out@0x2d5c40 (same address on both chips)
+chip row 0: x*2+1000  in[0..2]=0 1 2  out[0..2]=1000 1002 1004  out[1023]=3046
+chip row 1: x*3+7  in[0..2]=1024 1025 1026  out[0..2]=3079 3082 3085  out[1023]=6148
+mismatches: 0 of 2048
+[41622] 0.8 seconds (55.3 KHz)</code></pre>
+  <p>Check one value by hand: chip 1's first input is 1024, and 1024 × 3 + 7 = 3079. Run it again on the logging ttsim (<code>B10_ETHLOG=1</code>) and the launch on chip 1 shows up as messages. The one on chip 0 does not, because chip 0 is reached directly over PCIe. The next figure replays that log.</p>
+
+  <div class="viz" id="figFan"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figFan");
+    var g = TT.canvas(root, 900, 400), ctx = g.ctx, C = TT.C;
+    var steps = [
+      { dur: 1.3, text: "<b>One workload, two programs.</b> The host builds program A for mesh coordinate (0,0) with args (mul 2, add 1000) and program B for (1,0) with (mul 3, add 7). Same kernel source, same buffer addresses (0x2d4c40 in, 0x2d5c40 out), different data." },
+      { dur: 1.3, text: "<b>Input shards.</b> Chip 0's 4 KiB page goes over PCIe (not in the Ethernet log). Chip 1's page crosses the link: <code>[31205] c0:E9&rarr;c1:E1 op=5 BLOCK_WRITE addr=0x2d4c40 size=4096</code>." },
+      { dur: 1.5, text: "<b>Kernel binary and launch message to chip 1.</b> Clocks 31,240&ndash;31,396: 4-byte writes to <code>0x8a90..</code> via E9, plus blocks via E8 of 792 B (<code>0x8aa0</code>), 16 B, 20 B, and a 144-byte <code>launch_msg</code> to L1 <code>0x20</code> of core (18,18), which is logical (0,0)." },
+      { dur: 1.3, text: "<b>Go.</b> <code>[31434] c0:E8&rarr;c1:E0 op=1 addr=0x4a0 data=0x80000000</code>. The top byte 0x80 is <code>RUN_MSG_GO</code> (<code>dev_msgs.h:103</code>), written to the go-message word of chip 1's core. Chip 0's go is an MMIO write." },
+      { dur: 1.5, text: "<b>Poll for done.</b> The host reads <code>0x4a0</code> on chip 1 over the link again and again: 228 replies of <code>0x80000000</code>, then <code>[37909] data=0x0</code> = <code>RUN_MSG_DONE</code>. Each poll is a full request/response round trip through the relay." },
+      { dur: 1.4, text: "<b>Read back.</b> <code>[37932] op=6 BLOCK_READ addr=0x2d5c40 size=4096</code>, answered at <code>[37939]</code> by <code>op=7 BLOCK_RESP</code> carrying chip 1's results. The host compares: <b>0 of 2048 mismatches</b>. Total run: 41,622 clocks." }
+    ];
+    var host = [40, 160, 140, 80], c0 = [300, 70, 230, 260], c1 = [640, 70, 230, 260];
+    function chip(b, name, prog, on, done) {
+      TT.box(ctx, b[0], b[1], b[2], b[3], { stroke: C.border, r: 10 });
+      TT.text(ctx, name, b[0] + 10, b[1] + 16, { color: C.yellow, font: "14px" });
+      TT.box(ctx, b[0] + 70, b[1] + 100, 90, 50, { fill: done ? C.green : (on ? C.blue : C.bg3), alpha: on || done ? 0.35 : 1, stroke: on ? C.blue : C.border, r: 6, label: "core (0,0)", font: "12px" });
+      TT.text(ctx, prog, b[0] + 115, b[1] + 175, { color: C.muted, font: "12px", align: "center", mono: true });
+      TT.box(ctx, b[0] + 10, b[1] + 205, 90, 40, { fill: C.purple, alpha: 0.25, stroke: C.purple, r: 6, label: "DRAM", font: "12px" });
+      TT.box(ctx, b[0] + 130, b[1] + 205, 90, 40, { fill: C.purple, alpha: 0.25, stroke: C.purple, r: 6, label: "DRAM", font: "12px" });
+    }
+    function token(x1, y1, x2, y2, t, col, lab) {
+      var x = TT.lerp(x1, x2, t), y = TT.lerp(y1, y2, t);
+      TT.box(ctx, x - 34, y - 11, 68, 22, { fill: col, alpha: 0.9, r: 5, label: lab, color: "#000", font: "11px", mono: true });
+    }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.box(ctx, host[0], host[1], host[2], host[3], { fill: C.bg2, stroke: C.fg, r: 8, label: "host", font: "15px" });
+      chip(c0, "chip 0  (MMIO)", "x*2+1000", i >= 3, i >= 5);
+      chip(c1, "chip 1  (remote)", "x*3+7", i >= 3, i >= 5);
+      // PCIe and eth links
+      TT.arrow(ctx, 180, 200, 298, 200, { color: C.green, lw: 3 });
+      TT.text(ctx, "PCIe", 239, 188, { color: C.green, font: "12px", align: "center" });
+      ctx.strokeStyle = C.orange; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(530, 120); ctx.lineTo(640, 120); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(530, 145); ctx.lineTo(640, 145); ctx.stroke();
+      TT.text(ctx, "E8\u2194E0", 585, 110, { color: C.orange, font: "11px", align: "center", mono: true });
+      TT.text(ctx, "E9\u2194E1", 585, 158, { color: C.orange, font: "11px", align: "center", mono: true });
+      if (i === 0) {
+        token(110, 240, 415, 240, t, C.blue, "prog A");
+        token(110, 240, 755, 240, t, C.yellow, "prog B");
+      }
+      if (i === 1) {
+        token(180, 210, 360, 300, t, C.teal, "in[0:1024]");
+        token(530, 145, 700, 300, t, C.teal, "4 KiB #31205");
+      }
+      if (i === 2) {
+        token(530, 145, 755, 190, t, C.yellow, "text+launch");
+        token(530, 120, 755, 190, Math.max(0, t - 0.2) / 0.8, C.yellow, "792 B");
+      }
+      if (i === 3) {
+        token(180, 190, 415, 190, t, C.green, "GO (MMIO)");
+        token(530, 120, 755, 190, t, C.green, "GO 0x80");
+      }
+      if (i === 4) {
+        var k = Math.floor(t * 6) % 2;
+        token(k ? 640 : 530, 120, k ? 530 : 640, 120, (t * 6) % 1, k ? C.muted : C.pink, k ? "0x80.." : "rd 0x4a0");
+        if (t > 0.95) TT.text(ctx, "[37909] data=0x0  RUN_MSG_DONE", 755, 340, { color: C.green, font: "12px", align: "center", mono: true });
+      }
+      if (i === 5) {
+        token(700, 300, 530, 120, t, C.teal, "out 4 KiB");
+        token(360, 300, 180, 210, t, C.teal, "out (PCIe)");
+        if (t > 0.95) TT.text(ctx, "mismatches: 0 of 2048", 110, 270, { color: C.green, font: "13px", align: "center" });
+      }
+    }});
+  })();
+  </script>
+
+  <div class="callout key">To the host, a MeshWorkload is one call. Underneath, the MMIO chip gets ordinary PCIe writes. The remote chip gets the same writes as relayed messages: kernel text, launch message, go signal, and a stream of polls for "done". Both chips ran the same binary at the same L1 and DRAM addresses with different runtime arguments.</div>
+
+  <h2 id="cross">4. Making data cross the link</h2>
+  <p>So far the Ethernet link has carried only the host's traffic. Now make a <i>kernel</i> send bytes to the other chip. I tried three approaches, from most to least useful: the TT-Fabric API from a kernel, a ttnn all-gather (which uses the fabric), and a raw Ethernet-core kernel. The first two work after one fix, so I did not build the third (see exercise 4).</p>
+
+  <h3>4a. The fabric comes up, then chip 1 goes silent</h3>
+  <p><code>b10_fabric.cpp</code> does the minimum: <code>SetFabricConfig(FABRIC_1D)</code>, open the 2×1 mesh, query routing planes, close.</p>
+<pre><code>cp $W/host/b10_fabric.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b10_fabric.cpp
+time $LAB_HOME/b10_fabric 2</code></pre>
+<pre><code>SetFabricConfig(2) done
+... Metal | Initializing Fabric (fabric_firmware_initializer.cpp:319)
+... Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:466)
+... Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:336)
+MeshDevice up: 2 devices
+routing planes along axis 0: 1
+... warning | Metal | Exception during device close in ScopedDevices destructor: Timeout waiting for Ethernet core service remote IO request flush.
+closed
+... warning | Metal | Skipping RISC reset on device 1 during teardown: Timeout waiting for Ethernet core service remote IO request.
+... warning | Metal | Skipping ethernet routing reset during teardown: Timeout waiting for Ethernet core service remote IO request flush.
+[1380624] 17.8 seconds (77.5 KHz)
+real    0m19.742s</code></pre>
+  <p>The fabric initializes on both chips, and one routing plane is free for user traffic. Every host access to chip 1 after that times out, and each timeout costs 5 s (<code>NON_MMIO_RW_TIMEOUT = 5'000</code> ms, <code>tt-umd/api/tt-umd/utils/timeouts.hpp:10</code>). A program that writes a buffer to chip 1 after enabling the fabric dies on that write:</p>
+<pre><code>$LAB_HOME/b10_fabric_send       # (section 4b) with the stock fabric router
+terminate called after throwing an instance of 'tt::umd::error::UmdException&lt;tt::umd::error::RuntimeError&gt;'
+  what():  Timeout waiting for Ethernet core service remote IO request flush.
+ 1. tt::umd::RemoteCommunicationLegacyFirmware::wait_for_non_mmio_flush(...)
+ 2. tt::Cluster::write_core(...)
+ 3. tt::Cluster::write_dram_vec(...)
+ 4. tt::tt_metal::slow_dispatch::WriteToDeviceDRAMChannel(...)</code></pre>
+  <p>Why would turning on the fabric break the host's tunnel? Start from what the fabric does to the Ethernet cores. A fabric router is a kernel that takes over an Ethernet core and runs forever. On Wormhole, the base firmware on that core still has to service the host's remote queue. So the router must <b>yield</b> now and then: it calls a function pointer that the firmware stores at L1 <code>0x9020</code>. tt-isa-documentation defines this contract: "If the customer code is long running, it also needs to occasionally yield control back to the Tenstorrent code. This is done by reading four bytes in L1 at <code>0x9020</code> [and] calling the function pointer" (<code>WormholeB0/EthernetTile/BabyRISCV/CallingIntoCustomerCode.md:20-22</code>). ttsim's mock firmware installs <code>eth_yield_entry</code> there at boot (<code>eth_fw.c:797</code>), and that function runs the same <code>eth_service()</code> loop that drains the host queue.</p>
+  <p>So the question becomes: does every router yield? The patch has a second probe for this. With <code>B10_ETHLOG=1</code>, it prints a line every time an Ethernet hart's PC lands on the yield address stored at <code>0x9020</code>. The next figure shows the result for the 17.8-second run above, binned in 28 equal slices of simulated time:</p>
+
+  <div class="viz" id="figYield"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figYield");
+    var g = TT.canvas(root, 900, 400), ctx = g.ctx, C = TT.C;
+    // Real data: yields per bin (28 bins over 1,380,797 clocks), stock router, b10_fabric run.
+    var END = 1380797;
+    var D = {
+      "c0:E8": [1038, 73, 297, 265, 265, 265, 265, 265, 265, 265, 266, 265, 265, 265, 265, 265, 265, 221, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "c1:E0": [1953, 4168, 2, 2, 2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2],
+      "c0:E9": [1167, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "c1:E1": [2606, 4161, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    };
+    var rows = ["c0:E8", "c1:E0", "c0:E9", "c1:E1"];
+    var x0 = 150, x1 = 860, y0 = 60, rh = 62;
+    function X(clk) { return x0 + (x1 - x0) * clk / END; }
+    var steps = [
+      { dur: 1.2, text: "<b>Four fabric routers</b>, one per linked Ethernet core. Each row will show how often that core yields to the base firmware, the only time the host's tunnel requests get serviced. Time runs left to right over the 1,380,797 simulated clocks of <code>b10_fabric</code>." },
+      { dur: 1.8, text: "<b>The dispatch link (8&harr;0) keeps yielding.</b> c0:E8 yields about 265 times per slice until teardown. c1:E0 yields rarely but never stops. Their compile args, read from the JIT cache, are <code>SWITCH_INTERVAL 16</code> and <code>IDLE_CONTEXT_SWITCHING 0</code>." },
+      { dur: 1.8, text: "<b>The 9&harr;1 link stops dead.</b> c0:E9 yields for the last time at clock 97,960 and c1:E1 at 97,942, just after the host writes <code>READY_FOR_TRAFFIC</code> (0xA3B3C3D3) to the routers' status word. Their args are <code>SWITCH_INTERVAL 10000</code> and <code>IDLE_CONTEXT_SWITCHING 1</code>: one yield per 10,000 idle passes of an outer loop that itself runs 32 inner iterations." },
+      { dur: 1.8, text: "<b>The host's next request goes to E9 and is lost.</b> <code>[97970] c0:E9&rarr;c1:E1 op=1 addr=0x180a0</code> is never acknowledged, because c1:E1 never runs <code>eth_service()</code> again. UMD gives up after 5 s of wall-clock time, which is roughly 350,000 to 400,000 simulated clocks at this run's 77.5 kHz simulation rate." },
+      { dur: 1.8, text: "<b>With the B10 overlay</b> (every router yields after 16 idle checks), the same program finishes in 110,948 clocks and 3.1 s, with no warnings. Average gaps between yields from clock 97,960 to the end: c0:E9 every 43 clocks, c1:E1 every 16, c0:E8 every 85, c1:E0 every 41." }
+    ];
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "yields per slice (log scale)  \u2014  stock fabric router", x0, 30, { color: C.muted, font: "13px" });
+      rows.forEach(function (r, k) {
+        var y = y0 + k * rh;
+        var isLink9 = r === "c0:E9" || r === "c1:E1";
+        TT.text(ctx, r + (isLink9 ? "  (9\u21941)" : "  (8\u21940)"), 20, y + 22, { color: isLink9 ? C.yellow : C.blue, font: "13px", mono: true });
+        TT.box(ctx, x0, y, x1 - x0, rh - 14, { stroke: C.border, r: 2 });
+        if (i >= 1 && (!isLink9 || i >= 2)) {
+          var lim = (i === 1 && !isLink9) || (i === 2 && isLink9) ? t : 1;
+          var arr = D[r], n = arr.length, bw = (x1 - x0) / n;
+          for (var b = 0; b < n * lim; b++) {
+            var v = arr[b]; if (!v) continue;
+            var h = (rh - 18) * Math.min(1, Math.log10(v + 1) / Math.log10(5000));
+            TT.box(ctx, x0 + b * bw + 1, y + rh - 16 - h, bw - 2, h, { fill: isLink9 ? C.yellow : C.blue, alpha: 0.75, r: 1 });
+          }
+        }
+      });
+      if (i >= 2) {
+        var xr = X(97960);
+        ctx.strokeStyle = C.red; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+        ctx.beginPath(); ctx.moveTo(xr, y0 - 10); ctx.lineTo(xr, y0 + 4 * rh); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, "97,960: last E9/E1 yield", xr + 6, y0 + 4 * rh + 8, { color: C.red, font: "12px", mono: true });
+      }
+      if (i >= 3) {
+        var a = X(97970), b = X(97970 + 350000);
+        TT.box(ctx, a, y0 + 2 * rh + 6, (b - a) * (i === 3 ? t : 1), 16, { fill: C.red, alpha: 0.35, r: 3 });
+        TT.text(ctx, "host request waits \u2192 5 s UMD timeout", a + 8, y0 + 2 * rh + 14, { color: C.fg, font: "11px" });
+      }
+      if (i >= 4) {
+        TT.box(ctx, 150, 330, 710, 58, { fill: C.bg2, stroke: C.green, r: 8 });
+        TT.text(ctx, "overlay: SWITCH_INTERVAL capped at 16 on every link", 165, 348, { color: C.green, font: "13px" });
+        TT.text(ctx, "mean clocks between yields: E9 43 \u00b7 E1 16 \u00b7 E8 85 \u00b7 E0 41  \u2192  ends at 110,948 clocks", 165, 370, { color: C.fg, font: "12px", mono: true });
+      }
+    }});
+  })();
+  </script>
+
+  <p>The compile-time arguments come straight from the JIT cache. Every router build writes a <code>named_ct_arg_map_generated.h</code>:</p>
+<pre><code>for f in ~/.cache/tt-metal-cache/*/kernels/fabric_erisc_router/*/named_ct_arg_map_generated.h; do
+  grep -o '"SWITCH_INTERVAL",[0-9]*\|"IDLE_CONTEXT_SWITCHING",[0-9]\|"MY_ETH_CHANNEL",[0-9]*' $f | tr '\n' ' '; echo; done</code></pre>
+<pre><code>"IDLE_CONTEXT_SWITCHING",0 "MY_ETH_CHANNEL",0 "SWITCH_INTERVAL",16
+"IDLE_CONTEXT_SWITCHING",1 "MY_ETH_CHANNEL",1 "SWITCH_INTERVAL",10000
+"IDLE_CONTEXT_SWITCHING",1 "MY_ETH_CHANNEL",9 "SWITCH_INTERVAL",10000
+"IDLE_CONTEXT_SWITCHING",0 "MY_ETH_CHANNEL",8 "SWITCH_INTERVAL",16</code></pre>
+  <p>(The order of the three keys is the file's. The output is trimmed to one build per channel.) tt-metal does this on purpose. One link per chip is the <i>dispatch</i> link, and only that router is told to yield often:</p>
+  <div class="filename">tt-metal/tt_metal/fabric/compute_mesh_router_builder.cpp:881-885 @7aad8aac</div>
+<pre><code>void ComputeMeshRouterBuilder::configure_for_dispatch() {
+    // Dispatch requires higher context switching frequency to service slow dispatch / UMD / debug tools
+    constexpr uint32_t k_DispatchFabricRouterContextSwitchInterval = 16;
+    erisc_builder_-&gt;set_firmware_context_switch_interval(k_DispatchFabricRouterContextSwitchInterval);
+    erisc_builder_-&gt;set_firmware_context_switch_type(FabricEriscDatamoverContextSwitchType::INTERVAL);
+}</code></pre>
+  <p>Every other router keeps the default of 10000 (<code>erisc_datamover_builder.hpp:355</code>). That only works if the host sends its tunnel traffic over the dispatch link alone. tt-metal has code that pins UMD to exactly those channels, but it skips that code unless the target is real silicon:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/tt_cluster.cpp:1402-1405 @7aad8aac</div>
+<pre><code>void Cluster::configure_ethernet_cores_for_remote_transfers(
+    ChipId mmio_chip_id, const std::set&lt;tt_fabric::chan_id_t&gt;&amp; eth_chans) {
+    if (this-&gt;arch_ != tt::ARCH::WORMHOLE_B0 || this-&gt;target_type_ != tt::TargetDevice::Silicon || eth_chans.empty()) {
+        return;</code></pre>
+  <p>Under ttsim, <code>target_type_</code> is <code>Simulator</code> (<code>tt_target_device.hpp:14-16</code>), so UMD keeps round-robining over channels 8 <i>and</i> 9. The requests that land on channel 9 then wait for a router that, at ttsim's speed, did not yield again before UMD's 5 s timeout. On silicon, the requests never go to that router in the first place. tt-metal's own comment on the channel-pinning helper says the same: the other fabric routers "can hold the core for tens of seconds per transfer while fabric is active" (<code>fabric_host_utils.hpp:99-104</code>).</p>
+  <p><b>How sure is this?</b> Shown directly: the 9&harr;1 routers stop yielding (figure above), the next host request on E9 is never acknowledged, the gate at <code>tt_cluster.cpp:1404</code> excludes <code>Simulator</code>, and capping the yield interval makes every symptom go away (below). Inferred, not traced: that UMD's round-robin is what sends that request to E9. I did not instrument UMD, and I did not rebuild tt-metal without the <code>Silicon</code> check to confirm that pinning alone fixes it. Treat the early return as the most likely cause, not a proven one.</p>
+  <div class="callout warn"><b>Two easy wrong conclusions.</b> (1) "The fabric routers never yield in ttsim." The dispatch-link routers do (figure above). (2) "Give the Ethernet cores more steps per clock." I tried this: the patch adds <code>B10_ETH_IDLE_STEPS=N</code>. With N = 256, the write to chip 1 got through and the fabric kernel ran, but the read-back timed out. With N = 2048 it still timed out, after 41 s. Each yield on the 9&harr;1 link needs 10,000 idle passes of the router's outer loop, and each pass runs the inner loop 32 times (<code>erisc_datamover_builder.hpp:154</code>). More steps per clock also slows the host's clock, so the race against a wall-clock timeout keeps being lost.</div>
+
+  <h3>The workaround: a kernel overlay for the router</h3>
+  <p>The fabric router is compiled from source at run time like any other kernel, through the same search path. <code>compute_mesh_router_builder.cpp:979</code> names it <code>tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp</code>, so a copy under <code>$TT_METAL_KERNEL_PATH</code> wins (B00). The overlay in <code>sim-labs/overlays/b10/</code> changes only the yield threshold:</p>
+<pre><code>mkdir -p $LAB_HOME/kernels/tt_metal/fabric/impl/kernels/edm_fabric
+cp $W/../overlays/b10/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp \
+   $LAB_HOME/kernels/tt_metal/fabric/impl/kernels/edm_fabric/
+diff $TT_METAL_HOME/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp \
+     $LAB_HOME/kernels/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp</code></pre>
+<pre><code>13a14,20
+&gt; // B10 lab overlay, a ttsim-only workaround and NOT an upstream fix (do not use on silicon).
+&gt; // ...  (five more comment lines)
+&gt; constexpr uint32_t B10_SWITCH_INTERVAL = SWITCH_INTERVAL &lt; 16 ? SWITCH_INTERVAL : 16;
+2273c2280
+&lt;                         if (did_nothing_count++ &gt; SWITCH_INTERVAL) {
+---
+&gt;                         if (did_nothing_count++ &gt; B10_SWITCH_INTERVAL) {
+2279c2286
+&lt;                     if (did_nothing_count++ &gt; SWITCH_INTERVAL) {
+---
+&gt;                     if (did_nothing_count++ &gt; B10_SWITCH_INTERVAL) {</code></pre>
+  <p>Those two lines sit in the router's main loop, where it decides whether to call into the base firmware:</p>
+  <div class="filename">tt-metal/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp:2267-2282 @7aad8aac</div>
+<pre><code>if constexpr (enable_context_switch) {
+    // shouldn't do noc counter sync since we are not incrementing them
+    if constexpr (IDLE_CONTEXT_SWITCHING) {
+        if (did_something) {
+            did_nothing_count = 0;
+        } else {
+            if (did_nothing_count++ &gt; SWITCH_INTERVAL) {
+                did_nothing_count = 0;
+                run_coordinated_context_switch_to_base_firmware(termination_signal_ptr);
+            }
+        }
+    } else {
+        if (did_nothing_count++ &gt; SWITCH_INTERVAL) {
+            did_nothing_count = 0;
+            run_coordinated_context_switch_to_base_firmware(termination_signal_ptr);
+        }
+    }</code></pre>
+  <p>With the overlay in place, <code>b10_fabric</code> closes cleanly in 3.1 s instead of 19.7 s. The overlay is a workaround, not a fix. A fix would make tt-metal pin UMD's remote-transfer cores under the simulator too, or make the simulator's UMD path use only the dispatch link. Both are changes to tt-metal or UMD, which this series does not rebuild.</p>
+
+  <h3>4b. A kernel on chip 0 writes into chip 1's DRAM</h3>
+  <p><code>b10_fabric_send.cpp</code> allocates one 4 KiB DRAM page at the same address on both chips and zeroes it. It then runs a kernel <i>only on chip 0</i>. The kernel fills a page with a pattern and sends it one hop over the fabric. The kernel is adapted from tt-metal's unicast benchmark (<code>tests/tt_metal/tt_fabric/benchmark/collectives/unicast/kernels/unicast_tx_writer_cb_to_dst.cpp</code>):</p>
+  <div class="filename">sim-labs/overlays/b10/b10/fabric_send.cpp:33-43</div>
+<pre><code>volatile tt_l1_ptr PACKET_HEADER_TYPE* header = PacketHeaderPool::allocate_header();
+fabric_set_unicast_route&lt;false&gt;(header, 1);  // 1D route: deliver one hop away
+const auto dst = TensorAccessor(dst_args, dst_addr);
+header-&gt;to_noc_unicast_write(NocUnicastCommandHeader{dst.get_noc_addr(0, 0, 0)}, PAGE);
+
+sender.open&lt;true&gt;();
+sender.wait_for_empty_write_slot();
+sender.send_payload_without_header_non_blocking_from_address(l1, PAGE);
+sender.send_payload_blocking_from_address((uint32_t)header, sizeof(PACKET_HEADER_TYPE));
+noc_async_writes_flushed();
+sender.close();</code></pre>
+  <p>Look at what is missing: no address on chip 1 is resolved by hand, and no kernel runs on chip 1. The header says "one hop, then do a NoC write to this address". The sender object connects to chip 0's router through runtime arguments that the host appended with <code>append_fabric_connection_rt_args(src, dst, links.at(0), ...)</code>.</p>
+<pre><code>cp $W/host/b10_fabric_send.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b10_fabric_send.cpp
+time $LAB_HOME/b10_fabric_send 2&gt;&amp;1 | grep -v "| info"      # with the router overlay in place</code></pre>
+<pre><code>fabric nodes: chip0=(M0, D0) chip1=(M0, D1), forwarding links 0-&gt;1: 2
+sender kernel on chip 0 finished
+chip at mesh (0,0): word0=0x00000000 word1=0x00000000  0 of 1024 words match the pattern
+chip at mesh (1,0): word0=0x00b10b10 word1=0x9e8672a9  1024 of 1024 words match the pattern
+[143502] 3.3 seconds (43.9 KHz)
+real    0m5.803s</code></pre>
+  <p>Chip 1's page holds the pattern (<code>seed ^ i*0x9E3779B9</code>: word 0 is the seed <code>0xB10B10</code>). Chip 0's copy of the same buffer is still zero, so the data did not take a shortcut through the host. On the logging ttsim, the whole kernel-to-kernel transfer is three Ethernet events:</p>
+<pre><code>[112897] B10 ETH DATA c0:E9 -&gt; c1:E1 src=0x18240 dst=0x29540 n=4144 W 002d4c40 00000090 00000000 ... 00001000 00000001 | 00b10b10 9e8672a9
+[112899] B10 ETH REG c0:E9 -&gt; c1:E1 src=0x40 dst=0xffb42088 n=4
+[112905] B10 ETH REG c1:E1 -&gt; c0:E9 src=0x40 dst=0xffb45088 n=4</code></pre>
+
+  <h3>4c. ttnn.all_gather on two chips</h3>
+  <p>With the same overlay, the CCL that A21 could not run works too. <code>sim-labs/workbench/py/b10_all_gather.py</code> shards a 32×64 bf16 tensor by columns, so chip 0 holds values near 1.0 and chip 1 values near 2.0. It all-gathers along dim 3 and checks that each chip ends up with the full tensor:</p>
+<pre><code>source $TT_METAL_HOME/python_env/bin/activate
+python $W/py/b10_all_gather.py 2&gt;&amp;1 | grep -v "| info\|DEBUG\|^Config"</code></pre>
+<pre><code>... warning | Op | Allocating semaphores in L1, which may fragment L1 ... (ccl_common.cpp:173)
+... warning | Op | Fabric packet size 4352 B is suboptimal for transporting 2048 B pages. ... (ccl_common.cpp:80)
+mesh devices: 2 shape: MeshShape([2, 1])
+before: chip 0 holds shape (1, 1, 32, 32), [0,0,0,:3] = [1.0, 1.125, 1.25]
+before: chip 1 holds shape (1, 1, 32, 32), [0,0,0,:3] = [2.5, 2.625, 2.75]
+after:  chip 0 holds shape (1, 1, 32, 64), equals the full input: True
+after:  chip 1 holds shape (1, 1, 32, 64), equals the full input: True
+PASS
+[3458941] 73.0 seconds (47.4 KHz)</code></pre>
+  <p>The result is exact (<code>torch.equal</code>), as it should be: an all-gather copies bytes and does no arithmetic. Without the overlay (<code>TT_METAL_KERNEL_PATH</code> pointed at an empty directory), the same script dies at the very first <code>ttnn.from_torch</code> with <code>RuntimeError: Timeout waiting for Ethernet core service remote IO request flush.</code></p>
+  <p>The next figure replays both runs from the Ethernet log: the single fabric write from 4b, then the all-gather's 18 link events. Each fabric packet starts with a 48-byte <code>LowLatencyPacketHeader</code>. It holds 40 bytes of NoC command fields (the 64-bit destination NoC address comes first), then <code>payload_size_bytes</code> (u16), <code>noc_send_type</code> (u8) and <code>src_ch_id</code> (u8), and then 4 bytes of routing fields (<code>fabric_edm_packet_header.hpp:405-420, 1086-1092</code>). Words 10 and 11 of the dump are therefore size/type and route.</p>
+
+  <div class="viz" id="figReplay"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figReplay");
+    var g = TT.canvas(root, 900, 430), ctx = g.ctx, C = TT.C;
+    // Real events from fs_eth.log (b10_fabric_send) and ag_eth.log (b10_all_gather.py).
+    var EV = [
+      { clk: 112897, dir: 0, kind: "DATA", n: 4144, hdr: ["002d4c40","00000090","00001000","00000001"], pay: "00b10b10 9e8672a9", what: "NOC_UNICAST_WRITE, 4096 B payload, 1 hop" },
+      { clk: 112899, dir: 0, kind: "REG", n: 4, reg: "0xffb42088 += 0x40", what: "remote register write: stream 2, register 34 += 1 (a flow-control credit)" },
+      { clk: 112905, dir: 1, kind: "REG", n: 4, reg: "0xffb45088 += 0x40", what: "remote register write back: stream 5, register 34 += 1 (a credit in the other direction)" },
+      { clk: 3217449, dir: 0, kind: "DATA", n: 48, hdr: ["0016dfe0","00004920","00020000","00000001"], pay: "", what: "NOC_UNICAST_ATOMIC_INC +1, L1 0x16dfe0 at core (18,18): chip 0 ready" },
+      { clk: 3396611, dir: 1, kind: "DATA", n: 48, hdr: ["0016dfe0","00004920","00020000","00000001"], pay: "", what: "the same semaphore increment from chip 1: chip 1 ready" },
+      { clk: 3396904, dir: 1, kind: "DATA", n: 2096, hdr: ["402d5500","00002890","00000800","00000001"], pay: "40284020 40004030", what: "chip 1's tile (bf16 2.5, 2.625, ...) to chip 0's output buffer at 0x2d5500, 2048 B" },
+      { clk: 3397052, dir: 0, kind: "DATA", n: 2096, hdr: ["002d5500","00000090","00000800","00000001"], pay: "3f903f80 3fb03fa0", what: "chip 0's tile (bf16 1.0, 1.125, ...) to chip 1's output buffer at 0x2d5500, 2048 B" },
+      { clk: 3397056, dir: 1, kind: "DATA", n: 48, hdr: ["0016dfc0","00004920","00020000","00000001"], pay: "", what: "ATOMIC_INC on L1 0x16dfc0: chip 1 finished" },
+      { clk: 3397211, dir: 0, kind: "DATA", n: 48, hdr: ["0016dfc0","00004920","00020000","00000001"], pay: "", what: "ATOMIC_INC on L1 0x16dfc0: chip 0 finished" }
+    ];
+    var steps = [
+      { dur: 1.2, text: "<b>The link the kernels use</b> is c0:E9 &harr; c1:E1, the fabric plane. Each router keeps sender-channel buffers (0x18240, ...) and receiver-channel buffers (0x29540, ...) in its own L1. One Ethernet transfer copies a whole packet slot from one to the other." }
+    ];
+    EV.forEach(function (e, k) {
+      var label = (k < 3 ? "fabric_send" : "all_gather") + " &middot; <code>[" + e.clk + "] " + (e.dir ? "c1:E1&rarr;c0:E9" : "c0:E9&rarr;c1:E1") + " " + e.kind + " n=" + e.n + "</code>. ";
+      steps.push({ dur: 1.4, text: label + e.what + "." });
+    });
+    steps.push({ dur: 1.5, text: "<b>Tally.</b> The all-gather moved exactly one 2 KiB tile each way, plus two pairs of 48-byte semaphore packets (ready, done). Every DATA transfer is followed by two 4-byte credit writes, one in each direction (12 credits in total), which makes 18 link events. 4b's 4 KiB write took 3." });
+    var L = [70, 120, 300, 250], R = [530, 120, 300, 250];
+    function side(b, name, slots) {
+      TT.box(ctx, b[0], b[1], b[2], b[3], { stroke: C.border, r: 10 });
+      TT.text(ctx, name, b[0] + 12, b[1] + 18, { color: C.yellow, font: "14px" });
+      slots.forEach(function (s, k) {
+        TT.box(ctx, b[0] + 20, b[1] + 50 + k * 60, b[2] - 40, 42, { fill: C.bg3, stroke: C.border, r: 5 });
+        TT.text(ctx, s, b[0] + 30, b[1] + 71 + k * 60, { color: C.muted, font: "12px", mono: true });
+      });
+    }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      side(L, "chip 0  \u00b7  Ethernet tile E9 (1,6)", ["sender ch buf 0x18240..", "receiver ch buf 0x29540..", "stream regs 0xffb4_...."]);
+      side(R, "chip 1  \u00b7  Ethernet tile E1 (1,0)", ["sender ch buf 0x18240..", "receiver ch buf 0x29540..", "stream regs 0xffb4_...."]);
+      ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.setLineDash([6, 5]);
+      ctx.beginPath(); ctx.moveTo(370, 245); ctx.lineTo(530, 245); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "ch9 \u2194 ch1", 450, 232, { color: C.yellow, font: "12px", align: "center", mono: true });
+      if (i === 0 || i > EV.length) {
+        TT.text(ctx, i === 0 ? "step through the 9 logged events" : "3 events (4 KiB write)  +  18 events (all-gather) = the whole cross-chip story", 450, 400, { color: C.muted, font: "13px", align: "center" });
+        return;
+      }
+      var e = EV[i - 1];
+      var fromB = e.dir ? R : L, toB = e.dir ? L : R;
+      var fy = e.kind === "REG" ? 2 : 0, ty = e.kind === "REG" ? 2 : 1;
+      var sx = fromB[0] + fromB[2] / 2, sy = fromB[1] + 71 + fy * 60, tx = toB[0] + toB[2] / 2, ty2 = toB[1] + 71 + ty * 60;
+      var x = TT.lerp(sx, tx, t), y = TT.lerp(sy, ty2, t);
+      var w = e.kind === "REG" ? 70 : Math.max(70, Math.min(170, 40 + e.n / 30));
+      TT.box(ctx, x - w / 2, y - 14, w, 28, { fill: e.kind === "REG" ? C.pink : (e.n > 48 ? C.teal : C.orange), alpha: 0.92, r: 5, label: e.kind === "REG" ? "+1 credit" : (e.n + " B"), color: "#000", font: "12px", mono: true });
+      TT.text(ctx, "clock " + e.clk, 450, 90, { color: C.fg, font: "14px", align: "center", mono: true });
+      if (e.hdr) {
+        var s = "hdr w0-1 noc_addr=0x" + e.hdr[1] + "_" + e.hdr[0] + "   w10 size|type=0x" + e.hdr[2] + "   w11 route=0x" + e.hdr[3];
+        TT.text(ctx, s, 450, 392, { color: C.blue, font: "12px", align: "center", mono: true });
+        if (e.pay) TT.text(ctx, "payload words 0-1: " + e.pay, 450, 412, { color: C.teal, font: "12px", align: "center", mono: true });
+      } else {
+        TT.text(ctx, "remote register write: " + e.reg + "  (0x40 = 1 << REMOTE_DEST_BUF_WORDS_FREE_INC)", 450, 400, { color: C.pink, font: "12px", align: "center", mono: true });
+      }
+    }});
+  })();
+  </script>
+
+  <p>How to read the dumps:</p>
+  <ul>
+    <li><b>Word 10</b> packs <code>payload_size_bytes</code> in the low 16 bits and <code>noc_send_type</code> in the next byte. <code>0x00001000</code> is 4096 bytes of type 0 (<code>NOC_UNICAST_WRITE</code>). <code>0x00000800</code> is 2048 bytes, one bf16 tile. <code>0x00020000</code> is 0 bytes of type 2 (<code>NOC_UNICAST_ATOMIC_INC</code>) (<code>fabric_edm_packet_header.hpp:95-99</code>). For the increments, words 2–3 are the <code>val</code> (1) and <code>flush</code> fields of <code>NocUnicastAtomicIncCommandHeader</code> (<code>:289-296</code>).</li>
+    <li><b>Words 0–1</b> are the destination NoC address. In 4b it is <code>0x00000090_002d4c40</code>, whose low part is the buffer address from <code>buf-&gt;address()</code> on chip 1. In the semaphore packets it is L1 <code>0x16dfe0</code> or <code>0x16dfc0</code> at coordinate word <code>0x492</code>, that is x = 18, y = 18, which is translated Tensix (18,18) = logical worker (0,0) (B02). I did not decode which DRAM bank the all-gather's <code>0x2890</code> and <code>0x0090</code> coordinates name.</li>
+    <li><b>Payload</b> words confirm the data: <code>0x00b10b10</code> is the 4b pattern's seed, <code>0x4020</code>/<code>0x4028</code> are bf16 2.5/2.625 (chip 1's values) and <code>0x3f80</code>/<code>0x3f90</code> are 1.0/1.125 (chip 0's).</li>
+    <li><b>REG</b> lines are TXQ remote-register writes of <code>0x40</code>. That is <code>1 &lt;&lt; REMOTE_DEST_BUF_WORDS_FREE_INC</code> (= 1 &lt;&lt; 6) into register index 34 (<code>STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE</code>) of stream 2 or stream 5 on the peer (<code>noc_overlay_parameters.h:38-42, 405-408</code>; <code>fabric_stream_regs.hpp:97-100</code>). These are the fabric's flow-control credits. Which logical counter each stream ID plays is a router compile-time argument, which I did not trace.</li>
+  </ul>
+  <div class="callout key">A fabric packet is a 48-byte header that says "go N hops, then perform this NoC command", followed by the payload. The routers copy the whole slot over Ethernet, return a credit, and the receiving router performs the NoC command on its own chip. The host is not involved at any point.</div>
+
+  <h3>4d. What I did not do</h3>
+  <p>A hand-written Ethernet-core kernel that drives the TX queue directly would also work in principle: ttsim implements both TXQ commands that matter, data and remote register write (<code>tile.cpp:1992-2088</code>). I skipped it because the fabric path already demonstrates the transfer end to end. If you try it, remember that on Wormhole your kernel shares the core with the base firmware and must yield through <code>0x9020</code>, exactly as the fabric router does.</p>
+
+  <h2 id="stock">5. Why the stock distributed examples fail</h2>
+  <p>All four programs in <code>tt_metal/programming_examples/distributed/</code> start the same way:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/distributed/2_distributed_buffer_rw/distributed_buffer_rw.cpp:25 @7aad8aac</div>
+<pre><code>auto mesh_device = MeshDevice::create(MeshDeviceConfig(MeshShape(2, 4)));</code></pre>
+  <p>(<code>distributed_program_dispatch.cpp:16</code>, <code>distributed_eltwise_add.cpp:101</code> and <code>distributed_trace_and_events.cpp:130</code> are the same.) A 2×4 mesh is a T3000: eight chips. Run one on the n300 model:</p>
+<pre><code>$EX/distributed/distributed_buffer_rw</code></pre>
+<pre><code>critical | Always | TT_FATAL: Requested mesh shape MeshShape([2, 4]) requires 8 devices, but only 2 devices are available in the system mesh MeshShape([2, 1]). (assert.hpp:104)
+  what():  TT_FATAL @ .../tt_metal/distributed/system_mesh.cpp:159: requested_size &lt;= system_size</code></pre>
+  <div class="filename">tt-metal/tt_metal/distributed/system_mesh.cpp:153-159 @7aad8aac</div>
+<pre><code>TT_FATAL(
+    requested_size &lt;= system_size,
+    "Requested mesh shape {} requires {} devices, but only {} devices are available in the system mesh {}.",
+    requested_shape,
+    requested_size,
+    system_size,
+    system_shape);</code></pre>
+  <p>So the examples are not broken. They are written for a machine this orb cannot simulate. Change only the shape and they run. The stock <code>distributed_eltwise_add.cpp</code> with <code>MeshShape(2, 4)</code> replaced by <code>MeshShape(2, 1)</code> is <code>sim-labs/overlays/b10/host/eltwise_2x1.cpp</code> (that line and a two-line comment are the only differences):</p>
+<pre><code>cp $W/../overlays/b10/host/eltwise_2x1.cpp $LAB_HOME/
+$W/build_host.sh $LAB_HOME/eltwise_2x1.cpp &amp;&amp; $LAB_HOME/eltwise_2x1 2&gt;&amp;1 | grep -v "| info"</code></pre>
+<pre><code>Partial results: (note we are running under BFP16. It's going to be less accurate)
+Total values: 2048
+Distributed elementwise add verification: 2048 / 2048 passed
+[36038] 0.6 seconds (59.3 KHz)</code></pre>
+  <p>The obvious next move is ttsim's eight-chip build, <code>wh_x8</code>, with the T3000 descriptor. It fails while UMD is still starting the devices:</p>
+<pre><code>TT_METAL_SIMULATOR=$HOME/sim/wh_x8/libttsim_wh_x8.so \
+TT_METAL_MOCK_CLUSTER_DESC_PATH=$TT_METAL_HOME/tt_metal/third_party/umd/tests/cluster_descriptor_examples/t3k_cluster_desc.yaml \
+  $EX/distributed/distributed_buffer_rw
+[17] ERROR: UndefinedBehavior: e_tile_mmio_wr32: eth base fw reported error code 1 on eth tile 15</code></pre>
+  <p>Error code 1 is the mock firmware's <code>ETH_ERR_UNROUTABLE</code>, "remote-queue target chip not reachable in a single eth hop from this chip" (<code>eth_fw.c:109</code>). It is raised in <code>service_request_queue</code> when no local Ethernet core peers the target chip (<code>eth_fw.c:602-607</code>), and ttsim turns the firmware's write to <code>0xFFB12FF0</code> into this error (<code>tile.cpp:2332-2333</code>). The firmware got a host request for a chip it cannot route to from that core. I did not trace which chip ID UMD asked for. ttsim's README says why to expect trouble beyond <code>wh_x2</code>: "UMD changes for full support are not yet fully merged for platforms beyond <code>wh_x2</code>", and the <code>micah/native-sim</code> branch of tt-metal is the one verified against <code>wh_x8</code> (<code>ttsim/README.md:243-246</code>).</p>
+  <p>One more limit: fast dispatch. Run <code>b10_workload</code> without <code>TT_METAL_SLOW_DISPATCH_MODE</code> and tt-metal turns on <code>FABRIC_1D</code> "only for dispatch". It then fails in UMD's simulation chip with <code>Querying size for a host channel that does not exist.</code> (<code>tt-umd-workload/src/simulation/simulation_chip.cpp:180-183</code>). Everything in this lab uses slow dispatch.</p>
+
+  <h2 id="matrix">6. What works and what does not</h2>
+  <table class="t">
+    <tr><th>Attempt (wh_x2 + wormhole_N300.yaml unless noted)</th><th>Result</th><th>Wall time</th></tr>
+    <tr><td>Open 2×1 mesh, list devices and Ethernet links (<code>b10_inventory</code>)</td><td class="ok">works</td><td class="n">0.7 s</td></tr>
+    <tr><td>Sharded 32 MiB L1 MeshBuffer write/read (<code>dbrw</code>)</td><td class="ok">works, 16 MiB crosses the link each way in 4 KiB chunks</td><td class="n">7.7 s</td></tr>
+    <tr><td>MeshWorkload, one program per chip, different args (<code>b10_workload</code>)</td><td class="ok">works, 0 / 2048 mismatches</td><td class="n">1.3 s</td></tr>
+    <tr><td>Stock <code>distributed_eltwise_add</code> with shape edited to 2×1</td><td class="ok">works, 2048 / 2048</td><td class="n">1.6 s</td></tr>
+    <tr><td>Stock distributed examples as shipped (2×4)</td><td class="bad">TT_FATAL: needs 8 devices</td><td class="n">0.3 s</td></tr>
+    <tr><td><code>wh_x8</code> + <code>t3k_cluster_desc.yaml</code></td><td class="bad">eth base fw error code 1 (unroutable)</td><td class="n">&lt; 1 s</td></tr>
+    <tr><td>Fast dispatch on wh_x2</td><td class="bad">host channel does not exist</td><td class="n">&lt; 1 s</td></tr>
+    <tr><td>FABRIC_1D, stock router</td><td class="bad">fabric initializes; later host access to chip 1 times out</td><td class="n">19.7 s</td></tr>
+    <tr><td>FABRIC_1D, stock router, <code>B10_ETH_IDLE_STEPS=256</code> / <code>2048</code></td><td class="bad">gets further, read-back of chip 1 still times out</td><td class="n">17 s / 41 s</td></tr>
+    <tr><td>FABRIC_1D + B10 router overlay: open/close</td><td class="fix">works, clean teardown</td><td class="n">3.1 s</td></tr>
+    <tr><td>FABRIC_1D + overlay: kernel on chip 0 writes chip 1's DRAM (<code>b10_fabric_send</code>)</td><td class="fix">works, 1024 / 1024 words</td><td class="n">5.8 s</td></tr>
+    <tr><td>FABRIC_1D + overlay: <code>ttnn.all_gather</code> (<code>b10_all_gather.py</code>)</td><td class="fix">works, exact</td><td class="n">76 s</td></tr>
+    <tr><td><code>ttnn.all_gather</code>, stock router</td><td class="bad">timeout at the first <code>from_torch</code></td><td class="n">25 s</td></tr>
+  </table>
+  <div class="callout sim">Concepts behind this lab: <a href="../chapters/a21-many-chips.html">A21</a> (Ethernet cores, MeshDevice, TT-Fabric, CCLs). A21's own run of the fabric all-gather stops at the timeout in section 4a. This lab traces it to the most likely cause (<code>tt_cluster.cpp:1404</code>) and gets past it with the overlay. Dispatch and the host side of slow dispatch are in <a href="../chapters/a17-dispatch-host.html">A17</a>. The NoC logging technique is from <a href="b05-noc-and-dram.html">B05</a>.</div>
+
+  <h2 id="exercises">7. Exercises, with answers</h2>
+  <details class="quiz"><summary><b>Exercise 1.</b> Change <code>b10_workload</code> so that one program covers <i>both</i> chips (<code>MeshCoordinateRange(mesh-&gt;shape())</code>), keeping the sharded input. Predict the output before you run it.</summary>
+  <p>Both chips then run the same runtime arguments, say <code>mul 2, add 1000</code>, on their own shards. Chip 0 still sees 0..1023 and chip 1 sees 1024..2047, so the outputs are 1000, 1002, ... and 3048, 3050, .... The program's checker, which expects <code>x*3+7</code> on row 1, reports 1024 mismatches. That is the SPMD pattern of the stock examples: one program, different data per chip, because the <i>buffer</i> is sharded.</p></details>
+  <details class="quiz"><summary><b>Exercise 2.</b> In the <code>dbrw</code> log, the 16 MiB to chip 1 took 4096 BLOCK_WRITE packets. Why 4096 and not 16,384 (1 KiB each, the limit in BaselineDataMovementService.md)?</summary>
+  <p>UMD issues "host-DRAM block" requests (<code>CMD_DATA_BLOCK_DRAM</code>). Silicon firmware allows those up to 4 GiB per request, and ttsim's mock firmware streams them in <code>ETH_BLOCK_CHUNK</code> = 4096-byte pieces (<code>eth_fw.c:145</code>, <code>dram_write_to_peer</code> at <code>:391-410</code>): 16 MiB / 4 KiB = 4096. The 1 KiB limit applies to the L1-block variant without the DRAM flag.</p></details>
+  <details class="quiz"><summary><b>Exercise 3.</b> Make the fabric work <i>without</i> the router overlay by changing only the host program. Hint: which Ethernet cores does UMD use?</summary>
+  <p>Not possible through the public API at this commit. The function that pins UMD to the dispatch channels, <code>Cluster::configure_ethernet_cores_for_remote_transfers</code>, returns early for non-silicon targets, and <code>tt::Cluster</code> is not part of the installed API. The alternatives are to change tt-metal (drop the <code>Silicon</code> check, rebuild), to change the router's yield interval (the overlay), or to avoid host access to chip 1 after fabric init, which is impossible because results must be read back. A ttsim-only change cannot help either, short of servicing requests without the firmware, which would break the simulator's contract (ttsim <code>AGENTS.md</code>).</p></details>
+  <details class="quiz"><summary><b>Exercise 4.</b> Write a minimal Ethernet-core kernel on chip 0's E9 that copies 16 bytes to chip 1's E1 using the TX queue. Which ttsim checks will you meet?</summary>
+  <p>In <code>eth_txq_regs_wr32</code> (<code>tile.cpp:1992-2088</code>): start address, size and destination must each be 16-byte aligned (<code>UnimplementedFunctionality</code> otherwise), the tile must have a peer, the range must fit in Ethernet L1 (<code>UndefinedBehavior</code>), a previous command must not still be pending, and on Wormhole <code>ERISC_MAC_0</code>/<code>_1</code> must hold their trained values. Note that the public <code>CreateKernel</code> takes only <code>DataMovementConfig</code> or <code>ComputeConfig</code> (<code>host_api.hpp:148</code>). <code>EthernetConfig</code> is declared only in the internal <code>impl/kernels/kernel.hpp</code>, so you must build against internal headers or go through the experimental <code>tt_fabric::generate_erisc_datamover_kernel</code> (<code>experimental/fabric/fabric.hpp:159</code>). If it runs long, it must yield through <code>0x9020</code>, or the host loses chip 1 exactly as in section 4a.</p></details>
+  <details class="quiz"><summary><b>Exercise 5.</b> Using <code>B10_ETHLOG=1</code>, count the link events of the all-gather when the input is 32×128 (two tiles per chip). Predict first.</summary>
+  <p>Prediction: 2 tile packets each way (2096 bytes each, if the op sends one tile per packet), the same 4 semaphore packets, and two credit writes per DATA transfer: (4 + 4) × 3 = 24 events. Check with <code>grep "B10 ETH" ag_eth.log | grep -v "dst=0x14[9a]00\|dst=0x156\|dst=0x18000 n=16"</code> to drop the host's tunnel traffic and the routers' start-up handshakes. If the op batches tiles (the warning suggests 6144-byte packets would be optimal), you will see fewer, larger packets. Treat the prediction as a hypothesis to test.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><code>wh_x2</code> plus <code>wormhole_N300.yaml</code> gives a 2×1 mesh. Chip 0 is MMIO, and chip 1 is reachable only through chip 0's Ethernet channels 8 and 9 (to chip 1's 0 and 1). ttsim's <code>ETH_PEER_TABLE_N300</code> and the descriptor agree.</li>
+    <li>Everything the host does to chip 1 is relayed by firmware on chip 0's Ethernet cores. <code>dbrw</code>'s 16 MiB went as 4096 four-KiB block writes, each acknowledged. A remote kernel launch is kernel text, a launch message, <code>RUN_MSG_GO</code>, and polls until <code>RUN_MSG_DONE</code>.</li>
+    <li>A <code>MeshWorkload</code> can hold one program per device range. Same binary and addresses, different runtime arguments: verified with 0 / 2048 mismatches.</li>
+    <li>TT-Fabric initializes under ttsim. It then starves the host's tunnel, most likely because tt-metal pins UMD to the dispatch link only on silicon (<code>tt_cluster.cpp:1404</code>) while the non-dispatch routers yield only every 10000 idle checks.</li>
+    <li>A kernel overlay that caps the router's yield interval at 16 makes the fabric usable. A kernel on chip 0 writes chip 1's DRAM with one 4144-byte packet plus two credits, and <code>ttnn.all_gather</code> passes exactly.</li>
+    <li>The stock distributed examples ask for 2×4 (eight chips). Change the shape and they run. <code>wh_x8</code> fails in the mock firmware's routing, and fast dispatch fails in UMD.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Why does chip 1 report <code>mmio=false</code>, and what does that cost in this lab?</summary><p>It has no PCIe connection. The descriptor's <code>chips_with_mmio</code> lists only chip 0, and UMD builds chip 1 as a remote chip. Every host read or write to it becomes a request in chip 0's Ethernet-core queue that the firmware relays and acknowledges. In <code>b10_workload</code>, that is why chip 1's launch appears in the Ethernet log as 228 polls of the go word, while chip 0's launch does not appear at all.</p></details>
+  <details class="quiz"><summary>The inventory shows a third active Ethernet core on chip 0 (<code>0-15</code>) with no link. Is that a ttsim bug?</summary><p>No. tt-metal adds channel 15 to the active set on any Wormhole MMIO chip that tunnels to remote chips, because "channel 15 is used by syseng tools" (<code>control_plane.cpp:3145-3162</code>). It has no peer, so <code>get_connected_ethernet_core</code> raises a <code>TT_FATAL</code> for it.</p></details>
+  <details class="quiz"><summary>In section 4a, which of these would fix the timeout: (a) a faster host, (b) more ttsim steps per clock for Ethernet cores, (c) pinning UMD to channel 8, (d) a longer UMD timeout?</summary><p>(c) addresses the most likely cause: requests would only go to routers that yield every 16 checks, which is what tt-metal does on silicon (not tested here, since it needs a tt-metal rebuild). (d) might also work eventually (also untested), but the wait per request on channel 9 is huge. (a) and (b) only shrink the gap. The lab measured (b) at 256 and 2048 steps and the read-back still timed out. The overlay works for a different reason: it makes every router behave like a dispatch-link router.</p></details>
+  <details class="quiz"><summary>The 4b kernel's 4 KiB page crossed the link as one 4144-byte transfer. Where do the extra 48 bytes come from, and who writes the page into chip 1's DRAM?</summary><p>They are the <code>LowLatencyPacketHeader</code>: 40 bytes of NoC command (destination NoC address first), 2 bytes of payload size, 1 of send type, 1 of source channel, and 4 bytes of routing fields. The receiving router on chip 1's E1 reads that header and performs the NoC write into DRAM itself. No kernel runs on chip 1.</p></details>
+  <details class="quiz"><summary>The ttsim clock shows the all-gather's two tiles crossing 148 clocks apart (3,396,904 and 3,397,052). What does that tell you about link bandwidth?</summary><p>Nothing. An Ethernet send in ttsim is a <code>memcpy</code> done inside the register write (<code>tile.cpp:2032</code>). Clocks advance with host reads, and an idle Ethernet core steps once per clock while a busy one steps 16 times (<code>sim.h:402-405</code>). The order of events is meaningful. The gaps are not.</p></details>
+  <details class="quiz"><summary>Why do the stock <code>distributed_*</code> examples fail here, and is ttsim at fault?</summary><p>They hard-code <code>MeshShape(2, 4)</code>, eight devices. <code>SystemMesh</code> rejects the request because the n300 system mesh is 2×1 (<code>system_mesh.cpp:153-159</code>). ttsim is not involved: with the shape changed to 2×1, <code>distributed_eltwise_add</code> passes 2048/2048. The eight-chip simulator fails for a separate reason, in the mock Ethernet firmware's routing.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/EthernetMultichip/BasicEthernetGuide.md">Basic Ethernet Multichip guide</a>, the tech report on Ethernet cores, erisc kernels and the base-firmware contract.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/TT-Fabric/TT-Fabric-Architecture.md">TT-Fabric architecture</a>: routers, routing planes, packet headers and the layers above them.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/TT-Distributed/TT-Distributed-Architecture-1219.md">TT-Distributed architecture</a>: MeshDevice, MeshBuffer and MeshWorkload as designed.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Programming_Mesh_of_Devices/Programming_Mesh_of_Devices_with_TT-NN.md">Programming a mesh of devices with TT-NN</a>: mesh mappers, composers and CCLs from Python.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/CCLs/CCL_bandwidth.md">CCL bandwidth report</a>: how all-gather and reduce-scatter use the links on silicon.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/EthernetTile/BabyRISCV/CallingIntoCustomerCode.md">tt-isa-documentation: Calling into customer code</a>, the Wormhole Ethernet yield contract through L1 <code>0x9020</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/EthernetTile/BaselineDataMovementService.md">tt-isa-documentation: Baseline data movement service</a>, the host's remote-queue protocol that ttsim's mock firmware reimplements.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/EthernetTile/EthernetTxRx.md">tt-isa-documentation: Ethernet TX and RX</a>: the TX queues, raw and TT-link modes, and remote register writes.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/distributed">tt-metal distributed programming examples</a>, the four 2×4 examples discussed in section 5.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: its README lists the multichip configurations and their known issues.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole board specifications</a>: n150 vs n300 and the board's Ethernet ports.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a21-many-chips.html">&larr; A21 Many chips</a><a class="next" href="../chapters/a22-llm-capstone.html">A22 Capstone: running an LLM &rarr;</a></div>
+</main>
+</body>
+</html>

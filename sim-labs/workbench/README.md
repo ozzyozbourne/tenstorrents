@@ -60,11 +60,12 @@ cp $W/host/mm_fid.cpp $LAB_HOME/ && $W/build_host.sh $LAB_HOME/mm_fid.cpp
 MM_FIDELITY=0 MM_SEED=42 $LAB_HOME/mm_fid    # result_hash = 213e53fed10c0383
 ```
 
-### `build_ttsim.sh <name> [wh|bh] [release|debug]`
+### `build_ttsim.sh <name> [wh|bh|wh_x2|...] [release|debug]`
 
 On first use, copies `$TTSIM_HOME` to `$LAB_HOME/ttsim-<name>/` (edit `src/` there). Then it builds
 that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descriptor.yaml` in
 `$LAB_HOME/sim-<name>-<arch>-<flavor>/`, and prints the `export TT_METAL_SIMULATOR=...` line to use.
+Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x2`, ...) also work and get their architecture's soc descriptor (lab B10).
 
 ## Examples and helpers
 
@@ -77,8 +78,26 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
   PASS/FAIL. The host finds the kernels as `b06/*.cpp`, so run it with `TT_METAL_KERNEL_PATH=$W/kernels`, or copy
   `kernels/b06` into `$LAB_HOME/kernels/` to edit them.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
+- `host/b10_inventory.cpp`, `host/b10_workload.cpp`, `host/b10_fabric.cpp`, `host/b10_fabric_send.cpp` (lab B10): on `wh_x2` with
+  `wormhole_N300.yaml`, list each chip's Ethernet cores and peers; run one program per chip in a `MeshWorkload` (prints
+  `mismatches: 0 of 2048`); open and close a `FABRIC_1D` mesh (`b10_fabric 2`); and write chip 1's DRAM from a kernel on chip 0
+  over TT-Fabric (`1024 of 1024 words`). The kernels are `../overlays/b10/b10/*.cpp`: copy them to `$LAB_HOME/kernels/b10/`.
+- `py/b10_all_gather.py` (lab B10): `ttnn.all_gather` across the 2-chip mesh; prints PASS.
+- `../overlays/b10/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp` (lab B10): a ttsim-only workaround, not an
+  upstream fix, that caps the fabric router's yield interval at 16 so host access to chip 1 survives `FABRIC_1D`. `b10_fabric`
+  (after init), `b10_fabric_send` and `b10_all_gather.py` need it under `$LAB_HOME/kernels/`. `../overlays/b10/host/eltwise_2x1.cpp`
+  is the stock `distributed_eltwise_add` with `MeshShape(2, 1)`; build it with `build_host.sh`. The Ethernet log comes from
+  `../patches/b10-ethlog.patch` (`B10_ETHLOG=1`).
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
   `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
+- `harness/b09_step.c` (lab B09): drives `libttsim.so` like a host driver, with no tt-metal. It finds BAR0, programs two
+  1 MiB TLBs onto one core, writes an 8-instruction RISC-V program to L1, releases BRISC from soft reset and steps the
+  clock one cycle at a time. `gcc -O2 -o b09_step harness/b09_step.c -ldl && ./b09_step ~/sim/wh/libttsim_wh.so [x y] [clocks]`
+  (defaults 18 18 30) prints the running sum `5, 9, 12, 14, 15` after clocks 5-21. Wormhole only.
+- `py/b09_cbpeek.py` (lab B09): attaches tt-exalens to a hung run started with `TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1`
+  and prints `tiles_received`/`tiles_acked` for some CBs of one core:
+  `python -I $W/py/b09_cbpeek.py /tmp/tt-umd-sim-server-0 [x,y] [cb ...]` (defaults `0,0` and CBs 0 1 16). Activate
+  `$TT_METAL_HOME/python_env` first. The B09 bug overlays are in `../overlays/b09/<case>/`.
 - `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
   on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
@@ -106,6 +125,17 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 - `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
   program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
   Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.
+- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
+  under ttsim, restarting pytest after each simulator abort and reporting pass/fail/skip/abort counts; sweep one op over
+  shapes, dtypes, layouts and memory configs with PCC and the JIT-compiled kernel list per case (private
+  `TT_METAL_CACHE` per case); and run one matmul per memory config for NoC counting under `../patches/a20-counters.patch`.
+  `../patches/b11-ten3868.patch` makes ttsim skip the dummy unpack Wormhole's LLK issues after unpack-to-Dst, which
+  otherwise aborts most Wormhole ops on FP32 tensors or with `fp32_dest_acc_en`.
+- `py/a22_decoder_layer.py`, `py/a22_tt_transformers_block.py`, `py/a22_trace_decode_mlp.py` (chapter A22): a tiny
+  Llama decoder layer from TT-NN ops (prefill + paged-KV decode, `--precision perf|bf16`, PCC vs PyTorch); the real
+  `tt_transformers` `TransformerBlock` (Llama-3.2-1B config, dummy weights, one decode step; needs `PYTHONPATH=$TT_METAL_HOME`
+  and `A22_FP16_DST=1`, because ttsim cannot run kernels built with `fp32_dest_acc_en=True`); and a traced decode MLP
+  (run with `TT_METAL_SLOW_DISPATCH_MODE` unset, since trace needs fast dispatch).
 
 ## Common errors
 

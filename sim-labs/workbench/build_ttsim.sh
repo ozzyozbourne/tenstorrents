@@ -4,7 +4,7 @@
 # Creates $LAB_HOME/ttsim-<name>/ (a source copy you can edit) on first use, rebuilds it
 # (about 4 s), and prints the export line for TT_METAL_SIMULATOR.
 set -e
-name=${1:?usage: build_ttsim.sh <name> [wh|bh] [release|debug]}
+name=${1:?usage: build_ttsim.sh <name> [wh|bh|wh_x2|...] [release|debug]}
 arch=${2:-wh}; flavor=${3:-release}
 : "${TTSIM_HOME:?source env.sh first}" "${TT_METAL_HOME:?source env.sh first}" "${LAB_HOME:?source env.sh first}"
 src=$LAB_HOME/ttsim-$name

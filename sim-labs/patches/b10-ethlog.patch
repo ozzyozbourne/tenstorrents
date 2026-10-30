@@ -1,0 +1,143 @@
+diff -ru -x _out -x __pycache__ -x .git a/src/libttsim.cpp b/src/libttsim.cpp
+--- a/src/libttsim.cpp	2026-10-30 06:33:42.283526883 +0000
++++ b/src/libttsim.cpp	2026-10-30 08:59:45.163526883 +0000
+@@ -6,6 +6,7 @@
+ // be rare and should always correspond to physical ports/connectivity on the device.
+ // The API/ABI contract and compatibility policy are documented in docs/libttsim_api.md.
+ #include "sim.h"
++#include <stdlib.h> // B10: getenv
+ #include "pcie.h"
+ 
+ #define API_EXPORT __attribute((visibility("default")))
+@@ -241,6 +242,26 @@
+     g_chip->t_tile_cores_paused = false;
+ }
+ 
++// B10 lab: B10_ETH_IDLE_STEPS=N gives an idle eth core N steps per clock instead of 1 (a speed knob only).
++static uint32_t b10_idle_eth_steps() {
++    static uint32_t steps = 0;
++    if (!steps) {
++        const char *s = getenv("B10_ETH_IDLE_STEPS");
++        steps = s ? (uint32_t)atoi(s) : 1;
++        steps = steps ? steps : 1;
++    }
++    return steps;
++}
++
++// B10 lab: B10_ETHLOG=1 also logs every cooperative yield from an eth kernel into the base fw.
++static bool b10_yield_log_on() {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("B10_ETHLOG") != nullptr;
++    }
++    return on;
++}
++
+ static void clock_current_chip() {
+     if (g_chip->t_tile_cores_paused && !(g_clock % PAUSE_CLOCKS)) {
+         resume_paused_cores();
+@@ -285,6 +306,13 @@
+             g_t_tiles_busy[tile_id / 64] &= ~(1ull << (tile_id % 64));
+         }
+     }
++    if (b10_yield_log_on() && getenv("B10_PCLOG") && (g_clock % 100000) == 0) { // B10: where are the eth harts?
++        for (uint32_t t = 0; t < NUM_E_TILES; t++) {
++            if ((g_rv32_cores_active >> (t * RV32_CORES_PER_E_TILE)) & 1) {
++                ttsim_printf("B10 PC c%u:E%u pc=0x%x\n", g_current_chip_id, t, g_e_tiles[t].rv32[0].pc);
++            }
++        }
++    }
+     for (uint64_t rv32_mask = g_rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
+         uint32_t core_index = __builtin_ctzll(rv32_mask);
+         uint32_t tile_id = core_index / RV32_CORES_PER_E_TILE;
+@@ -292,9 +320,15 @@
+         auto *p_hart = &g_e_tiles[tile_id].rv32[rv32_index];
+         // Hack: for simulator perf, an eth core busy lately (its sram written to, or it issued a NOC or eth command)
+         // takes several steps per clock, so relayed traffic doesn't wait on it; an idle one takes one
+-        uint32_t steps = (g_clock < g_e_tiles[tile_id].busy_until) ? ETH_BUSY_STEPS : 1;
++        uint32_t steps = (g_clock < g_e_tiles[tile_id].busy_until) ? ETH_BUSY_STEPS : b10_idle_eth_steps();
+         for (uint32_t i = 0; (i < steps) && ((g_rv32_cores_active >> core_index) & 1); i++) {
+             rv32_step(p_hart);
++            if (b10_yield_log_on()) { // B10: a kernel on this eth core yielded to ttsim's base fw (eth_yield_entry)
++                uint32_t yield_pc = mem_rd<uint32_t>(&g_e_tiles[tile_id].sram[0x9020]);
++                if (yield_pc && p_hart->pc == yield_pc) {
++                    ttsim_printf("B10 YIELD c%u:E%u\n", g_current_chip_id, tile_id);
++                }
++            }
+         }
+     }
+ }
+diff -ru -x _out -x __pycache__ -x .git a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tile.cpp	2026-10-30 09:08:34.675526883 +0000
+@@ -5,6 +5,7 @@
+ #include "sim.h"
+ #include "topology.h"
+ #include "eth_fw_blob.h" // generated
++#include <stdlib.h> // B10: getenv
+ 
+ #if TT_ARCH_VERSION == 0
+ static constexpr uint64_t PCIE_HOST_WINDOW_BASE = 0x800000000ull;
+@@ -515,6 +516,11 @@
+     mem_wr<uint32_t>(&p_tile->sram[0], eth_jal_x0(eth_fw_base)); // seed reset pc with jump to fw
+     eth_fw_write_topology_tables(tile_id);
+     if (eth_peer(tile_id, &remote_chip_id, &remote_eth_id)) {
++        if (getenv("B10_ETHLOG")) { // B10: print each trained link as ttsim sets it up
++            uint32_t a = tile_to_coord('E', tile_id), b = tile_to_coord('E', remote_eth_id);
++            ttsim_printf("B10 LINK c%u:E%u(%u,%u) -> c%u:E%u(%u,%u)\n", g_current_chip_id, tile_id, a & 63, a >> 6,
++                remote_chip_id, remote_eth_id, b & 63, b >> 6);
++        }
+         p_tile->ierisc_reset_pc = eth_fw_base;
+         mem_wr<uint32_t>(&p_tile->sram[0x1104], 1); // ETH_TRAIN_STATUS_ADDR = LINK_TRAIN_SUCCESS
+         mem_wr<uint32_t>(&p_tile->sram[0x104C], g_num_chips == 32); // ROUTING_FIRMWARE_STATE: 1 = disabled on 6U
+@@ -1989,6 +1995,32 @@
+     }
+ }
+ 
++// B10 lab: log one Ethernet transfer. Set B10_ETHLOG=1 to enable. A 32-byte send to the peer's
++// request/response inbox (0x14900/0x14A00) is a header of ttsim's mock eth fw (fw/eth/eth_fw.c), so decode it.
++static void b10_eth_log(const char *kind, uint32_t tile_id, uint32_t remote_chip_id, uint32_t remote_tile_id,
++                        uint32_t src, uint32_t dst, uint32_t size, const uint8_t *p_src) {
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("B10_ETHLOG") != nullptr;
++    }
++    if (!on) {
++        return;
++    }
++    if (size == 32 && (dst == 0x14900 || dst == 0x14A00)) {
++        const uint32_t *w = (const uint32_t *)p_src;
++        ttsim_printf("B10 ETH %s c%u:E%u -> c%u:E%u src=0x%x dst=0x%x n=%u HDR seq=%u op=%u addr=0x%x mid=0x%x size=%u data=0x%x\n",
++            kind, g_current_chip_id, tile_id, remote_chip_id, remote_tile_id, src, dst, size, w[0], w[1], w[2], w[3], w[4], w[5]);
++    } else if (size >= 48 && dst >= 0x18000) { // B10: a fabric router packet: dump the 48-byte header + 2 payload words
++        const uint32_t *w = (const uint32_t *)p_src;
++        ttsim_printf("B10 ETH %s c%u:E%u -> c%u:E%u src=0x%x dst=0x%x n=%u W %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x\n",
++            kind, g_current_chip_id, tile_id, remote_chip_id, remote_tile_id, src, dst, size,
++            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13]);
++    } else {
++        ttsim_printf("B10 ETH %s c%u:E%u -> c%u:E%u src=0x%x dst=0x%x n=%u\n",
++            kind, g_current_chip_id, tile_id, remote_chip_id, remote_tile_id, src, dst, size);
++    }
++}
++
+ static void eth_txq_regs_wr32(uint32_t tile_id, uint32_t offset, uint32_t data) {
+     EthTile *p_tile = &g_e_tiles[tile_id];
+     uint32_t queue_id = offset / 0x1000;
+@@ -2026,6 +2058,8 @@
+                 TTSIM_VERIFY(dest_addr + size_bytes <= ETH_SRAM_SIZE, UndefinedBehavior,
+                     "eth_txq_dest_addr=0x%x eth_txq_transfer_size_bytes=0x%x", dest_addr, size_bytes);
+                 // eth_send_packet (ETH_TXQ_CMD_START_DATA): copy local L1 to the peer eth tile's L1
++                b10_eth_log("DATA", tile_id, remote_chip_id, remote_tile_id, start_addr, dest_addr, size_bytes,
++                    &p_tile->sram[start_addr]);
+                 uint32_t saved_chip_id = g_current_chip_id;
+                 ttsim_select_chip(remote_chip_id);
+                 eth_set_busy(&g_e_tiles[remote_tile_id]);
+@@ -2047,6 +2081,8 @@
+                 uint32_t saved_chip_id = g_current_chip_id;
+                 uint32_t dest_addr = p_tile->eth_txq_dest_addr[queue_id];
+                 uint32_t remote_reg_data = p_tile->eth_txq_remote_reg_data[queue_id];
++                b10_eth_log("REG", tile_id, remote_chip_id, remote_tile_id, remote_reg_data, dest_addr, 4,
++                    (const uint8_t *)&remote_reg_data);
+                 ttsim_select_chip(remote_chip_id);
+                 uint32_t coord = tile_to_coord('E', remote_tile_id);
+                 tile_wr_bytes(coord, dest_addr, &remote_reg_data, sizeof(remote_reg_data));
