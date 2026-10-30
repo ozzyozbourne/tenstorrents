@@ -89,6 +89,11 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 - `py/a20_count.py`, `py/a20_summary.py` (chapter A20): run one ttnn op (format, fidelity, block size, fusion,
   sharding cases) under a ttsim built with `../patches/a20-counters.patch`, then summarise its exact DRAM/NoC byte
   counts and Tensix instruction counts. Counts only; the simulator's clocks are not performance.
+- `py/b08_formats.py` (lab B08): round-trips one tile through float32, bfloat16, bfloat8_b and bfloat4_b on the host
+  and on the device. `B08_SRC=bf16` starts from a BF16 tile (needed on Wormhole, where FP32 typecast hits ttsim UB).
+- `host/b08_sfpu.cpp` (lab B08): one SFPU function over evenly spaced inputs vs a double reference, chosen with
+  `B08_FN=copy|map|piecewise|sin|exp|recip` and `B08_FMT`, `B08_DST32`, `B08_U2D`, `B08_APPROX`, `B08_EXPT`, `B08_FOLD`.
+  Needs the overlay: `cp -r ../overlays/b08/. $LAB_HOME/kernels/`.
 - `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
   built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
 - `py/b07_mvmul.py` (lab B07): reproduces every Dst element of an MVMUL dump bit for bit (independent and chained

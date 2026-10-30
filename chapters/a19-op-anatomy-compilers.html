@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A19 · How an op is built, and the compiler stack · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a18-ttnn-user.html">&larr; Prev</a>
+  <a href="a20-performance.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 19</span><span class="tag">Prerequisites: A10, A11, A12, A13, A17, A18</span>
+  <h1><span class="num">19.</span> How an op is built, and the compiler stack</h1>
+  <p class="subtitle">By the end you will be able to follow <code>ttnn.add(a, b)</code> from Python down to the five RISC-V cores, say what each layer builds and why the second call skips most of that work, write a working op of your own without touching C++, and place TT-NN under TT-MLIR, TT-XLA and TT-Forge.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#two-costs">Two kinds of work: the plate and the paper</a></li>
+      <li><a href="#struct">Anatomy of a device operation</a></li>
+      <li><a href="#lifecycle">The life of one call</a></li>
+      <li><a href="#factories">Program factories: four ways to say "build this"</a></li>
+      <li><a href="#kernels">Where the kernels live, and which ones actually ran</a></li>
+      <li><a href="#cache">The program cache: hit, miss, and patching</a></li>
+      <li><a href="#generic">Your own op, no C++: <code>ttnn.generic_op</code></a></li>
+      <li><a href="#above">The layers above: TT-MLIR, TT-XLA, TT-Forge</a></li>
+      <li><a href="#sim">Run it in the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="a18-ttnn-user.html">A18</a> you used TT-NN the way most people do: make two tensors, call one function, read the answer.</p>
+<pre><code>c = ttnn.add(a, b)        # a, b: 32x32 bfloat16, TILE layout, in DRAM</code></pre>
+  <p>From <a href="a10-first-program.html">A10</a>–<a href="a14-one-tiles-journey.html">A14</a> you also know what the chip needs before it can add anything. It needs a reader kernel to pull tiles over the NoC into circular buffers, a compute kernel that the JIT compiles three times, once each for UNPACK, MATH and PACK, a writer kernel to push results back, circular buffers with sizes and data formats, and runtime arguments on every core that tell each kernel where its tensor lives and how many tiles are its share. That is a lot of decisions, and <code>ttnn.add</code> takes only two arguments.</p>
+  <p><strong>What happens between <code>ttnn.add(a, b)</code> and the FPU?</strong> Who decides which kernels to run and how many cores to use? Who compiles them, and why is the second call about a hundred times faster than the first?</p>
+  <p>Below is the whole descent for that call, as it actually ran in this orb. Every layer takes a description from the layer above and emits a more concrete <em>artifact</em> for the layer below. Step through it once now. The rest of the chapter takes each layer apart.</p>
+
+  <div class="viz" id="fig-descent"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 1 (the "aha"). One <code>ttnn.add</code> on a 32×32 bf16 tile descending the stack on simulated Wormhole. The kernel directory names, hash numbers, defines and addresses are copied from the run in <a href="#sim">Run it in the simulator</a>.</div>
+
+  <p>Notice where the expensive work sits. Steps 3–5 build things: an output tensor, a program description, compiled binaries. Step 6 only <em>uses</em> them. TT-NN is built so that a second call to the same op skips steps 4 and 5. That is the <em>program cache</em>, and most of the design you are about to see exists to make it safe.</p>
+
+  <h2 id="two-costs">Two kinds of work: the plate and the paper</h2>
+  <p>Think of an old print shop. Making a printing plate is slow: someone has to set the type, lock the frame and ink it. Printing a page from a finished plate is fast. A shop that prints the same flyer every week keeps the plate in a rack and only feeds in new paper.</p>
+  <p>A TT-NN op splits its work the same way:</p>
+  <ul>
+    <li><b>The plate</b> is everything that depends on <em>what</em> is computed: which kernel source files run, their <code>#define</code>s and compile-time arguments, the circular-buffer layout, the set of cores. Changing any of these means a different binary or a different L1 layout. In tt-metal these become a <code>Program</code>, and the kernels get JIT-compiled (<a href="a13-llk-mops-jit.html">A13</a>).</li>
+    <li><b>The paper</b> is everything that depends on <em>where</em> the data happens to be this time: the DRAM address of <code>a</code>, of <code>b</code> and of the output, and sometimes how many tiles each core should process. These are <em>runtime arguments</em>. They are words written into each core's L1 just before launch, and a kernel reads them with <code>get_arg_val</code>.</li>
+  </ul>
+  <p>The program cache is the plate rack. Its key has to capture everything that would change the plate, and nothing that only changes the paper. If the key includes too much, every call misses and you rebuild forever. If it includes too little, you print with the wrong plate: a stale kernel or the wrong buffer address, and the result is silently wrong.</p>
+  <p>The analogy has two limits. First, a real plate does not care which paper you feed it, but a cached <code>Program</code> still holds the <em>old</em> addresses in its runtime-argument slots. Someone has to overwrite them before each reuse, and that job (<code>override_runtime_arguments</code>) is the subtle part of writing an op. Second, there are really two racks. The program cache holds whole <code>Program</code> objects in host memory for the life of the process. The JIT cache from A13 holds compiled ELF files on disk across processes. You will see both in the measurements.</p>
+
+  <div class="callout gpu">On a GPU, <code>a + b</code> in PyTorch launches a CUDA kernel that was compiled when PyTorch was built. Launching it means pushing a pointer and a few scalars. Specialisation to shapes and dtypes happens through templates instantiated ahead of time. Tenstorrent kernels are compiled at run time, specialised by <code>#define</code>s and compile-time arguments, and a launch has to configure circular buffers and per-core arguments on up to 64+ independent cores. So TT-NN looks less like cuBLAS and more like a JIT system with a cache, in the same family as Triton's per-signature kernel cache or <code>torch.compile</code>'s guards.</div>
+
+  <h2 id="struct">Anatomy of a device operation</h2>
+  <p>The C++ type that owns one op's plate-making is called a <em>device operation</em>. tt-metal ships a toy one, <code>ExampleDeviceOperation</code>, as a template for new ops. Its header is short enough to read in full. Here is the part that matters:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/examples/example/device/example_device_operation.hpp:18-31, 50-54 @7aad8aac</div>
+<pre><code>struct ExampleDeviceOperation {
+    // Define the operation attributes. This is used to store all variables needed by operations that aren't tensors.
+    struct operation_attributes_t {
+        bool attribute;
+        int some_other_attribute;
+    };
+
+    // Define the tensor arguments. This is used to store all tensors passed in and/or out of the operation.
+    // ...
+    struct tensor_args_t {
+        // This example will use a tensor that can only be used as an input
+        const Tensor&amp; input_tensor;
+    ...
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+    ...
+    using tensor_return_value_t = Tensor;</code></pre>
+  <p>The op's inputs are split into two structs, and the split is deliberate. <code>operation_attributes_t</code> holds the non-tensor settings: for <code>add</code>, the op type, output dtype, memory config, which cores to use. <code>tensor_args_t</code> holds the tensors. The framework hashes both to build the cache key (shown <a href="#cache">later</a>), and it walks <code>tensor_args_t</code> by reflection to find every <code>Tensor</code> it has to validate. The return types say what comes back: a <code>TensorSpec</code> describes an output before it exists (shape, dtype, layout, memory config), and a <code>Tensor</code> is the allocated result.</p>
+  <p>Then come the functions, all <code>static</code>. A device operation keeps no state of its own:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/examples/example/device/example_device_operation.hpp:84-99 @7aad8aac</div>
+<pre><code>    using program_factory_t = std::variant&lt;SingleCore, MultiCore&gt;;
+
+    static program_factory_t select_program_factory(const operation_attributes_t&amp;, const tensor_args_t&amp;);
+
+    // Validate the operation when it creates a program. Also called on cache hit by default.
+    static void validate_on_program_cache_miss(const operation_attributes_t&amp;, const tensor_args_t&amp;);
+
+    // Optional: override to use lighter validation on cache hit.
+    // If not provided, the framework calls validate_on_program_cache_miss.
+    // static void validate_on_program_cache_hit(const operation_attributes_t&amp;, const tensor_args_t&amp;);
+
+    // Compute the output specs based on the operation attributes and tensor args.
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&amp;, const tensor_args_t&amp;);
+
+    // Create the output tensors based on the operation attributes and tensor args.
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&amp;, const tensor_args_t&amp;);</code></pre>
+  <ul>
+    <li><b><code>program_factory_t</code></b> is a <code>std::variant</code> of program factories, each a different way to build the program. The example has two, <code>SingleCore</code> and <code>MultiCore</code>. Matmul has seven, from a simple multi-core one to the 2D-multicast and DRAM-sharded ones you met in <a href="a15-matmul-one-to-many.html">A15</a>/<a href="a16-multicast-sync.html">A16</a> (<code>matmul_device_operation.hpp:24-31</code>).</li>
+    <li><b><code>select_program_factory</code></b> picks one of them from the attributes and tensors. Its answer is a variant <em>index</em>, and the cache stores that index alongside the program.</li>
+    <li><b><code>validate_on_program_cache_miss</code></b> checks the call and throws on bad input (wrong layout, mismatched shapes). The name says when it runs: only on a miss, unless the op provides a cheaper <code>validate_on_program_cache_hit</code>. Even without one, the hit path calls the miss version (<code>device_operation.hpp:285-289</code>), so a hit is still validated.</li>
+    <li><b><code>compute_output_specs</code></b> is pure shape and type arithmetic. <code>add</code> uses it to broadcast shapes and pick the output dtype, and to make integer division return FP32 (<code>binary_ng_device_operation.cpp:504-520</code>).</li>
+    <li><b><code>create_output_tensors</code></b> usually just allocates a device tensor from that spec (<code>example_device_operation.cpp:31-35</code>). It also handles a caller-supplied <code>output_tensor</code>, which is how in-place ops work.</li>
+  </ul>
+  <p>The C++ entry point that users call is a small free function that fills the two structs and hands them to the framework:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/examples/example/device/example_device_operation.cpp:40-46 @7aad8aac</div>
+<pre><code>ttnn::operations::examples::ExampleDeviceOperation::tensor_return_value_t example(const Tensor&amp; input_tensor) {
+    using OperationType = ttnn::operations::examples::ExampleDeviceOperation;
+    auto operation_attributes = OperationType::operation_attributes_t{true, 42};
+    auto tensor_args = OperationType::tensor_args_t{input_tensor};
+
+    return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);
+}</code></pre>
+  <p><code>ttnn.add</code> follows the same shape. The Python name is a nanobind binding of the C++ <code>ttnn::add</code>. A macro expands that to <code>invoke_binary_ng(..., BinaryOpType::ADD, ...)</code> (<code>binary.cpp:20-44, 1230</code>). That function fills <code>BinaryNgDeviceOperation::operation_attributes_t</code>, about twenty fields long, and ends with the same one line: <code>return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);</code> (<code>binary_ng_device_operation.cpp:807</code>). Everything interesting happens inside <code>launch</code>.</p>
+
+  <h2 id="lifecycle">The life of one call</h2>
+  <p>Here is <code>launch</code>, trimmed to its spine:</p>
+  <div class="filename">tt-metal/ttnn/api/ttnn/device_operation.hpp:620-638 @7aad8aac (trimmed)</div>
+<pre><code>    detail::validate_input_tensors&lt;device_operation_t&gt;(operation_attributes, input_tensors);
+
+    auto tensor_return_value = device_operation_t::create_output_tensors(operation_attributes, tensor_args);
+
+    ttnn::MeshDevice* mesh_device = detail::get_mesh_device&lt;device_operation_t&gt;(operation_attributes, tensor_args);
+    ...
+    detail::place_output_tensors&lt;device_operation_t&gt;(
+        operation_attributes, tensor_args, input_tensors, mesh_device, tensor_return_value);
+
+    detail::launch_operation_with_adapter&lt;MeshDeviceOperationAdapter&lt;device_operation_t&gt;&gt;(
+        operation_attributes, tensor_args, tensor_return_value, mesh_device);</code></pre>
+  <p>Two details are easy to miss. First, the output tensor is allocated <em>before</em> the op's own <code>validate_on_program_cache_miss</code> runs. <code>validate_input_tensors</code> is only the framework's generic check: every input is on a device and allocated (<code>device_operation.hpp:551-558</code>). The op-specific validation happens later, inside the cache-miss branch. Second, every op runs on a <code>MeshDevice</code>, even a single chip. <code>ttnn.open_device</code> returns a 1×1 mesh (A18), and the adapter turns the op's program into a <em>mesh workload</em>, one program per device range. The next figure walks both branches, first a miss and then a hit.</p>
+
+  <div class="viz" id="fig-lifecycle"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 2. <code>launch&lt;Op&gt;</code> for a first call (miss) and a second call with new tensors (hit). Line numbers refer to <code>ttnn/api/ttnn/device_operation.hpp</code> at 7aad8aac unless marked otherwise.</div>
+
+  <p>The miss branch, in the source:</p>
+  <div class="filename">tt-metal/ttnn/api/ttnn/device_operation.hpp:326-329, 349-361 @7aad8aac (trimmed)</div>
+<pre><code>    mesh_device_operation_t::validate_on_program_cache_miss(operation_attributes, tensor_args);
+
+    auto program_factory = mesh_device_operation_t::select_program_factory(operation_attributes, tensor_args);
+    auto program_factory_index = program_factory.index();
+    ...
+        auto cached_workload = create_mesh_workload_from_workload_factory&lt;WorkloadFactory, mesh_device_operation_t&gt;(
+            operation_attributes, tensor_coords, tensor_args, tensor_return_value);
+        // Cached only after this use returns, so a use that throws leaves the cache unchanged.
+        use_workload(cached_workload.workload);
+        ...
+        bool should_cache = program_cache.is_enabled() &amp;&amp; !graph_capture_blocks_dispatch();
+        if (should_cache) {
+            program_cache.insert(program_key, CachedProgramFactory{std::move(cached_workload), program_factory_index});
+        }</code></pre>
+  <p><code>use_workload</code> is the enqueue. The program is inserted into the cache only after it has been enqueued successfully, so a program that fails to compile or does not fit in L1 never pollutes the cache. The JIT build itself does not happen in the factory. It happens inside the enqueue: <code>EnqueueMeshWorkload</code> calls <code>compile()</code> in fast dispatch, and slow dispatch compiles inside <code>LaunchProgram</code> (<code>tt_metal/distributed/distributed.cpp:125-138</code>). The factory only <em>describes</em> kernels. tt-metal turns the descriptions into ELFs the first time they are needed.</p>
+  <p>The hit branch:</p>
+  <div class="filename">tt-metal/ttnn/api/ttnn/device_operation.hpp:285-310 @7aad8aac (trimmed)</div>
+<pre><code>    if constexpr (HasValidateOnProgramCacheHit&lt;mesh_device_operation_t&gt;) {
+        mesh_device_operation_t::validate_on_program_cache_hit(operation_attributes, tensor_args);
+    } else {
+        mesh_device_operation_t::validate_on_program_cache_miss(operation_attributes, tensor_args);
+    }
+
+    auto&amp; cached_program_factory = program_cache.get(program_key);
+    auto program_factory_index = cached_program_factory.program_factory_index;
+    ...
+            if constexpr (requires { &amp;WorkloadFactory::apply_descriptor; }) {
+                WorkloadFactory::apply_descriptor(
+                    cached_mesh_workload, operation_attributes, tensor_args, tensor_return_value);
+            } else {
+                WorkloadFactory::override_runtime_arguments(
+                    cached_mesh_workload, operation_attributes, tensor_args, tensor_return_value);
+            }</code></pre>
+  <p>On a hit there is no <code>select_program_factory</code> decision, because the index is in the cache entry. There is no factory call and no new <code>Program</code>, so nothing goes to the JIT. What remains is validation and the paper: rewriting runtime arguments, and possibly circular-buffer addresses, for the tensors of <em>this</em> call. <code>apply_descriptor</code> is the name the framework's adapters give that step. Depending on the factory flavour it calls the op's own <code>override_runtime_arguments</code> or patches buffer addresses for the op automatically.</p>
+
+  <div class="callout warn"><b>Do not read "validate → specs → factory" as the order of execution.</b> Tutorials often list the device-operation methods in that order. At this commit the actual order is: generic input check → <code>create_output_tensors</code> (which calls <code>compute_output_specs</code>) → hash and look up → <em>then</em> <code>validate_on_program_cache_miss</code>. <code>compute_output_specs</code> must therefore cope with inputs that have not been validated yet. binary_ng's own comment notes a related ordering trap: its hash function runs "before validate_on_program_cache_miss" and so has to tolerate unreadable buffers (<code>binary_ng_device_operation.cpp:271-275</code>).</div>
+
+  <h2 id="factories">Program factories: four ways to say "build this"</h2>
+  <p>A program factory turns attributes and tensors into a program. Over time tt-metal has accumulated several flavours. The framework recognises each one by C++ concepts and adapts them all to a mesh workload (<code>operation_concepts.hpp:25-153</code>, <code>device_operation.hpp:244-275</code>). There are four you should recognise.</p>
+
+  <h3>1. The imperative factory: <code>create</code> + <code>override_runtime_arguments</code></h3>
+  <p>The oldest style. <code>create</code> builds a <code>Program</code> with the host API from A10 (<code>CreateCircularBuffer</code>, <code>CreateKernel</code>, <code>SetRuntimeArgs</code>) and returns it together with a <code>shared_variables_t</code>: whatever <code>override_runtime_arguments</code> needs later to find its slots again, such as kernel handles and core lists. The concept that defines this flavour says exactly that:</p>
+  <div class="filename">tt-metal/ttnn/api/ttnn/operation_concepts.hpp:25-34 @7aad8aac</div>
+<pre><code>template &lt;typename T&gt;
+concept ProgramFactoryConcept = requires {
+    typename T::cached_program_t;
+
+    [](const auto&amp; operation_attributes, const auto&amp; tensor_args, auto&amp; tensor_return_value) {
+        auto cached_program = T::create(operation_attributes, tensor_args, tensor_return_value);
+
+        T::override_runtime_arguments(cached_program, operation_attributes, tensor_args, tensor_return_value);
+    };
+};</code></pre>
+  <p>A compact real example is the experimental RGB-to-YUV op:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/experimental/rgb_to_yuv/device/rgb_to_yuv_program_factory.hpp:12-34 @7aad8aac (trimmed)</div>
+<pre><code>struct RgbToYuvProgramFactory {
+    struct shared_variables_t {
+        tt::tt_metal::KernelHandle reader_kernel_id;
+        tt::tt_metal::KernelHandle writer_kernel_id;
+        tt::tt_metal::KernelHandle compute_kernel_id;
+        uint32_t num_cores;
+        ...
+    };
+
+    using cached_program_t = ttnn::device_operation::CachedProgram&lt;shared_variables_t&gt;;
+
+    static cached_program_t create(
+        const RgbToYuvParams&amp; op_attrs, const RgbToYuvInputs&amp; tensor_args, std::tuple&lt;Tensor, Tensor, Tensor&gt;&amp; output);
+
+    static void override_runtime_arguments(
+        cached_program_t&amp; cached_program, ...);
+};</code></pre>
+  <p>And its override, which is the "new paper" step written by hand. It fetches the cached program's runtime-argument vectors by reference and overwrites the address slots in place:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/experimental/rgb_to_yuv/device/rgb_to_yuv_program_factory.cpp:285-309 @7aad8aac (trimmed)</div>
+<pre><code>    const uint32_t src_addr = tensor_args.input.buffer()-&gt;address();
+    const uint32_t y_addr = y_out.buffer()-&gt;address();
+    ...
+    for (const auto&amp; core : cores_vec) {
+        ...
+        {
+            auto&amp; args = GetRuntimeArgs(program, sv.reader_kernel_id, core);
+            args[0] = src_addr;
+            ...
+        }
+        {
+            auto&amp; args = GetRuntimeArgs(program, sv.writer_kernel_id, core);
+            args[0] = y_addr;
+            ...</code></pre>
+  <p>The weakness is obvious once you see it: <code>create</code> and the override must agree, slot by slot, on what argument <code>args[0]</code> is. If they drift apart, the op still works on the first call (a miss) and returns wrong data on the second (a hit). A test that calls an op only once will never catch this.</p>
+
+  <h3>2. The descriptor factory: <code>create_descriptor</code></h3>
+  <p>The current tutorial steers new ops to a declarative style. The factory returns a <code>ProgramDescriptor</code>: plain data listing kernels, circular buffers and semaphores. The framework builds the <code>Program</code> from it with <code>Program{desc}</code> (<code>mesh_device_operation_adapter.hpp:592</code>):</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/program_descriptors.hpp:221-228 @7aad8aac</div>
+<pre><code>struct ProgramDescriptor {
+    using KernelDescriptors = ttsl::SmallVector&lt;KernelDescriptor, 3&gt;;
+    using SemaphoreDescriptors = ttsl::SmallVector&lt;SemaphoreDescriptor, 3&gt;;
+    using CBDescriptors = ttsl::SmallVector&lt;CBDescriptor, 5&gt;;
+
+    KernelDescriptors kernels;
+    SemaphoreDescriptors semaphores;
+    CBDescriptors cbs;</code></pre>
+  <p>Each <code>KernelDescriptor</code> carries a <code>kernel_source</code> (a file path or inline source code), <code>core_ranges</code>, <code>compile_time_args</code>, <code>defines</code>, per-core <code>runtime_args</code> and a <code>config</code>: Reader, Writer, generic DataMovement or Compute (<code>program_descriptors.hpp:133-166</code>). Runtime arguments may contain <code>Buffer*</code> entries instead of raw addresses. The framework records where those landed and, on a cache hit, patches them with the current addresses, so the op author never writes an override at all. That is the tutorial's selling point: "No manual buffer address patching — the framework auto-patches buffer addresses on cache hits" (<code>docs/source/ttnn/ttnn/adding_new_ttnn_operation.rst:72</code>).</p>
+  <p><code>ttnn.add</code>'s binary_ng op uses this flavour. Here is the compute kernel it declares:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:1492-1502 @7aad8aac</div>
+<pre><code>    KernelDescriptor compute_desc;
+    compute_desc.kernel_source = get_kernel_file_path(compute_kernel, is_sfpu_op, is_where_op);
+    compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
+    compute_desc.core_ranges = all_device_cores;
+    compute_desc.defines = {compute_kernel_defines.begin(), compute_kernel_defines.end()};
+    compute_desc.compile_time_args = {num_tiles_per_cycle, static_cast&lt;uint32_t&gt;(fill_with_value_int)};
+    compute_desc.config = ComputeConfigDescriptor{
+        .fp32_dest_acc_en = fp32_dest_acc_en,
+        .unpack_to_dest_mode = {unpack_to_dest_mode.begin(), unpack_to_dest_mode.end()},
+    };</code></pre>
+  <p>The kernel is placed on <code>all_device_cores</code>, the whole worker grid, and not only on the cores that have work. Cores without work get zero-filled runtime arguments. This matters for the cache, as you will see. binary_ng still provides its own <code>override_runtime_arguments</code> even though it is a descriptor factory. The reason is in its hash, which we come to <a href="#cache">below</a>.</p>
+
+  <h3>3. The Metal 2.0 spec factory: <code>create_program_artifacts</code></h3>
+  <p>A newer flavour returns a <code>ProgramSpec</code> plus <code>ProgramRunArgs</code>, which the framework turns into a workload and patches tensor bindings on hits (<code>operation_concepts.hpp:76-91</code>, <code>metal_v2_artifacts.hpp:26-36</code>). The comment calls it a "stepping-stone concept for incremental migration of operations to Metal 2.0". Even so, it is already the most common flavour in the tree, and six of matmul's seven factories use it (the seventh, the legacy gather_in0 path, is a mesh-workload factory):</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_2d_program_factory.hpp:14-15 @7aad8aac</div>
+<pre><code>struct MatmulMultiCoreReuseMcast2DProgramFactory {
+    static ttnn::device_operation::ProgramArtifacts create_program_artifacts(</code></pre>
+
+  <h3>4. Mesh-workload factories</h3>
+  <p>Ops that need different programs on different chips, such as the collectives of <a href="a21-many-chips.html">A21</a>, implement <code>create_mesh_workload</code> or <code>create_at(mesh_coordinate, ...)</code> directly and get a <code>cached_mesh_workload_t</code> (<code>operation_concepts.hpp:36-54</code>). On a single chip you can ignore them.</p>
+  <p>How common is each flavour? Counting header files under <code>ttnn/cpp/ttnn/operations</code> at this commit (approximate counts):</p>
+  <table>
+    <tr><th>Flavour</th><th>Marker searched for</th><th>Files</th></tr>
+    <tr><td>Imperative <code>create</code> + override</td><td><code>using cached_program_t =</code></td><td>25</td></tr>
+    <tr><td>Mesh workload</td><td><code>using cached_mesh_workload_t =</code></td><td>33</td></tr>
+    <tr><td>Descriptor</td><td><code>ProgramDescriptor create_descriptor(</code> in <code>.hpp</code></td><td>132</td></tr>
+    <tr><td>Metal 2.0 spec</td><td><code>ProgramArtifacts create_program_artifacts(</code> in <code>.hpp</code></td><td>257</td></tr>
+  </table>
+  <div class="callout warn"><b>The docs and the tree disagree.</b> <code>adding_new_ttnn_operation.rst:55-57</code> says "All new operations must use the ProgramDescriptor pattern" and calls <code>CachedProgram</code>/<code>shared_variables_t</code> legacy. The source code, meanwhile, counts the Metal 2.0 <code>create_program_artifacts</code> flavour twice as often as descriptors and labels it a stepping stone (<code>operation_concepts.hpp:89-91</code>). Both statements are true at 7aad8aac: the codebase is mid-migration. Read whichever factory your op uses, and do not assume the tutorial's pattern is the one in front of you. (The counts are rough. They come from <code>rg -l</code> over headers, and an op may define several factories in one file.)</div>
+
+  <h2 id="kernels">Where the kernels live, and which ones actually ran</h2>
+  <p>Kernels for an op sit next to its device operation, under <code>device/kernels/</code>. For binary_ng, the factory maps a <code>KernelName</code> to a path:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp:81-88, 107-116 @7aad8aac (trimmed)</div>
+<pre><code>std::string get_kernel_file_path(KernelName kernel_name, bool is_sfpu, bool is_where_op) {
+    constexpr std::string_view root = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels";
+    constexpr std::string_view root_ng = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng";
+    ...
+        case KernelName::ReaderNoBcastNg: return fmt::format(dataflow, root_ng, "reader_interleaved_no_bcast.cpp");
+    ...
+        case KernelName::WriterNoBcastNg: return fmt::format(dataflow, root_ng, "writer_interleaved_no_bcast.cpp");
+    ...
+        case KernelName::ComputeNoBcast:
+            return fmt::format(
+                compute,
+                root,
+                is_where_op ? "eltwise_where_no_bcast.cpp"
+                            : (is_sfpu ? "eltwise_binary_sfpu_no_bcast.cpp" : "eltwise_binary_no_bcast.cpp"));</code></pre>
+  <p>There are two kernel directories with overlapping file names: <code>kernels/</code> and <code>kernels_ng/</code> both contain a <code>reader_interleaved_no_bcast.cpp</code>. The compute kernel also depends on <code>is_sfpu</code>. Reading the code alone, you cannot easily tell which files a given call uses. So ask the machine instead. Point <code>TT_METAL_CACHE</code> at an empty directory, run exactly one op, and list what the JIT built:</p>
+<pre><code>add (32x32 bf16):
+  kernels/eltwise_binary_no_bcast/17004479259107570459:   trisc0 trisc1 trisc2
+  kernels/reader_interleaved_no_bcast/16205775118047441966: ncrisc
+  kernels/writer_interleaved_no_bcast/5600697495145128638:  brisc
+matmul (64x64 @ 64x64 bf16):
+  kernels/bmm_large_block_zm_fused_bias_activation_metal2/9812065657012588232:    trisc0 trisc1 trisc2
+  kernels/reader_bmm_tile_layout_in0_receiver_metal2/10887230863831720782:         ncrisc
+  kernels/reader_bmm_tile_layout_in0_sender_padding_metal2/413359948367364653:     ncrisc
+  kernels/reader_bmm_tile_layout_in1_receiver_writer_padding_metal2/593917439117918801: brisc
+  kernels/reader_bmm_tile_layout_in1_sender_writer_padding_metal2/17922988459297141816: brisc</code></pre>
+  <p>Each directory is <code>kernels/&lt;source basename&gt;/&lt;kernel hash&gt;/&lt;processor&gt;/</code>. The hash covers the defines, compile-time arguments, source and config (<code>tt_metal/impl/kernels/kernel.cpp:688-696, 832-837</code>). Change a define and you get a second directory next to the first. Inside each one, the JIT left the files it generated. They settle the which-file question for good:</p>
+<pre><code># reader_interleaved_no_bcast/16205775118047441966/kernel_includes.hpp
+#include "/home/user/workspace/refs/tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp"
+
+# eltwise_binary_no_bcast/17004479259107570459/defines_generated.h
+#define BINARY_OP add_tiles
+#define BINARY_OP_TYPE EltwiseBinaryType::ELWADD
+#define PROCESS_LHS_ACTIVATIONS(i)
+#define PROCESS_POST_ACTIVATIONS(i)
+...
+# eltwise_binary_no_bcast/17004479259107570459/chlkc_descriptors.h
+constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast&lt;ckernel::MathFidelity&gt;(4);
+constexpr uint8_t unpack_src_format[32] = { 5,5,5,255,255,...</code></pre>
+  <p>Read these against what you know. The reader and writer come from <code>kernels_ng/</code>, the compute kernel from <code>kernels/</code>. The reader went to NCRISC and the writer to BRISC (A04). <code>BINARY_OP</code> is <code>add_tiles</code>, so this is the FPU path of A12–A14, ending in an <code>ELWADD</code> instruction. Fidelity is HiFi4 (4). Circular buffers 0, 1 and 2 hold format 5 (bf16, <code>Float16_b</code>), and every other CB slot is 255, unused. The matmul binary's descriptor says <code>MATH_FIDELITY ... (2)</code>, HiFi2, the matmul default you can override with a compute-kernel config (A06, A18). Its kernels have <code>_metal2</code> names because matmul is a Metal 2.0 spec factory. Here is the compute kernel those defines plug into:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_no_bcast.cpp:50-65 @7aad8aac</div>
+<pre><code>        tile_regs_acquire();
+        for (uint32_t i = 0; i &lt; n; ++i) {
+            BINARY_OP(cb_post_lhs.get_cb_id(), cb_post_rhs.get_cb_id(), i, i, i);
+            PROCESS_POST_ACTIVATIONS(i);
+        }
+        tile_regs_commit();
+
+        tile_regs_wait();
+        for (uint32_t i = 0; i &lt; n; ++i) {
+            pack_tile(i, cb_out.get_cb_id());
+        }
+        tile_regs_release();
+
+        cb_out.push_back(n);
+        cb_post_lhs.pop_front(n);
+        cb_post_rhs.pop_front(n);</code></pre>
+  <p>This is the acquire/commit/wait/release handshake from A12. <code>BINARY_OP</code> is a macro, so one source file serves add, sub and mul. Activations get fused in through <code>PROCESS_*_ACTIVATIONS</code>, which expand to nothing here. The device operation's real work is choosing these defines.</p>
+  <p>Changing the dtype changes the kernel. A float32 <code>ttnn.add</code> in the same orb built <code>eltwise_binary_sfpu_no_bcast</code> instead. For <code>ADD</code>, <code>is_binary_sfpu_op</code> picks the SFPU when both inputs are FLOAT32 (<code>binary_ng_device_operation.cpp:55-58</code>), and <code>resolve_fast_and_approximate_mode</code> defaults to <code>true</code> so that bf16 add keeps the FPU (<code>binary.cpp:922-925</code>).</p>
+
+  <div class="callout key">A TT-NN op is mostly a <em>decision procedure</em>: from shapes, dtypes, layouts and memory configs it chooses kernel files, defines, compile-time arguments, circular buffers and a core split. The arithmetic itself lives in a few short kernels that it reuses. To learn what an op really does, list what the JIT built under <code>$TT_METAL_CACHE/.../kernels/</code>.</div>
+
+  <h2 id="cache">The program cache: hit, miss, and patching</h2>
+  <p>The cache itself is an ordinary hash map that belongs to the device:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/program_cache.hpp:144-170 @7aad8aac (trimmed)</div>
+<pre><code>struct ProgramCache {
+    bool contains(const ProgramCacheKey&amp; program_key) const { return this-&gt;cache_.contains(program_key); }
+    CachedProgramFactory&amp; get(const ProgramCacheKey&amp; program_key) { return this-&gt;cache_.at(program_key); }
+    void insert(const ProgramCacheKey&amp; program_key, CachedProgramFactory&amp;&amp; program) { ... }
+    void enable() { is_enabled_ = true; }
+    void disable() { is_enabled_ = false; }
+    ...
+    std::size_t num_entries() const { return this-&gt;cache_.size(); }
+
+private:
+    bool is_enabled_ = true;
+    bool allow_cache_misses_ = true;
+    std::unordered_map&lt;ProgramCacheKey, CachedProgramFactory, ProgramCacheKeyHasher&gt; cache_;
+};</code></pre>
+  <p>It is <b>enabled by default</b> (<code>is_enabled_ = true</code>). Older tutorials call <code>device.enable_program_cache()</code> first, but at this commit that call is a no-op unless you disabled the cache earlier. The Python <code>MeshDevice</code> exposes <code>enable_program_cache</code>, <code>disable_and_clear_program_cache</code>, <code>clear_program_cache</code> and <code>num_program_cache_entries</code> (<code>ttnn/core/distributed/distributed_nanobind.cpp:369-382, 516-517</code>). <code>allow_cache_misses_</code> is a guard: switch it off (<code>set_program_cache_misses_allowed(False)</code>) and any miss throws (<code>device_operation.hpp:414-416</code>). Model code does this around trace capture so that nothing gets compiled while a trace records (for example <code>models/demos/k2_horizon_7b_qb2/tt/generator.py:654</code>); tt-metal does not switch it off for you.</p>
+  <p>The key is a 64-bit hash plus an exact "canonical" string that resolves hash collisions (<code>device_operation.hpp:404-413</code>). By default the hash covers the op's type and everything reflection can see in both argument structs:</p>
+  <div class="filename">tt-metal/ttnn/api/ttnn/device_operation.hpp:76-86 @7aad8aac</div>
+<pre><code>    if constexpr (DeviceOperationWithCustomProgramCacheConcept&lt;device_operation_t&gt;) {
+        ...
+        return ttsl::hash::hash_objects_with_default_seed(
+            ttsl::hash::type_hash&lt;device_operation_t&gt;,
+            device_operation_t::compute_program_hash(operation_attributes, tensor_args));
+    } else {
+        ZoneScopedN("Compute default program hash");
+        return ttsl::hash::hash_objects_with_default_seed(
+            ttsl::hash::type_hash&lt;device_operation_t&gt;, operation_attributes, tensor_args);
+    }</code></pre>
+  <p>What does "a <code>Tensor</code> in <code>tensor_args</code>" contribute? Its reflected attributes are <code>storage</code> and <code>tensor_spec</code> (<code>ttnn/api/ttnn/tensor/tensor.hpp:252-253</code>), and both storage types expose an empty attribute list (<code>storage.hpp:41-42, 203-204</code>). So by default the key includes the <b>shape, dtype, layout and memory config</b> of every input, and <b>never the buffer address</b>. That is exactly the plate/paper line. Matmul uses this default; its header comments that it deliberately does not define a custom hash (<code>matmul_device_operation.hpp:45-49</code>).</p>
+  <p>binary_ng draws the line somewhere else. Its <code>tensor_args_t</code> defines its own <code>to_hash</code>, which the hasher uses in place of reflection:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.hpp:133-141 @7aad8aac</div>
+<pre><code>    struct tensor_args_t {
+        const Tensor&amp; input_tensor_a;
+        std::optional&lt;Tensor&gt; input_tensor_b;
+        std::optional&lt;Tensor&gt; output_tensor;
+
+        // Operand dtypes, memory configs, Alignment, and Tile, plus each sharded operand's shape in
+        // pages. Omits logical shape by design, so differently-shaped interleaved calls share one cache entry.
+        ttsl::hash::hash_t to_hash() const;
+    };</code></pre>
+  <p>"Omits logical shape by design." An interleaved add of 32×32 and an add of 64×128 hit the <em>same</em> cached program. That is safe only because the shape-dependent quantities (tile count, how tiles split across cores, strides) are runtime arguments and not compile-time ones, and because the program's kernels already cover the whole worker grid. binary_ng therefore cannot rely on the framework's automatic address patching. It writes an override that re-runs the same argument builder its <code>create_descriptor</code> used:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:413-422 @7aad8aac</div>
+<pre><code>// SINGLE SOURCE OF TRUTH for binary_ng per-core runtime args.  Run by BOTH create_descriptor()
+// (cache miss) and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit).
+//
+// binary_ng's compute_program_hash intentionally EXCLUDES the tensor volume, so one cached program
+// is shared across differently-shaped calls.  On a cache hit the descriptor is NOT rebuilt, so every
+// shape/work-split-dependent per-core arg (c_start_id, per-core tile counts, strides, D/N/C/Ht/Wt,
+// compute_tiles, freq/counter, packed scalar, ...) would otherwise stay frozen at the first-miss
+// shape and corrupt results.  override_runtime_arguments() re-runs THIS builder for the current
+// tensors and re-applies each arg every dispatch.</code></pre>
+  <p>This answers the question from the imperative factories: how do you stop <code>create</code> and the override from drifting apart? Make them call the same function. The comment's warning is the general rule: <b>anything left out of the key must be rewritten on every hit</b>. Here is the cache across the ten calls of the lab script, with the real counts, addresses and timings:</p>
+
+  <div class="viz" id="fig-cache"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 3. Ten calls from <code>a19_cache_demo.py</code> on simulated Wormhole (cold JIT cache). Entry counts, output addresses and wall times are from the run. The per-core split for the 64×128 hit was computed by calling the same <code>split_work_to_cores</code> (row-major, as binary_ng requests) over the 8×8 grid; it was not read back from the device.</div>
+
+  <p>The table behind the figure, as printed:</p>
+<pre><code>program cache enabled at open: 0 entries
+add 32x32   (1st call)             entries=1  wall= 1.96s  out@0x2d5c40
+add 32x32   (2nd call, same shape) entries=1  wall= 0.01s  out@0x2d5c40
+add 64x128  (new shape)            entries=1  wall= 0.02s  out@0x2d6c40
+mul 32x32   (new op type)          entries=2  wall= 1.19s  out@0x2d6c40
+add 32x32 bfp8 (new dtype)         entries=3  wall= 0.87s  out@0x2d74c0
+add 32x32 out in L1 (new mem cfg)  entries=4  wall= 0.55s  out@0x16d800
+matmul 32x64 @ 64x32 (1st)         entries=5  wall= 0.79s  out@0x2d84c0
+matmul 32x64 @ 64x32 (2nd)         entries=5  wall= 0.01s  out@0x2d84c0
+matmul 64x64 @ 64x64 (new shape)   entries=6  wall= 1.70s  out@0x2d94c0
+add 64x128  again                  entries=6  wall= 0.01s  out@0x2d94c0
+check add 64x128 vs torch, max abs diff: 0.00390625
+... JIT cache stats: 0/34 hits (0.0%) ...</code></pre>
+  <p>Read it line by line. The add with a new shape did <em>not</em> add an entry, but the matmul with a new shape did. That is the to_hash comment, confirmed by experiment. New op type, dtype or output memory config each made a new entry. The 64×128 add wrote its output at a different address from the 32×32 one (<code>0x2d6c40</code> against <code>0x2d5c40</code>) and still matched torch to within bf16 rounding, so the override really did rewrite the addresses and tile counts. Misses cost 0.5–2 s here, almost all of it JIT compilation: the JIT reported 0 hits out of 34 builds. Run the script again in a fresh process with the disk cache now warm, and every miss drops to about 0.02 s while the entry counts are unchanged ("34/34 hits"). The two racks really are separate.</p>
+  <p>How much does the program cache save once compiling is free? The script <code>a19_hit_vs_miss.py</code> runs 100 adds with the cache on, then off, then on again, with the disk JIT cache warm:</p>
+<pre><code>cache ON :  11.61 ms per ttnn.add   entries=1
+cache OFF:  13.04 ms per ttnn.add   entries=0
+cache ON :  11.32 ms per ttnn.add   entries=1
+... JIT cache stats: 13/13 hits (100.0%) [13 cached, 303 build-once dedup, ...]</code></pre>
+  <p>About 1.4 ms per call, or 12%, in that run (a rerun printed 11.38 / 13.85 / 11.69 ms, about 2.3 ms or 18%: host wall time under the simulator varies), and most of the 11 ms is ttsim simulating the cores. Do not read these as silicon numbers (A17, B01). On hardware the device time for one tile is microseconds, so the same host-side saving is a much larger share of the total. The telemetry line has a clean count, though. With the cache off, every call rebuilt its <code>Program</code> and asked the JIT for its three kernels again, each answered from an in-process dedup table. 303 = 3 × 100 calls with the cache off + 3 for the first call after re-enabling. A run with 20 calls per phase printed 63 = 3 × 20 + 3. The 200 cache-on calls asked for nothing.</p>
+
+  <div class="callout warn"><b>The cache bug you will write.</b> If your op reads something on the device that is not in the key and not rewritten on a hit, the first call is right and later calls are wrong. The classic case is a scalar baked in as a compile-time argument but left out of the hash. binary_ng's attributes list spells this out: "Runtime scalar/tolerance values are excluded; they are patched as runtime args" (<code>binary_ng_device_operation.hpp:76</code>). Always test an op by calling it at least twice, with different tensors and values.</div>
+
+  <h2 id="generic">Your own op, no C++: <code>ttnn.generic_op</code></h2>
+  <p>To build an op you normally write a device operation in C++ and rebuild TT-NN. There is a shortcut that needs no rebuild. <code>ttnn.generic_op</code> is a device operation whose "factory" just returns a <code>ProgramDescriptor</code> that <em>you</em> pass in from Python:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/generic_op.hpp:13-25 @7aad8aac</div>
+<pre><code>// GenericOp exposes everything needed to construct and write an operation on device for the user.
+// This includes: cb attributes, data movement attributes, compute attributes, rt args, compile time args.
+// Unlike other operations, must create and pass in output tensor with the input tensors.
+// See tests/ttnn/unit_tests/gtests/test_generic_op.cpp for some examples.
+// The main use case right now is an interface for PyKernel to pass dynamic kernel paths.
+...
+// Convenience entry point for single ProgramDescriptor (SPMD mode)
+Tensor generic_op(const std::vector&lt;Tensor&gt;&amp; io_tensors, const tt::tt_metal::ProgramDescriptor&amp; program_descriptor);</code></pre>
+  <p>So I wrote one: <code>sqdiff(a, b) = (a − b)²</code>, computed on a single core with an FPU subtract followed by an SFPU square on the same Dst tile. TT-NN has its own squared difference, so this op is only practice. The reader and compute kernels are inline C++ strings (<code>SourceType.SOURCE_CODE</code>), and the writer reuses a stock TT-NN kernel by path. Here is the heart of the compute kernel:</p>
+  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (COMPUTE string)</div>
+<pre><code>    for (uint32_t i = 0; i &lt; n_tiles; ++i) {
+        cb_wait_front(0, 1); cb_wait_front(1, 1); cb_reserve_back(16, 1);
+        tile_regs_acquire();
+        sub_init(0, 1);
+        sub_tiles(0, 1, 0, 0, 0);   // FPU: Dst[0] = a - b
+        square_tile_init();
+        square_tile(0);             // SFPU: Dst[0] = Dst[0]^2
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile(0, 16);
+        tile_regs_release();
+        cb_push_back(16, 1); cb_pop_front(0, 1); cb_pop_front(1, 1);
+    }</code></pre>
+  <p>And the Python that describes the program, one <code>KernelDescriptor</code> per kernel. This is the same structure binary_ng builds in C++:</p>
+  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (sqdiff, trimmed)</div>
+<pre><code>    rd_rt[0][0] = [a.buffer_address(), b.buffer_address(), n_tiles]     # runtime args for core (0,0)
+    reader = ttnn.KernelDescriptor(kernel_source=READER, source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
+        core_ranges=core,
+        compile_time_args=ttnn.TensorAccessorArgs(a).get_compile_time_args() + ttnn.TensorAccessorArgs(b).get_compile_time_args(),
+        runtime_args=rd_rt, config=ttnn.ReaderConfigDescriptor())
+    ...
+    desc = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=[cb(0), cb(1), cb(16)])
+    return ttnn.generic_op([a, b, out], desc)</code></pre>
+  <p>I called it three times with new random tensors each time:</p>
+<pre><code>call 0: a@0x2d4c40 out@0x2d5c40 cache entries=1 max|err|=0.0019 PCC=1.00000
+call 1: a@0x2d6440 out@0x2d4c40 cache entries=1 max|err|=0.0019 PCC=1.00000
+call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</code></pre>
+  <p>Every buffer moved between calls, yet there is one cache entry and every result matches torch. That is because generic_op's hash covers kernel sources, core ranges, compile-time arguments, defines and CB layout, but only the <em>number</em> of runtime arguments, not their values:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/device/generic_op_device_operation.cpp:57-72 @7aad8aac</div>
+<pre><code>    auto hash_kernel = [&amp;](const KernelDescriptor&amp; kernel) -&gt; size_t {
+        return ttsl::hash::hash_objects_with_default_seed(
+            kernel.kernel_source,
+            kernel.source_type,
+            kernel.core_ranges,
+            kernel.compile_time_args,
+            kernel.named_compile_time_args,
+            kernel.defines,
+            kernel.common_runtime_args.size(),
+            ...
+            kernel.runtime_args.size(),
+            kernel.config.index(),
+            kernel.config);
+    };</code></pre>
+  <p>On a hit, the descriptor adapter sees raw <code>uint32_t</code> runtime arguments that it cannot map back to buffers. So it takes its "slow path": it calls the factory again to get your new descriptor and copies only its runtime arguments into the cached <code>Program</code> (<code>mesh_device_operation_adapter.hpp:758-762</code>). Nothing is recompiled. The JIT cache directory shows two kernels named <code>Kernel_Source_Code</code> (the inline ones; they collapse into one name directory) and <code>writer_unary_interleaved_start_id</code>.</p>
+  <div class="callout warn"><b>Two traps from writing this op.</b> (1) The kernel APIs are mid-migration. The stock reader uses the newer <code>Noc</code>/<code>DataflowBuffer</code> objects while the compute side still uses <code>cb_wait_front</code>, and both compile at this commit. Pin examples to a commit. (2) The writer's first compile-time argument is the output CB index, so the CB and the arguments must agree (16 here). Get it wrong and the kernel waits forever on an empty CB.</div>
+
+  <h2 id="above">The layers above: TT-MLIR, TT-XLA, TT-Forge</h2>
+  <p>So far a person has written every op call. Real models arrive as PyTorch or JAX programs, and nobody wants to hand-translate a transformer into <code>ttnn.*</code> calls (A22 shows what that looks like when experts do it). The compiler stack above TT-NN does the translation automatically.</p>
+  <div class="callout warn"><b>Provenance.</b> Everything in this section comes from Tenstorrent's public documentation and READMEs, read on 2026-10-30. tt-mlir, tt-xla and tt-forge are separate repositories that are not pinned or built in this series, so none of it was run or checked against source here. The one link checked in source is TT-NN's side of it: <code>ttnn.generic_op</code> exists, and its header names PyKernel (a tt-mlir feature) as its main user.</div>
+  <p>Per the docs, the pieces are:</p>
+  <ul>
+    <li><b>TT-Forge</b> is the umbrella name: "Tenstorrent's end-to-end compiler stack. It consists of frontends (TT-XLA, TT-Forge-ONNX), a middle and backend compiler (TT-MLIR), and a cookbook ... (TT-Blacksmith)."</li>
+    <li><b>TT-XLA</b> is the front end for PyTorch and JAX. It "ingests JAX models via jit compile and PyTorch models through torch-xla, providing StableHLO (SHLO) graphs to the TT-MLIR compiler", and plugs into both frameworks as a <a href="https://github.com/openxla/xla/tree/main/xla/pjrt/c">PJRT</a> plugin, <code>pjrt_plugin_tt.so</code>, which bundles tt-mlir and tt-metal. From PyTorch you write <code>torch.compile(model, backend="tt")</code>.</li>
+    <li><b>TT-Forge-ONNX</b> is the front end for ONNX, TensorFlow and PaddlePaddle models.</li>
+    <li><b>TT-Torch</b>, the earlier PyTorch 2.0 / torch-mlir front end, is deprecated. Its README now points to TT-XLA.</li>
+    <li><b>TT-MLIR</b> is the compiler. Its main dialects (an MLIR <em>dialect</em> is a named family of IR operations) are <code>ttir</code> ("Named ops on tensors (akin to shlo, tosa, etc)"), <code>ttnn</code> ("models the tt-nn API ... as closely as possible"), <code>d2m</code> ("generic compute ... similar to linalg.generic, but with constructs that map well to the Tenstorrent execution model"), <code>ttkernel</code> ("intended to be a 1-1 mapping to tt-metalium kernels") and <code>ttmetal</code> (host-side buffer and program-enqueue operations).</li>
+  </ul>
+  <p>There are two roads through TT-MLIR, and they correspond to the two halves of this chapter:</p>
+  <ol>
+    <li><b>The TT-NN road.</b> TTIR is lowered to the <code>ttnn</code> dialect, where every op is a TT-NN call with a chosen layout, for example <code>memref&lt;2x4x!ttcore.tile&lt;32x32, bf16&gt;, #dram&gt;, &lt;interleaved&gt;</code>. The optimizer picks layouts and sharding, and the result is serialised to a <code>.ttnn</code> flatbuffer, "a compiled binary file intended to be loaded and executed by the TTNN backend runtime". At run time each op in that file becomes an ordinary TT-NN call, which enters <code>device_operation::launch</code> exactly as in Figure 2. The program cache, factories and kernels are the ones you just read.</li>
+    <li><b>The direct-to-metal (D2M) road.</b> TTIR is lowered to <code>d2m.generic</code> regions and then to <code>ttkernel</code>, so the compiler <em>generates</em> its own reader/compute/writer kernels instead of using TT-NN's hand-written ones. The <code>ttnn.jit</code> docs explain how this meets TT-NN: the D2M pipeline "wraps the generated kernels in <code>ttnn.generic</code> operations that contain the necessary host side program setup. Each <code>ttnn.generic</code> op requires a <code>ProgramDescriptor</code>." In other words, compiler-generated kernels enter tt-metal through the same <code>generic_op</code> door your <code>sqdiff</code> used. Its selling point is fusion: a <code>@ttnn_jit.jit()</code>-decorated chain like <code>exp → neg → exp → add → multiply</code> is compiled "into a single fused kernel" instead of five separate ops, each of which would write its intermediate tensor back to memory.</li>
+  </ol>
+
+  <div class="viz" id="fig-stack"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 4. The compiler stack from a framework graph down to tt-metal kernels. Boxes with a green edge were exercised in this orb. Grey-edged boxes, and the IR excerpts shown for them, are quoted from the TT-MLIR, TT-XLA and TT-Forge docs and were not run here.</div>
+
+  <div class="callout gpu">The stack has the same shape as the GPU world's. TT-XLA's PJRT plugin plays the role of the CUDA backend inside XLA, the <code>ttnn</code> dialect is like XLA calling into cuDNN and cuBLAS, and the D2M road is like Triton or XLA's own fusion emitter generating kernels. The difference is the bottom layer. On a GPU a generated kernel is one SIMT program. Here every generated op is still three or more cooperating kernels per core, joined by circular buffers.</div>
+
+  <h2 id="sim">Run it in the simulator</h2>
+  <div class="callout sim">This chapter's runs use TT-NN's Python API under ttsim. The workbench is set up in <a href="../sim-labs/b00-workbench.html">B00</a>, and <a href="../sim-labs/b11-ttnn-on-sim.html">B11</a> covers TT-NN on the simulator in depth. Remember that ttsim is a functional, bit-exact model, not a timing model, so the wall times below are simulator times.</div>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs          # env.sh cds away, so use absolute paths
+export LAB_HOME=$HOME/ttlab/a19
+source $W/workbench/env.sh wh
+source $TT_METAL_HOME/python_env/bin/activate      # Python 3.11 with ttnn
+export TT_METAL_CACHE=$LAB_HOME/jit &amp;&amp; rm -rf $TT_METAL_CACHE   # a fresh, private JIT cache
+
+python -u $W/workbench/py/a19_cache_demo.py        # Figure 3 table; run twice for the warm numbers
+python -u $W/workbench/py/a19_hit_vs_miss.py       # cache on / off / on
+python -u $W/workbench/py/a19_sqdiff_generic.py    # the custom op
+
+# which kernels did the JIT build?
+cd $TT_METAL_CACHE/tt-metal-cache[0-9]*/kernels &amp;&amp; for k in *; do for v in $k/*; do
+  echo "$v: $(ls $v | grep -E '^(brisc|ncrisc|trisc[0-2])$' | tr '\n' ' ')"; done; done
+grep -h include */*/kernel_includes.hpp */*/chlkc_math.cpp | sort -u</code></pre>
+  <p>Use <code>python -u</code>. If ttsim stops the process on an error, buffered output is lost and you will not see which call failed. For the single-op listings in <a href="#kernels">the kernels section</a>, I used a separate empty <code>TT_METAL_CACHE</code> per op and a script that runs only <code>ttnn.add</code> on 32×32 (PCC 0.99999 against torch) or only <code>ttnn.matmul</code> on 64×64 (PCC 0.99945). Each left exactly one program-cache entry. The 8×8 worker grid in the figure comes from <code>device.compute_with_storage_grid_size()</code>, which printed <code>8 8</code>, and <code>ttnn.split_work_to_cores(grid, n, True)</code> (row-major, which is what binary_ng passes for interleaved tensors, <code>binary_ng_program_factory.cpp:503-504, 643</code>) gave core (0,0) for 1 tile and cores (0,0)–(7,0), 1 tile each, for 8 tiles.</p>
+  <div class="callout warn"><b>An observed ttsim limit.</b> <code>ttnn.add</code> on two <code>float32</code> tensors, which takes the SFPU kernel, stopped the simulator on Wormhole:
+<pre><code>[4716] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
+  Data format 0 is Float32. I did not investigate whether this is a ttsim modelling gap or a real misconfiguration that silicon tolerates. bf16 and bfp8 adds, mul and matmul all ran. Note this if you build labs on FP32 elementwise ops.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A TT-NN op is a <b>device operation</b>: two argument structs (<code>operation_attributes_t</code>, <code>tensor_args_t</code>) and static functions (<code>validate_on_program_cache_miss/hit</code>, <code>compute_output_specs</code>, <code>create_output_tensors</code>, <code>select_program_factory</code>), handed to <code>device_operation::launch</code>.</li>
+    <li><code>launch</code> checks inputs, allocates the output from its spec, hashes the arguments and looks up the <b>program cache</b>. On a miss it validates, selects a factory, builds a program, enqueues it (the JIT compiles here) and caches it. On a hit it validates, then only patches runtime arguments and enqueues.</li>
+    <li>Factories come in flavours: imperative <code>create</code> + <code>override_runtime_arguments</code>, declarative <code>create_descriptor</code> returning a <code>ProgramDescriptor</code>, Metal 2.0 <code>create_program_artifacts</code>, and mesh-workload factories. The docs recommend descriptors, while matmul and much of the tree already use Metal 2.0 specs.</li>
+    <li>The cache key is the plate/paper line: by default op type plus attributes plus each tensor's spec (shape, dtype, layout, memory config) and never addresses. binary_ng deliberately drops the shape, so one entry serves every interleaved shape, at the price of rewriting all per-core arguments on each hit.</li>
+    <li>To see what an op really ran, give it an empty <code>TT_METAL_CACHE</code> and read <code>kernels/&lt;name&gt;/&lt;hash&gt;/</code>, including <code>defines_generated.h</code> and <code>kernel_includes.hpp</code>.</li>
+    <li><code>ttnn.generic_op</code> runs any <code>ProgramDescriptor</code> from Python: your own op, with the program cache, and no C++ rebuild.</li>
+    <li>Above TT-NN, per the docs: TT-XLA (PyTorch via torch-xla, and JAX, through PJRT) and TT-Forge-ONNX feed TT-MLIR. TT-MLIR either lowers to TT-NN calls (a <code>.ttnn</code> flatbuffer) or generates kernels directly (D2M), which reach the chip through <code>ttnn.generic</code>/<code>generic_op</code>.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>You call <code>ttnn.add</code> on 32×32 tensors, then on 64×128 tensors, both bf16 interleaved in DRAM. How many program-cache entries are there, and what happens on the second call?</summary><p>One. binary_ng's <code>tensor_args_t::to_hash</code> omits the logical shape, so the second call hashes to the same key and hits. On the hit, no factory runs and nothing is compiled. <code>override_runtime_arguments</code> re-runs the shared argument builder: the output now has 8 tiles instead of 1, split over 8 cores of the 8×8 grid, and the buffer addresses are new. The run in this chapter shows exactly that: <code>entries=1</code> before and after, and the output at <code>0x2d6c40</code> instead of <code>0x2d5c40</code>, correct to bf16 rounding.</p></details>
+  <details class="quiz"><summary>Why does a 64×64 matmul after a 32×64 @ 64×32 matmul create a new entry, while add did not?</summary><p>Matmul uses the default hash: <code>type_hash</code> plus reflected attributes plus reflected <code>tensor_args</code>, and a <code>Tensor</code> reflects its <code>tensor_spec</code>, which includes the shape. Matmul's program really does depend on shape (blocking, subblocks, grid, CB sizes), so it should not share programs across shapes. Add's program differs only in runtime arguments, so its authors could afford to drop the shape from the key.</p></details>
+  <details class="quiz"><summary>An op author bakes a user-supplied scalar into the compute kernel as a <code>#define</code> but forgets to put it in <code>operation_attributes_t</code>'s hashed fields. What symptom will users see?</summary><p>The first call with each new set of shapes, dtypes and configs is correct. Every later call with a <em>different</em> scalar hits the cached program, which still has the old <code>#define</code> compiled in, so it silently computes with the old value. A test that calls the op once passes. The fix is either to include the scalar in the key, which costs a compile per value, or to pass it as a runtime argument and rewrite it on every hit, as binary_ng does with "runtime scalar/tolerance values".</p></details>
+  <details class="quiz"><summary>The cold run took 1.96 s for the first <code>add</code> and 0.02 s for the first add in a second process. The program cache starts empty in both processes, so why the difference?</summary><p>The program cache lives in memory and dies with the process, so the second process also missed and rebuilt the <code>Program</code>. But the expensive part of a miss is the JIT compilation of five RISC-V binaries (3 TRISC + NCRISC + BRISC), and that output is cached on disk under <code>TT_METAL_CACHE</code>, keyed by a hash of the kernel's source, defines and compile-time arguments. The second process found all of them ("34/34 hits"). Program building without compiling costs on the order of a millisecond.</p></details>
+  <details class="quiz"><summary>In the <code>generic_op</code> run, the input and output addresses changed on every call, yet there was one cache entry and correct results. Which part of the key ignores the addresses, and who rewrote them?</summary><p>generic_op's hash covers kernel source, core ranges, compile-time arguments, defines, config and CB layout, but for runtime arguments only <code>runtime_args.size()</code>. The addresses are runtime-argument <em>values</em>, so they do not change the key. On the hit, the descriptor adapter had no buffer bindings to patch, because the arguments were raw <code>uint32_t</code>, so it re-invoked the factory to get the new descriptor and applied its runtime arguments to the cached program, without rebuilding or recompiling.</p></details>
+  <details class="quiz"><summary>A PyTorch model is compiled with <code>torch.compile(model, backend="tt")</code>. Name the artifacts on the TT-NN road from that call to a kernel running on a Tensix core.</summary><p>Per the docs: torch-xla traces the model and hands a StableHLO module through TT-XLA's PJRT plugin. TT-MLIR converts it to TTIR, lowers it to the <code>ttnn</code> dialect with layouts chosen, and serialises a <code>.ttnn</code> flatbuffer. The runtime executes each op in it as a TT-NN call. From there it is this chapter, verified in the orb: <code>device_operation::launch</code> → cache key → factory → <code>ProgramDescriptor</code>/<code>Program</code> → JIT-compiled ELFs per RISC-V → enqueue → reader on NCRISC, compute on TRISC0–2, writer on BRISC.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/adding_new_ttnn_operation.html">Adding New TT-NN Operation</a>: the official tutorial for the device-operation structure and the ProgramDescriptor pattern.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/ttnn/cpp/ttnn/operations/examples/example">ttnn/.../examples/example</a>: the toy device operation with single- and multi-core descriptor factories, the best file to copy from.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/ttnn/cpp/ttnn/operations/generic/generic_op.hpp">generic_op.hpp</a>: the door for Python-built and compiler-generated programs; see also <code>tests/ttnn/unit_tests/operations/debug/test_generic_op.py</code>.</li>
+    <li><a href="https://docs.tenstorrent.com/forge/index.html">TT-Forge</a>: the overview of the compiler stack and its front ends.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-mlir/overview.html">TT-MLIR introduction</a>: the TTIR → TTNN / D2M → TTKernel → TTMetal flow with real IR for a small linear or matmul at each level.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-mlir/dialects-overview.html">TT-MLIR dialects overview</a>: a one-page list of <code>ttcore</code>, <code>ttir</code>, <code>ttnn</code>, <code>ttkernel</code> and <code>ttmetal</code>.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-mlir/ttnn-jit.html"><code>ttnn.jit</code></a>: how D2M-generated, fused kernels are wrapped as <code>ttnn.generic</code> ops with ProgramDescriptors.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-mlir/flatbuffers.html">TT-MLIR flatbuffers</a>: what <code>.ttnn</code>, <code>.ttb</code> and <code>.ttsys</code> files are.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-xla/getting_started.html">TT-XLA getting started</a>: the PJRT plugin, the JAX and PyTorch/XLA wrappers, and <code>torch.compile(..., backend="tt")</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-torch">tt-torch</a>: the deprecated PyTorch front end; its README points to TT-XLA.</li>
+    <li><a href="https://openxla.org/stablehlo">StableHLO</a>: the portable op set TT-XLA hands to TT-MLIR.</li>
+    <li><a href="https://arxiv.org/abs/2002.11054">MLIR: A Compiler Infrastructure for the End of Moore's Law</a> (Lattner et al., 2020): why compilers are built from stacked dialects.</li>
+  </ul>
+
+  <div class="pager"><a href="a18-ttnn-user.html">&larr; 18 TT-NN as a user</a><a class="next" href="a20-performance.html">20 Thinking like a performance engineer &rarr;</a></div>
+</main>
+
+<script>
+/* Shared drawing helpers for this chapter's figures. */
+var A19 = (function () {
+  var C = TT.C;
+  function mono(ctx, s, x, y, color, size) {
+    TT.text(ctx, s, x, y, { mono: true, font: (size || 12) + "px", color: color || C.fg });
+  }
+  function panel(ctx, x, y, w, h, title, lines, color, alpha) {
+    TT.box(ctx, x, y, w, h, { fill: C.bg2, stroke: color || C.border, lw: 1.5 });
+    TT.text(ctx, title, x + 12, y + 16, { font: "bold 12px", color: color || C.muted });
+    ctx.save();
+    ctx.globalAlpha = alpha == null ? 1 : alpha;
+    for (var k = 0; k < lines.length; k++) {
+      var L = lines[k], col = C.fg, s = L;
+      if (typeof L === "object") { s = L.s; col = L.c || C.fg; }
+      mono(ctx, s, x + 12, y + 38 + k * 17, col);
+    }
+    ctx.restore();
+  }
+  return { mono: mono, panel: panel };
+})();
+</script>
+
+<script>
+/* Figure 1: one ttnn.add descending the stack. */
+(function () {
+  var root = document.getElementById("fig-descent");
+  var g = TT.canvas(root, 800, 470), ctx = g.ctx, C = TT.C;
+  var layers = [
+    { name: "Python", call: "ttnn.add(a, b)", col: C.blue,
+      art: ["a, b: Tensor [32, 32] bfloat16", "      TILE layout, DRAM interleaved", "",
+            "ttnn.add is a nanobind binding of the", "C++ function ttnn::add"] },
+    { name: "TT-NN C++", call: "ttnn::add -> invoke_binary_ng", col: C.blue,
+      art: ["operation_attributes_t {", "  binary_op_type = ADD, dtype = BFLOAT16,",
+            "  memory_config = DRAM interleaved,", "  worker_grid = 8x8 cores, is_sfpu = false, ... }",
+            "tensor_args_t { a, b, output = nullopt }"] },
+    { name: "Device-op framework", call: "launch<BinaryNgDeviceOperation>", col: C.yellow,
+      art: ["compute_output_specs -> [32,32] bf16 TILE DRAM", "create_output_tensors -> out @ 0x2d5c40",
+            "hash(type, attributes, to_hash(tensor_args))", "program cache lookup: MISS (0 entries)",
+            "validate_on_program_cache_miss: ok"] },
+    { name: "Program factory", call: "ProgramFactory::create_descriptor", col: C.orange,
+      art: ["ProgramDescriptor", " cbs: c_0, c_1, c_2   (2 tiles x 2048 B each)",
+            " kernels[0] kernels_ng/.../reader_interleaved_no_bcast",
+            " kernels[1] kernels_ng/.../writer_interleaved_no_bcast",
+            " kernels[2] kernels/compute/eltwise_binary_no_bcast",
+            "   defines BINARY_OP=add_tiles, ELWADD",
+            " runtime args: core (0,0) gets 1 tile,", "   other 63 cores get zeros"] },
+    { name: "TT-Metalium + JIT", call: "Program{desc}; compile at enqueue", col: C.purple,
+      art: ["$TT_METAL_CACHE/.../kernels/", " eltwise_binary_no_bcast/17004479259107570459/",
+            "   trisc0  trisc1  trisc2", " reader_interleaved_no_bcast/1620577511.../ncrisc",
+            " writer_interleaved_no_bcast/5600697495.../brisc",
+            "MATH_FIDELITY = 4 (HiFi4), CB formats 5 (bf16)"] },
+    { name: "Dispatch", call: "EnqueueMeshWorkload(cq, workload)", col: C.teal,
+      art: ["slow dispatch under ttsim (A17): the host writes", "binaries, CB config and runtime args, then GO",
+            "", "program_cache.insert(key, {workload, index 0})", "num_program_cache_entries() == 1"] },
+    { name: "Tensix core (0,0)", call: "5 RISC-Vs run 3 kernels", col: C.green,
+      art: ["NCRISC  reader: DRAM a,b -> CB c_0, c_1", "TRISC0  unpack: c_0 -> SrcA, c_1 -> SrcB",
+            "TRISC1  math:   ELWADD SrcA + SrcB -> Dst", "TRISC2  pack:   Dst -> CB c_2",
+            "BRISC   writer: CB c_2 -> DRAM out", "", "result vs torch: PCC 0.99999"] }
+  ];
+  var steps = layers.map(function (L, k) {
+    var texts = [
+      "<b>Python.</b> You call <code>ttnn.add(a, b)</code>. Python only forwards the call; there is no arithmetic here.",
+      "<b>TT-NN C++.</b> <code>ttnn::add</code> fills the op's two argument structs: attributes (op type, dtype, memory config, cores) and tensor arguments.",
+      "<b>Framework.</b> <code>launch</code> allocates the output from <code>compute_output_specs</code>, hashes the arguments and looks up the program cache. First call: a miss.",
+      "<b>Factory.</b> On a miss, the factory chosen by <code>select_program_factory</code> describes the program as data: 3 circular buffers, 3 kernels with defines, and per-core runtime args.",
+      "<b>tt-metal.</b> The descriptor becomes a <code>Program</code>. At enqueue, the JIT compiles each kernel for its RISC-V. These are the real cache directories from this run.",
+      "<b>Dispatch.</b> The workload is enqueued, and only then inserted into the program cache. The next identical call skips the factory and the JIT.",
+      "<b>Hardware.</b> One tile, one core: reader on NCRISC, UNPACK/MATH/PACK on TRISC0/1/2, writer on BRISC. <code>add_tiles</code> became an FPU <code>ELWADD</code> (A13, A14)."
+    ];
+    return { dur: 1.1, text: texts[k] };
+  });
+  var bx = 16, bw = 300, top = 14, bh = 52, gap = 12;
+  TT.stepper({
+    root: root, steps: steps,
+    draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      for (var k = 0; k < layers.length; k++) {
+        var y = top + k * (bh + gap), L = layers[k];
+        var active = k === i, done = k < i;
+        TT.box(ctx, bx, y, bw, bh, { fill: L.col, alpha: active ? 0.28 : (done ? 0.12 : 0.04), stroke: active ? L.col : C.border, lw: active ? 2.5 : 1 });
+        TT.text(ctx, L.name, bx + 12, y + 17, { font: "bold 13px", color: active || done ? L.col : C.muted });
+        A19.mono(ctx, L.call, bx + 12, y + 37, active || done ? C.fg : C.muted, 11.5);
+        if (k < layers.length - 1) TT.arrow(ctx, bx + bw / 2, y + bh + 1, bx + bw / 2, y + bh + gap - 1, { color: C.border, head: 5, lw: 1.5 });
+      }
+      // moving token between layers
+      var yFrom = top + Math.max(0, i - 1) * (bh + gap) + bh / 2, yTo = top + i * (bh + gap) + bh / 2;
+      var yy = i === 0 ? yTo : TT.lerp(yFrom, yTo, t);
+      ctx.beginPath(); ctx.arc(bx + bw - 18, yy, 7, 0, Math.PI * 2); ctx.fillStyle = C.yellow; ctx.fill();
+      // artifact panel
+      var L = layers[i], py = top + i * (bh + gap);
+      TT.arrow(ctx, bx + bw + 4, py + bh / 2, 352, Math.min(py + bh / 2, 300), { color: L.col, head: 7, lw: 1.5 });
+      A19.panel(ctx, 352, 120, 432, 200, "artifact emitted by this layer", L.art, L.col, TT.smooth(t * 1.5));
+      TT.text(ctx, "verified in this orb (ttsim, Wormhole)", 352, 345, { font: "12px", color: C.green });
+      TT.text(ctx, "layer " + (i + 1) + " of " + layers.length, 352, 100, { font: "12px", color: C.muted });
+    }
+  });
+})();
+</script>
+
+<script>
+/* Figure 2: the lifecycle of launch<Op>, miss then hit. */
+(function () {
+  var root = document.getElementById("fig-lifecycle");
+  var g = TT.canvas(root, 800, 520), ctx = g.ctx, C = TT.C;
+  var B = {
+    launch: { x: 16, y: 14, w: 180, h: 54, t: "launch<Op>()", s: "collect Tensor args" },
+    vin:    { x: 212, y: 14, w: 180, h: 54, t: "validate_input_tensors", s: "on device? allocated?" },
+    out:    { x: 408, y: 14, w: 180, h: 54, t: "create_output_tensors", s: "uses compute_output_specs" },
+    hash:   { x: 604, y: 14, w: 180, h: 54, t: "hash + cache lookup", s: "type+attrs+tensor_args" },
+    m1: { x: 40, y: 140, w: 330, h: 50, t: "validate_on_program_cache_miss", s: "op-specific checks, may throw" },
+    m2: { x: 40, y: 205, w: 330, h: 50, t: "select_program_factory", s: "returns variant; index is cached" },
+    m3: { x: 40, y: 270, w: 330, h: 50, t: "factory builds the program", s: "create / create_descriptor / ..._artifacts" },
+    m4: { x: 40, y: 335, w: 330, h: 50, t: "enqueue (EnqueueMeshWorkload)", s: "JIT compiles kernels here, first time" },
+    m5: { x: 40, y: 400, w: 330, h: 50, t: "program_cache.insert(key, ...)", s: "only after a successful enqueue" },
+    h1: { x: 430, y: 140, w: 330, h: 50, t: "validate_on_program_cache_hit", s: "defaults to the miss validator" },
+    h2: { x: 430, y: 205, w: 330, h: 50, t: "program_cache.get(key)", s: "cached workload + factory index" },
+    h3: { x: 430, y: 270, w: 330, h: 50, t: "override_runtime_arguments", s: "new addresses, tile counts (paper)" },
+    h4: { x: 430, y: 335, w: 330, h: 50, t: "enqueue the same workload", s: "no factory, no JIT" },
+    cache: { x: 430, y: 410, w: 330, h: 46, t: "program cache", s: "" }
+  };
+  var seq = [
+    { on: ["launch"], call: 1, entries: 0, txt: "<b>Call 1.</b> <code>launch</code> gathers every <code>Tensor</code> in <code>tensor_args_t</code> by reflection (device_operation.hpp:609-611)." },
+    { on: ["vin"], call: 1, entries: 0, txt: "Generic input checks only: each input is a device tensor and allocated (551-558). The op's own validation comes later." },
+    { on: ["out"], call: 1, entries: 0, txt: "The output is allocated <b>now</b>, from <code>compute_output_specs</code>, before any program exists (622)." },
+    { on: ["hash"], call: 1, entries: 0, miss: true, txt: "Hash of op type + attributes + tensor_args (+ mesh coordinates), plus a canonical key for collisions. Not found: <b>miss</b> (394-419)." },
+    { on: ["m1"], call: 1, entries: 0, miss: true, txt: "Now the op validates its inputs properly: shapes broadcastable, layouts and dtypes supported (326)." },
+    { on: ["m2"], call: 1, entries: 0, miss: true, txt: "<code>select_program_factory</code> picks one alternative of the <code>program_factory_t</code> variant, e.g. matmul's 2D-multicast factory (328-329)." },
+    { on: ["m3"], call: 1, entries: 0, miss: true, txt: "The factory makes the plate: kernels, CBs, semaphores, initial runtime args, as a Program, a ProgramDescriptor or a ProgramSpec (349-350)." },
+    { on: ["m4"], call: 1, entries: 0, miss: true, txt: "Enqueue. This is where kernels are JIT-compiled the first time they are needed (distributed.cpp:125-138), or found in the disk cache." },
+    { on: ["m5", "cache"], call: 1, entries: 1, miss: true, txt: "Only after the enqueue succeeds is the workload inserted with its factory index (358-361). Entries: 0 &rarr; 1." },
+    { on: ["launch", "vin", "out"], call: 2, entries: 1, txt: "<b>Call 2</b>, new tensors at new addresses. The same three steps run: an output is always allocated." },
+    { on: ["hash"], call: 2, entries: 1, hit: true, txt: "Same op, same attributes, same specs, so the same key. Addresses are not in it: <b>hit</b> (413)." },
+    { on: ["h1"], call: 2, entries: 1, hit: true, txt: "Validation still runs: the op's <code>validate_on_program_cache_hit</code> if it has one, else the miss validator (285-289)." },
+    { on: ["h2", "cache"], call: 2, entries: 1, hit: true, txt: "Fetch the cached workload and the factory index. No <code>select_program_factory</code>, no factory call (291-294)." },
+    { on: ["h3"], call: 2, entries: 1, hit: true, txt: "New paper: <code>override_runtime_arguments</code> / <code>apply_descriptor</code> rewrites buffer addresses and any shape-dependent args in place (303-309)." },
+    { on: ["h4"], call: 2, entries: 1, hit: true, txt: "Enqueue the patched workload. Nothing new to compile, nothing inserted. Entries stay at 1." }
+  ];
+  var steps = seq.map(function (s) { return { dur: 0.9, text: s.txt }; });
+  function drawBox(b, active, col, dim) {
+    TT.box(ctx, b.x, b.y, b.w, b.h, { fill: col, alpha: active ? 0.3 : 0.05, stroke: active ? col : C.border, lw: active ? 2.5 : 1 });
+    A19.mono(ctx, b.t, b.x + 10, b.y + 17, active ? C.fg : (dim ? C.muted : C.fg), 12);
+    TT.text(ctx, b.s, b.x + 10, b.y + 36, { font: "11.5px", color: C.muted });
+  }
+  TT.stepper({
+    root: root, steps: steps,
+    draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var S = seq[i];
+      var on = {}; S.on.forEach(function (k) { on[k] = true; });
+      ["launch", "vin", "out", "hash"].forEach(function (k) { drawBox(B[k], on[k], C.blue); });
+      for (var k = 0; k < 3; k++) TT.arrow(ctx, B.launch.x + 180 + k * 196, 41, B.launch.x + 196 + k * 196, 41, { color: C.border, head: 5, lw: 1.5 });
+      // branch
+      TT.arrow(ctx, 694, 70, 694, 98, { color: C.border, head: 5 });
+      TT.box(ctx, 600, 98, 188, 26, { fill: C.bg3, stroke: C.border, label: "key in cache?", font: "12px" });
+      TT.arrow(ctx, 600, 111, 205, 111, { color: S.miss ? C.red : C.border, lw: S.miss ? 2.5 : 1.5 });
+      TT.arrow(ctx, 205, 111, 205, 138, { color: S.miss ? C.red : C.border, lw: S.miss ? 2.5 : 1.5 });
+      TT.arrow(ctx, 694, 124, 694, 138, { color: S.hit ? C.green : C.border, lw: S.hit ? 2.5 : 1.5 });
+      TT.text(ctx, "no: MISS", 260, 100, { font: "bold 12px", color: S.miss ? C.red : C.muted });
+      TT.text(ctx, "yes: HIT", 706, 130, { font: "bold 12px", color: S.hit ? C.green : C.muted });
+      ["m1", "m2", "m3", "m4", "m5"].forEach(function (k, j) { drawBox(B[k], on[k], C.red, true); if (j < 4) TT.arrow(ctx, 205, B[k].y + 50, 205, B[k].y + 64, { color: C.border, head: 5, lw: 1.5 }); });
+      ["h1", "h2", "h3", "h4"].forEach(function (k, j) { drawBox(B[k], on[k], C.green, true); if (j < 3) TT.arrow(ctx, 595, B[k].y + 50, 595, B[k].y + 64, { color: C.border, head: 5, lw: 1.5 }); });
+      // cache box
+      var cb = B.cache, ca = on.cache;
+      TT.box(ctx, cb.x, cb.y, cb.w, cb.h, { fill: C.yellow, alpha: ca ? 0.25 : 0.06, stroke: ca ? C.yellow : C.border, lw: ca ? 2.5 : 1 });
+      TT.text(ctx, "program cache (per device, in memory)", cb.x + 10, cb.y + 15, { font: "bold 12px", color: C.yellow });
+      var n = S.entries;
+      for (var e = 0; e < Math.max(n, 1); e++) {
+        TT.box(ctx, cb.x + 12 + e * 60, cb.y + 26, 50, 14, { fill: n ? C.yellow : C.bg3, alpha: n ? (ca ? TT.lerp(0.3, 0.8, t) : 0.6) : 0.5, stroke: C.border, r: 3 });
+      }
+      TT.text(ctx, "entries: " + n, cb.x + 250, cb.y + 33, { font: "12px", color: C.fg });
+      // insert / get arrows
+      if (S.on.indexOf("m5") >= 0) TT.arrow(ctx, 370, 425, TT.lerp(370, 428, t), 430, { color: C.yellow, lw: 2 });
+      if (S.on.indexOf("h2") >= 0) {
+        // route up the right margin so the arrow does not cross the h3/h4 labels
+        var yTop = TT.lerp(433, 230, t);
+        ctx.save(); ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(760, 433); ctx.lineTo(776, 433); ctx.lineTo(776, yTop); ctx.stroke(); ctx.restore();
+        if (t > 0.95) TT.arrow(ctx, 776, 230, 762, 230, { color: C.yellow, lw: 2 });
+      }
+      TT.text(ctx, "call " + S.call + (S.call === 1 ? ": first time this key is seen" : ": same op, new tensors"), 16, 495, { font: "bold 13px", color: S.call === 1 ? C.red : C.green });
+    }
+  });
+})();
+</script>
+
+<script>
+/* Figure 3: program cache hit vs miss across the real ten-call run. */
+(function () {
+  var root = document.getElementById("fig-cache");
+  var g = TT.canvas(root, 800, 480), ctx = g.ctx, C = TT.C;
+  var calls = [
+    { l: "add 32x32 bf16", e: "A", miss: 1, n: 1, w: "1.96 s", out: "0x2d5c40", why: "first add: build + JIT", key: ["BinaryNg", "ADD", "bf16", "DRAM", "(shape not in key)"], rt: ["cores with work: 1 of 64", "core(0,0): num_tiles = 1", "out addr = 0x2d5c40"] },
+    { l: "add 32x32 (again)", e: "A", miss: 0, n: 1, w: "0.01 s", out: "0x2d5c40", why: "identical key", key: ["BinaryNg", "ADD", "bf16", "DRAM", "(shape not in key)"], rt: ["cores with work: 1 of 64", "core(0,0): num_tiles = 1", "out addr = 0x2d5c40 (rewritten)"] },
+    { l: "add 64x128", e: "A", miss: 0, n: 1, w: "0.02 s", out: "0x2d6c40", why: "shape not in binary_ng key", key: ["BinaryNg", "ADD", "bf16", "DRAM", "(shape not in key)"], rt: ["cores with work: 1 -> 8 of 64", "8 cores x num_tiles = 1", "out addr 0x2d5c40 -> 0x2d6c40"], patch: 1 },
+    { l: "multiply 32x32", e: "B", miss: 1, n: 2, w: "1.19 s", out: "0x2d6c40", why: "binary_op_type = MUL", key: ["BinaryNg", "MUL", "bf16", "DRAM", "(shape not in key)"] },
+    { l: "add 32x32 bfp8_b", e: "C", miss: 1, n: 3, w: "0.87 s", out: "0x2d74c0", why: "dtype in key", key: ["BinaryNg", "ADD", "bfp8_b", "DRAM", "(shape not in key)"] },
+    { l: "add 32x32 -> L1", e: "D", miss: 1, n: 4, w: "0.55 s", out: "0x16d800", why: "memory_config in key", key: ["BinaryNg", "ADD", "bf16", "out: L1", "(shape not in key)"] },
+    { l: "matmul 32x64@64x32", e: "E", miss: 1, n: 5, w: "0.79 s", out: "0x2d84c0", why: "new op type", key: ["Matmul", "default hash", "bf16", "DRAM", "shapes 32x64, 64x32"] },
+    { l: "matmul (again)", e: "E", miss: 0, n: 5, w: "0.01 s", out: "0x2d84c0", why: "identical key", key: ["Matmul", "default hash", "bf16", "DRAM", "shapes 32x64, 64x32"] },
+    { l: "matmul 64x64@64x64", e: "F", miss: 1, n: 6, w: "1.70 s", out: "0x2d94c0", why: "tensor_spec (shape) in key", key: ["Matmul", "default hash", "bf16", "DRAM", "shapes 64x64, 64x64"] },
+    { l: "add 64x128 (again)", e: "A", miss: 0, n: 6, w: "0.01 s", out: "0x2d94c0", why: "still entry A", key: ["BinaryNg", "ADD", "bf16", "DRAM", "(shape not in key)"], rt: ["cores with work: 8 of 64", "8 cores x num_tiles = 1", "out addr -> 0x2d94c0"] }
+  ];
+  var entryNames = { A: "A  binary_ng ADD bf16 DRAM", B: "B  binary_ng MUL bf16", C: "C  binary_ng ADD bfp8_b", D: "D  binary_ng ADD out->L1", E: "E  matmul 32x64@64x32", F: "F  matmul 64x64@64x64" };
+  var order = ["A", "B", "C", "D", "E", "F"];
+  var steps = calls.map(function (c, k) {
+    var s = "<b>Call " + (k + 1) + ": " + c.l + ".</b> " + (c.miss ? "<span style='color:#fc6255'>Miss</span>" : "<span style='color:#83c167'>Hit</span>") + " (" + c.why + "), " + c.w + ", entries = " + c.n + ".";
+    if (c.patch) s += " Same program, new paper: the override re-runs the argument builder, so 8 cores now get 1 tile each and every address slot is rewritten.";
+    else if (!c.miss) s += " The factory and the JIT are skipped; only runtime args are rewritten.";
+    else s += " The factory builds a new program; the JIT compiles its kernels.";
+    return { dur: 1.0, text: s };
+  });
+  TT.stepper({
+    root: root, steps: steps,
+    draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var c = calls[i];
+      // call list
+      TT.text(ctx, "calls (one process)", 16, 14, { font: "bold 12px", color: C.muted });
+      for (var k = 0; k < calls.length; k++) {
+        var y = 30 + k * 26, cur = k === i, seen = k <= i;
+        TT.box(ctx, 16, y, 230, 22, { fill: cur ? (calls[k].miss ? C.red : C.green) : C.bg2, alpha: cur ? 0.3 : 1, stroke: cur ? (calls[k].miss ? C.red : C.green) : C.border, lw: cur ? 2 : 1, r: 4 });
+        A19.mono(ctx, calls[k].l, 24, y + 11, seen ? C.fg : C.muted, 11.5);
+        if (seen) TT.text(ctx, calls[k].miss ? "MISS" : "HIT", 238, y + 11, { font: "bold 11px", color: calls[k].miss ? C.red : C.green, align: "right" });
+      }
+      // key panel
+      TT.box(ctx, 266, 30, 230, 150, { fill: C.bg2, stroke: C.border });
+      TT.text(ctx, "cache key fields (this call)", 276, 46, { font: "bold 12px", color: C.muted });
+      for (var j = 0; j < c.key.length; j++) A19.mono(ctx, c.key[j], 280, 70 + j * 21, c.key[j].indexOf("not") >= 0 ? C.orange : C.fg, 12);
+      TT.text(ctx, "addresses: never in the key", 276, 172, { font: "11.5px", color: C.muted });
+      // arrow key -> cache
+      var hitIdx = order.indexOf(c.e);
+      var ty = 46 + hitIdx * 34;
+      TT.arrow(ctx, 496, 100, TT.lerp(500, 532, t), TT.lerp(100, ty + 12, t), { color: c.miss ? C.red : C.green, lw: 2 });
+      // cache entries
+      TT.text(ctx, "program cache: " + c.n + " entr" + (c.n === 1 ? "y" : "ies"), 536, 14, { font: "bold 12px", color: C.yellow });
+      for (var e = 0; e < order.length; e++) {
+        var present = e < c.n, isT = e === hitIdx;
+        var yy = 30 + e * 34;
+        var a = present ? (isT && c.miss ? TT.lerp(0.05, 0.3, t) : (isT ? 0.3 : 0.1)) : 0.02;
+        TT.box(ctx, 536, yy, 248, 28, { fill: isT ? (c.miss ? C.red : C.green) : C.yellow, alpha: a, stroke: present ? (isT ? (c.miss ? C.red : C.green) : C.yellow) : C.border, lw: isT ? 2.2 : 1, r: 4 });
+        A19.mono(ctx, present || (isT && t > 0.5) ? entryNames[order[e]] : "(empty)", 546, yy + 14, present ? C.fg : C.muted, 11.5);
+      }
+      // runtime args panel
+      var rt = c.rt || (c.miss ? ["new program: CBs, kernels, defines", "kernels JIT-compiled at enqueue", "out addr = " + c.out] : ["cached program reused", "runtime args rewritten", "out addr = " + c.out]);
+      A19.panel(ctx, 266, 300, 518, 120, c.miss ? "miss: build the plate" : "hit: new paper (override_runtime_arguments)", rt, c.miss ? C.red : C.green, c.patch ? TT.smooth(t * 1.4) : 1);
+      TT.text(ctx, "wall time for this call (ttsim, cold JIT): " + c.w, 266, 445, { font: "12px", color: C.muted });
+      // simple core grid for add calls
+      if (c.key[0] === "BinaryNg" && c.e === "A") {
+        var nWork = (i === 0 || i === 1) ? 1 : 8;
+        if (c.patch) nWork = t > 0.5 ? 8 : 1;
+        TT.text(ctx, "8x8 worker grid", 16, 302, { font: "bold 12px", color: C.muted });
+        for (var gx = 0; gx < 8; gx++) for (var gy = 0; gy < 8; gy++) {
+          var idx = gy * 8 + gx; // row-major split (binary_ng passes row_major = true): cores (0,0)..(7,0) first
+          var work = idx < nWork;
+          TT.box(ctx, 16 + gx * 28, 316 + gy * 19, 24, 15, { fill: work ? C.green : C.bg3, alpha: work ? 0.7 : 1, stroke: C.border, r: 2 });
+        }
+        TT.text(ctx, "green = has a tile", 16, 474, { font: "11px", color: C.muted });
+      }
+    }
+  });
+})();
+</script>
+
+<script>
+/* Figure 4: the compiler stack from framework graph to tt-metal kernels. */
+(function () {
+  var root = document.getElementById("fig-stack");
+  var g = TT.canvas(root, 800, 560), ctx = g.ctx, C = TT.C;
+  var N = {
+    pt:   { x: 20,  y: 12,  w: 170, h: 40, t: "PyTorch", v: 0 },
+    jax:  { x: 210, y: 12,  w: 120, h: 40, t: "JAX", v: 0 },
+    onnx: { x: 560, y: 12,  w: 220, h: 40, t: "ONNX / TF / Paddle", v: 0 },
+    xla:  { x: 20,  y: 72,  w: 310, h: 40, t: "TT-XLA (PJRT plugin)", v: 0 },
+    tfo:  { x: 560, y: 72,  w: 220, h: 40, t: "TT-Forge-ONNX", v: 0 },
+    ttir: { x: 200, y: 132, w: 400, h: 40, t: "TT-MLIR: StableHLO -> TTIR", v: 0 },
+    ttnn: { x: 20,  y: 192, w: 360, h: 40, t: "TTNN dialect -> .ttnn flatbuffer", v: 0 },
+    d2m:  { x: 420, y: 192, w: 360, h: 40, t: "D2M -> TTKernel (generated kernels)", v: 0 },
+    rt:   { x: 20,  y: 252, w: 360, h: 40, t: "runtime: one TT-NN op call per node", v: 0 },
+    gen:  { x: 420, y: 252, w: 360, h: 40, t: "ttnn.generic + ProgramDescriptor", v: 0 },
+    dop:  { x: 20,  y: 312, w: 760, h: 40, t: "device_operation::launch -> cache -> factory -> Program  (Figures 2, 3)", v: 1 },
+    jit:  { x: 20,  y: 372, w: 760, h: 40, t: "tt-metal JIT: ELF per RISC-V -> enqueue -> Tensix cores  (Figure 1)", v: 1 }
+  };
+  var edges = [["pt", "xla"], ["jax", "xla"], ["onnx", "tfo"], ["xla", "ttir"], ["tfo", "ttir"], ["ttir", "ttnn"], ["ttir", "d2m"], ["ttnn", "rt"], ["d2m", "gen"], ["rt", "dop"], ["gen", "dop"], ["dop", "jit"]];
+  var seq = [
+    { on: ["pt", "jax"], art: ["# PyTorch (per TT-XLA docs)", "model = torch.compile(model, backend=\"tt\")", "", "# JAX: jax.jit(fn) with the TT PJRT plugin installed"],
+      txt: "<b>Frameworks.</b> PyTorch goes through torch-xla, JAX through <code>jax.jit</code>. Both end up asking a PJRT plugin to compile a graph. (Docs only.)" },
+    { on: ["xla"], art: ["pjrt_plugin_tt/", "   pjrt_plugin_tt.so     # PJRT plugin binary", "   tt-metal/             # kernels, riscv compiler/linker", "   lib/                  # tt-mlir, tt-metal shared libraries", "jax_plugin_tt/, torch_plugin_tt/   # thin wrappers"],
+      txt: "<b>TT-XLA</b> receives a StableHLO module and hands it to TT-MLIR. Note that the wheel bundles tt-metal itself: the kernels and RISC-V toolchain this chapter's JIT used. (Docs: getting started.)" },
+    { on: ["onnx", "tfo"], art: ["TT-Forge-ONNX: ONNX, TensorFlow and PaddlePaddle front end,", "\"built on top of the TT-MLIR backend\"", "", "TT-Torch (PyTorch 2.0 + torch-mlir): deprecated -> use TT-XLA"],
+      txt: "<b>The other front end.</b> ONNX, TensorFlow and Paddle models enter through TT-Forge-ONNX. The older TT-Torch front end is deprecated. (Docs and README.)" },
+    { on: ["ttir"], art: ["// TTIR example from the tt-mlir introduction", "%0 = ttir.empty() : tensor<64x64xbf16>", "%1 = \"ttir.linear\"(%arg0, %arg1, %bias, %0)", "     : (tensor<64x128xbf16>, tensor<128x64xbf16>, ...)", "     -> tensor<64x64xbf16>"],
+      txt: "<b>TTIR:</b> named ops on plain tensors, with no layouts or devices yet. This is the hub where every front end meets. (IR quoted from the TT-MLIR docs.)" },
+    { on: ["ttnn"], art: ["#ttnn_layout = #ttnn.ttnn_layout<..., <1x1>,", "    memref<2x4x!ttcore.tile<32x32, bf16>, #dram>, <interleaved>>", "%0 = \"ttnn.linear\"(%arg0, %arg1, %arg2)", "     <{transpose_a = false, transpose_b = false}> : ...", "\"ttnn.deallocate\"(%arg2) <{force = false}>"],
+      txt: "<b>TTNN road.</b> Each op is now a TT-NN call with a concrete layout: tiles, DRAM, interleaved (A18's vocabulary). The result is serialised as a <code>.ttnn</code> flatbuffer. (Docs.)" },
+    { on: ["rt"], art: [".ttnn flatbuffer: \"a compiled binary file intended to be", "loaded and executed by the TTNN backend runtime\"", "", "for each op: call ttnn::linear / ttnn::add / ...", "   -> the same C++ entry points you can call by hand"],
+      txt: "<b>Runtime.</b> The runtime walks the flatbuffer and calls ordinary TT-NN ops. From here on, nothing is compiler-specific. (Docs.)" },
+    { on: ["d2m"], art: ["%7 = d2m.generic {..., grid = #ttcore.grid<1x1>, ...}", "  ^compute0(%cb0, %cb1, %cb2):", "    \"d2m.tile_matmul\"(%in, %in_0, %out)", "ttkernel.cb_wait_front(%0, %c1_i32_4)", "ttkernel.tile_regs_acquire()   ttkernel.pack_tile(...)"],
+      txt: "<b>D2M road.</b> Instead of calling TT-NN's hand-written kernels, the compiler generates its own: <code>d2m.generic</code> regions lowered to TTKernel, a 1-to-1 model of Metalium kernel code. (IR quoted from the docs.)" },
+    { on: ["gen"], art: ["ttnn.jit / D2M: \"wraps the generated kernels in ttnn.generic", "operations ... Each ttnn.generic op requires a ProgramDescriptor\"", "", "-> enters tt-metal through ttnn.generic_op, like this", "   chapter's sqdiff op (verified here: generic_op exists, works)"],
+      txt: "<b>Generated kernels enter TT-NN</b> as <code>ttnn.generic</code> ops carrying a <code>ProgramDescriptor</code>: the same door your <code>sqdiff</code> used. (Docs; the door itself was run in this orb.)" },
+    { on: ["dop"], art: ["launch<BinaryNgDeviceOperation> / launch<MatmulDeviceOperation>", "  validate -> specs -> key -> MISS: factory -> Program", "                             HIT:  override runtime args", "this orb: 10 calls -> 6 cache entries; add shape change = hit"],
+      txt: "<b>Both roads meet</b> in <code>device_operation::launch</code>, with its program cache and factories. Everything from here down was run in this orb." },
+    { on: ["jit"], art: ["kernels/bmm_large_block_zm_fused_bias_activation_metal2/  trisc0-2", "kernels/reader_bmm_tile_layout_in0_sender_padding_metal2/  ncrisc", "kernels/reader_bmm_tile_layout_in1_sender_writer_padding_metal2/ brisc", "... + in0/in1 receiver kernels  (64x64 matmul, HiFi2)"],
+      txt: "<b>Bottom.</b> The tt-metal JIT compiles each kernel per RISC-V and dispatch runs them. <code>ttnn::linear</code> runs on the same matmul device operation as <code>ttnn.matmul</code> (<code>matmul.cpp:225, 344, 496</code>). These are the kernels the JIT built for a 64×64 <code>ttnn.matmul</code> in this orb." }
+  ];
+  var steps = seq.map(function (s) { return { dur: 1.0, text: s.txt }; });
+  function center(n) { return { x: n.x + n.w / 2, y: n.y + n.h / 2 }; }
+  TT.stepper({
+    root: root, steps: steps,
+    draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var on = {}; seq[i].on.forEach(function (k) { on[k] = true; });
+      var visited = {}; for (var s = 0; s <= i; s++) seq[s].on.forEach(function (k) { visited[k] = true; });
+      edges.forEach(function (e) {
+        var a = N[e[0]], b = N[e[1]];
+        var ca = center(a), cb = center(b);
+        var lit = visited[e[0]] && visited[e[1]];
+        TT.arrow(ctx, ca.x, a.y + a.h, cb.x, b.y - 1, { color: lit ? C.muted : C.border, head: 6, lw: lit ? 1.8 : 1 });
+      });
+      Object.keys(N).forEach(function (k) {
+        var n = N[k], act = on[k], vis = visited[k];
+        var edge = n.v ? C.green : C.muted;
+        TT.box(ctx, n.x, n.y, n.w, n.h, { fill: n.v ? C.green : C.blue, alpha: act ? TT.lerp(0.1, 0.32, t) : (vis ? 0.12 : 0.03), stroke: act ? (n.v ? C.green : C.blue) : edge, lw: act ? 2.5 : 1.2 });
+        TT.text(ctx, n.t, n.x + n.w / 2, n.y + n.h / 2, { font: (act ? "bold " : "") + "12.5px", color: vis ? C.fg : C.muted, align: "center" });
+      });
+      TT.text(ctx, "TT-NN road", 24, 180, { font: "11px", color: C.muted });
+      TT.text(ctx, "direct-to-metal road", 776, 180, { font: "11px", color: C.muted, align: "right" });
+      var verified = seq[i].on.some(function (k) { return N[k].v; });
+      A19.panel(ctx, 20, 428, 760, 120, verified ? "artifact (from this orb's runs)" : "artifact (quoted from Tenstorrent docs, not run here)", seq[i].art, verified ? C.green : C.muted, TT.smooth(t * 1.5));
+    }
+  });
+})();
+</script>
+</body>
+</html>
