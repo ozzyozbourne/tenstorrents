@@ -1,0 +1,68 @@
+--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
+@@ -67,6 +67,7 @@
+ };
+ 
+ static bool s_ttsim_running = false;
++static uint64_t c_calls, c_calls1, c_rv, c_tx, c_rd, c_wr, c_extra;
+ static void (*s_pfn_libttsim_pci_dma_mem_rd_bytes)(uint64_t paddr, void *p, uint32_t size);
+ static void (*s_pfn_libttsim_pci_dma_mem_wr_bytes)(uint64_t paddr, const void *p, uint32_t size);
+ 
+@@ -81,6 +82,7 @@
+ extern "C" API_EXPORT void libttsim_exit() {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
++    ttsim_printf("COUNT clock_calls=%lu (n==1: %lu) pci_rd=%lu pci_wr=%lu rv32_steps=%lu tensix_insts=%lu extra_tile_passes=%lu\n", c_calls, c_calls1, c_rd, c_wr, c_rv, c_tx, c_extra);
+     ttsim_exit();
+     s_ttsim_running = false;
+ }
+@@ -164,6 +166,7 @@
+     uint32_t device = pcie_device_from_paddr(paddr, size);
+     uint32_t saved_chip_id = g_current_chip_id;
+     ttsim_select_chip(device);
++    c_rd++;
+     pcie_mem_rd_bytes(paddr, p, size);
+     ttsim_select_chip(saved_chip_id);
+ }
+@@ -175,6 +178,7 @@
+     uint32_t device = pcie_device_from_paddr(paddr, size);
+     uint32_t saved_chip_id = g_current_chip_id;
+     ttsim_select_chip(device);
++    c_wr++;
+     pcie_mem_wr_bytes(paddr, p, size);
+     ttsim_select_chip(saved_chip_id);
+ }
+@@ -253,7 +257,7 @@
+         for (;;) {
+             for (uint32_t rv32_mask = p_tile->rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
+                 uint32_t rv32_index = __builtin_ctz(rv32_mask);
+-                rv32_step(&p_tile->rv32[rv32_index]);
++                rv32_step(&p_tile->rv32[rv32_index]); c_rv++;
+             }
+             [[maybe_unused]] bool any_tensix = false;
+             for (uint32_t tensix_id = 0; tensix_id < std::size(p_tile->tensix); tensix_id++) {
+@@ -267,7 +271,7 @@
+                     if (inst_rd_ptr != p_tensix->inst_wr_ptr[pipe]) {
+                         uint32_t inst = p_tensix->inst[pipe][inst_rd_ptr];
+                         if (tensix_decode_and_execute(p_tensix, pipe, inst)) {
+-                            any_tensix = true;
++                            any_tensix = true; c_tx++;
+                             inst_rd_ptr = (inst_rd_ptr + 1) % TENSIX_INST_FIFO_SIZE;
+                             p_tensix->inst_rd_ptr[pipe] = inst_rd_ptr;
+                             if (inst_rd_ptr == p_tensix->inst_wr_ptr[pipe]) {
+@@ -277,6 +281,7 @@
+                     }
+                 }
+             }
++            if (any_tensix) c_extra++;
+             if (!any_tensix) {
+                 break; // no Tensix instructions executed, bail out
+             }
+@@ -302,6 +307,7 @@
+ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
++    c_calls++; if (n_clocks == 1) c_calls1++;
+     uint32_t saved_chip_id = g_current_chip_id;
+     for (uint32_t i = 0; i < n_clocks; i++) {
+         for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {

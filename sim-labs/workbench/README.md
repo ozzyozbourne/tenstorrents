@@ -57,7 +57,7 @@ contain pinned `.cpmcache/` hashes and library versions, so regenerate them from
 
 ```bash
 cp $W/host/mm_fid.cpp $LAB_HOME/ && $W/build_host.sh $LAB_HOME/mm_fid.cpp
-MM_FIDELITY=LoFi MM_SEED=42 $LAB_HOME/mm_fid    # result_hash = 213e53fed10c0383
+MM_FIDELITY=0 MM_SEED=42 $LAB_HOME/mm_fid    # result_hash = 213e53fed10c0383
 ```
 
 ### `build_ttsim.sh <name> [wh|bh] [release|debug]`
@@ -68,7 +68,7 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 
 ## Examples and helpers
 
-- `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=LoFi|HiFi2|HiFi3|HiFi4` and `MM_SEED`;
+- `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=0|2|3|4` (numeric: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; names silently mean LoFi) and `MM_SEED`;
   prints `mean_abs_err` and `result_hash`.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:

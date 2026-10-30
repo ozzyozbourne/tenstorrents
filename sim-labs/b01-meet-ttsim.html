@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B01 · Meet ttsim · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .modebar { display:flex; gap:.5rem; flex-wrap:wrap; padding:.6rem .8rem; background:var(--bg2); border-top:1px solid var(--border); font-size:14px; align-items:center; }
+  .modebar button { background:var(--bg3); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:.3rem .8rem; cursor:pointer; font:inherit; font-size:14px; }
+  .modebar button.on { background:var(--blue); color:#000; }
+  .modebar span { color:var(--muted); }
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  td.num, th.num { text-align:right; font-family:var(--mono); font-size:14px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="b00-workbench.html">&larr; Prev</a>
+  <a href="b02-map-and-boot.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B01</span><span class="tag">Prerequisites: B00 (A10 and A17 help)</span>
+  <h1><span class="num">B01.</span> Meet ttsim</h1>
+  <p class="subtitle">Run real Tenstorrent programs on a virtual Wormhole and Blackhole, learn what the simulator's clock is really counting, and make your first edit to a kernel.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. Its clock counts are not silicon cycles and say nothing reliable about performance on real hardware. This lab shows you why, using measurements you take yourself.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#run">Run real programs on WH and BH</a></li>
+      <li><a href="#heartbeat">Reading the heartbeat line</a></li>
+      <li><a href="#determinism">Determinism: same input, same clock</a></li>
+      <li><a href="#clock">What the clock means, and what it does not</a></li>
+      <li><a href="#models">What ttsim models, and what it leaves out</a></li>
+      <li><a href="#tour">A guided tour of the source</a></li>
+      <li><a href="#edit">First edit: change + to *</a></li>
+      <li><a href="#exercises">Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>You run a single-core matrix multiply on a simulated Wormhole. It passes, and the last line of output reads <code>[330591] 8.9 seconds (37.3 KHz)</code>. Then you run it again with the matrix engine set to its <em>lowest</em> precision, LoFi. On silicon LoFi does a quarter of the multiplier passes of HiFi4, so it should be faster. The simulator reports <code>[699743]</code>, more than twice as many clocks.</p>
+  <p>Is the simulator wrong? No. It is answering a different question from the one you asked. By the end of this lab you will be able to point at the exact lines of C++ that produce both numbers. You will also know what the bracketed number does measure (the host's polling, mostly) and what you can trust ttsim for: bit-exact results and strict checking of the ISA rules.</p>
+  <p>All commands below run in this orb, and every output was captured here. Long log lines are trimmed with <code>…</code>.</p>
+
+  <h2 id="run">1. Run real programs on Wormhole and Blackhole</h2>
+  <p>Set up the workbench from <a href="b00-workbench.html">B00</a>. Give each lab its own scratch directory so that labs never share output:</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/b01
+source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+$EX/metal_example_add_2_integers_in_riscv</code></pre>
+  <p><code>env.sh wh</code> points <code>TT_METAL_SIMULATOR</code> at <code>~/sim/wh/libttsim_wh.so</code>, sets slow dispatch, and changes directory into <code>$LAB_HOME/run</code>. That library is byte-identical to the one built from the pinned source: its md5sum <code>db0520ab…</code> matches <code>refs/ttsim/src/_out/release_wh/libttsim.so</code>. Here is the run, with most of the <code>info</code> lines removed:</p>
+<pre><code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of the Data Movement kernels.
+… | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:159)
+[0] 0.0 seconds (0.0 KHz)
+… | info     | EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0x401e (tt_sim_tt_device.cpp:163)
+… | info     |             UMD | Established firmware bundle version: 18.4.0 (topology_discovery.cpp:711)
+Success: Result is 21
+… | info     |    BuildKernels | JIT cache stats: 9/9 hits (100.0%) …
+… | info     | EmulationDriver | Sending exit signal to remote... (tt_sim_communicator.cpp:343)
+[4501] 0.2 seconds (28.8 KHz)
+
+real	0m0.351s</code></pre>
+  <p>The host program never knew it wasn't talking to a real card. UMD, the user-mode driver, read PCI config space and got vendor <code>0x1e52</code> (Tenstorrent) and device <code>0x401e</code> (Wormhole). Running <code>env.sh bh</code> gives <code>device_id=0xb140</code> (Blackhole) and firmware bundle 18.5.0. The two lines beginning with a number in brackets come from ttsim itself. Section 2 decodes them.</p>
+  <p>Now run three examples on each chip, twice each. The table summarises the twelve runs. Every cell is a real measurement, and "wall" is <code>/usr/bin/time</code> elapsed time on the warm second run:</p>
+  <table>
+    <tr><th>Example</th><th>Result line</th><th class="num">WH clocks (run 1 / run 2)</th><th class="num">BH clocks (run 1 / run 2)</th><th class="num">wall, WH / BH</th></tr>
+    <tr><td><code>add_2_integers_in_riscv</code></td><td>Success: Result is 21</td><td class="num">4501 / 4501</td><td class="num">6596 / 6596</td><td class="num">0.35 s / 0.42 s</td></tr>
+    <tr><td><code>eltwise_binary</code></td><td>Test Passed</td><td class="num">7959 / 7959</td><td class="num">8873 / 8873</td><td class="num">0.38 s / 0.50 s</td></tr>
+    <tr><td><code>matmul_single_core</code></td><td>PCC = 0.981…, 0.980… / Test Passed</td><td class="num">330591 / 330591</td><td class="num">276921 / 276921</td><td class="num">8.2 s / 10.1 s</td></tr>
+  </table>
+  <p>The matmul's tail on Wormhole, run 1:</p>
+<pre><code>Output vector of size 409600
+Metalium vs Golden -- PCC = 0.98139745
+Test Passed
+[330591] 9.0 seconds (36.7 KHz)
+wall=8.43 s user=8.72 s</code></pre>
+  <p>Three things stand out already. Every program passes on both architectures, so the simulator is functionally complete enough to run real code. The clock counts repeat exactly. And the counts look strange: Blackhole needs <em>more</em> clocks than Wormhole for the 1+2 kernel but <em>fewer</em> for the matmul. Hold on to that strangeness.</p>
+
+  <div class="callout warn">Do not run examples with your working directory set to <code>TT_METAL_HOME</code>. tt-metal searches the current directory for kernel sources before it looks at <code>TT_METAL_KERNEL_PATH</code>, so from there it silently picks the stock kernels and your overlay never runs (<code>tt_metal/impl/kernels/kernel.cpp:50-95</code>). <code>env.sh</code> moves you into <code>$LAB_HOME/run</code> for this reason.</div>
+
+  <h2 id="heartbeat">2. Reading the heartbeat line</h2>
+  <p>The last line of every run, <code>[4501] 0.2 seconds (28.8 KHz)</code>, is printed by one function, which runs when the simulator shuts down:</p>
+  <div class="filename">ttsim/src/sim.cpp:98-106 @b3620244</div>
+<pre><code>void ttsim_heartbeat() {
+    float seconds_elapsed = float(clock()) / CLOCKS_PER_SEC; // XXX this is "seconds of CPU time used" and not "time elapsed"; what do we really want?
+    float mhz = g_clock / (seconds_elapsed * 1000000);
+    if (mhz &gt;= 10.0f) {
+        ttsim_printf("%.1f seconds (%.1f MHz)\n", seconds_elapsed, mhz);
+    } else {
+        ttsim_printf("%.1f seconds (%.1f KHz)\n", seconds_elapsed, mhz * 1000);
+    }
+}</code></pre>
+  <p>The bracketed prefix is added by <code>ttsim_printf</code>, which stamps every simulator message with the current clock (<code>common.cpp:24-31</code>). So the line reads:</p>
+  <table>
+    <tr><th>Field</th><th>Meaning</th><th>Source</th></tr>
+    <tr><td><code>[4501]</code></td><td><code>g_clock</code>: how many times the simulated chip was clocked since <code>libttsim_init</code></td><td><code>common.cpp:25-28</code>, <code>libttsim.cpp:311</code></td></tr>
+    <tr><td><code>0.2 seconds</code></td><td><code>clock()</code>: CPU time used by <em>this host process</em>, summed over all its threads. It is not wall time, and it excludes child processes such as the JIT compiler.</td><td><code>sim.cpp:99</code></td></tr>
+    <tr><td><code>(28.8 KHz)</code></td><td>clocks divided by CPU seconds: the simulation rate. It is printed in MHz once it reaches 10 MHz.</td><td><code>sim.cpp:100-105</code></td></tr>
+  </table>
+  <p>Our logs show both caveats. The first Wormhole <code>eltwise_binary</code> run shows <code>user=3.04 s</code> from <code>/usr/bin/time</code> but only <code>0.3 seconds</code> in the heartbeat, because the 3 s were spent in compiler child processes building the 5 uncached kernels. The matmul shows <code>9.0 seconds</code> of CPU time against 8.43 s of wall time, because more than one host thread was busy.</p>
+  <p><strong>What about the <code>[0] 0.0 seconds</code> line near the top?</strong> It comes from a separate, short-lived copy of the simulator. During topology discovery UMD needs to know which chip the <code>.so</code> simulates. To find out, it <code>dlopen</code>s the image, calls <code>libttsim_init</code>, scans PCI config space, and calls <code>libttsim_exit</code>. No clock is ever run in that copy, so its heartbeat reads 0.</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/simulation/tt_sim_communicator.cpp:488-503 @7aad8aac</div>
+<pre><code>    // Config space only answers while the image is running. …
+    sim_init();
+    …
+    struct SimRunGuard {
+        void (*exit_fn)();
+        ~SimRunGuard() { exit_fn(); }
+    } sim_run_guard{sim_exit};
+
+    ImageProbe probe;
+    probe.bdfs = scan_pci_endpoints(config_read32);</code></pre>
+  <p>The device that actually runs your program is then started with a second <code>libttsim_init</code>. For a single chip this is the same loaded image, not a fresh copy: <code>LD_DEBUG=files</code> shows <code>libttsim_wh.so</code> opened three times with a rising <code>direct_opencount</code> and finalised only once, at process exit. That is harmless here because the probe never clocked, so <code>g_clock</code> is still 0 (nothing in ttsim resets it). UMD only copies the <code>.so</code> into a sealed <code>memfd</code> and <code>dlopen</code>s <code>/proc/self/fd/N</code>, which gives private globals, when it is asked to (<code>copy_sim_binary</code>, <code>tt_sim_communicator.cpp:294-302</code>), which is off by default.</p>
+
+  <h2 id="determinism">3. Determinism: same input, same clock</h2>
+  <p>Every pair of runs in the table above gave the same count. That is by design:</p>
+  <ul>
+    <li>The library is single-threaded and "creates no threads of its own" (<code>docs/libttsim_api.md</code>).</li>
+    <li>Busy tiles are visited in ascending ID order (<code>libttsim.cpp:250</code>).</li>
+    <li>Every entry point forces the default floating-point environment with <code>FpEnvGuard</code> (<code>libttsim.cpp:13-67</code>), so the results do not depend on how the host has set rounding.</li>
+    <li>The device's <code>WALL_CLOCK</code> register returns <code>g_clock</code> itself (<code>tile.cpp:1034</code>), not host time.</li>
+  </ul>
+  <p>The UMD side also clocks the simulator synchronously from the calling thread. Its comment explains why: "A background clock thread would race with reads/writes and produce non-reproducible runs" (<code>tt_sim_tt_device.cpp:418-427</code>).</p>
+  <p>The stock matmul has a catch. It fills its inputs from <code>std::mt19937 rng(std::random_device{}())</code> (<code>matmul_single_core.cpp:203</code>), so every run multiplies different numbers. You can see it in the two Wormhole runs: PCC was 0.98139745 and then 0.98024255. Yet the clock count was 330591 both times. To compare results bit for bit, use the workbench's <code>mm_fid</code>. It is the same program with a seed (<code>MM_SEED</code>), a selectable fidelity (<code>MM_FIDELITY</code>), and a hash over the output:</p>
+<pre><code>mkdir -p $LAB_HOME/host
+cp /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/host/
+/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/build_host.sh $LAB_HOME/host/mm_fid.cpp
+MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid      # run it twice</code></pre>
+<pre><code>math_fidelity = 4
+Metalium vs Golden -- PCC = 0.9801915
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383
+Test Passed
+[330591] 8.9 seconds (37.3 KHz)
+…second run…
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383
+[330591] 9.0 seconds (36.9 KHz)</code></pre>
+  <p>Same seed, same hash, same clock count. The CPU seconds differ (8.9 vs 9.0) because those depend on the host. With <code>MM_SEED=7</code> the hash changes to <code>f79d5e7a67b40383</code>, but the count is <em>still</em> <code>[330591]</code>. The number of clocks does not depend on the data at all. The kernel's control flow is the same for any input values, and, as section 4 shows, ttsim charges nothing extra for "harder" numbers.</p>
+  <div class="callout warn"><code>mm_fid</code> parses <code>MM_FIDELITY</code> with <code>std::atoi</code>, so it expects the enum's numbers: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4 (<code>tt_metal/api/tt-metalium/base_types.hpp:13-19</code>). <code>MM_FIDELITY=HiFi4</code> parses as 0 and quietly runs LoFi. We tried it, and it printed <code>math_fidelity = 0</code> and the LoFi hash <code>213e53fed10c0383</code>.</div>
+  <p>Determinism has one important exception, which section 4 explains. When the host itself has several threads touching the device, the count stops being reproducible.</p>
+
+  <h2 id="clock">4. What the clock means, and what it does not</h2>
+  <h3>Three measurements that should surprise you</h3>
+  <p>Take these yourself. Each changes one thing in a run you have already done.</p>
+<pre><code># (a) DPRINT on: compile the kernel with printing and start the print server
+TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_riscv
+# (b) fidelity: same seed, LoFi (0) vs HiFi4 (4); also try 2 and 3
+MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid
+# (c) fast dispatch: drop the slow-dispatch variable that env.sh sets
+env -u TT_METAL_SLOW_DISPATCH_MODE $EX/metal_example_add_2_integers_in_riscv</code></pre>
+  <table>
+    <tr><th>Experiment</th><th>Result</th><th class="num">clocks</th><th>Silicon intuition says</th></tr>
+    <tr><td>add_2, baseline (slow dispatch)</td><td>Result is 21</td><td class="num">4501, 4501</td><td></td></tr>
+    <tr><td>(a) add_2 with DPRINT, 6 runs (the third on the instrumented build below)</td><td><code>0:0-0:BR: Adding integers: 14 + 7</code>, Result is 21</td><td class="num">6064, 5115, 5060, 5063, 5058, 5064</td><td>a print adds a few hundred cycles, the same every time</td></tr>
+    <tr><td>(b) mm_fid seed 42, LoFi</td><td>mean_abs_err 2.216311, hash 213e53fe…</td><td class="num">699743, 699743</td><td>fastest</td></tr>
+    <tr><td>(b) mm_fid seed 42, HiFi2</td><td>mean_abs_err 1.508125, hash 31d1b688…</td><td class="num">586559</td><td></td></tr>
+    <tr><td>(b) mm_fid seed 42, HiFi3</td><td>mean_abs_err 1.505054, hash ef7abcd1…</td><td class="num">458575</td><td></td></tr>
+    <tr><td>(b) mm_fid seed 42, HiFi4</td><td>mean_abs_err 1.505054, hash ef7abcd1…</td><td class="num">330591, 330591</td><td>slowest (4 fidelity phases)</td></tr>
+    <tr><td>(c) add_2 with fast dispatch, 2 runs</td><td>Result is 21</td><td class="num">10946, 10946</td><td>fast dispatch is <em>faster</em></td></tr>
+  </table>
+  <p>All three go the "wrong" way. A print makes the count jump around between runs. More precision means fewer clocks. Fast dispatch takes 2.4× as many clocks as slow dispatch. (Results are bit-exact throughout, and HiFi3 and HiFi4 produce identical bits for these inputs, which <a href="b07-matmul-fidelity.html">B07</a> explains.) To see why the clocks behave like this, we have to find out who turns the crank.</p>
+
+  <h3>Who advances time? The host does.</h3>
+  <p>The API documentation states the rule in one line: "The simulator does not advance time on its own; it only runs inside <code>libttsim_clock</code>." So who calls <code>libttsim_clock</code> under tt-metal? Search UMD and you find this:</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/tt_device/tt_sim_tt_device.cpp:334-338 @7aad8aac</div>
+<pre><code>void TTSimTTDevice::after_read() {
+    // Ideally we would not auto-clock on reads at all, but some clocking is required to avoid hangs
+    // in the absence of an API reliably called from all spin loops polling the device.
+    communicator_-&gt;advance_clock(1);
+}</code></pre>
+  <p>It is called at the end of every NoC read the host makes:</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/tt_device/simulation_tt_device.cpp:203-220 @7aad8aac</div>
+<pre><code>void SimulationTTDevice::noc_read_translated(tt_xy_pair core, uint64_t addr, void* mem_ptr, size_t size) {
+    …
+    if (should_use_cached_tlb_window()) {
+        read_block_reconfigure(*cached_tlb_window_, mem_ptr, core, addr, size, get_selected_noc_id());
+    } else {
+        tile_read_bytes(core, addr, mem_ptr, size);
+    }
+    after_read();
+}</code></pre>
+  <p>Writes have no such hook. Now think about what the host does after it launches a kernel in slow dispatch. It sits in a loop reading each worker core's <code>go_msg</code> mailbox until the core reports DONE (<code>llrt.cpp:338-342</code>, inside <code>wait_until_cores_done</code> at <code>llrt.cpp:444</code>). Each read clocks the chip once. <strong>The device moves forward exactly as fast as the host polls it.</strong></p>
+  <p>Step through it. Switch modes to see how DPRINT and fast dispatch change who supplies the clocks.</p>
+
+  <div class="viz" id="fig-host"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-host");
+    var g = TT.canvas(root, 880, 380), ctx = g.ctx, C = TT.C;
+    var mode = "slow", seed = 1;
+    function rnd() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
+    // Each event: lane ('main' | 'srv'), kind ('W' write, 'R' read, 'A' advance_device_execution, 'S' sleep), clocks (0/1)
+    function build() {
+      var ev = [], need, pre = 0;
+      ev.push({ lane: "main", kind: "W", c: 0, label: "input" }, { lane: "main", kind: "W", c: 0, label: "kernel" }, { lane: "main", kind: "W", c: 0, label: "go" });
+      if (mode === "slow") {
+        need = 6;
+        for (var i = 0; i < 7; i++) ev.push({ lane: "main", kind: "R", c: 1, label: "go_msg" });
+        ev.push({ lane: "main", kind: "R", c: 1, label: "result" });
+      } else if (mode === "dprint") {
+        need = 8; var clocks = 0;
+        while (clocks < need) {
+          ev.push({ lane: "main", kind: "R", c: 1, label: "go_msg" }); clocks++;
+          if (clocks >= need) break;
+          ev.push({ lane: "main", kind: "S", c: 0, label: "sleep 5ms" });
+          var k = Math.floor(rnd() * 3);
+          for (var j = 0; j < k; j++) { ev.push({ lane: "srv", kind: "R", c: 1, label: "print buf" }); clocks++; }
+        }
+        ev.push({ lane: "main", kind: "R", c: 1, label: "go_msg DONE" });
+        var tail = Math.floor(rnd() * 3);
+        for (var j2 = 0; j2 < tail; j2++) ev.push({ lane: "srv", kind: "R", c: 1, label: "print buf" });
+        ev.push({ lane: "main", kind: "R", c: 1, label: "result" });
+      } else {
+        need = 6; pre = 4;
+        for (var a = 0; a < pre + need + 1; a++) ev.push({ lane: "main", kind: "A", c: 1, label: "cq poll" });
+        ev.push({ lane: "main", kind: "R", c: 1, label: "result" });
+      }
+      return { ev: ev, need: need, pre: pre };
+    }
+    var model = build();
+    var texts = {
+      slow: [
+        "<b>Writes.</b> The host writes the inputs, the kernel binary and the go message into device memory through BAR writes (<code>libttsim_pci_mem_wr_bytes</code>). Writes never clock, so <code>g_clock</code> is still 0. In the real add_2 run the instrumented library counted 17,361 writes.",
+        "<b>First poll.</b> The host reads the core's go_msg mailbox. UMD's <code>after_read()</code> calls <code>libttsim_clock(1)</code>, and the kernel's hart executes exactly one instruction.",
+        "<b>Polling drives time.</b> Each further read buys one more clock. The kernel moves only while the host keeps asking whether it has finished yet.",
+        "<b>Still polling.</b> The host has no idea how far the kernel has got. It just reads, and each read is one clock.",
+        "<b>Still polling.</b> Count the marks: the reads on the host lane and the ticks on the clock lane are the same events.",
+        "<b>Kernel finishes.</b> The 6th clock retires the kernel's last instruction (6 in this toy; the real kernel needs far more).",
+        "<b>The next read sees DONE.</b> That read clocked the chip too, even though nothing was left to run.",
+        "<b>Reading back the result</b> is one more read and one more clock.",
+        "<b>Summary.</b> Clocks equal host reads. In the real add_2 run: 4,501 clocks and 4,539 BAR reads, and every <code>libttsim_clock</code> call had n = 1.",
+        "<b>So what is the count?</b> Mostly it measures how many times the host had to ask. That is roughly the instructions on the device's slowest path, plus every poll the host makes for other reasons."
+      ],
+      dprint: [
+        "<b>Writes.</b> As before, no clocks. This time the kernel was compiled with <code>-DDEBUG_PRINT_ENABLED</code>, so it has more instructions to run (8 in this toy).",
+        "<b>Main thread polls once</b>, then sleeps 5 ms. tt-metal adds that sleep whenever DPRINT or Watcher is on (<code>llrt.cpp:514-519</code>).",
+        "<b>While the main thread sleeps</b>, the DPRINT server thread reads the print buffer. Each of its reads clocks the chip too.",
+        "<b>How many server reads fit into one sleep</b> depends on the OS scheduler, not on the program.",
+        "<b>Clocks now come from two threads</b>, interleaved by the scheduler.",
+        "<b>The kernel finishes</b> once 8 clocks have reached it, whichever thread supplied them.",
+        "<b>The main thread's next poll sees DONE.</b> The server may keep reading in the meantime.",
+        "<b>Result readback.</b> The server's reads landed at different moments, so the total differs from run to run.",
+        "<b>Summary.</b> Real runs gave 6064, 5115, 5060, 5063, 5058 and 5064 clocks. Press <i>Re-run</i> to re-shuffle the server's reads and watch the total change.",
+        "<b>Lesson.</b> ttsim is deterministic, but the host is not. Determinism only holds while a single host thread touches the device."
+      ],
+      fast: [
+        "<b>Fast dispatch.</b> The host mostly writes commands into a queue in host memory, and the device's own prefetcher and dispatcher firmware fetch them. Still no clocks.",
+        "<b>The host waits on the completion queue</b>, which is in host memory, so no device read happens. tt-metal therefore clocks the simulator explicitly with <code>advance_device_execution()</code> (<code>system_memory_manager.cpp:780-786</code>).",
+        "<b>The dispatch firmware runs first.</b> Before the kernel starts, the prefetch and dispatch cores have to fetch the command, write the kernel to the worker, and send the go message.",
+        "<b>More cores are running.</b> In the real run, 3,283,966 hart-steps were executed, against 963,752 in slow dispatch.",
+        "<b>Now the kernel runs</b>, one clock per host poll.",
+        "<b>The kernel is still running.</b>",
+        "<b>The kernel finishes.</b>",
+        "<b>A completion entry appears</b> in host memory, and the host's next poll notices it.",
+        "<b>Summary.</b> Real run: 10,946 clocks but only 4,960 BAR reads. About 6,000 clocks came from <code>advance_device_execution()</code> calls in tt-metal's dispatch wait loops (completion queue, and fetch-queue space).",
+        "<b>Lesson.</b> Fast dispatch is not \"slower\". The simulated device did extra work (the dispatch firmware), and a different host loop turned the crank."
+      ]
+    };
+    var steps = [];
+    for (var s = 0; s < 10; s++) steps.push({ dur: 1.0, text: "" });
+    function visible(i, t) {
+      var n = model.ev.length, first = 3;
+      if (i === 0) return Math.round(3 * t);
+      if (i >= 8) return n;
+      var per = (n - first) / 7;
+      return Math.min(n, Math.round(first + per * (i - 1) + per * t));
+    }
+    var laneY = { main: 70, srv: 135, clk: 215, dev: 300 };
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var labels = [["host main thread", laneY.main], [mode === "dprint" ? "DPRINT server thread" : "(no second host thread)", laneY.srv], ["libttsim_clock / g_clock", laneY.clk], ["device progress", laneY.dev]];
+      labels.forEach(function (l, k) {
+        TT.text(ctx, l[0], 12, l[1], { color: (k === 1 && mode !== "dprint") ? C.border : C.muted, font: "13px" });
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(180, l[1]); ctx.lineTo(868, l[1]); ctx.stroke();
+      });
+      var nv = visible(i, t), n = model.ev.length, dx = Math.min(44, 680 / n), x0 = 196;
+      var clocks = 0, reads = 0, writes = 0, adv = 0;
+      for (var e = 0; e < nv; e++) {
+        var ev = model.ev[e], x = x0 + e * dx, y = laneY[ev.lane];
+        var col = ev.kind === "W" ? C.purple : ev.kind === "R" ? C.blue : ev.kind === "A" ? C.orange : C.border;
+        if (ev.kind === "S") { TT.box(ctx, x - dx / 2 + 3, y - 7, dx - 6, 14, { fill: C.bg3, stroke: C.border, r: 3 }); TT.text(ctx, "zz", x, y, { color: C.muted, font: "10px", align: "center" }); }
+        else { TT.box(ctx, x - 13, y - 13, 26, 26, { fill: col, alpha: 0.85, r: 5, label: ev.kind, color: "#000", font: "bold 12px" }); }
+        if (ev.kind === "W") writes++;
+        if (ev.kind === "R") reads++;
+        if (ev.kind === "A") adv++;
+        if (ev.c) {
+          clocks++;
+          TT.arrow(ctx, x, y + 15, x, laneY.clk - 14, { color: C.yellow, lw: 1.5, head: 6 });
+          TT.box(ctx, x - 13, laneY.clk - 12, 26, 24, { fill: C.yellow, alpha: 0.9, r: 4, label: String(clocks), color: "#000", font: "bold 11px" });
+        }
+      }
+      // device progress bars
+      var pre = model.pre, need = model.need;
+      var preDone = Math.min(pre, clocks), kDone = Math.max(0, Math.min(need, clocks - pre));
+      var bx = 196, bw = 300;
+      if (pre > 0) {
+        TT.text(ctx, "dispatch fw", bx, laneY.dev - 22, { color: C.muted, font: "12px" });
+        TT.box(ctx, bx, laneY.dev - 10, bw * 0.4, 20, { stroke: C.border, r: 4 });
+        if (preDone) TT.box(ctx, bx, laneY.dev - 10, bw * 0.4 * preDone / pre, 20, { fill: C.orange, alpha: 0.8, r: 4 });
+        bx += bw * 0.4 + 16;
+      }
+      TT.text(ctx, "kernel instructions retired: " + kDone + " / " + need, bx, laneY.dev - 22, { color: C.muted, font: "12px" });
+      TT.box(ctx, bx, laneY.dev - 10, bw, 20, { stroke: C.border, r: 4 });
+      if (kDone) TT.box(ctx, bx, laneY.dev - 10, bw * kDone / need, 20, { fill: kDone === need ? C.green : C.teal, alpha: 0.8, r: 4 });
+      if (kDone === need) TT.text(ctx, "DONE", bx + bw + 10, laneY.dev, { color: C.green, font: "bold 13px" });
+      TT.text(ctx, "writes " + writes + "   reads " + reads + (mode === "fast" ? "   advance_device_execution " + adv : "") + "   g_clock = " + clocks, 12, 355, { color: C.fg, font: "14px", mono: true });
+      TT.text(ctx, "W write   R read   A explicit advance   zz sleep", 868, 20, { color: C.muted, font: "12px", align: "right" });
+    }
+    function setTexts() { for (var s = 0; s < 10; s++) steps[s].text = texts[mode][s]; }
+    setTexts();
+    var bar = document.createElement("div"); bar.className = "modebar";
+    var lab = document.createElement("span"); lab.textContent = "Mode:"; bar.appendChild(lab);
+    var btns = {};
+    [["slow", "Slow dispatch"], ["dprint", "Slow dispatch + DPRINT"], ["fast", "Fast dispatch"]].forEach(function (m) {
+      var b = document.createElement("button"); b.textContent = m[1]; btns[m[0]] = b;
+      b.onclick = function () { mode = m[0]; model = build(); setTexts(); for (var k in btns) btns[k].className = (k === mode ? "on" : ""); st.render(); };
+      bar.appendChild(b);
+    });
+    var rr = document.createElement("button"); rr.textContent = "Re-run (new OS schedule)";
+    rr.onclick = function () { if (mode !== "dprint") return; seed = Math.floor(Math.random() * 100000) + 1; model = build(); st.render(); };
+    bar.appendChild(rr);
+    btns.slow.className = "on";
+    root.appendChild(bar);
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>DPRINT has a second effect. The host's poll loop deliberately sleeps between polls whenever DPRINT or Watcher is on, so that their own reads can get through:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/llrt.cpp:514-519 @7aad8aac</div>
+<pre><code>        // Continuously polling cores here can cause other host-driven noc transactions (dprint, watcher) to drastically
+        // slow down for remote devices. So when debugging with these features, add a small delay to allow other
+        // host-driven transactions through.
+        if (rtoptions.get_watcher_enabled() || rtoptions.get_feature_enabled(tt::llrt::RunTimeDebugFeatureDprint)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }</code></pre>
+  <p>While the main thread sleeps, the print server, which runs on its own <code>std::thread</code> (<code>dprint_server.cpp:998</code>), keeps reading, and each of its reads is a clock. The two threads interleave however the OS schedules them, which is why six runs gave six different counts. Fast dispatch hands the crank to a different loop. Its completion queue is in host memory, so tt-metal clocks explicitly as it polls:</p>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/system_memory_manager.cpp:780-786 @7aad8aac</div>
+<pre><code>    auto wait_operation_body = [this, cq_id, &amp;write_ptr_and_toggle, &amp;write_ptr, &amp;write_toggle]() {
+        write_ptr_and_toggle = get_cq_completion_wr_ptr&lt;true&gt;(this-&gt;context_id, this-&gt;device_id, cq_id, this-&gt;cq_size);
+        …
+        // Yield to clock the simulator when running on TTSim; no-op on real hardware.
+        tt::tt_metal::MetalContext::instance(this-&gt;context_id).get_cluster().advance_device_execution(this-&gt;device_id);
+    };</code></pre>
+
+  <h3>What one clock does inside the chip</h3>
+  <p>That explains where clocks come from. It does not yet explain the fidelity result: the host polls the same way in both matmul runs. For that we need to look inside <code>libttsim_clock</code>. All 70 lines of it are worth reading. (It mentions Tensix instructions such as <code>UNPACR</code> and <code>MVMUL</code>, the Src register banks, and fidelity phases. Here you only need to know that they are Tensix coprocessor instructions (<code>UNPACR</code> fills a Src bank, <code>MVMUL</code> multiplies two of them) and that they can stall; <a href="../chapters/a04-inside-tensix.html">A04</a> and <a href="../chapters/a06-matrix-engine.html">A06</a> explain them.) Here is the core:</p>
+  <div class="filename">ttsim/src/libttsim.cpp:250-283 @b3620244 (trimmed)</div>
+<pre><code>    for (uint32_t tile_id = next_busy_t_tile(0); tile_id &lt; NUM_T_TILES; tile_id = next_busy_t_tile(tile_id + 1)) {
+        TensixTile *p_tile = &amp;g_t_tiles[tile_id];
+        // Hack: for simulator perf, we clock a tile repeatedly as long as it successfully executes at least one Tensix instruction
+        for (;;) {
+            for (uint32_t rv32_mask = p_tile-&gt;rv32_cores_active; rv32_mask; rv32_mask &amp;= rv32_mask - 1) {
+                uint32_t rv32_index = __builtin_ctz(rv32_mask);
+                rv32_step(&amp;p_tile-&gt;rv32[rv32_index]);
+            }
+            [[maybe_unused]] bool any_tensix = false;
+            …   // MOP/replay expanders: tensix_frontend_step() for each expanding pipe
+                for (uint32_t pipe_mask = p_tensix-&gt;inst_pipes_active; pipe_mask; pipe_mask &amp;= pipe_mask - 1) {
+                    …
+                        if (tensix_decode_and_execute(p_tensix, pipe, inst)) {
+                            any_tensix = true;
+                            …   // pop the FIFO head
+            if (!any_tensix) {
+                break; // no Tensix instructions executed, bail out
+            }
+        }</code></pre>
+  <p>Read it line by line:</p>
+  <ul>
+    <li><strong>Only busy tiles are visited</strong>, lowest ID first. <code>next_busy_t_tile</code> scans a bitmask (<code>libttsim.cpp:211-219</code>), so 79 idle Tensix tiles cost nothing.</li>
+    <li><strong>Each active hart executes exactly one instruction</strong> per pass. <code>rv32_step</code> fetches, decodes and executes one word (<code>riscv_impl.h:1938-1978</code>). A stall is a replay: a load that cannot complete does <code>pc -= 4</code> and tries again next pass (<code>riscv_impl.h:731</code>).</li>
+    <li><strong>Each Tensix pipe tries its FIFO head.</strong> A handler returns <code>false</code> to stall. For example, <code>UNPACR</code> waits while its Src bank is still valid (<code>tensix.cpp:3169-3172</code>), and <code>MVMUL</code> waits until both Src banks are valid (<code>tensix.cpp:1766</code>).</li>
+    <li><strong>The "hack": the repeat loop.</strong> If <em>any</em> Tensix instruction succeeded, the whole tile is clocked again <em>in the same clock</em>, and that includes another step for every hart.</li>
+  </ul>
+  <p>After the Tensix tiles, each active Ethernet core takes 1 step, or 16 steps if it was busy within the last 1024 clocks (<code>libttsim.cpp:288-299</code>, <code>sim.h:404-405</code>). Then <code>g_clock++</code> (<code>libttsim.cpp:311</code>). Step through one clock:</p>
+
+  <div class="viz" id="fig-clock"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-clock");
+    var g = TT.canvas(root, 880, 470), ctx = g.ctx, C = TT.C;
+    var code = [
+      "libttsim_clock(1):                  :302",
+      " for chip in chips:                 :307",
+      "  for tile in busy T tiles (by id): :250",
+      "   repeat {                         :253",
+      "    each active hart: rv32_step()   :254",
+      "    each pipe: execute FIFO head    :264",
+      "   } while a Tensix inst succeeded  :280",
+      "   tile idle? clear its busy bit    :284",
+      "  each active ERISC: 1 or 16 steps  :288",
+      " g_clock++                          :311"
+    ];
+    var H = ["BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"];
+    function hs(act, ins) { return H.map(function (n, k) { return { n: n, a: act[k], i: ins[k] }; }); }
+    var allOn = [1, 1, 1, 1, 1];
+    var S = [
+      { line: 0, busy: [1,0,1,0,0,1,0,0], cur: -1, clock: 1000, pass: 0, steps: 0, harts: null, pipes: [["UNPACR"], ["MVMUL"], []], st: [null, null, null],
+        text: "<b>The host calls <code>libttsim_clock(1)</code></b>, for example from UMD's <code>after_read()</code>. Nothing on the chip moves between such calls." },
+      { line: 1, busy: [1,0,1,0,0,1,0,0], cur: -1, clock: 1000, pass: 0, steps: 0, harts: null, pipes: [["UNPACR"], ["MVMUL"], []], st: [null, null, null],
+        text: "<b>For each chip.</b> A <code>wh</code> build has one chip; a <code>wh_x2</code> build steps both chips, one after the other, inside the same clock." },
+      { line: 2, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 0, steps: 0, harts: null, pipes: [["UNPACR"], ["MVMUL"], []], st: [null, null, null],
+        text: "<b>Busy tiles only.</b> The busy bitmask says tiles 0, 2 and 5 may have something running (8 tiles stand in for Wormhole's 80). They are visited in ascending order, and the idle ones cost nothing." },
+      { line: 4, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 1, steps: 5, harts: hs(allOn, ["lw  (poll CB)", "tti UNPACR", "tti MVMUL", "lw  (poll sem)", "sw  (NoC cmd)"]), pipes: [["UNPACR", "UNPACR"], ["MVMUL", "MVMUL"], []], st: [null, null, null],
+        text: "<b>Tile 0, pass 1: every active hart executes one instruction.</b> TRISC0 and TRISC1 execute <code>tti</code> words, which push Tensix instructions into their pipe's FIFO (<code>riscv_impl.h:1461-1485</code>)." },
+      { line: 5, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 1, steps: 5, harts: hs(allOn, ["lw  (poll CB)", "tti UNPACR", "tti MVMUL", "lw  (poll sem)", "sw  (NoC cmd)"]), pipes: [["UNPACR", "UNPACR"], ["MVMUL", "MVMUL"], []], st: ["ok", "ok", null],
+        text: "<b>Pass 1, Tensix side.</b> Pipes 0 and 1 each execute their FIFO head, and both succeed. Because something succeeded, the loop goes round again <em>without</em> advancing <code>g_clock</code>." },
+      { line: 4, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 2, steps: 10, harts: hs(allOn, ["bne", "addi", "tti MVMUL", "bne", "lw"]), pipes: [["UNPACR"], ["MVMUL", "MVMUL"], []], st: [null, null, null],
+        text: "<b>Pass 2: the harts step again, for free.</b> These 5 instructions happen inside the same clock 1000. This is the \"hack\" (<code>libttsim.cpp:252</code>)." },
+      { line: 5, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 2, steps: 10, harts: hs(allOn, ["bne", "addi", "tti MVMUL", "bne", "lw"]), pipes: [["UNPACR"], ["MVMUL", "MVMUL"], []], st: ["stall", "ok", null],
+        text: "<b>Pass 2, Tensix side.</b> UNPACR stalls because its Src bank is still valid (<code>tensix.cpp:3169-3172</code>). MVMUL succeeds, and one success is enough to repeat." },
+      { line: 6, busy: [1,0,1,0,0,1,0,0], cur: 0, clock: 1000, pass: 3, steps: 15, harts: hs(allOn, ["lw  (poll CB)", "bne", "addi", "lw  (poll sem)", "bne"]), pipes: [["UNPACR"], ["MVMUL"], []], st: ["stall", "stall", null],
+        text: "<b>Pass 3.</b> The harts step once more. Now UNPACR is still blocked and MVMUL waits for both Src banks (<code>tensix.cpp:1766</code>). Nothing succeeded, so the loop breaks. Tile 0 got <b>3 passes and 15 hart-steps</b> in one clock." },
+      { line: 7, busy: [1,0,1,0,0,1,0,0], cur: 2, clock: 1000, pass: 1, steps: 16, harts: hs([1,0,0,0,0], ["lw  (wait go)", "", "", "", ""]), pipes: [[], [], []], st: [null, null, null],
+        text: "<b>Tile 0 is still active, so it stays busy. Next is tile 2.</b> Only its BRISC is running a wait loop. It gets one pass and one instruction. No Tensix work means no repeat." },
+      { line: 7, busy: [1,0,1,0,0,0,0,0], cur: 5, clock: 1000, pass: 1, steps: 17, harts: hs([0,0,0,0,1], ["", "", "", "", "PAUSE"]), pipes: [[], [], []], st: [null, null, null],
+        text: "<b>Tile 5:</b> its only active hart executes <code>PAUSE</code> and is parked until the next multiple of 256 clocks (<code>libttsim.cpp:230-247</code>). Nothing on the tile is active now, so its busy bit is cleared." },
+      { line: 8, busy: [1,0,1,0,0,0,0,0], cur: -1, clock: 1000, pass: 0, steps: 17, harts: null, pipes: [[], [], []], st: [null, null, null], eth: true,
+        text: "<b>Ethernet cores.</b> Each active ERISC takes 1 step, or 16 if it was sent work within the last 1024 clocks (<code>ETH_BUSY_STEPS</code>, <code>sim.h:404-405</code>)." },
+      { line: 9, busy: [1,0,1,0,0,0,0,0], cur: -1, clock: 1001, pass: 0, steps: 17, harts: null, pipes: [[], [], []], st: [null, null, null],
+        text: "<b><code>g_clock++</code>.</b> One clock has passed. Tile 0 did 3 passes, tile 2 did 1. <b>A tile that keeps its Tensix pipes succeeding gets more RISC-V work done per clock.</b> That is the key to the fidelity puzzle." }
+    ];
+    function draw(i, t) {
+      var s = S[i];
+      TT.clear(ctx, g.W, g.H);
+      // code panel
+      TT.box(ctx, 8, 8, 318, 300, { fill: C.bg2, stroke: C.border, r: 8 });
+      TT.text(ctx, "libttsim.cpp (paraphrased)", 18, 24, { color: C.muted, font: "12px" });
+      code.forEach(function (l, k) {
+        var y = 50 + k * 25;
+        if (k === s.line || (s.line === 6 && (k === 4 || k === 5) && false)) {
+          ctx.globalAlpha = 0.12 + 0.16 * t; ctx.fillStyle = C.yellow; ctx.fillRect(12, y - 11, 310, 22); ctx.globalAlpha = 1;
+        }
+        TT.text(ctx, l, 16, y, { color: k === s.line ? C.yellow : C.fg, font: "11.5px", mono: true });
+      });
+      // counters
+      TT.box(ctx, 8, 320, 318, 140, { fill: C.bg2, stroke: C.border, r: 8 });
+      TT.text(ctx, "g_clock", 20, 345, { color: C.muted });
+      TT.text(ctx, String(s.clock), 150, 345, { color: i === S.length - 1 ? C.green : C.yellow, font: "bold 18px", mono: true });
+      TT.text(ctx, "pass on this tile", 20, 380, { color: C.muted });
+      TT.text(ctx, s.cur >= 0 && s.pass ? String(s.pass) : "-", 150, 380, { color: C.fg, font: "bold 16px", mono: true });
+      TT.text(ctx, "hart-steps this clock", 20, 415, { color: C.muted });
+      TT.text(ctx, String(s.steps), 190, 415, { color: C.teal, font: "bold 16px", mono: true });
+      TT.text(ctx, "all within one g_clock value", 20, 443, { color: C.muted, font: "11px" });
+      // tile strip
+      TT.text(ctx, "Tensix tiles (busy bitmask)", 345, 22, { color: C.muted, font: "12px" });
+      for (var k = 0; k < 8; k++) {
+        var x = 345 + k * 64, y = 34;
+        var isCur = k === s.cur, b = s.busy[k];
+        TT.box(ctx, x, y, 56, 36, { fill: isCur ? C.yellow : (b ? C.orange : C.bg3), alpha: isCur ? 0.35 + 0.4 * t : (b ? 0.3 : 1), stroke: isCur ? C.yellow : (b ? C.orange : C.border), lw: isCur ? 2.5 : 1.2, label: "T" + k, color: b || isCur ? C.fg : C.muted, font: "13px" });
+        TT.text(ctx, b ? "1" : "0", x + 28, y + 48, { color: b ? C.orange : C.muted, font: "11px", mono: true, align: "center" });
+      }
+      if (s.eth) {
+        for (var e = 0; e < 4; e++) TT.box(ctx, 345 + e * 64, 362, 56, 36, { fill: C.purple, alpha: 0.2 + 0.5 * t, stroke: C.purple, label: "E" + e, font: "13px" });
+        TT.text(ctx, "ERISCs step after all Tensix tiles", 610, 380, { color: C.purple, font: "12px" });
+      }
+      // harts
+      TT.text(ctx, s.cur >= 0 ? "Inside tile " + s.cur + ": five RISC-V harts" : "Inside a tile: five RISC-V harts", 345, 108, { color: C.muted, font: "12px" });
+      for (var h = 0; h < 5; h++) {
+        var hx = 345 + h * 104, hy = 120;
+        var hh = s.harts ? s.harts[h] : null, on = hh && hh.a;
+        var lit = on && (s.line === 4 || s.line === 6 || s.line === 7);
+        TT.box(ctx, hx, hy, 96, 34, { fill: lit ? C.teal : C.bg3, alpha: lit ? 0.25 + 0.5 * t : 1, stroke: on ? C.teal : C.border, label: H[h], color: on ? C.fg : C.muted, font: "12px" });
+        if (hh && hh.i) TT.text(ctx, hh.i, hx + 48, hy + 50, { color: lit ? C.teal : C.muted, font: "11px", mono: true, align: "center" });
+      }
+      // pipes
+      TT.text(ctx, "Tensix instruction FIFOs (one per TRISC; BRISC can also push to pipe 0)", 345, 200, { color: C.muted, font: "12px" });
+      for (var p = 0; p < 3; p++) {
+        var py = 216 + p * 44;
+        TT.text(ctx, "pipe " + p + " \u2190 TRISC" + p, 345, py + 14, { color: C.fg, font: "12px", mono: true });
+        TT.box(ctx, 470, py, 290, 30, { stroke: C.border, r: 5 });
+        var q = s.pipes[p];
+        for (var j = 0; j < q.length; j++) {
+          var cx = 476 + j * 92, isHead = j === 0, stt = isHead ? s.st[p] : null;
+          var col = stt === "ok" ? C.green : stt === "stall" ? C.red : C.blue;
+          TT.box(ctx, cx, py + 3, 86, 24, { fill: col, alpha: stt ? 0.35 + 0.45 * t : 0.25, stroke: col, label: q[j], font: "11px", mono: true });
+        }
+        if (s.st[p]) TT.text(ctx, s.st[p] === "ok" ? "\u2713 executed" : "\u2717 stalled", 770, py + 15, { color: s.st[p] === "ok" ? C.green : C.red, font: "12px" });
+        if (!q.length) TT.text(ctx, "empty", 480, py + 15, { color: C.muted, font: "11px" });
+      }
+      // repeat indicator
+      if (s.line === 5 || s.line === 6) {
+        var any = s.st.indexOf("ok") >= 0;
+        TT.box(ctx, 345, 360, 505, 40, { fill: any ? C.green : C.red, alpha: 0.12 + 0.2 * t, stroke: any ? C.green : C.red, r: 8,
+          label: any ? "any_tensix = true \u2192 clock this tile AGAIN (same g_clock)" : "any_tensix = false \u2192 break, move to next busy tile", color: C.fg, font: "13px" });
+      }
+      if (i === S.length - 1) {
+        TT.box(ctx, 345, 360, 505, 40, { fill: C.yellow, alpha: 0.15 + 0.2 * t, stroke: C.yellow, r: 8, label: "1 clock: tile 0 = 3 passes, tile 2 = 1, tile 5 = 1 (then idle)", font: "13px" });
+      }
+    }
+    TT.stepper({ root: root, steps: S.map(function (s) { return { dur: 1.3, text: s.text }; }), draw: draw });
+  })();
+  </script>
+
+  <div class="callout key">A ttsim clock is one call to <code>libttsim_clock</code>. In it, each busy tile's harts step one instruction, and they step again for as long as that tile's Tensix pipes keep succeeding. The host decides how many clocks happen. Neither of these is how silicon spends cycles.</div>
+
+  <h3>Proving it with an instrumented simulator</h3>
+  <p>Claims about code are cheap, so let's measure. <code>build_ttsim.sh count wh</code> makes an editable copy of ttsim. In it we added seven counters to <code>libttsim.cpp</code>: calls to <code>libttsim_clock</code> (and how many had n = 1), BAR reads and writes, hart-steps, successful Tensix instructions, and extra passes. They are printed at <code>libttsim_exit</code>.</p>
+<p>The exact change is <a href="patches/b01-count.patch"><code>patches/b01-count.patch</code></a>, a <code>diff -u</code> against pristine ttsim <code>b3620244</code>. Make the copy, apply the patch, and rebuild:</p>
+<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs
+$W/workbench/build_ttsim.sh count wh       # first use copies ttsim to $LAB_HOME/ttsim-count
+patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/patches/b01-count.patch
+$W/workbench/build_ttsim.sh count wh       # rebuild with the counters
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
+$EX/metal_example_add_2_integers_in_riscv
+…
+Success: Result is 21
+[4501] COUNT clock_calls=4501 (n==1: 4501) pci_rd=4539 pci_wr=17361 rv32_steps=963752 tensix_insts=576 extra_tile_passes=576
+[4501] 0.2 seconds (29.6 KHz)</code></pre>
+  <table>
+    <tr><th>Run (WH)</th><th class="num">clocks</th><th class="num">BAR reads</th><th class="num">BAR writes</th><th class="num">hart-steps</th><th class="num">Tensix insts</th><th class="num">extra passes</th></tr>
+    <tr><td>add_2, slow dispatch</td><td class="num">4,501</td><td class="num">4,539</td><td class="num">17,361</td><td class="num">963,752</td><td class="num">576</td><td class="num">576</td></tr>
+    <tr><td>add_2, DPRINT</td><td class="num">5,060</td><td class="num">5,098</td><td class="num">18,282</td><td class="num">1,064,299</td><td class="num">576</td><td class="num">576</td></tr>
+    <tr><td>add_2, fast dispatch</td><td class="num">10,946</td><td class="num">4,960</td><td class="num">18,426</td><td class="num">3,283,966</td><td class="num">581</td><td class="num">581</td></tr>
+    <tr><td>eltwise_binary</td><td class="num">7,959</td><td class="num">7,997</td><td class="num">21,085</td><td class="num">2,219,951</td><td class="num">4,121</td><td class="num">2,843</td></tr>
+    <tr><td>mm_fid seed 42, LoFi</td><td class="num">699,743</td><td class="num">699,781</td><td class="num">714,211</td><td class="num">252,199,356</td><td class="num">265,474</td><td class="num">190,276</td></tr>
+    <tr><td>mm_fid seed 42, HiFi4</td><td class="num">330,591</td><td class="num">330,629</td><td class="num">345,059</td><td class="num">121,150,636</td><td class="num">657,474</td><td class="num">559,476</td></tr>
+  </table>
+  <p>Read the table column by column:</p>
+  <ul>
+    <li><strong>clocks ≈ reads</strong> in slow dispatch, and every call had n = 1. The gap is exactly 38 reads in every run, so it is not noise: some fixed set of reads (probably during device setup) takes a path that does not clock. We have not traced which. Fast dispatch breaks the pattern: about 6,000 clocks come from <code>advance_device_execution</code>, not from reads.</li>
+    <li><strong>About 214 hart-steps per clock</strong> in add_2 (963,752 / 4,501), although the kernel uses one hart on one core. Firmware on every other core is running wait loops, and each of those harts gets a step per clock too.</li>
+    <li><strong>HiFi4 executed 2.5× more Tensix instructions than LoFi</strong> (657k vs 265k), because each extra fidelity phase is more <code>MVMUL</code>s, yet it needed less than half the clocks.</li>
+  </ul>
+  <p>Now add each fidelity run's clocks and extra passes together:</p>
+  <p style="text-align:center; font-family:var(--mono)">LoFi: 699,743 + 190,276 = 890,019 &nbsp;&nbsp;&nbsp; HiFi4: 330,591 + 559,476 = 890,067</p>
+  <p>The two totals agree to within 48. The matmul tile needs about 890,000 passes either way, and these passes are mostly RISC-V instructions: loop counters, CB polling, <code>tti</code> pushes. Every extra MVMUL that succeeds buys one more pass inside the same clock. HiFi4 has more MVMULs, so it gets more free passes and needs fewer real clocks. The simulator's clock is cheaper exactly when the matrix engine is doing more work.</p>
+  <p>To confirm it, remove the hack. Make a second copy (<code>ttsim-noloop</code>) and replace the <code>if (!any_tensix) break;</code> with an unconditional <code>break;</code>, so each tile gets exactly one pass per clock. <a href="patches/b01-noloop.patch"><code>patches/b01-noloop.patch</code></a> is the counters plus that one change:</p>
+<pre><code>$W/workbench/build_ttsim.sh noloop wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-noloop &lt; $W/patches/b01-noloop.patch
+$W/workbench/build_ttsim.sh noloop wh
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-noloop-wh-release/libttsim.so
+MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid</code></pre>
+<pre><code>[889442] COUNT clock_calls=889442 … tensix_insts=265474 …     # LoFi,  hash 213e53fed10c0383, wall 12.45 s
+[889490] COUNT clock_calls=889490 … tensix_insts=657474 …     # HiFi4, hash ef7abcd145720383, wall 15.04 s</code></pre>
+  <p>With one pass per clock, LoFi and HiFi4 take the same number of clocks to within 48. The output bits are unchanged, so the repeat loop is purely a speed optimisation and never affects results. The runs also took longer in wall time (12.5 s and 15.0 s, against 9.8 s and 8.7 s), which is why the hack exists ("for simulator perf"). Even without it, one MVMUL costs one clock, the same as a NOP, so 2.5× more matrix work does not show up in the count at all. Explore the three views:</p>
+
+  <div class="viz" id="fig-fid"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-fid");
+    var g = TT.canvas(root, 880, 330), ctx = g.ctx, C = TT.C;
+    var views = {
+      a: { title: "Stock ttsim: clocks by fidelity (mm_fid, seed 42, WH)", max: 900000,
+           bars: [["LoFi", [[699743, C.blue]]], ["HiFi2", [[586559, C.blue]]], ["HiFi3", [[458575, C.blue]]], ["HiFi4", [[330591, C.blue]]]],
+           cap: "More precision means FEWER clocks. Silicon behaves the other way round: each extra fidelity phase is another pass through the multipliers." },
+      b: { title: "Instrumented: clocks (blue) + free extra passes (yellow)", max: 900000,
+           bars: [["LoFi", [[699743, C.blue], [190276, C.yellow]]], ["HiFi4", [[330591, C.blue], [559476, C.yellow]]]],
+           cap: "Clocks + extra passes is about 890k in both cases. HiFi4's extra MVMULs buy free passes inside the same clock, so fewer clocks are needed." },
+      c: { title: "Repeat loop removed (one pass per tile per clock)", max: 900000,
+           bars: [["LoFi", [[889442, C.green]]], ["HiFi4", [[889490, C.green]]]],
+           cap: "Without the hack the counts match to within 48 clocks, and the results stay bit-identical. Tensix work costs no extra clocks at all." }
+    };
+    var cur = "a", t0 = performance.now();
+    function draw(p) {
+      var v = views[cur];
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, v.title, 20, 22, { color: C.fg, font: "15px" });
+      var x0 = 110, w = 720, y = 60, bh = Math.min(48, 220 / v.bars.length - 12);
+      for (var gx = 0; gx <= 900000; gx += 150000) {
+        var xx = x0 + w * gx / v.max;
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(xx, 45); ctx.lineTo(xx, 290); ctx.stroke();
+        TT.text(ctx, (gx / 1000) + "k", xx, 302, { color: C.muted, font: "11px", align: "center" });
+      }
+      v.bars.forEach(function (b, k) {
+        var yy = y + k * (bh + 14), xs = x0, tot = 0;
+        TT.text(ctx, b[0], 20, yy + bh / 2, { color: C.fg, font: "14px" });
+        b[1].forEach(function (seg) {
+          var ww = w * seg[0] / v.max * p;
+          TT.box(ctx, xs, yy, Math.max(1, ww), bh, { fill: seg[1], alpha: 0.75, r: 3 });
+          xs += ww; tot += seg[0];
+        });
+        var lbl = b[1].length > 1 ? b[1].map(function (s) { return s[0].toLocaleString("en-US"); }).join(" + ") + " = " + tot.toLocaleString("en-US") : tot.toLocaleString("en-US");
+        var inside = xs > 600;
+        TT.text(ctx, lbl, inside ? xs - 8 : xs + 8, yy + bh / 2, { color: inside ? "#000" : C.fg, font: "bold 12px", mono: true, align: inside ? "right" : "left" });
+      });
+    }
+    function anim(now) { var p = Math.min(1, (now - t0) / 600); draw(TT.smooth(p)); if (p < 1) requestAnimationFrame(anim); }
+    var bar = document.createElement("div"); bar.className = "controls";
+    var cap = document.createElement("div"); cap.className = "narration";
+    var bs = {};
+    [["a", "1. Stock clocks"], ["b", "2. + free passes"], ["c", "3. Hack removed"]].forEach(function (m) {
+      var b = document.createElement("button"); b.textContent = m[1]; bs[m[0]] = b;
+      b.onclick = function () { cur = m[0]; for (var k in bs) bs[k].className = k === cur ? "on" : ""; cap.innerHTML = views[cur].cap; t0 = performance.now(); requestAnimationFrame(anim); };
+      bar.appendChild(b);
+    });
+    bs.a.className = "on"; cap.innerHTML = views.a.cap;
+    root.appendChild(bar); root.appendChild(cap);
+    requestAnimationFrame(anim);
+  })();
+  </script>
+
+  <div class="callout gpu">GPU architects use two kinds of simulator. Cycle-level models such as GPGPU-Sim or Accel-Sim track pipelines, caches and DRAM queues so they can predict time. Functional emulators run the ISA as fast as possible and only promise correct results. ttsim is firmly the second kind, and its own docs name a separate "performance-modeling sim for shipping silicon" as one of the team's engineering priorities (<code>docs/unsupported_functionality.md:31-33</code>). Treat its clock like an instruction-retired counter that also ticks once per host poll.</div>
+
+  <h2 id="models">5. What ttsim models, and what it leaves out</h2>
+  <p>If the clock is not time, what is ttsim good for? A great deal, as long as you ask it questions about correctness:</p>
+  <table>
+    <tr><th>Modelled</th><th>Evidence</th></tr>
+    <tr><td><strong>Functional behaviour</strong> of every implemented instruction: RISC-V, Tensix, NoC, DMA, ARC, Ethernet</td><td>Real tt-metal examples pass unmodified on WH and BH (section 1). The README says many tt-metal, ttnn and LLK tests pass, as well as whole LLMs.</td></tr>
+    <tr><td><strong>Bit-exact numerics</strong>, NaN bit patterns included</td><td>README, "Numerical Accuracy": "designed to provide bit-exact numerical results relative to silicon for all computations". Our hashes repeat exactly.</td></tr>
+    <tr><td><strong>The ISA contract</strong>, strictly: anything undefined is fatal</td><td><code>ttsim_error</code> prints <code>[clock] ERROR: Category: func: msg</code> and calls <code>_Exit(1)</code> (<code>common.cpp:33-45</code>). For example, NoC writes must keep <code>(src&amp;15)==(dst&amp;15)</code> (<code>tile.cpp:1588-1589</code>), and <code>fence</code> on WH is rejected (<code>riscv_impl.h:1079-1084</code>).</td></tr>
+    <tr><td><strong>Ordering that software creates</strong>: stalls on Src valid, semaphores, FIFO-full replays</td><td>Handlers return <code>false</code> and are retried (<code>tensix.cpp:1766, 3171</code>; <code>riscv_impl.h:1479-1484</code>).</td></tr>
+  </table>
+  <table>
+    <tr><th>Not modelled</th><th>Evidence</th><th>Consequence</th></tr>
+    <tr><td><strong>Timing</strong> of anything</td><td>One instruction per hart per pass; Tensix instructions repeat for free (section 4)</td><td>Clock counts are not performance. Use silicon and the profiler for that.</td></tr>
+    <tr><td><strong>NoC latency and bandwidth</strong></td><td>A read copies the bytes and bumps the "response received" counter in the same MMIO write that launched it (<code>tile.cpp:1619-1621</code>)</td><td>Barriers always pass at once, so a <em>missing</em> barrier goes unnoticed (<a href="b05-noc-and-dram.html">B05</a>).</td></tr>
+    <tr><td><strong>Contention</strong>: NoC links, L1 banks, DRAM queues</td><td>L1 is one flat array, <code>uint8_t sram[TENSIX_SRAM_SIZE]</code> (<code>sim.h:355</code>); there are no link or bank queues</td><td>Bad data placement looks just as fast as good placement.</td></tr>
+    <tr><td><strong>Caches</strong></td><td>The hooks exist but are empty: <code>icache_invalidate</code>, <code>dcache_invalidate</code> and <code>dcache_access</code> have empty bodies (<code>riscv_impl.h:62-70, 613-614</code>)</td><td>A missing cache flush that would break on silicon may still pass. The README lists "missing synchronization, cache flushes, or memory fences" as a source of divergence.</td></tr>
+    <tr><td><strong>Every hardware feature</strong></td><td>"roughly 70% of the WH/BH architectural feature surface" is implemented; the rest is <code>UnsupportedFunctionality</code> on purpose (<code>docs/unsupported_functionality.md:9-11</code>)</td><td>For example, SFPLOADMACRO, so <code>env.sh</code> sets <code>TT_METAL_DISABLE_SFPLOADMACRO=1</code>.</td></tr>
+  </table>
+  <div class="callout warn">"Passes on ttsim" means "my program does not break the ISA contract on the paths this run took, and it produced these exact bits." It does not mean "this is fast", and it does not mean "my synchronisation is right". Instant NoC transfers can hide races that silicon would expose. The README warns about this too: ttsim "may evaluate operations in any order permitted by software synchronization".</div>
+
+  <h2 id="tour">6. A guided tour of the source</h2>
+  <p>ttsim is small enough to read: about 16,000 lines in <code>src/</code> (<code>wc -l</code> on <code>*.cpp *.h</code> gives 16,226). The files you will open most often:</p>
+  <table>
+    <tr><th>File</th><th class="num">lines</th><th>What lives there</th></tr>
+    <tr><td><code>tensix.cpp</code></td><td class="num">5,776</td><td>The Tensix coprocessor: MOP and replay expanders, unpack, matrix engine, SFPU, pack</td></tr>
+    <tr><td><code>tile.cpp</code></td><td class="num">2,898</td><td>Tile MMIO, the NoC, ARC, Ethernet, reset PCs</td></tr>
+    <tr><td><code>riscv_impl.h</code></td><td class="num">1,980</td><td>The RISC-V interpreter shared by RV32 and RV64</td></tr>
+    <tr><td><code>sim.h</code></td><td class="num">671</td><td>All the state structs, and the interfaces between modules</td></tr>
+    <tr><td><code>libttsim.cpp</code></td><td class="num">314</td><td>The exported API and the clock loop</td></tr>
+    <tr><td><code>sim.cpp</code>, <code>common.cpp</code></td><td class="num">106, 45</td><td>Globals, <code>ttsim_init</code>, the heartbeat, errors</td></tr>
+  </table>
+  <h3>ChipState: the whole chip is one struct</h3>
+  <div class="filename">ttsim/src/sim.h:576-585 @b3620244</div>
+<pre><code>struct ChipState {
+    TensixTile t_tiles[NUM_T_TILES];
+    EthTile e_tiles[NUM_E_TILES];
+    ArcTile a_tile;
+    PcieTile p_tile;
+    DramChannel dram[NUM_DRAM_CHANNELS];
+    uint64_t rv32_cores_active;
+    uint64_t t_tiles_busy[(NUM_T_TILES + 63) / 64]; // T tiles that may have a core or Tensix pipe active
+    bool t_tile_cores_paused; // some T tile has a core in rv32_cores_paused
+};</code></pre>
+  <p>There is no heap and no object graph. <code>sim.cpp:14</code> declares a static array <code>ChipState g_chips[...]</code>, and <code>g_chip</code> points at the selected chip. The sizes come from <code>config.h</code>:</p>
+  <table>
+    <tr><th></th><th>Wormhole (<code>TT_ARCH_VERSION 0</code>)</th><th>Blackhole (<code>TT_ARCH_VERSION 1</code>)</th></tr>
+    <tr><td>Tensix tiles (<code>NUM_T_TILES</code>)</td><td>80</td><td>140</td></tr>
+    <tr><td>Ethernet tiles</td><td>16</td><td>14</td></tr>
+    <tr><td>DRAM channels × size</td><td>6 × 2 GiB</td><td>8 × 4080 MiB</td></tr>
+    <tr><td>L1 per Tensix tile</td><td>1464 KiB</td><td>1536 KiB</td></tr>
+    <tr><td>NoC grid</td><td>10 × 12</td><td>17 × 12</td></tr>
+  </table>
+  <p>(<code>config.h:13-84</code>, <code>sim.h:73-83</code>.) Each <code>TensixTile</code> holds 5 RV32 harts (BRISC=0, TRISC0–2=1–3, NCRISC=4), one <code>TensixState</code>, its L1 <code>sram[]</code>, and its NoC registers (<code>sim.h:341-400</code>).</p>
+  <div class="callout warn"><strong>"Tile" means three things.</strong> In ttsim source, a <em>tile</em> is a node on the NoC grid, identified by a type letter: <code>'T'</code> Tensix, <code>'E'</code> Ethernet, <code>'A'</code> ARC, <code>'P'</code> PCIe, and <code>'D'</code> for a DRAM channel's NoC endpoints (<code>coord_to_tile</code>, <code>tile.cpp:723</code>). It is not a 32×32 data tile, and it is not quite "a Tensix core" either. This lab always says "Tensix tile" or "data tile". <a href="b02-map-and-boot.html">B02</a> maps every coordinate.</div>
+  <h3>ttsim_init: build every tile, map DRAM lazily</h3>
+  <div class="filename">ttsim/src/sim.cpp:23-46 @b3620244 (trimmed)</div>
+<pre><code>void ttsim_init() {
+    for (uint32_t chip_id = 0; chip_id &lt; g_num_chips; chip_id++) {
+        ttsim_select_chip(chip_id);
+        p_tile_init();
+        for (uint32_t tile_id = 0; tile_id &lt; std::size(g_t_tiles); tile_id++) {
+            t_tile_init(tile_id);
+        }
+        … e_tile_init(), a_tile_init() …
+        for (uint32_t i = 0; i &lt; std::size(g_dram); i++) {
+            g_dram[i].p_mem = (uint8_t *)mmap(nullptr, DRAM_CHANNEL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);</code></pre>
+  <p><code>t_tile_init</code> (<code>tile.cpp:253-268</code>) initialises the 5 harts and the Tensix unit and sets <code>soft_reset_0</code> to its reset value, so every core starts <em>held in reset</em>. Nothing runs until the host writes the soft-reset register, which is the subject of <a href="b02-map-and-boot.html">B02</a>. DRAM is <code>MAP_NORESERVE</code>, so 12 GiB of virtual Wormhole DRAM costs only the pages you touch. <code>MAP_PRIVATE</code> means a <code>fork()</code> gives a copy-on-write snapshot of the whole chip, which the API docs recommend for running many tests from one booted state.</p>
+  <h3>The clock loop</h3>
+  <p>You have already read it in section 4 (<code>libttsim.cpp:244-314</code>). Two details remain. The outer function loops over chips <em>inside</em> each clock and increments a single global <code>g_clock</code> ("single global timebase, advanced once per clock across all chips", <code>:311</code>). And Tensix instructions reach the FIFOs through the interpreter. A 32-bit word whose low two bits are not <code>11</code> is not a RISC-V instruction, so <code>rv32_step</code> passes it to <code>tti()</code>. That function rotates it into a Tensix instruction and pushes it, or replays the word if the FIFO is full:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:1479-1484 @b3620244</div>
+<pre><code>    if (tensix_can_push_inst(p_tensix, pipe)) {
+        uint32_t tensix_inst = (inst &lt;&lt; 30) | (inst &gt;&gt; 2);
+        tensix_push_inst(p_tensix, pipe, tensix_inst, bypass_mop_expander);
+    } else {
+        p_hart-&gt;pc -= 4; // replay TTI instruction
+    }</code></pre>
+  <h3>The whole API: ten functions</h3>
+  <p>The library's surface is fixed by a linker version script. Check what is actually exported:</p>
+<pre><code>$ nm -D --defined-only ~/sim/wh/libttsim_wh.so
+000000000000caa0 T libttsim_clock
+000000000000c6d0 T libttsim_exit
+000000000000c670 T libttsim_init
+000000000000c770 T libttsim_pci_config_rd32
+000000000000c7e0 T libttsim_pci_config_wr32
+000000000000c860 T libttsim_pci_mem_rd_bytes
+000000000000c8f0 T libttsim_pci_mem_wr_bytes
+000000000000c720 T libttsim_set_pci_dma_mem_callbacks
+000000000000ca20 T libttsim_tile_rd_bytes
+000000000000ca60 T libttsim_tile_wr_bytes</code></pre>
+  <table>
+    <tr><th>Function</th><th>Role</th><th>Source</th></tr>
+    <tr><td><code>libttsim_init</code> / <code>libttsim_exit</code></td><td>Build and tear down the chip. A second <code>init</code> is a fatal ConfigurationError. <code>exit</code> prints the heartbeat.</td><td><code>libttsim.cpp:73-86</code></td></tr>
+    <tr><td><code>libttsim_set_pci_dma_mem_callbacks</code></td><td>Lets the device DMA into host memory. Must be called before <code>init</code>.</td><td><code>:88-96</code></td></tr>
+    <tr><td><code>libttsim_pci_config_rd32</code> / <code>wr32</code></td><td>PCI config space: IDs and BARs</td><td><code>:137-156</code></td></tr>
+    <tr><td><code>libttsim_pci_mem_rd_bytes</code> / <code>wr_bytes</code></td><td>BAR accesses, the main data path. BAR0 is a set of TLB windows onto the NoC.</td><td><code>:160-180</code></td></tr>
+    <tr><td><code>libttsim_clock</code></td><td>The only way time passes</td><td><code>:302-314</code></td></tr>
+    <tr><td><code>libttsim_tile_rd_bytes</code> / <code>wr_bytes</code></td><td>Transitional; on WH and BH they raise <code>UnsupportedFunctionality</code></td><td><code>:199-208</code></td></tr>
+  </table>
+  <p>UMD resolves 9 of them by name with <code>dlsym</code> right after the <code>dlopen</code> (<code>tt_sim_communicator.cpp:755-770</code>). The only one it skips there is <code>pci_config_wr32</code>. Because the surface is this small, you can drive the chip with no tt-metal at all. The workbench's 16-line <code>harness/h.c</code> <code>dlopen</code>s the library, calls <code>init</code>, reads config space, clocks 1000 times and exits:</p>
+<pre><code>$ gcc -o h sim-labs/workbench/harness/h.c -ldl &amp;&amp; ./h ~/sim/wh/libttsim_wh.so
+cfg[0] = 0x401e1e52 (device&lt;&lt;16 | vendor)
+[1000] 0.0 seconds (163.2 KHz)</code></pre>
+  <p>Here the clock count is exactly what the caller asked for, because no host poll loop is involved. The rate is far higher because every Tensix core is still held in reset (<code>t_tile_init</code>), so there are no busy Tensix tiles to step. <a href="b09-breaking-things.html">B09</a> builds this into a full bare-metal harness.</p>
+  <div class="callout sim">Next labs take this tour deeper: chip init and reset PCs in <a href="b02-map-and-boot.html">B02</a>, the RISC-V decode table in <a href="b03-riscv-interpreter.html">B03</a>, and Tensix opcodes per pipe in <a href="b04-tensix-instructions.html">B04</a>.</div>
+
+  <h2 id="edit">7. First edit: change + to *</h2>
+  <p>The add_2 kernel runs on BRISC alone. It reads two integers from DRAM into L1, adds them, and writes the sum back (<code>reader_writer_add_in_riscv.cpp:32-56</code>). The host checks for 21 = 14 + 7. Let's break it on purpose, <em>without rebuilding anything</em>. Put a modified copy under <code>$LAB_HOME/kernels</code> at the same relative path the example asks for:</p>
+<pre><code>K=add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+mkdir -p $LAB_HOME/kernels/tt_metal/programming_examples/$(dirname $K)
+cp $TT_METAL_HOME/tt_metal/programming_examples/$K $LAB_HOME/kernels/tt_metal/programming_examples/$K
+sed -i 's/(\*out0) = (\*dat0) + (\*dat1);/(*out0) = (*dat0) * (*dat1);/' $LAB_HOME/kernels/tt_metal/programming_examples/$K
+$EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code>@@ -40,7 +40,7 @@
+     DPRINT("Adding integers: {} + {}\n", *dat0, *dat1);
+ 
+-    (*out0) = (*dat0) + (*dat1);
++    (*out0) = (*dat0) * (*dat1);
+</code></pre>
+<pre><code>[0] 0.1 seconds (0.0 KHz)
+Error: Expected result of 21, got 98
+… | info     |    BuildKernels | JIT cache stats: 8/9 hits (88.9%) …
+[4501] 0.2 seconds (24.5 KHz)
+exit=255</code></pre>
+  <p>14 × 7 = 98. The run shows four things:</p>
+  <ul>
+    <li><strong>The overlay worked.</strong> tt-metal found your file through <code>TT_METAL_KERNEL_PATH</code>. The JIT cache keys on source content, so 1 of 9 kernels was rebuilt (8/9 hits).</li>
+    <li><strong>The arithmetic is real.</strong> BRISC really executed a RISC-V <code>mul</code>, and the host read back the device's answer.</li>
+    <li><strong>The clock count is unchanged at 4501.</strong> One <code>mul</code> replaced one <code>add</code>, so the instruction count, and therefore the poll count, stayed the same.</li>
+    <li><strong>The host program's exit code (255) tells you it failed</strong>, which is convenient for scripts.</li>
+  </ul>
+  <p>When you are done, remove the overlay (<code>rm $LAB_HOME/kernels/tt_metal/programming_examples/$K</code>), or every later run of this example will multiply.</p>
+  <div class="callout sim">Series A connection: <a href="../chapters/a10-first-program.html">A10</a> explains the host code (MeshDevice, buffers, CreateKernel, runtime args) of the example you just broke, and <a href="../chapters/a17-dispatch-host.html">A17</a> explains slow vs fast dispatch, whose clock signatures you measured above.</div>
+
+  <h2 id="exercises">8. Exercises, with answers</h2>
+  <details class="quiz"><summary>Exercise 1. Add <code>volatile uint32_t spin = 0; for (uint32_t i = 0; i &lt; 1000; i++) { spin = spin + i; }</code> before the addition in your overlay. Predict the new clock count, then run it. What if the loop runs 2000 times?</summary>
+  <p>Measured: 1000 iterations gave <code>[9505]</code> (twice), and 2000 gave <code>[14505]</code>. That is +5,004 and +10,004 clocks: exactly 5 clocks per iteration plus 4. Disassemble the JIT-built ELF (the newest <code>brisc.elf</code> under <code>~/.cache/tt-metal-cache/…/reader_writer_add_in_riscv/</code>) with <code>runtime/sfpi/compiler/bin/riscv-tt-elf-objdump -d</code> and the loop is 5 instructions:</p>
+<pre><code>    4ce8:	lw	a4,12(sp)
+    4cec:	add	a4,a4,a5
+    4cf0:	sw	a4,12(sp)
+    4cf4:	addi	a5,a5,1
+    4cf8:	bne	a5,a3,4ce8 &lt;.L15&gt;</code></pre>
+  <p>One instruction per clock for the hart on the critical path, and the host polled once per clock to keep it going. On real silicon the <code>lw</code>/<code>sw</code> to the stack and the taken branch would not each take exactly one cycle.</p></details>
+  <details class="quiz"><summary>Exercise 2. In your <code>ttsim-noloop</code> copy, predict the LoFi and HiFi4 clock counts and result hashes before you run them.</summary>
+  <p>The counts should be roughly the passes the tile needed, about 890k for both. Measured: LoFi 889,442 and HiFi4 889,490. The hashes are unchanged (<code>213e53fe…</code> and <code>ef7abcd1…</code>), because the repeat loop only changes <em>when</em> the same instructions run in clock terms, never <em>what</em> they compute. The gap to the conservation sum (890,019 − 889,442 = 577) is close to the 576 extra passes that even add_2 shows, so it is probably work common to every run. We have not traced exactly where it comes from.</p></details>
+  <details class="quiz"><summary>Exercise 3. Every run prints <code>[0] 0.0 seconds (0.0 KHz)</code> before the device even opens. Find the code responsible.</summary>
+  <p><code>TTSimCommunicator::probe_image</code> (<code>tt_sim_communicator.cpp:450-505</code>). It <code>dlopen</code>s the image, calls <code>libttsim_init</code>, scans PCI endpoints, and then a guard object calls <code>libttsim_exit</code>, which prints the heartbeat at clock 0. The instrumented build confirms this: that first instance prints <code>COUNT clock_calls=0 … pci_rd=0</code>.</p></details>
+  <details class="quiz"><summary>Exercise 4. Using only the counters, why does fast dispatch need 10,946 clocks when slow dispatch needs 4,501?</summary>
+  <p>Two effects. (1) Fast dispatch made only 4,960 BAR reads but 10,946 clock calls, so about 6,000 clocks came from <code>advance_device_execution()</code> in the dispatch wait loops, such as polling the completion queue in host memory (<code>system_memory_manager.cpp:780-786</code>) and waiting for prefetch-queue space (<code>:719-724</code>). (2) The device did more work: 3,283,966 hart-steps against 963,752, because the prefetcher and dispatcher firmware cores were running. Neither effect says anything about how fast fast dispatch is on silicon, which is the whole reason it exists (<a href="../chapters/a17-dispatch-host.html">A17</a>).</p></details>
+  <details class="quiz"><summary>Exercise 5. You want a reproducible clock count while debugging with prints. What do you do?</summary>
+  <p>You can't, with DPRINT: its server thread's reads interleave with the main thread's at times set by the OS scheduler (6064, 5115, 5060, 5063, 5058, 5064 in our runs). The ttsim README points to the alternative, "arbitrary debug visibility via source-level modification": edit an instrumented copy of ttsim and call <code>ttsim_printf</code>, which stamps each line with <code>[g_clock]</code> and adds no host reads. Our COUNT line is an example, and the count stayed exactly 4501.</p></details>
+  <details class="quiz"><summary>Exercise 6. Run <code>matmul_single_core</code> on BH and WH. Why might BH take fewer clocks (276,921 vs 330,591) while add_2 takes more (6,596 vs 4,501)?</summary>
+  <p>The counts follow instruction counts on the critical path plus host polling. They do not follow hardware speed. Each architecture builds its own firmware and its own LLK code, and the chips have different grids (80 vs 140 Tensix tiles), so the instruction streams and the number of polls differ. We have not broken down which part of the difference comes from where, and neither number predicts which chip is faster. The honest answer is "different code ran". <a href="b03-riscv-interpreter.html">B03</a>'s per-core instruction counts let you dig into it.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>ttsim is one <code>libttsim.so</code> with 10 exported C functions (check with <code>nm -D</code>). UMD <code>dlopen</code>s it, and tt-metal programs run on it unchanged, on both WH and BH.</li>
+    <li>The heartbeat <code>[N] S seconds (R KHz)</code> means: N = <code>g_clock</code>, S = host CPU time, R = N/S.</li>
+    <li>Runs are deterministic: same input, same bits, same clock count. The count does not even depend on the data. Several host threads touching the device (DPRINT, Watcher) break determinism.</li>
+    <li>Time only moves inside <code>libttsim_clock</code>. Under tt-metal, UMD calls it once per host read (<code>after_read</code>), and fast dispatch adds explicit calls. So the clock mostly counts polls.</li>
+    <li>In one clock, each busy tile's harts step one instruction, repeated as long as Tensix instructions keep succeeding. This is why HiFi4 takes fewer clocks than LoFi. Clocks plus free passes is about 890k either way.</li>
+    <li>ttsim models functional behaviour, bit-exact numerics and the ISA contract. It does not model timing, NoC latency, contention or caches. It is the place to test correctness, not performance.</li>
+    <li>A kernel overlay under <code>$LAB_HOME/kernels</code> changes device code without rebuilding: <code>+</code> → <code>*</code> gives "Expected result of 21, got 98".</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>A colleague posts: "ttsim shows HiFi4 matmul is 2× faster than LoFi on Wormhole." What is wrong, in one sentence of mechanism?</summary>
+  <p>ttsim's clock counts host polls, and it re-clocks a tile for free while Tensix instructions keep succeeding (<code>libttsim.cpp:252-283</code>), so HiFi4's extra MVMULs <em>reduce</em> the count. On silicon each extra fidelity phase costs real cycles, so the claim inverts reality.</p></details>
+  <details class="quiz"><summary>In slow dispatch without DPRINT, you add a 10 ms <code>sleep</code> in the host between launching the kernel and the first poll. Does the clock count change?</summary>
+  <p>No. The simulator does nothing between <code>libttsim_clock</code> calls, and a sleep makes no reads, so it adds no clocks. The device simply waits, frozen, for the next poll. (Wall time grows by 10 ms, of course.)</p></details>
+  <details class="quiz"><summary>Why does the stock <code>matmul_single_core</code> print a different PCC each run, yet the same clock count?</summary>
+  <p>Its inputs come from <code>std::random_device</code>, so the data changes every run. But the kernel's control flow does not depend on the values, and ttsim charges the same for every instruction whatever its operands. So the instruction stream, and with it the poll count, is identical. <code>mm_fid</code> with <code>MM_SEED</code> fixes the data too, and the hash then repeats.</p></details>
+  <details class="quiz"><summary>You forget <code>noc_async_read_barrier()</code> in a reader kernel. Will ttsim catch it?</summary>
+  <p>Almost certainly not. <code>noc_cmd_ctrl</code> copies the data and increments the "read response received" counter immediately, in the same MMIO write that issued the read (<code>tile.cpp:1619-1621</code>), so the data is always there by the time the kernel uses it. Silicon has real latency, and the bug would show up there. <a href="b05-noc-and-dram.html">B05</a> explores this.</p></details>
+  <details class="quiz"><summary>Which exported function would you call to run the chip for 1000 clocks from your own C program, and what happens if you call <code>libttsim_tile_rd_bytes</code> on a Wormhole build?</summary>
+  <p><code>libttsim_clock(1000)</code>. It loops 1000 times over all chips and increments <code>g_clock</code> each time (<code>libttsim.cpp:302-314</code>). <code>libttsim_tile_rd_bytes</code> is transitional and on WH/BH raises <code>UnsupportedFunctionality</code>, which prints an error and terminates the whole process via <code>_Exit(1)</code> (<code>libttsim.cpp:199-202</code>, <code>common.cpp:33-45</code>).</p></details>
+  <details class="quiz"><summary>In ttsim source, what is a "tile", and how many 'T' tiles does a Blackhole build have?</summary>
+  <p>A node of the NoC grid, typed T/E/A/P (plus D for DRAM endpoints), not a 32×32 data tile. Blackhole has <code>NUM_T_TILES 140</code> (<code>config.h:53</code>), against 80 on Wormhole.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/ttsim">tenstorrent/ttsim</a>: the source and README, including the behaviour contract and the numerical-accuracy policy quoted above.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/libttsim_api.md">libttsim API and ABI</a>: the ten entry points, the "no time passes outside libttsim_clock" rule, and forking.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/sim_error_handling.md">Simulator error handling</a>: why every error is fatal, and the fork-per-test pattern.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/releases">ttsim releases</a>: prebuilt <code>libttsim_wh.so</code>, <code>_bh.so</code> and <code>_qsr.so</code> for x86_64 and aarch64.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/Glossary.md">tt-isa-documentation Glossary</a>: the definitions of UndefinedBehavior, UnpredictableValue and NonContractualBehavior that ttsim enforces.</li>
+    <li><a href="https://github.com/tenstorrent/tt-umd">tt-umd</a>: the user-mode driver, whose <code>TTSimTTDevice</code> turns host reads into clocks.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/add_2_integers_in_riscv">add_2_integers_in_riscv</a>: the example you modified, with its walkthrough.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_print.html">Device print (DPRINT) docs</a>: how kernel printing works, including the host-side server whose reads you measured.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/index.html">TT-Metalium programming examples</a>: the official guide to the examples run in this lab.</li>
+    <li><a href="https://github.com/tenstorrent/tt-lab">tt-lab</a>: an LLM running on ttsim through the raw libttsim API, with a bit-exact <code>--check</code>.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim-qemu">ttsim-qemu</a>: the same library presented as a PCI device to a QEMU guest running the real kernel driver, a different host that turns the clock in its own way.</li>
+    <li><a href="https://www.corsix.org/content/tt-wh-part1">corsix: Tenstorrent Wormhole series, part 1</a>: a hands-on blog about Wormhole from the bottom up, good background for the PCIe and TLB side.</li>
+  </ul>
+
+  <div class="pager"><a href="b00-workbench.html">&larr; B00 Setting up the workbench</a><a class="next" href="b02-map-and-boot.html">B02 Map the chip and watch it boot &rarr;</a></div>
+</main>
+</body>
+</html>
