@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A20 · Thinking like a performance engineer · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a19-op-anatomy-compilers.html">&larr; Prev</a>
+  <a href="a21-many-chips.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 20</span><span class="tag">Prerequisites: A01, A06, A09, A11, A15, A16, A17</span>
+  <h1><span class="num">20.</span> Thinking like a performance engineer</h1>
+  <p class="subtitle">You will learn to name the wall an op is hitting (compute, L1 and NoC, DRAM, or the host), predict how each lever (format, fidelity, block size, sharding, overlap, trace, fusion) moves it, and read the tools that measure it on silicon. You will also learn which of those quantities the simulator can count exactly, and which it cannot measure at all.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#walls">Four walls, with numbers</a></li>
+      <li><a href="#roofline">The roofline, rebuilt for tiles</a></li>
+      <li><a href="#format">Lever 1: data format moves bytes</a></li>
+      <li><a href="#fidelity">Lever 2: math fidelity moves the roof</a></li>
+      <li><a href="#reuse">Lever 3: block size, multicast and the NoC</a></li>
+      <li><a href="#l1">Lever 4: keep it in L1</a></li>
+      <li><a href="#overlap">Lever 5: overlap with double buffering</a></li>
+      <li><a href="#dispatch">Lever 6: dispatch overhead and trace</a></li>
+      <li><a href="#fusion">Lever 7: fusion, and a trap</a></li>
+      <li><a href="#tools">Measuring on silicon: profiler, Tracy, ops CSV, tt-perf-report</a></li>
+      <li><a href="#sim">What the simulator can and cannot tell you</a></li>
+      <li><a href="#conflicts">Where the sources disagree</a></li>
+      <li><a href="#checklist">A checklist</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here is one line from a real performance report. It comes from <code>wh_clip_encoder_2.csv</code>, a profile captured on a Wormhole that Tenstorrent ships as a test fixture of its <code>tt-perf-report</code> tool. I ran the tool on it myself (<a href="#tools">below</a>), but I did not capture the profile.</p>
+<pre><code>ID    Bound  OP Code                           Device Time  Op-to-Op Gap  Cores  DRAM     DRAM %  FLOPs       FLOPs %  Math Fidelity
+1844  SLOW   MinimalMatmulOp 32 x 1280 x 1280  61 μs        1 μs          64     57 GB/s  19.6 %  1.7 TFLOPs  2.6 %    HiFi4 BF16 x BF16 =&gt; BF16</code></pre>
+  <p>A 32×1280 activation times a 1280×1280 weight is 2·32·1280·1280 ≈ 105 million floating-point operations. Sixty-four Wormhole cores at HiFi4 can do about 65 trillion per second, which is <b>1.6 µs</b> of work. The op has to read the weight (3.3 MB in bf16) plus the activation and write the output, about 3.44 MB in all. At the card's 288 GB/s that takes <b>about 12 µs</b>. The op took <b>61 µs</b>.</p>
+  <p>So the op is not at the compute limit and not at the DRAM limit. What is it hitting? That is the question this chapter teaches you to ask about every op: <b>which wall?</b> Then: <b>which lever moves that wall?</b> And: <b>how do I find out without guessing?</b></p>
+  <p>The first part is arithmetic, and you have already met it in A01 and A15. The second part is a list of levers that Tenstorrent hardware exposes directly: number format, math fidelity, block size, where tensors live, buffering, dispatch, and fusion. The third part needs tools: the device profiler, Tracy, the ops CSV, and <code>tt-perf-report</code>. These tools run on silicon only. The simulator cannot time anything, but it can count something that matters just as much, every byte and every instruction, exactly. This chapter uses it for that and nothing else.</p>
+
+  <div class="callout warn">Every simulator number on this page is a <b>count</b>: bytes, NoC commands, instructions. None of them is a time. ttsim is a functional, bit-exact model, and its clock advances when the host polls it (<a href="../sim-labs/b01-meet-ttsim.html">B01</a>). Below, a LoFi matmul takes <i>more</i> simulated clocks than a HiFi4 one while doing a quarter of the multiplies. All speed numbers on this page come from Tenstorrent's documentation and reports, cited where they are used, or from a labelled model.</div>
+
+  <h2 id="walls">Four walls, with numbers</h2>
+  <p>An op on a Tensix grid can be held back by four kinds of limit. Picture data flowing inward: from the host, through dispatch, out of DRAM, across the NoC into L1, through the unpackers into the matrix engine, and back out. Whichever stage is narrowest for <i>this</i> op sets its speed.</p>
+  <ol>
+    <li><b>Compute.</b> The FPU retires at most one <code>MVMUL</code> (an 8×16 by 16×16 product, 4,096 FLOP) per cycle, and a matmul at fidelity <i>p</i> needs <i>p</i> of them per useful product (A06). The SFPU is a separate, much lower roof for element-wise math (A07).</li>
+    <li><b>L1 and the NoC.</b> Each core's L1 has 16 banks, each able to do one 128-bit access per cycle (<code>L1.md:5</code>). One unpacker can read up to four 128-bit words per cycle (<code>L1.md:37</code>). One NoC hop carries 32 GB/s on Wormhole (<code>DRAMTile/README.md:70</code>).</li>
+    <li><b>DRAM.</b> Twelve GDDR6 channels on Wormhole at 24 GB/s each, 288 GB/s in total (<code>DRAMTile/README.md:66</code>). On a Blackhole p150 the figure is 512 GB/s.</li>
+    <li><b>Host and dispatch.</b> The time between the end of one op and the start of the next: building commands on the host, sending them, and launching the kernels (A17).</li>
+  </ol>
+  <table>
+    <tr><th>Wall</th><th>Wormhole n150</th><th>Blackhole p150</th><th>Source</th></tr>
+    <tr><td>Clock</td><td>1 GHz</td><td>up to 1.35 GHz</td><td>docs.tenstorrent.com card tables</td></tr>
+    <tr><td>Tensix cores on the card / usable compute grid</td><td>72 / 8×8 = 64</td><td>120 / 11×10 = 110</td><td>card tables; A17 (grid measured on ttsim); <code>tt-perf-report</code> uses 64 and 110</td></tr>
+    <tr><td>FPU peak per core, 1 / 2 / 3 / 4 fidelity phases</td><td>4.096 / 2.048 / 1.366 / 1.024 TFLOP/s</td><td>5.53 / 2.76 / 1.84 / 1.38 (derived: ×1.35)</td><td><code>MatrixUnit.md:60-77</code>; <code>GEMM_FLOPS.md</code></td></tr>
+    <tr><td>Chip compute, LoFi / HiFi2 / HiFi4, on the usable grid</td><td>262 / 131 / 65.5 TFLOP/s</td><td>608 / 304 / 152 TFLOP/s</td><td>derived: cores × 4096 × clock ÷ phases</td></tr>
+    <tr><td>Published card figures</td><td>FP8 262, BLOCKFP8 148, FP16 74</td><td>BLOCKFP8 664</td><td>card tables (A06 explains which fidelity each assumes)</td></tr>
+    <tr><td>DRAM</td><td>288 GB/s spec; 267 measured (micro-benchmark); ≈190 interleaved matmul; ≈240 DRAM-sharded</td><td>512 GB/s spec (448 on p100a)</td><td><code>Saturating_DRAM_bandwidth.md:64-70</code>; <code>llms.md:1844-1845</code></td></tr>
+    <tr><td>NoC link (per hop, per direction)</td><td>32 GB/s</td><td>86.4 GB/s derived; 83 GB/s on HC2024 slides</td><td><code>DRAMTile/README.md:70</code>; A08</td></tr>
+    <tr><td>L1 per core</td><td>16 banks × 16 B/cycle = 256 B/cycle</td><td>(94 TB/s chip SRAM bandwidth, HC2024)</td><td><code>L1.md:5</code>; A01</td></tr>
+    <tr><td>Op-to-op gap</td><td colspan="2">"Typically tracing reduces the OP-to-OP gap below 6us"; <code>tt-perf-report</code> flags gaps over 6.5 µs</td><td><code>llms.md:1826</code>; <code>perf_report.py:2281</code></td></tr>
+  </table>
+  <p>Two of these walls need care. The ISA says to multiply the per-core figure by the 72 Tensix tiles of an n150 (<code>MatrixUnit.md:77</code>). But with fast dispatch, one row is reserved for the dispatch firmware, so a matmul gets at most 64 cores (A17). Throughout this chapter the compute roof uses the grid an op can actually get, which is also what <code>tt-perf-report</code> does. And "DRAM bandwidth" is really three numbers. The spec (288 GB/s) is an upper bound. A tuned micro-benchmark reaches about 92% of it. An ordinary matmul reading interleaved tiles gets about 190 GB/s, because every reader touches every bank and the routes cross (A09).</p>
+
+  <h2 id="roofline">The roofline, rebuilt for tiles</h2>
+  <p>A01 drew the roofline for a whole chip: attainable FLOP/s = min(compute roof, intensity × bandwidth), where <i>intensity</i> is FLOPs per byte moved from DRAM. A15 worked out the intensity of a blocked matmul. Here it is again, with one change: the two operands can be stored in different formats.</p>
+  <p>Take one core that owns a block of <i>M<sub>b</sub></i>×<i>N<sub>b</sub></i> output tiles. For each step along K it reads <i>M<sub>b</sub></i> activation tiles and <i>N<sub>b</sub></i> weight tiles, then does <i>M<sub>b</sub>·N<sub>b</sub></i> tile matmuls of 2·32³ = 65,536 FLOP each. If an activation tile costs <i>B<sub>a</sub></i> bytes and a weight tile <i>B<sub>w</sub></i> bytes:</p>
+  <p style="text-align:center"><b>intensity = 65,536 · M<sub>b</sub>·N<sub>b</sub> / (M<sub>b</sub>·B<sub>a</sub> + N<sub>b</sub>·B<sub>w</sub>)</b> FLOP per DRAM byte</p>
+  <p>With bf16 on both sides (2048-byte tiles) and a square block of side <i>b</i>, this is 16<i>b</i>, the formula from A15. Now look at the decode case, where the activation is a single tile row (<i>M<sub>b</sub></i> = 1) and the weight is wide. As <i>N<sub>b</sub></i> grows, intensity approaches 65,536/<i>B<sub>w</sub></i>, which is <b>32 FLOP/B for bf16 weights, 60 for bfp8, and 114 for bfp4</b>. The ridge of a Wormhole at HiFi2 is 131 TFLOP/s ÷ 288 GB/s ≈ 455 FLOP/B. No block size gets a decode matmul there. Only the number of bytes per weight moves it.</p>
+  <p>Drag the sliders. The point is the kernel, the solid slanted line is DRAM, and the flat lines are the compute roofs for each fidelity (the bright one is selected).</p>
+
+  <div class="viz" id="fig-roof"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-roof");
+    var g = TT.canvas(root, 880, 430), ctx = g.ctx, C = TT.C;
+    // Sourced parameters (see the table above). Compute roof uses the usable compute grid.
+    var ARCH = {
+      wh: { name: "Wormhole n150", cores: 64, clk: 1.0, dram: 288, extra: { bw: 190, label: "≈190 GB/s interleaved matmul (llms.md)" }, grid: 8 },
+      bh: { name: "Blackhole p150", cores: 110, clk: 1.35, dram: 512, extra: null, grid: 10 }
+    };
+    var FMT = { bf16: 2048, bfp8: 1088, bfp4: 576 };   // bytes per 32x32 tile (tt_backend_api_types.hpp:122-140)
+    var FID = { LoFi: 1, HiFi2: 2, HiFi3: 3, HiFi4: 4 };
+    var st = { arch: "wh", fid: "HiFi2", fmt: "bf16", mb: 1, nb: 8, actL1: false, mcast: false };
+    var narr;
+
+    function roofTF(a, p) { return a.cores * 4096 * a.clk * 1e9 / p / 1e12; }
+    function model() {
+      var a = ARCH[st.arch], p = FID[st.fid], bw = FMT[st.fmt];
+      var m = st.mb, n = st.nb;
+      if (st.mcast) { m *= a.grid === 8 ? 8 : 10; n *= a.grid === 8 ? 8 : 11; }
+      var bytes = (st.actL1 ? 0 : m * 2048) + n * bw;
+      var I = 65536 * m * n / bytes;
+      var roof = roofTF(a, p), memTF = I * a.dram / 1000;
+      return { a: a, I: I, roof: roof, att: Math.min(roof, memTF), memTF: memTF, ridge: roof * 1000 / a.dram, m: m, n: n };
+    }
+    // log-log axes
+    var X0 = 70, X1 = 860, Y0 = 395, Y1 = 20, LX0 = Math.log10(4), LX1 = Math.log10(30000), LY0 = Math.log10(1), LY1 = Math.log10(1000);
+    function px(I) { return X0 + (Math.log10(I) - LX0) / (LX1 - LX0) * (X1 - X0); }
+    function py(tf) { return Y0 - (Math.log10(tf) - LY0) / (LY1 - LY0) * (Y0 - Y1); }
+    function draw() {
+      var r = model(), a = r.a;
+      TT.clear(ctx, g.W, g.H);
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      [10, 100, 1000, 10000].forEach(function (v) { var x = px(v); ctx.beginPath(); ctx.moveTo(x, Y1); ctx.lineTo(x, Y0); ctx.stroke(); TT.text(ctx, String(v), x, Y0 + 14, { color: C.muted, align: "center", font: "12px" }); });
+      [1, 10, 100, 1000].forEach(function (v) { var y = py(v); ctx.beginPath(); ctx.moveTo(X0, y); ctx.lineTo(X1, y); ctx.stroke(); TT.text(ctx, String(v), X0 - 8, y, { color: C.muted, align: "right", font: "12px" }); });
+      TT.text(ctx, "intensity: FLOP per DRAM byte (log)", (X0 + X1) / 2, Y0 + 30, { color: C.muted, align: "center", font: "12px" });
+      ctx.save(); ctx.translate(18, (Y0 + Y1) / 2); ctx.rotate(-Math.PI / 2); TT.text(ctx, "attainable TFLOP/s (log)", 0, 0, { color: C.muted, align: "center", font: "12px" }); ctx.restore();
+      // fidelity roofs
+      Object.keys(FID).forEach(function (f) {
+        var tf = roofTF(a, FID[f]), on = f === st.fid, ridge = tf * 1000 / a.dram;
+        ctx.strokeStyle = on ? C.yellow : C.border; ctx.lineWidth = on ? 3 : 1.5; ctx.setLineDash(on ? [] : [4, 4]);
+        ctx.beginPath(); ctx.moveTo(px(Math.max(ridge, 4)), py(tf)); ctx.lineTo(X1, py(tf)); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, f + " " + tf.toFixed(0) + " TF", X1 - 4, py(tf) + (f === "HiFi4" ? 12 : -9), { color: on ? C.yellow : C.muted, align: "right", font: "12px" });
+      });
+      // DRAM roof (spec) up to the selected roof
+      ctx.strokeStyle = C.blue; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(px(4), py(4 * a.dram / 1000)); ctx.lineTo(px(r.ridge), py(r.roof)); ctx.stroke();
+      ctx.save(); ctx.translate(px(4.6), py(4.6 * a.dram / 1000) - 10); ctx.rotate(-Math.atan2(py(4 * a.dram / 1000) - py(40 * a.dram / 1000), px(40) - px(4)));
+      TT.text(ctx, "DRAM " + a.dram + " GB/s (spec)", 0, 0, { color: C.blue, font: "12px" }); ctx.restore();
+      if (a.extra) {
+        var e = a.extra, rid2 = r.roof * 1000 / e.bw;
+        ctx.strokeStyle = C.teal; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(px(4), py(4 * e.bw / 1000)); ctx.lineTo(px(rid2), py(r.roof)); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, e.label, px(130), py(130 * e.bw / 1000) + 18, { color: C.teal, font: "11px" });
+      }
+      // ridge marker
+      ctx.strokeStyle = C.yellow; ctx.setLineDash([2, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px(r.ridge), py(r.roof)); ctx.lineTo(px(r.ridge), Y0); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "ridge " + r.ridge.toFixed(0), px(r.ridge) + 4, Y0 - 10, { color: C.yellow, font: "12px" });
+      // decode asymptotes for the chosen weight format
+      var asym = 65536 / FMT[st.fmt];
+      ctx.strokeStyle = C.pink; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(px(asym), Y1 + 30); ctx.lineTo(px(asym), Y0); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "Mb=1 limit " + asym.toFixed(0), px(asym) + 4, Y1 + 36, { color: C.pink, font: "11px" });
+      // the kernel
+      var x = px(Math.min(Math.max(r.I, 4), 30000)), y = py(Math.max(r.att, 1));
+      var memBound = r.memTF < r.roof;
+      ctx.fillStyle = memBound ? C.blue : C.yellow; ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.fill();
+      ctx.strokeStyle = C.fg; ctx.lineWidth = 1.5; ctx.stroke();
+      TT.text(ctx, r.I.toFixed(0) + " FLOP/B → " + r.att.toFixed(1) + " TF", x - 12, y - 16, { color: C.fg, font: "13px", align: "right" });
+      TT.text(ctx, a.name + " · " + a.cores + "-core grid · weights " + st.fmt + " · " + st.fid, X0 + 8, Y1 + 10, { color: C.muted, font: "12px" });
+      var verdict = memBound
+        ? "<b>DRAM-bound.</b> Intensity " + r.I.toFixed(1) + " FLOP/B is below the ridge (" + r.ridge.toFixed(0) + "), so the model caps it at " + r.att.toFixed(1) + " TFLOP/s, " + (r.roof / r.att).toFixed(1) + "× under the " + st.fid + " roof. Lowering fidelity would not help. Fewer bytes per FLOP would: a bigger block, a smaller weight format, or activations already in L1."
+        : "<b>Compute-bound.</b> Intensity " + r.I.toFixed(1) + " FLOP/B is past the ridge (" + r.ridge.toFixed(0) + "). The " + st.fid + " roof of " + r.roof.toFixed(0) + " TFLOP/s is the limit, so " + (st.fid === "LoFi" ? "only more cores raise it (LoFi is already the fewest phases)." : "only a lower fidelity (if accuracy allows) or more cores raise it.");
+      narr.innerHTML = verdict + " <span style='color:var(--muted)'>Effective block " + r.m + "×" + r.n + " tiles. Model only: roofs from the table above; real kernels sit below the line.</span>";
+    }
+    // controls
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    function group(label, opts, key) {
+      var l = document.createElement("label"); l.textContent = label; ctrl.appendChild(l);
+      var bs = opts.map(function (o) {
+        var b = document.createElement("button"); b.textContent = o[1]; b.onclick = function () { st[key] = o[0]; sync(); draw(); };
+        b._v = o[0]; b._k = key; ctrl.appendChild(b); return b;
+      });
+      return bs;
+    }
+    var buttons = [].concat(group("chip", [["wh", "WH n150"], ["bh", "BH p150"]], "arch"),
+      group("fidelity", [["LoFi", "LoFi"], ["HiFi2", "HiFi2"], ["HiFi3", "HiFi3"], ["HiFi4", "HiFi4"]], "fid"),
+      group("weights", [["bf16", "bf16"], ["bfp8", "bfp8"], ["bfp4", "bfp4"]], "fmt"));
+    function sync() { buttons.forEach(function (b) { b.className = st[b._k] === b._v ? "on" : ""; }); mbv.textContent = st.mb; nbv.textContent = st.nb; }
+    var ctrl2 = document.createElement("div"); ctrl2.className = "controls";
+    function slider(label, key) {
+      var l = document.createElement("label"); l.textContent = label;
+      var s = document.createElement("input"); s.type = "range"; s.min = 1; s.max = 16; s.value = st[key];
+      var v = document.createElement("b"); v.style.minWidth = "1.5em";
+      s.oninput = function () { st[key] = +s.value; sync(); draw(); };
+      l.appendChild(s); l.appendChild(v); ctrl2.appendChild(l); return v;
+    }
+    var mbv = slider("block rows Mb", "mb"), nbv = slider("block cols Nb", "nb");
+    function check(label, key) {
+      var l = document.createElement("label"); var c = document.createElement("input"); c.type = "checkbox";
+      c.onchange = function () { st[key] = c.checked; draw(); }; l.appendChild(c); l.appendChild(document.createTextNode(label)); ctrl2.appendChild(l);
+    }
+    check("activations already in L1", "actL1");
+    check("2-D multicast over the grid", "mcast");
+    narr = document.createElement("div"); narr.className = "narration";
+    root.appendChild(ctrl); root.appendChild(ctrl2); root.appendChild(narr);
+    sync(); draw();
+  })();
+  </script>
+
+  <p>Things to try:</p>
+  <ul>
+    <li><b>Start at M<sub>b</sub> = 1</b>, the decode shape. Slide N<sub>b</sub> to 16. The point stops moving to the right well before the ridge: it approaches the pink line at 32 FLOP/B. Now switch the weights to bfp8 and then bfp4. The pink line jumps to 60 and then 114. At N<sub>b</sub> = 16 the attainable TFLOP/s rises 1.79× and 3.09×, because the activation tile still costs bf16 bytes. Tick "activations already in L1" and the ratios become exactly the pink lines' 1.88× and 3.56×. This is why decode weights ship in bfp8 or bfp4 (A22).</li>
+    <li><b>Switch fidelity while DRAM-bound.</b> Nothing happens to the point. A lower fidelity raises a roof the kernel is not touching.</li>
+    <li><b>Make the block 16×16</b> at HiFi4 on Wormhole. Intensity is 256 FLOP/B, just past the ridge at 228. Now choose LoFi. The ridge moves 4× to the right (910), and the same kernel is DRAM-bound again. Faster math makes reuse more important, not less (A15 said the same).</li>
+    <li><b>Turn on multicast.</b> When a whole grid row shares one in0 slab and a grid column shares one in1 slab (A16), the DRAM sees one effective block that is 8× (or 10×/11×) larger on each side. With bf16 weights, this is the only way in the figure that the matmul clears the LoFi ridge (bfp8 or bfp4 weights with activations in L1 also do it).</li>
+  </ul>
+  <div class="callout key">For any op, compute two numbers: its <b>intensity</b> (FLOPs ÷ DRAM bytes, from the loop structure) and the <b>ridge</b> (compute roof ÷ bandwidth, from the table). Below the ridge, only fewer bytes help. Above it, only fewer cycles per FLOP help. If the measured time is far below <i>both</i> roofs, the wall is somewhere else: the NoC, latency, or the host.</div>
+  <div class="callout gpu">Nsight Compute draws the same chart and reports "speed of light" percentages. Two differences matter. On a GPU, "DRAM bytes" depend on what the L2 cache catches, so you measure them rather than predict them. Here there is no cache: the bytes are exactly the reads your kernels issue, which is why the simulator can count them. And the GPU's compute roof is fixed per data type, while here the same bf16 operands give four different roofs, one per fidelity.</div>
+
+  <h2 id="format">Lever 1: data format moves bytes</h2>
+  <p>Block floating point (A05) stores 16 mantissas per shared exponent. Here is what that means in bytes per tile, straight from the function every buffer size goes through:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/tt_backend_api_types.hpp:122-140 @7aad8aac (trimmed)</div>
+<pre><code>constexpr static uint32_t tile_size(const DataFormat&amp; format) {
+    switch (format) {
+        case DataFormat::Bfp2:
+        case DataFormat::Bfp2_b: return (64 * 4) + (16 * 4);
+        case DataFormat::Bfp4:
+        case DataFormat::Bfp4_b: return (128 * 4) + (16 * 4);
+        case DataFormat::Bfp8:
+        case DataFormat::Bfp8_b: return (256 * 4) + (16 * 4);
+        ...
+        case DataFormat::Float16:
+        case DataFormat::Float16_b: return (1024 * 2);
+        case DataFormat::Float32: return (1024 * 4);</code></pre>
+  <p>A bf16 tile is 2,048 bytes. A bfp8 tile is 1,024 bytes of sign-and-mantissa plus 64 bytes of exponents (one byte for each of the 64 rows of 16), so 1,088. A bfp4 tile is 576. When an op is DRAM-bound, its time is proportional to its bytes, so these numbers translate directly into speed: bfp8 weights are 1.88× fewer bytes than bf16 and bfp4 weights 3.56× fewer.</p>
+  <p>That is a prediction. To check it I counted it. I patched a copy of ttsim (<code>sim-labs/patches/a20-counters.patch</code>, described <a href="#sim">below</a>) to add up every NoC command a Tensix core issues, sorted by kind, and to count every Tensix instruction each thread retires. Then I ran one <code>ttnn.matmul</code> of a 128×512 bf16 activation (4×16 tiles) by a 512×512 weight (16×16 tiles), with the weight stored three ways. Everything else stayed the same: default program config, HiFi2, bf16 output.</p>
+  <table>
+    <tr><th>Weight dtype</th><th>DRAM bytes read</th><th>= activation + weight</th><th>DRAM bytes written</th><th>Multicast bytes sent → delivered</th><th>MVMUL</th><th>PCC vs fp32</th></tr>
+    <tr><td>bfloat16</td><td>655,360</td><td>131,072 + 256 × 2,048</td><td>131,072</td><td>655,744 → 2,492,032</td><td>32,768</td><td>0.99993</td></tr>
+    <tr><td>bfloat8_b</td><td>409,600</td><td>131,072 + 256 × 1,088</td><td>131,072</td><td>409,984 → 1,754,752</td><td>32,768</td><td>0.99991</td></tr>
+    <tr><td>bfloat4_b</td><td>278,528</td><td>131,072 + 256 × 576</td><td>131,072</td><td>278,912 → 1,361,536</td><td>32,768</td><td>0.99309</td></tr>
+  </table>
+  <p>The weight bytes are exactly 256 tiles times the tile size, to the byte. Each input tile was read from DRAM exactly once: the default matmul for this shape multicasts tiles between cores rather than having each core fetch its own (A16). The multicast traffic shrinks by the same factor, because the cores pass the tiles around in their packed format. The multiply count does not change at all. Format is a <b>bandwidth lever</b>: it changes bytes and leaves compute alone. The PCC column shows its price. bfp8 is almost free here, while bfp4 costs about 0.007 of correlation on random data.</p>
+
+  <h2 id="fidelity">Lever 2: math fidelity moves the roof</h2>
+  <p>Now hold the format at bf16 and change only <code>math_fidelity</code>:</p>
+  <table>
+    <tr><th>Fidelity</th><th>MVMUL</th><th>T1 (math) instructions</th><th>T0 (unpack)</th><th>T2 (pack)</th><th>DRAM bytes read</th><th>PCC</th><th>ttsim clock (meaningless)</th></tr>
+    <tr><td>LoFi</td><td>16,384</td><td>33,760</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99987</td><td>[5931]</td></tr>
+    <tr><td>HiFi2</td><td>32,768</td><td>51,168</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99993</td><td>[5768]</td></tr>
+    <tr><td>HiFi3</td><td>49,152</td><td>67,552</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99993</td><td>[5693]</td></tr>
+    <tr><td>HiFi4</td><td>65,536</td><td>83,936</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99993</td><td>[5710]</td></tr>
+  </table>
+  <p>The matmul is 4 × 16 × 16 = 1,024 tile products, and each tile product is 16 <code>MVMUL</code>s per fidelity phase (A06). So the prediction is 16,384 × phases, and the counts match exactly. The math thread's total grows by exactly 16,384 per phase, so every extra instruction is an <code>MVMUL</code>. Unpack, pack and DRAM traffic are identical in all four rows. Fidelity is a <b>compute lever</b>: on silicon, the FPU time scales with phases, and nothing else changes.</p>
+  <p>Look at the last column. These are ttsim's bracketed clock counts at exit. LoFi did a quarter of the multiplies and "took" the most clocks. That is the warning from the top of the page in action. The simulator's clock counts how often the host polled it, not how long the hardware would work.</p>
+  <p>Which fidelity do you need? The rule of thumb depends on the operands, because of how the multipliers split the work (A06). in1, the weights, goes to SrcA and the 5-bit side. in0 goes to SrcB and the 7-bit side. <code>tt-perf-report</code> encodes the rule by mantissa width (<code>perf_report.py:1151-1270</code>): HiFi2 is "sufficient for BFP8 multiplication", and "LoFi is sufficient with BFP4 weights". My runs agree. bfp4 weights gave PCC 0.99309 at both LoFi and HiFi2, to five digits, so HiFi2 spent twice the multiplies for nothing. With bfp8 weights, LoFi gave 0.99985 against 0.99991 at HiFi2.</p>
+  <div class="callout warn">The two levers interact through the roofline. A DRAM-bound op gains nothing from lower fidelity. A compute-bound op gains nothing from a smaller format. Changing both "to be safe" can cost accuracy without any speed-up. Find the wall first.</div>
+
+  <h2 id="reuse">Lever 3: block size, multicast and the NoC</h2>
+  <p>A15 showed that DRAM traffic depends on how often each input tile is fetched, and that blocking fetches each tile fewer times. Here is the same effect in TT-NN, with a program config that turns off multicast: <code>MatmulMultiCoreReuseProgramConfig</code>, where each core owns <code>per_core_M</code> rows of output tiles across all N columns. Same matmul, bf16, HiFi2:</p>
+  <table>
+    <tr><th>per_core_M</th><th>Cores</th><th>DRAM bytes read (counted)</th><th>Prediction: cores × (per_core_M·Kt + Kt·Nt) × 2048</th><th>MVMUL</th></tr>
+    <tr><td>4</td><td>1</td><td>655,360</td><td>1 × (64 + 256) × 2048 = 655,360</td><td>32,768</td></tr>
+    <tr><td>2</td><td>2</td><td>1,179,648</td><td>2 × (32 + 256) × 2048 = 1,179,648</td><td>32,768</td></tr>
+    <tr><td>1</td><td>4</td><td>2,228,224</td><td>4 × (16 + 256) × 2048 = 2,228,224</td><td>32,768</td></tr>
+  </table>
+  <p>Every core reads the whole weight, so splitting the rows over more cores multiplies the weight traffic. More cores means less compute per core but more bytes in total. The same compute, 32,768 <code>MVMUL</code>s, costs 3.4× more DRAM traffic on four cores than on one. Multicast removes the duplication: one core reads a tile and broadcasts it to a row or column of cores. Here are the three tt-metal examples from A15 and A16, counted with the same instrumented simulator:</p>
+  <table>
+    <tr><th>Example</th><th>Problem (tiles)</th><th>Cores</th><th>DRAM tiles read</th><th>Minimum (each tile once)</th><th>Multicast bytes delivered</th><th>MVMUL (HiFi4)</th></tr>
+    <tr><td>matmul_multi_core</td><td>20×20×20</td><td>64</td><td>16,000</td><td>800</td><td>0</td><td>512,000</td></tr>
+    <tr><td>matmul_multicore_reuse</td><td>20×20×20</td><td>5</td><td>2,400</td><td>800</td><td>0</td><td>512,000</td></tr>
+    <tr><td>matmul_multicore_reuse_mcast</td><td>64×16×32 (M×K×N)</td><td>16</td><td>1,536</td><td>1,536</td><td>15,729,344</td><td>2,097,152</td></tr>
+  </table>
+  <p>The multicast version reads each of its 1,024 + 512 input tiles exactly once. It does not avoid moving data. It moves the copies off the DRAM and onto the NoC: 15.7 MB delivered into L1s across a 2×8 grid of 32×4-tile blocks. Each in0 tile goes to the 7 other cores in its row, and each in1 tile to the 1 other core in its column: (1,024 × 7 + 512 × 1) × 2,048 = 15,728,640 bytes, plus 704 bytes of semaphore flags.</p>
+  <p>That NoC traffic is the next wall. A Wormhole NoC hop carries 32 GB/s (<code>DRAMTile/README.md:70</code>). One core running the naive A15 loop at HiFi4 would want 64 bytes per cycle, which is twice what a link can bring in. When many transfers share a link, they queue. The DRAM bandwidth report gives a concrete case: with the DRAM readers placed on the top or bottom rows or the left or right columns of the grid, "the DRAM routes for each bank overlap with each other" and the bandwidth target was missed. Moving the readers so that no two routes share a link brought it back to 92% (<code>Saturating_DRAM_bandwidth.md:26,42</code>). The ISA documentation adds a buffering detail. Each router port has 2 KiB of buffer, shared among virtual channels, and large writes into a slower DRAM channel can fill the buffers along the whole path (<code>DRAMTile/README.md:70</code>).</p>
+  <div class="callout sim">The simulator moves every byte but models no contention at all. Two transfers on the same link finish just as they would alone. So it can tell you <i>how many</i> bytes cross the NoC (the multicast column above), but not whether they will collide. To see individual NoC commands with their source and destination coordinates, use <code>b05-noclog.patch</code> in <a href="../sim-labs/b05-noc-and-dram.html">B05</a>. Then count how many routes share a link using dimension-order routing (A08).</div>
+
+  <h2 id="l1">Lever 4: keep it in L1</h2>
+  <p>The fastest DRAM byte is the one you never read. If an op's input is already sharded in the L1 of the cores that consume it, the op reads it at L1 speed and the NoC is idle. The LLM tech report puts it as "The perfect OP runs on the entire core grid using sharded inputs from L1" (<code>llms.md</code>, section 4.6). To check this I counted an element-wise add of two 512×512 bf16 tensors (256 tiles each) both ways. For the sharded case, I ran the setup alone (the two <code>to_memory_config</code> calls that shard the inputs) and subtracted its counts from the full run's.</p>
+  <table>
+    <tr><th>What ran</th><th>DRAM bytes read</th><th>DRAM bytes written</th><th>NoC commands</th><th>ELWADD</th></tr>
+    <tr><td><code>ttnn.add</code>, inputs and output DRAM-interleaved</td><td>1,048,576</td><td>524,288</td><td>768</td><td>2,048</td></tr>
+    <tr><td><code>ttnn.add</code>, inputs and output height-sharded in L1 (16 cores)</td><td>0</td><td>0</td><td>0</td><td>2,048</td></tr>
+    <tr><td>the two reshards into L1 that the sharded add needed first</td><td>1,048,576</td><td>0</td><td>512</td><td>0</td></tr>
+  </table>
+  <p>The sharded add issued <b>zero</b> NoC commands. Each core added its own shard in place, doing exactly the same 2,048 <code>ELWADD</code>s. But the bytes did not vanish. They moved to the reshard. Sharding pays off when a tensor <i>stays</i> sharded across a chain of ops, which is why the LLM report warns about "unnecessary ShardedToInterleaved and InterleavedToSharded calls". In roofline terms, the "activations already in L1" box in the figure removes the activation bytes from the denominator. For a decode matmul that changes little, because the weights dominate. For an element-wise chain it removes the DRAM wall entirely.</p>
+  <p>An element-wise add has an intensity of 1 FLOP per 6 bytes from DRAM (read 2+2, write 2). On Wormhole that caps it at 288 GB/s ÷ 6 = 48 GFLOP/s, the A01 puzzle. In L1, the remaining walls are the unpackers and the FPU's <code>ELWADD</code> rate of 0.128 to 0.256 TFLOP/s per core (<code>MatrixUnit.md:60-71</code>).</p>
+
+  <h2 id="overlap">Lever 5: overlap with double buffering</h2>
+  <p>Every kernel in this series is three programs: a reader, a compute kernel, and a writer, joined by circular buffers (A11, A12). They run on different RISC-V cores, so they <i>can</i> run at the same time, but only if the buffers let them. The single-core matmul example says why its buffers hold two tiles:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/matmul_single_core.cpp:98-108 @7aad8aac (trimmed)</div>
+<pre><code>// Create circular buffers for the input and output data.
+// Using 2 tiles per circular buffer to allow for double buffering (data movement can be reading from one tile while
+// the compute kernel is using the other tile). ...
+tt::DataFormat cb_data_format = tt::DataFormat::Float16_b;
+...
+uint32_t num_input_tiles = 2;
+CircularBufferConfig cb_src0_config =
+    CircularBufferConfig(num_input_tiles * single_tile_size, {{src0_cb_index, cb_data_format}})</code></pre>
+  <p>Why does a second slot matter? With one slot, the reader cannot <code>cb_reserve_back</code> the next tile until compute has done <code>cb_pop_front</code> on the current one, and compute pops only after it has finished with it. So reading and computing take turns. With two slots, the reader fills the second slot while compute works on the first. Step through the model below. Each stage takes a fixed time per tile, and the rules are exactly the CB rules: a stage waits for its input to be pushed and for a free output slot.</p>
+
+  <div class="viz" id="fig-overlap"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-overlap");
+    var g = TT.canvas(root, 880, 300), ctx = g.ctx, C = TT.C;
+    var N = 8;
+    var P = { R: 2, Cc: 3, W: 1, D: 1 };
+    var presets = [
+      { R: 2, Cc: 3, W: 1, D: 1 }, { R: 2, Cc: 3, W: 1, D: 2 }, { R: 4, Cc: 3, W: 1, D: 2 }, { R: 4, Cc: 3, W: 1, D: 4 }, null
+    ];
+    function sim(p) {
+      var er = [], ec = [], ew = [], sr = [], sc = [], sw = [];
+      for (var i = 0; i < N; i++) {
+        sr[i] = Math.max(i ? er[i - 1] : 0, i >= p.D ? ec[i - p.D] : 0);  // free input slot: compute popped tile i-D
+        er[i] = sr[i] + p.R;
+        sc[i] = Math.max(er[i], i ? ec[i - 1] : 0, i >= p.D ? ew[i - p.D] : 0); // free output slot: writer popped tile i-D
+        ec[i] = sc[i] + p.Cc;
+        sw[i] = Math.max(ec[i], i ? ew[i - 1] : 0);
+        ew[i] = sw[i] + p.W;
+      }
+      return { sr: sr, er: er, sc: sc, ec: ec, sw: sw, ew: ew, T: ew[N - 1] };
+    }
+    var lanes = [["reader (NCRISC)", C.blue, "sr", "er"], ["compute (TRISCs)", C.yellow, "sc", "ec"], ["writer (BRISC)", C.green, "sw", "ew"]];
+    var X0 = 150, X1 = 860;
+    var lastI = -1, sliders = {};
+    function draw(i, t) {
+      if (i !== lastI) { if (presets[i]) { P = Object.assign({}, presets[i]); syncSliders(); } lastI = i; }
+      var s = sim(P), seq = sim({ R: P.R, Cc: P.Cc, W: P.W, D: 1 }), dbl = sim({ R: P.R, Cc: P.Cc, W: P.W, D: 2 });
+      var TMAX = Math.max(60, Math.ceil(seq.T / 5) * 5), scale = (X1 - X0) / TMAX, now = t * s.T;
+      TT.clear(ctx, g.W, g.H);
+      for (var k = 0; k <= TMAX; k += 5) { var x = X0 + k * scale; ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, 30); ctx.lineTo(x, 210); ctx.stroke(); TT.text(ctx, String(k), x, 222, { color: C.muted, align: "center", font: "11px" }); }
+      TT.text(ctx, "time units (model)", X1, 238, { color: C.muted, align: "right", font: "11px" });
+      lanes.forEach(function (ln, j) {
+        var y = 40 + j * 58;
+        TT.text(ctx, ln[0], 10, y + 20, { color: ln[1], font: "13px" });
+        for (var q = 0; q < N; q++) {
+          var a = s[ln[2]][q], b = s[ln[3]][q];
+          if (a >= now) continue;
+          var bb = Math.min(b, now);
+          TT.box(ctx, X0 + a * scale, y, Math.max(1, (bb - a) * scale), 40, { fill: ln[1], alpha: 0.75, r: 3 });
+          if ((bb - a) * scale > 14) TT.text(ctx, String(q), X0 + (a + bb) / 2 * scale, y + 20, { color: "#000", align: "center", font: "12px" });
+        }
+      });
+      ctx.strokeStyle = C.red; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X0 + now * scale, 30); ctx.lineTo(X0 + now * scale, 212); ctx.stroke();
+      var busy = N * P.Cc, util = busy / s.T * 100;
+      TT.text(ctx, "CB depth " + P.D + " · read " + P.R + ", compute " + P.Cc + ", write " + P.W + " per tile · " + N + " tiles", 10, 262, { color: C.fg, font: "13px" });
+      TT.text(ctx, "total " + s.T + "   (depth 1: " + seq.T + ", depth 2: " + dbl.T + ", lower bound N·max + fill: " + (N * Math.max(P.R, P.Cc, P.W) + P.R + P.Cc + P.W - Math.max(P.R, P.Cc, P.W)) + ")   compute busy " + util.toFixed(0) + "%", 10, 284, { color: C.muted, font: "13px" });
+    }
+    var steps = [
+      { dur: 3, text: "<b>Single buffer (depth 1).</b> The reader cannot reserve tile 1's slot until compute pops tile 0, and compute pops only when it is done. Reading and computing take turns, so each tile costs read + compute = 5 units. Compute is busy only 3/5 of the time." },
+      { dur: 3, text: "<b>Double buffer (depth 2).</b> Same per-tile times. The reader fills the second slot while compute works on the first, so after the first tile, compute never waits. The total falls to about N × compute plus the time to fill the pipeline. This op is now compute-bound." },
+      { dur: 3, text: "<b>Read-bound.</b> Make reading slower than compute (4 vs 3). Even double-buffered, compute now waits for the reader every tile, and the total is set by N × read. Double buffering hides the faster stage behind the slower one. It cannot make the slower one faster." },
+      { dur: 3, text: "<b>Deeper buffers do not fix a steady bottleneck.</b> Depth 4 with the same read-bound times gives the same total as depth 2. Extra slots only absorb jitter (a DRAM read that is sometimes slow). For a steady rate mismatch, you must fix the slow stage: fewer bytes, more cores, or better placement." },
+      { dur: 3, text: "<b>Your turn.</b> Use the sliders to set the per-tile times and the depth. Find a setting where depth 2 still leaves compute idle." }
+    ];
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    function mk(label, key, min, max) {
+      var l = document.createElement("label"); l.textContent = label;
+      var s = document.createElement("input"); s.type = "range"; s.min = min; s.max = max; s.value = P[key];
+      var v = document.createElement("b"); v.style.minWidth = "1.2em";
+      s.oninput = function () { P[key] = +s.value; v.textContent = s.value; api.render(); };
+      l.appendChild(s); l.appendChild(v); ctrl.appendChild(l); sliders[key] = [s, v];
+    }
+    function syncSliders() { Object.keys(sliders).forEach(function (k) { sliders[k][0].value = P[k]; sliders[k][1].textContent = P[k]; }); }
+    mk("read", "R", 1, 6); mk("compute", "Cc", 1, 6); mk("write", "W", 1, 6); mk("CB depth", "D", 1, 4);
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    root.appendChild(ctrl);
+    syncSliders();
+  })();
+  </script>
+
+  <p>This is why a well-written reader issues a whole slab of reads before a single barrier (A15's blocked reader). It is also why the example's comment asks for two tiles per CB, and why the LLM report recommends <code>in0_block_w</code> of at least two. Overlap turns <i>sum of stages</i> into <i>max of stages</i>. The roofline assumes perfect overlap. A kernel with single-buffered CBs can sit far below both roofs, and the profiler would show it as the compute kernel waiting in <code>cb_wait_front</code>. The ops CSV even has columns for this: <code>DEVICE COMPUTE CB WAIT FRONT [ns]</code> and <code>DEVICE COMPUTE CB RESERVE BACK [ns]</code> (<code>process_ops_logs.py:96-97</code>).</p>
+  <div class="callout warn">Analogy: an assembly line with a tray between each pair of stations. One tray: each worker waits for the next one to empty it. Two trays: each worker can start the next item at once. The analogy is accurate about the rule. Where it breaks is that real stage times are not constant. A DRAM read's latency depends on the bank, the route and other traffic, so extra depth is insurance against jitter as well as a way to overlap. Like the figure, the simulator cannot show you that jitter.</div>
+
+  <h2 id="dispatch">Lever 6: dispatch overhead and trace</h2>
+  <p>So far every wall was inside an op. The last wall is between ops. A17 took fast dispatch apart: per launch, the host builds command bytes, writes them into its issue queue and rings a 4-byte doorbell, and the prefetcher and dispatcher cores do the rest. That is cheap for the device, but the host still has to <i>think</i> for each op: look up the cached program, fill in runtime args, and serialise the commands. If an op runs for less time than the host needs to prepare the next one, the device waits. The tech report shows exactly such a profile, where "the device is stuck stalling waiting for the host" (<code>AdvancedPerformanceOptimizationsForModels.md:41</code>). The LLM report shows a layer that spent more time "in between OPs (756us)" than "running OPs on device (362us)" (<code>llms.md:1813</code>).</p>
+  <p>Trace (A17) records the command bytes once and replays them from DRAM with a single command, so the host's per-op work leaves the critical path. It does not remove the dispatcher's own gap between ops: "Typically tracing reduces the OP-to-OP gap below 6us" (<code>llms.md:1826</code>). The model below has exactly these two terms: <i>h</i>, host preparation per op, and <i>g</i>, the minimum device gap. Both are parameters you set. It is a labelled model, not a measurement.</p>
+
+  <div class="viz" id="fig-trace"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-trace");
+    var g = TT.canvas(root, 880, 290), ctx = g.ctx, C = TT.C;
+    var N = 8;
+    var P = { k: 40, h: 20, gap: 3, trace: false };
+    var presets = [
+      { k: 40, h: 20, gap: 3, trace: false }, { k: 8, h: 30, gap: 3, trace: false }, { k: 8, h: 30, gap: 3, trace: true }, { k: 2, h: 30, gap: 3, trace: true }, null
+    ];
+    function sim(p) {
+      var hs = [], he = [], ds = [], de = [];
+      for (var i = 0; i < N; i++) {
+        if (p.trace) { hs[i] = 0; he[i] = i === 0 ? p.h : 0; }       // one execute_trace call replaces N host preparations
+        else { hs[i] = i ? he[i - 1] : 0; he[i] = hs[i] + p.h; }     // host prepares op i, sequentially and asynchronously
+        var ready = p.trace ? p.h : he[i];
+        ds[i] = Math.max(ready, i ? de[i - 1] + p.gap : 0);
+        de[i] = ds[i] + p.k;
+      }
+      return { hs: hs, he: he, ds: ds, de: de, T: de[N - 1] };
+    }
+    var X0 = 120, X1 = 860, lastI = -1, sliders = {};
+    function draw(i, t) {
+      if (i !== lastI) { if (presets[i]) { P = Object.assign({}, presets[i]); sync(); } lastI = i; }
+      var s = sim(P), other = sim(Object.assign({}, P, { trace: !P.trace }));
+      var TMAX = Math.max(s.T, other.T, 60), scale = (X1 - X0) / TMAX, now = t * s.T;
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "host", 10, 62, { color: C.purple, font: "13px" });
+      TT.text(ctx, "device", 10, 142, { color: C.yellow, font: "13px" });
+      ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(X0, 180); ctx.lineTo(X1, 180); ctx.stroke();
+      for (var q = 0; q < N; q++) {
+        if (!P.trace || q === 0) {
+          var a = s.hs[q], b = s.he[q];
+          if (a < now) TT.box(ctx, X0 + a * scale, 42, Math.max(1, (Math.min(b, now) - a) * scale), 40, { fill: C.purple, alpha: 0.7, r: 3, label: (Math.min(b, now) - a) * scale > 40 ? (P.trace ? "execute_trace" : "prep " + q) : "", color: "#000", font: "11px" });
+        }
+        var c = s.ds[q], d = s.de[q];
+        var prevEnd = q ? s.de[q - 1] : null;
+        if (prevEnd !== null && c > prevEnd && prevEnd < now) {
+          ctx.globalAlpha = 0.35; ctx.fillStyle = C.red; ctx.fillRect(X0 + prevEnd * scale, 122, (Math.min(c, now) - prevEnd) * scale, 40); ctx.globalAlpha = 1;
+        }
+        if (c < now) TT.box(ctx, X0 + c * scale, 122, Math.max(1, (Math.min(d, now) - c) * scale), 40, { fill: C.yellow, alpha: 0.85, r: 3, label: (Math.min(d, now) - c) * scale > 16 ? String(q) : "", color: "#000", font: "12px" });
+      }
+      var span = s.T - s.ds[0], idle = span - N * P.k;   // gaps between the first start and the last end
+      TT.text(ctx, (P.trace ? "TRACE" : "no trace") + " · kernel k=" + P.k + " µs · host prep h=" + P.h + " µs/op · min gap g=" + P.gap + " µs · " + N + " ops", 10, 205, { color: C.fg, font: "13px" });
+      TT.text(ctx, "total " + s.T + " µs · gaps between ops (red) " + idle + " µs = " + (idle / span * 100).toFixed(0) + "% of the device span · the other mode: " + other.T + " µs", 10, 230, { color: C.muted, font: "13px" });
+      TT.text(ctx, "Model only: h, g and the execute_trace call (drawn as one h) are inputs, not measurements. Anchors: < 6 µs gaps with trace (llms.md:1826).", 10, 262, { color: C.muted, font: "11px" });
+    }
+    var steps = [
+      { dur: 3, text: "<b>Device-bound, no trace.</b> Each kernel (40 µs) takes longer than the host needs to prepare the next op (20 µs). The host runs ahead, the queue stays full, and the device's gaps are just the dispatcher minimum <i>g</i>. Trace would save almost nothing here." },
+      { dur: 3, text: "<b>Host-bound, no trace.</b> Now the kernels are short (8 µs) and the host needs 30 µs per op. The device finishes each op and waits for the next one (red). Most of the wall-clock time is host time. This is the 756 µs-gap versus 362 µs-device profile from the LLM report." },
+      { dur: 3, text: "<b>Same ops, with trace.</b> The host issues one <code>execute_trace</code>. The prefetcher replays the recorded commands from DRAM, so ops follow each other after the minimum gap <i>g</i>. The host's per-op cost is gone from the critical path." },
+      { dur: 3, text: "<b>Tiny ops, even with trace.</b> At 2 µs per kernel, a 3 µs gap is still more than half of the timeline. Trace cannot help further here. Fewer, bigger ops can: fuse them (next section), or give each op more work." },
+      { dur: 3, text: "<b>Your turn.</b> Set <i>k</i>, <i>h</i> and <i>g</i>, and toggle trace. The rule: trace pays when h &gt; k, and fusion pays when g is comparable to k." }
+    ];
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    function mk(label, key, min, max) {
+      var l = document.createElement("label"); l.textContent = label;
+      var s = document.createElement("input"); s.type = "range"; s.min = min; s.max = max; s.value = P[key];
+      var v = document.createElement("b"); v.style.minWidth = "1.6em";
+      s.oninput = function () { P[key] = +s.value; v.textContent = s.value; api.render(); };
+      l.appendChild(s); l.appendChild(v); ctrl.appendChild(l); sliders[key] = [s, v];
+    }
+    mk("kernel k µs", "k", 1, 60); mk("host h µs", "h", 1, 60); mk("gap g µs", "gap", 1, 10);
+    var tb = document.createElement("button"); tb.textContent = "trace"; tb.onclick = function () { P.trace = !P.trace; sync(); api.render(); }; ctrl.appendChild(tb);
+    function sync() { Object.keys(sliders).forEach(function (k) { sliders[k][0].value = P[k]; sliders[k][1].textContent = P[k]; }); tb.className = P.trace ? "on" : ""; }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    root.appendChild(ctrl);
+    sync();
+  })();
+  </script>
+
+  <p>How do you know which regime you are in? <code>tt-perf-report</code> prints the op-to-op gap for every op and adds advice when the gap exceeds 6.5 µs. On the CLIP fixture it printed "Running with tracing could save 16625648 μs (99.6% of overall time)". That figure is misleading: the whole capture includes a first pass in which about 20 ops each waited 0.3 to 1.3 s (mostly 0.7 to 1 s), which looks like one-time kernel compilation rather than dispatch. Restricted to the last layer with <code>--id-range 1840-1873</code>, the gaps are 1 to 2 µs except for two ops, and the claimed saving drops to 500 µs. <b>Always cut the warm-up out of the window</b>, with signposts or <code>--id-range</code>. The LLM report says the same: "Skip the first compilation iteration".</p>
+  <div class="callout gpu">This is the CUDA Graphs story (A17). A stream of small kernels on a GPU is host-launch-bound in the same way, and graph capture is the same fix. The difference is that the replay here is executed by two ordinary Tensix cores running prefetcher and dispatcher firmware, so you can read the code that does it.</div>
+
+  <h2 id="fusion">Lever 7: fusion, and a trap</h2>
+  <p>Fusion attacks two walls at once. It removes an op launch (the gap above), and it removes a DRAM round trip for the intermediate tensor. The classic case is an activation after a matmul. The matmul's packer can apply ReLU as it writes the output tile, so the result goes to DRAM already activated. The kernel source shows where: under <code>PACK_RELU</code>, <code>pack_relu_config(ReluConfig::zero())</code> is enabled for the final output pack only (<code>bmm_large_block_zm_fused_bias_activation.cpp:333-336</code>).</p>
+  <p>I wrote the obvious TT-NN code, <code>ttnn.linear(x, w, activation="relu")</code>, and counted it. It was not fused. The counts were identical to an explicit <code>ttnn.relu(ttnn.matmul(x, w))</code>. The reason is in the op's host code:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/matmul/matmul.cpp:323-330 @7aad8aac</div>
+<pre><code>// With a user core grid the activation is fused into the kernel, which would apply it before a
+// post-processed bias. In that case keep it out of the kernel and apply it after the bias instead.
+std::optional&lt;UnaryWithParam&gt; trailing_activation;
+if (parameters.user_fused_activation.has_value() &amp;&amp;
+    (!parameters.user_core_coord.has_value() || post_process_bias)) {
+    trailing_activation = parameters.user_fused_activation;
+    parameters.user_fused_activation = std::nullopt;
+}</code></pre>
+  <p>Without a user <code>core_grid</code> (or a program config with <code>fused_activation</code>), the activation becomes a <i>trailing</i> op: a separate <code>unary_chain</code> launched after the matmul (lines 390-393). Pass <code>core_grid=ttnn.CoreGrid(y=4, x=8)</code> and it is fused. The counts, with bfp8 weights at HiFi2:</p>
+  <table>
+    <tr><th>Code</th><th>Ops launched</th><th>DRAM bytes read</th><th>DRAM bytes written</th><th>T2 (pack) instructions</th><th>SFPU instructions</th></tr>
+    <tr><td><code>linear(x, w, activation="relu")</code> (no core_grid)</td><td>2</td><td>540,672</td><td>262,144</td><td>11,456</td><td>9,048</td></tr>
+    <tr><td><code>relu(matmul(x, w))</code></td><td>2</td><td>540,672</td><td>262,144</td><td>11,456</td><td>9,048</td></tr>
+    <tr><td><code>linear(x, w, activation="relu", core_grid=4×8)</code></td><td>1</td><td>409,600</td><td>131,072</td><td>4,672</td><td>216</td></tr>
+    <tr><td><code>linear(x, w, core_grid=4×8)</code>, no activation</td><td>1</td><td>409,600</td><td>131,072</td><td>4,480</td><td>216</td></tr>
+  </table>
+  <p>The unfused version writes the 64-tile intermediate (131,072 bytes), reads it back, and writes the result again: one extra round trip plus a second launch. The fused version costs 192 extra pack-thread instructions over no activation at all, and zero extra bytes. (The 216 SFPU instructions appear in every run, including setup-only runs, so they are initialisation, not ReLU.) All four results had the same PCC, 0.99986 or 0.99991 without ReLU. The lesson goes beyond ReLU: <b>check that a fusion you asked for actually happened</b>. In a profile, an unfused activation shows up as an extra <code>UnaryDeviceOperation</code> row after the matmul. In the simulator it shows up as doubled DRAM writes.</p>
+
+  <h2 id="tools">Measuring on silicon: profiler, Tracy, ops CSV, tt-perf-report</h2>
+  <p>Everything so far is either a model or a count. To learn where the 61 µs went, you need timestamps from silicon. tt-metal has three tools, and they stack.</p>
+  <h3>1. The device profiler: timestamps from every RISC-V</h3>
+  <p>Set <code>TT_METAL_DEVICE_PROFILER=1</code> at run time (profiling support is compiled in by default; <code>build_metal.sh --disable-profiler</code> removes it). The firmware and kernels then record zones. A zone is a pair of 64-bit timestamps written into a small L1 buffer per RISC, which the host collects when the device closes or when you call <code>ReadMeshDeviceProfilerResults</code>. You add your own zones with one macro:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/debug/kernel_profiler.hpp:996-999 and 252-257 @7aad8aac</div>
+<pre><code>#define DeviceZoneScopedN(name)                                                \
+    DO_PRAGMA(message(PROFILER_MSG_NAME(name)));                               \
+    auto constexpr hash = kernel_profiler::Hash16_CT(PROFILER_MSG_NAME(name)); \
+    kernel_profiler::profileScope&lt;hash&gt; zone = kernel_profiler::profileScope&lt;hash&gt;();
+...
+    volatile tt_reg_ptr uint32_t* p_reg = reinterpret_cast&lt;volatile tt_reg_ptr uint32_t*&gt;(RISCV_DEBUG_REG_WALL_CLOCK_L);
+    profiler_data_buffer[myRiscID].data[index] =
+        PROFILER_MARKER_VALID | ((timer_id &amp; PROFILER_MARKER_TIMER_ID_MASK) &lt;&lt; PROFILER_MARKER_TIMER_ID_SHIFT) |
+        (p_reg[WALL_CLOCK_HIGH_INDEX] &amp; PROFILER_MARKER_TS_HIGH_MASK);
+    profiler_data_buffer[myRiscID].data[index + 1] = p_reg[WALL_CLOCK_LOW_INDEX];</code></pre>
+  <p>Read it line by line. The <code>#pragma message</code> prints the zone's name, file and line at <i>compile</i> time. The host profiler collects these messages into <code>zone_src_locations.log</code> and uses them to turn a 16-bit hash back into a name. The macro then builds a RAII object: its constructor stamps a start marker and its destructor an end marker. Each marker is the zone's hash plus the core's free-running wall-clock register, read directly from a debug register. That makes a zone cost only a few instructions, which is why the docs still warn against putting zones in tight loops. Each core's buffer has room for only 125 scopes. RISCs on one core share a clock. Different cores are "closely synced but may have minor skews", and different chips are not synced at all (<a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_program_profiler.html">device profiler docs</a>, Limitations). The output is <code>profile_log_device.csv</code>, one row per marker: core x/y, RISC, timer id, cycle count, zone name and source line. The firmware adds default zones such as <code>BRISC-FW</code> and <code>BRISC-KERNEL</code>, so every kernel is timed even if you add nothing.</p>
+  <div class="callout warn">Device profiling, DPRINT and Watcher all reserve L1 for their buffers, and the docs say not to enable them together. A kernel that only works with DPRINT on is a kernel you cannot profile as is.</div>
+  <h3>2. Tracy: the host side, and the glue</h3>
+  <p>Tracy is an open-source frame profiler, and tt-metal links a fork of it (v0.10) into <code>tt_metal.so</code> (<a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/MetalProfiler/metal-profiler.md">Metal Profiler tech report</a>). Host code is instrumented with Tracy zones, and device zones are pushed into the same Tracy timeline, so you can see the host preparing op <i>n</i>+1 while the device runs op <i>n</i>. That is exactly the picture in the trace figure above, but measured. For Python, the wrapper is <code>python -m tracy</code>, where <code>-r</code> generates the ops report, <code>-p</code> profiles only enabled zones and <code>-v</code> is verbose (<code>tools/tracy/__main__.py:20-23</code>). In a test you add <code>tracy.signpost("Performance pass")</code> to mark the region you care about.</p>
+  <h3>3. The ops CSV: one row per op</h3>
+  <p><code>python -m tracy -r</code> post-processes the device log and the host log into <code>ops_perf_results_&lt;date&gt;.csv</code> (<code>process_ops_logs.py:55</code>), with one row per op. These are the columns that answer "which wall":</p>
+  <div class="filename">tt-metal/tools/tracy/process_ops_logs.py:64-97 @7aad8aac (selected)</div>
+<pre><code>"OP CODE", "MATH FIDELITY", "CORE COUNT", "AVAILABLE WORKER CORE COUNT",
+"HOST START TS", "HOST END TS", "HOST DURATION [ns]",
+"DEVICE FW START CYCLE", "DEVICE FW END CYCLE",
+"OP TO OP LATENCY [ns]",
+"DEVICE FW DURATION [ns]", "DEVICE KERNEL DURATION [ns]",
+"DEVICE KERNEL DURATION PER CORE MIN [ns]", "DEVICE KERNEL DURATION PER CORE MAX [ns]",
+"DEVICE BRISC KERNEL DURATION [ns]", "DEVICE NCRISC KERNEL DURATION [ns]",
+"DEVICE TRISC0 KERNEL DURATION [ns]", "DEVICE TRISC1 KERNEL DURATION [ns]", "DEVICE TRISC2 KERNEL DURATION [ns]",
+"DEVICE COMPUTE CB WAIT FRONT [ns]", "DEVICE COMPUTE CB RESERVE BACK [ns]",</code></pre>
+  <p>Each column maps to a wall. Kernel duration minus the ideal compute time shows how far the op is from the compute roof. <code>OP TO OP LATENCY</code> is the dispatch wall. A large spread between <code>PER CORE MIN</code> and <code>MAX</code> means load imbalance, like the 7-versus-6 tile split of A15. A long <code>CB WAIT FRONT</code> means compute was starved by the reader: the overlap figure above, measured. The CSV also carries the tensor shapes, dtypes and memory configs as <code>INPUTS</code>/<code>OUTPUTS</code>. That is everything needed to compute FLOPs and bytes, and it is exactly what the next tool does.</p>
+  <h3>4. tt-perf-report: the roofline, per op</h3>
+  <p><code>tt-perf-report</code> moved out of tt-metal into its own repository (<code>models/perf/README.md</code>). It is a few thousand lines of pandas, and its core is a roofline computed per op. For matmuls it computes FLOPs = 2·M·K·N and bytes = (inputs in DRAM + output in DRAM) × element size, divides each by the device kernel duration, and compares them with the peaks it registers per architecture:</p>
+  <div class="filename">tt-perf-report/src/tt_perf_report/perf_report.py:467-494 @e3121ae (trimmed)</div>
+<pre><code># Blackhole-family peaks use phase divisors (HiFi4=/4, HiFi3=/3, HiFi2=/2, LoFi=/1).
+# Wormhole uses published chip peaks; HiFi3 is derived as HiFi4 × 4/3 (LoFi is empirical).
+_wormhole_tflops_hifi4 = 74 / 72
+ArchitectureSpec(
+    name="wormhole",
+    worker_cores=64,  # N150 and N300 with ETH dispatch
+    dram_bandwidth_gb_s=288,
+    tflops_hifi4=_wormhole_tflops_hifi4,
+    tflops_hifi2=148 / 72,
+    tflops_lofi=262 / 72,
+...
+    name="blackhole",
+    worker_cores=110,  # P150 with dispatch cores reserved
+    dram_bandwidth_gb_s=512,
+    tflops_hifi4=4096 * 1.35 / 1000 / 4,</code></pre>
+  <p>The FLOPs peak is per core and multiplied by the number of cores the op actually used, so an op on 8 cores is judged against an 8-core roof. The <code>Bound</code> column is just two thresholds:</p>
+  <div class="filename">tt-perf-report/src/tt_perf_report/perf_report.py:2099-2111 @e3121ae (trimmed)</div>
+<pre><code>if dram_percentage &gt;= 65 and flops_percentage &gt;= 65:
+    op_data["Bound"] = Cell("BOTH")
+elif dram_percentage &gt;= 65:
+    op_data["Bound"] = Cell("DRAM")
+elif flops_percentage &gt;= 65:
+    op_data["Bound"] = Cell("FLOP")
+else:
+    op_data["Bound"] = Cell("SLOW")</code></pre>
+  <p>Now the opening line makes sense. 57 GB/s is 19.6% of 288, and 1.7 TFLOP/s is 2.6% of 64 × 74/72. Neither is near 65%, so the tool says <b>SLOW</b>: the op hit neither roof. The tool's advice for that row was "If possible place input 0 in L1 (currently in DEV_0_DRAM_INTERLEAVED)" and "No program_config specified, try using one to override in0_block_w and out_subblock_h/w". From this chapter you can add more. An M = 32 matmul has intensity of about 30 FLOP/B, so its roof is DRAM, and the gap between 57 GB/s and roughly 190 to 240 GB/s is the thing to close. That points to Lever 3 (how each core's weight reads are placed, and the DRAM-sharded matmul of A09) and Lever 4, not to fidelity. Note what <code>SLOW</code> does <i>not</i> tell you: whether the cause is NoC congestion, read latency without enough reads in flight, or imbalance. For that you go back to the CSV columns and the device zones.</p>
+  <p>Here is a steady-state slice of the same fixture, run by me with the published tool (<code>pip install -e</code> of commit e3121ae, <code>--id-range 1840-1873 --no-color</code>, trimmed):</p>
+<pre><code>ID     Total %  Bound  OP Code                           Device Time  Op-to-Op Gap  Cores  DRAM      DRAM %  FLOPs       FLOPs %
+ 1840    9.8 %   SLOW  MinimalMatmulOp 32 x 5120 x 1280       177 μs                   64   77 GB/s  26.6 %  2.4 TFLOPs    3.6 %
+ 1842    3.1 %         LayerNormDeviceOperation                54 μs          2 μs      1
+ 1854    1.9 %   SLOW  Matmul b={20} x 32 x 64 x 32            33 μs          1 μs      1    6 GB/s   2.2 %  0.1 TFLOPs    7.8 %
+ 1863   10.4 %   SLOW  MinimalMatmulOp 32 x 1280 x 5120       187 μs          1 μs     64   72 GB/s  25.1 %  2.2 TFLOPs    3.4 %
+ 1872   28.5 %         TransposeDeviceOperation                32 μs        485 μs     64
+ 1873    2.9 %   SLOW  Matmul 32 x 1280 x 1280                 26 μs         27 μs     40  133 GB/s  46.1 %  4.0 TFLOPs    9.8 %
+...
+These ops have a &gt;6 μs gap since the previous operation. Running with tracing could save 500 μs (27.6% of overall time)</code></pre>
+  <p>Read it like a performance engineer. The LayerNorm runs on <b>1 core</b> (the tool colours core counts red when they are under 10 and under half the budget). The batched attention matmul uses one or two cores and reaches 2% of DRAM. Those are grid problems before they are anything else. The 485 µs gap before op 1872 is one host stall, and it costs more than the slice's two largest matmuls together (177 + 187 µs). Op 1873, the same 32×1280×1280 shape but run as a plain <code>Matmul</code> on 40 cores, reaches 133 GB/s against the <code>MinimalMatmulOp</code>'s 57. The kernel, not the shape, is the difference.</p>
+  <div class="callout key">Measure in this order. (1) Op-to-op gaps: if they dominate, fix the host side (trace, fewer ops) before touching any kernel. (2) Core counts: an op on one core cannot be fixed by format or fidelity. (3) The roofline columns: SLOW means look at the per-core and CB-wait columns, DRAM means fewer bytes, FLOP means fewer cycles.</div>
+
+  <h2 id="sim">What the simulator can and cannot tell you</h2>
+  <h3>The profiler under ttsim: what actually happens</h3>
+  <p>The research notes recorded that the device profiler produces "a CSV with only the header" on ttsim, cause unknown. I tried it again in two ways (Wormhole, slow dispatch, <code>LAB_HOME=$HOME/ttlab/a20</code>):</p>
+<pre><code>$ TT_METAL_DEVICE_PROFILER=1 $EX/metal_example_add_2_integers_in_riscv
+Success: Result is 21
+[4892] ...                       (ttsim's exit line; its wall-time and rate fields are trimmed: they are not speeds)
+$ cat $LAB_HOME/profiler/.logs/profile_log_device.csv
+ARCH: wormhole_b0, CHIP_FREQ[MHz]: 0, Max Compute Cores: 72
+PCIe slot, core_x, core_y, RISC processor type, timer_id, time[cycles since reset], data, run host ID, trace id, trace id counter, zone name, type, source line, source file, meta data
+
+$ TT_METAL_DEVICE_PROFILER=1 $EX/profiler/test_full_buffer
+...
+[39955] ERROR: UnsupportedFunctionality: noc_cmd_ctrl: write: noc_at_len_be=0</code></pre>
+  <p>The first run compiled the firmware with profiling: the zone names appear in <code>zone_src_locations.log</code>, and ttsim's clock at exit read 4,892 instead of 4,501 (more host polls, not a measure of cost). The program passed, but the CSV has no rows, and <code>CHIP_FREQ[MHz]: 0</code> suggests that the host could not read an AI clock from the simulated chip. The profiler's own example, which fills the buffer with zones, stopped inside the simulator. Something issued a zero-length NoC write, which ttsim does not implement. The kernel itself only runs <code>nop</code> loops inside zones, so the profiler's own buffer-flushing code is the likely source. I did not chase the root cause further, because this is not a gap worth working around. Look at what a timestamp would be, even if the plumbing worked:</p>
+  <div class="filename">ttsim/src/tile.cpp:1034-1036 @b3620244</div>
+<pre><code>case RISCV_DEBUG_REGS_WALL_CLOCK_0: return uint32_t(g_clock);
+case RISCV_DEBUG_REGS_WALL_CLOCK_1: return uint32_t(g_clock &gt;&gt; 32); // high part, unlatched
+case RISCV_DEBUG_REGS_WALL_CLOCK_1_AT: return uint32_t(g_clock &gt;&gt; 32); // XXX add the latching behavior on this reg</code></pre>
+  <p>The wall-clock register the profiler reads <i>is</i> ttsim's global clock, the one the host advances by polling. A zone's duration would measure how often the host polled while that zone ran. (The profiler is not switched off for the simulator on purpose: <code>getDeviceProfilerState</code> returns false only for mock and emulated clusters, <code>profiler.cpp:3046-3053</code>, and ttsim is <code>TargetDevice::Simulator</code>.)</p>
+  <h3>What it counts exactly: the a20 counters</h3>
+  <p>What ttsim does have is every NoC command, executed one at a time with its real length, and every Tensix instruction, issued after MOP and replay expansion (A13). So I added counters in three places. In <code>noc_cmd_ctrl</code>, each command a Tensix tile issues is classified as a DRAM read, DRAM write, L1-to-L1 read or write, multicast (counted both as sent and per receiver), atomic, or inline write, and its bytes are added. In <code>tensix_decode_and_execute</code>, each retired instruction is counted per thread and per opcode. At <code>ttsim_exit</code> the totals are printed. The read branch, for example:</p>
+  <div class="filename">ttsim/src/tile.cpp, noc_cmd_ctrl read branch @b3620244 + sim-labs/patches/a20-counters.patch</div>
+<pre><code>        if (tile_type == 'T') a20_add(src_tile_type == 'D' ? a20_dram_rd : src_tile_type == 'T' ? a20_l1_rd : a20_other_rd, noc_at_len_be);
+        tile_rd_bytes(src_coordinate, src_addr, &amp;p_tile-&gt;sram[dst_addr], noc_at_len_be);</code></pre>
+  <p>It extends A15's <code>a15-dram-read-count.patch</code> (reads only) and B04's per-tile trace (<code>b04-trace.patch</code>) into totals over the whole chip. As a check, the stock single-core matmul (A15) gave <code>dram_read cmds=16000 bytes=32768000</code>, <code>dram_write cmds=400 bytes=819200</code> and <code>MVMUL</code> = 512,000 = 8,000 tile products × 16 × 4 phases. All three are exactly as predicted. To reproduce every table on this page:</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/a20
+W=$PWD/tenstorrent-from-zero/sim-labs        # absolute: env.sh changes directory
+source $W/workbench/env.sh wh
+$W/workbench/build_ttsim.sh count wh          # first call copies ttsim to $LAB_HOME/ttsim-count
+(cd $LAB_HOME/ttsim-count &amp;&amp; patch -p1 &lt; $W/patches/a20-counters.patch)
+$W/workbench/build_ttsim.sh count wh          # rebuild with the counters
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
+source $TT_METAL_HOME/python_env/bin/activate
+python $W/workbench/py/a20_count.py mm_bfp8_hifi2 &gt; bfp8.log 2&gt;&amp;1   # cases: mm_&lt;bf16|bfp8|bfp4&gt;_&lt;lofi|hifi2|hifi3|hifi4&gt;,
+python $W/workbench/py/a20_summary.py bfp8.log                         #   blk_m&lt;1|2|4&gt;, fuse_no, fuse_yes, grid_noact, grid_relu, add_dram, add_l1shard
+== bfp8.log
+  noc dram_read    cmds=320 bytes=409600
+  noc dram_write   cmds=64 bytes=131072
+  noc mcast_sent   cmds=192 bytes=409984
+  noc mcast_recv   cmds=832 bytes=1754752
+  noc atomic       cmds=416 bytes=1664
+  tensix T0=22304 T1=52512 T2=7552
+  ops: MVMUL=32768 ELWADD=0 ELWMUL=0 UNPACR=3328 PACR=1024 SFPU*=216</code></pre>
+  <p>Each case is one process (about 5 s of wall time). Adding <code>prep</code> after the case name runs only the setup. For the matmul cases the setup counted zero NoC commands, because tensors uploaded with <code>from_torch</code> travel over PCIe, not over the NoC. So every NoC count in the tables belongs to the op. The Tensix counts include a small fixed setup share: a setup-only run retired 576 T0 instructions (216 of them SFPU) and nothing on T1 or T2. The sharded add was the one case with setup traffic, and it was subtracted as described. The metal examples were counted with the same simulator: <code>$EX/metal_example_matmul_multicore_reuse_mcast</code> and so on.</p>
+  <table>
+    <tr><th>Question</th><th>ttsim answers?</th><th>Why</th></tr>
+    <tr><td>How many bytes does this op read from and write to DRAM?</td><td>Yes, exactly</td><td>Every NoC command is executed with its real length</td></tr>
+    <tr><td>How many NoC transfers, how much multicast fan-out?</td><td>Yes, exactly</td><td>Same</td></tr>
+    <tr><td>How many MVMULs, ELWADDs, SFPU ops, per thread?</td><td>Yes, exactly</td><td>Instructions are executed after MOP/replay expansion</td></tr>
+    <tr><td>Does a lever change the bytes or the multiplies as predicted?</td><td>Yes</td><td>The tables above</td></tr>
+    <tr><td>Is it correct? (PCC, bit-exact results)</td><td>Yes</td><td>Functional, bit-exact model</td></tr>
+    <tr><td>How long does it take? Which wall?</td><td><b>No</b></td><td>The clock is host-driven. There is no timing of DRAM, NoC, L1 banks or the FPU pipeline.</td></tr>
+    <tr><td>Do two transfers congest a link?</td><td><b>No</b></td><td>No contention is modelled</td></tr>
+    <tr><td>Does double buffering overlap?</td><td><b>No</b></td><td>The ordering is right, but no durations are modelled</td></tr>
+    <tr><td>Device profiler zones?</td><td><b>No</b></td><td>Header-only CSV or a simulator error (above), and timestamps would be the host-driven clock anyway</td></tr>
+  </table>
+  <p>The useful habit is to <b>predict, then count</b>. Write down the bytes and multiplies your loop structure implies, then confirm them in the simulator before you ever get on silicon. If a count surprises you (an unfused activation, a weight read four times), that is a performance bug you found without a profiler. Then take the counts to silicon and let the profiler supply the denominator: time.</p>
+  <div class="callout sim">Related labs: <a href="../sim-labs/b04-tensix-instructions.html">B04</a> traces the instruction stream of one core, <a href="../sim-labs/b05-noc-and-dram.html">B05</a> logs every NoC transfer with coordinates, <a href="../sim-labs/b07-matmul-fidelity.html">B07</a> goes bit-level on fidelity, <a href="../sim-labs/b09-breaking-things.html">B09</a> lists what ttsim cannot see, and <a href="../sim-labs/b11-ttnn-on-sim.html">B11</a> runs TT-NN under the simulator.</div>
+
+  <h2 id="conflicts">Where the sources disagree</h2>
+  <ul>
+    <li><b>How much faster LoFi is than HiFi4.</b> The ISA and the GEMM report say 4× (16 versus 64 cycles per tile, <code>GEMM_FLOPS.md:107</code>; <code>MatrixUnit.md:60-71</code>). The LLM report says "3.6x faster with LoFi" (<code>llms.md:1884</code>). <code>tt-perf-report</code> uses the n150 card's FP8 figure, 262/72 TFLOP/s per core, and calls it "empirical". That gives 3.54× over its HiFi4 figure of 74/72. A06 traced the card's FP8 number to an unexplained 8/9 factor. On Blackhole, the same tool uses the exact 4× formula. I use the ISA's formula for the roofs and treat 3.5 to 3.6× as what software reported.</li>
+    <li><b>The Blackhole grid.</b> The p150 product page says 120 Tensix cores. The GEMM report measures utilisation against "13x10 in Blackhole" (<code>GEMM_FLOPS.md:83,108</code>), which is 130 cores and only fits an unharvested 140-core die. <code>tt-perf-report</code> uses 110 ("P150 with dispatch cores reserved"), which matches the 11×10 grid ttsim reports (A17). The figure above uses 110.</li>
+    <li><b>Blackhole NoC link bandwidth.</b> 64 B × 1.35 GHz = 86.4 GB/s from the ISA's clock, against 83 GB/s on the Hot Chips 2024 slides (A08).</li>
+    <li><b>Bytes per bfp element in tt-perf-report.</b> Its <code>get_datatype_size</code> takes the digit in the dtype name ÷ 8, so <code>BFLOAT8_B</code> counts as 1 byte and <code>BFLOAT4_B</code> as 0.5 (<code>perf_report.py:1045-1047</code>). Real tiles carry shared exponents: 1,088 and 576 bytes per 1,024 elements (<code>tile_size</code> above, and the counts in Lever 1). So the tool under-counts bfp traffic: the real tiles are 6.25% and 12.5% larger than it assumes (it misses about 5.9% and 11.1% of the bytes), which makes DRAM % slightly low for bfp weights.</li>
+    <li><b>How to enable profiling.</b> The LLM report says "metal must be compiled with <code>-p</code>" (<code>llms.md:1776</code>). <code>build_metal.sh</code> at 7aad8aac has no <code>-p</code> option. Profiling is on by default (<code>--disable-profiler</code> turns it off), and device profiling is switched on at run time with <code>TT_METAL_DEVICE_PROFILER=1</code>. The doc page puts the CSV in <code>$TT_METAL_HOME/generated/profiler/.logs/</code>. The workbench redirects it through <code>TT_METAL_PROFILER_DIR</code> to <code>$LAB_HOME/profiler/.logs/</code>.</li>
+    <li><b>The 65% threshold.</b> The tool's README says "&gt;65%". The code tests <code>&gt;= 65</code> (above). This is trivial, but if you script against the report, trust the code.</li>
+  </ul>
+
+  <h2 id="checklist">A checklist</h2>
+  <ol>
+    <li><b>Is the window right?</b> Warm-up excluded (signpost or <code>--id-range</code>), one layer, trace on if production uses it.</li>
+    <li><b>Gaps.</b> Is the sum of op-to-op gaps comparable to device time? Then use trace (needs fast dispatch, fixed shapes and addresses), merge or fuse small ops, and move runtime args to compile-time args where you can.</li>
+    <li><b>Cores.</b> Does every heavy op use most of the grid? One-core LayerNorms and two-core matmuls come first.</li>
+    <li><b>Intensity.</b> For each heavy op, compute FLOPs ÷ DRAM bytes from the shapes and compare it with the ridge for its fidelity. Below the ridge: fewer bytes (bfp8/bfp4 weights, larger or multicast blocks, inputs kept sharded in L1, DRAM-sharded matmul for decode). Above it: lower fidelity if accuracy allows (HiFi2 for bfp8, LoFi for bfp4 weights), more cores.</li>
+    <li><b>SLOW ops</b> (under 65% of both roofs). Look at per-core min/max (imbalance), <code>CB WAIT FRONT</code> (starved compute, so deepen or batch the reads), the NoC routes of the readers (congestion), and subblock sizes (Dst usage, A15).</li>
+    <li><b>Data movement ops.</b> Every <code>InterleavedToSharded</code>/<code>ShardedToInterleaved</code>, reshape and transpose is pure traffic. Can neighbouring ops agree on one layout?</li>
+    <li><b>Fusions.</b> Did the activation, bias or reduction you asked for actually fuse? Count the ops (profile) or the DRAM writes (simulator).</li>
+    <li><b>Before silicon:</b> predict the bytes and multiplies, and confirm them with the a20 counters in ttsim. After silicon: let the profiler tell you the time, and compare it against the two roofs.</li>
+  </ol>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>Four walls: compute (FPU at 4,096 FLOP/cycle/core ÷ fidelity phases; the SFPU much lower), L1/NoC (256 B/cycle per core L1; 32 GB/s per Wormhole hop), DRAM (288 GB/s n150 spec, about 190 for interleaved matmuls, about 240 for DRAM-sharded; 512 GB/s p150), and host/dispatch (op-to-op gaps; under about 6 µs with trace).</li>
+    <li>A matmul block's intensity is 65,536·M<sub>b</sub>N<sub>b</sub> / (M<sub>b</sub>B<sub>a</sub> + N<sub>b</sub>B<sub>w</sub>). Decode (M<sub>b</sub>=1) is capped at 65,536/B<sub>w</sub>: 32, 60 and 114 FLOP/B for bf16, bfp8 and bfp4 weights, far below any ridge.</li>
+    <li>Format is a bandwidth lever: 2,048 → 1,088 → 576 bytes per tile, counted exactly in ttsim with the multiplies unchanged. Fidelity is a compute lever: MVMULs = 16 per tile product per phase, counted exactly, with the bytes unchanged.</li>
+    <li>Blocking and multicast cut DRAM reads to each tile once (1,536 of 1,536 in the mcast example) by moving the copies onto the NoC (15.7 MB delivered). The NoC then becomes the wall to watch for congestion, which ttsim does not model.</li>
+    <li>An add with L1-sharded operands issued zero NoC commands, but resharding cost the same 1 MiB of DRAM reads. Keep tensors sharded across a chain of ops.</li>
+    <li>Double buffering turns sum-of-stages into max-of-stages. Trace removes host time per op but not the dispatcher's minimum gap. Fusion removes both a launch and a DRAM round trip, but <code>ttnn.linear(activation=...)</code> only fuses with a user <code>core_grid</code> or program config.</li>
+    <li>The device profiler stamps the wall-clock register in RISC-V zones. Tracy merges host and device timelines. The ops CSV gives one row per op. <code>tt-perf-report</code> divides FLOPs and bytes by device time and labels each op DRAM/FLOP/BOTH/SLOW at 65%.</li>
+    <li>ttsim counts but does not time. Its profiler output is empty, and its wall clock is the host-driven clock. Predict and count in the simulator, then measure on silicon.</li>
+  </ul>
+  <p>Next, A21 takes the same question to many chips, where Ethernet links become a fifth wall and collectives (all-gather, reduce-scatter) are ops that move only data.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>A decode matmul (M = 32) with bf16 weights runs on a Wormhole at HiFi4. A colleague switches it to LoFi to "make it 4× faster". What happens, and what would you change instead?</summary><p>Almost nothing happens to the speed. With M<sub>b</sub> = 1 the intensity is at most 65,536/2,048 = 32 FLOP/B, far below the HiFi4 ridge of about 228 (64 cores ÷ 288 GB/s), so the op is DRAM-bound and LoFi only raises a roof it is not touching. It also costs accuracy, since bf16 weights need HiFi2 or more. Reduce the bytes instead: bfp8 weights (32 → 60 FLOP/B, about 1.9× faster when DRAM-bound) at HiFi2, or bfp4 (114 FLOP/B, about 3.6×) at LoFi if accuracy allows. Also use the DRAM-sharded matmul so the reads approach about 240 GB/s instead of about 190.</p></details>
+  <details class="quiz"><summary>In the simulator, the bfp8 run read 409,600 bytes and the bf16 run 655,360. Show that the difference is exactly what the formats predict.</summary><p>The activation is the same in both: 4×16 = 64 bf16 tiles = 131,072 bytes. The weight is 16×16 = 256 tiles: 256 × 2,048 = 524,288 bytes in bf16, and 256 × 1,088 = 278,528 bytes in bfp8 (1,024 bytes of sign and mantissa plus 64 bytes of shared exponents per tile, <code>tile_size</code>). 131,072 + 524,288 = 655,360 and 131,072 + 278,528 = 409,600. The difference, 245,760 = 256 × 960, is all weight. Each tile was read exactly once, because the default program config multicasts tiles between cores.</p></details>
+  <details class="quiz"><summary>tt-perf-report labels an op SLOW at 20% DRAM and 3% FLOPs. List three possible causes and the evidence that would separate them.</summary><p>(1) Starved compute from single-buffered or latency-bound reads. Evidence: a large <code>DEVICE COMPUTE CB WAIT FRONT</code> share of kernel time, and readers that barrier after each tile. (2) Load imbalance, or too few cores doing most of the work. Evidence: <code>PER CORE MAX</code> much larger than <code>MIN</code>, or a low <code>CORE COUNT</code>. (3) NoC congestion from crossing reader routes, or interleaved reads all hitting every bank. Evidence: the zones of reader kernels stretched while compute waits, and a reader placement whose dimension-order routes share links. Fixing it with DRAM-sharded or L1-sharded layouts should move DRAM % up. Fidelity and format will not explain SLOW.</p></details>
+  <details class="quiz"><summary>A model has 300 ops per step, mostly 4 µs kernels, and the host spends about 25 µs preparing each op. Estimate the step time with and without trace, and say what would help after trace.</summary><p>Without trace the host is the bottleneck. The device waits for each op, so the step takes about 300 × 25 = 7.5 ms, of which the device is busy only 300 × 4 = 1.2 ms. With trace the host cost leaves the critical path, and the step is about 300 × (4 + g). With a few-µs dispatcher gap, say 3 µs, that is about 2.1 ms. After trace, the gaps are still more than 40% of the timeline, so the next lever is fewer ops: fuse element-wise chains and activations into their producers, and avoid reshards between ops. That is the 2 µs-kernel step of the trace figure.</p></details>
+  <details class="quiz"><summary>Why can't you use ttsim to decide whether double buffering helped your kernel, even though the kernel runs correctly there? What can you use ttsim for in that investigation?</summary><p>ttsim models order and function, not duration. Its clock advances when the host polls it, it models no DRAM or NoC latency, and the device profiler's timestamps would be that same host-driven clock (<code>RISCV_DEBUG_REGS_WALL_CLOCK_0</code> returns <code>g_clock</code>). So overlap, which is a question about time, is invisible to it. What it can do: confirm the kernel is still correct with deeper CBs (PCC, bit-exact output), confirm the byte and instruction counts are unchanged (double buffering should change neither), and catch synchronisation bugs. Whether it is faster is a question for the device profiler on silicon: compare <code>CB WAIT FRONT</code> and kernel duration before and after.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-perf-report">tt-perf-report</a>: the per-op roofline tool. Its README explains every column, and <code>perf_report.py</code> holds the peaks and thresholds quoted here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_program_profiler.html">Device Program Profiler (docs)</a>: <code>DeviceZoneScopedN</code>, the CSV format, buffer limits and clock-sync caveats.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/tracy_profiler.html">Tracy Profiler (docs)</a>: building the GUI, <code>python -m tracy</code>, the web viewer and remote capture.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/MetalProfiler/metal-profiler.md">Metal Profiler tech report</a>: how tt-metal's Tracy fork, capture, csvexport and post-processing fit together.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">LLMs tech report</a>, section 4.5-4.6: the op-to-op gap, the ops CSV workflow, data-movement advice and fidelity rules of thumb.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md">Matrix Multiply FLOPS tech report</a>: cycles per tile by fidelity, the utilisation formula, and measured TFLOPS with and without trace.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md">Saturating DRAM bandwidth</a>: how reader placement and NoC route overlap decide whether you get 92% of DRAM.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md">Advanced Performance Optimizations for Models</a>: Metal Trace and two command queues, with Tracy timelines before and after.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MatrixUnit.md">ISA: Matrix Unit performance</a> and <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/DRAMTile/README.md">ISA: DRAM tile</a> and <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/L1.md">ISA: L1</a>: the per-core, per-channel and per-bank limits behind every roof on this page.</li>
+    <li><a href="https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.html">Williams, Waterman, Patterson: Roofline</a>: the original roofline paper (Berkeley tech report).</li>
+    <li><a href="https://jax-ml.github.io/scaling-book/roofline/">All about rooflines (JAX scaling book)</a>: arithmetic intensity and ridge points for accelerator matmuls, with worked examples.</li>
+    <li><a href="https://github.com/wolfpld/tracy">Tracy</a>: the upstream profiler and its manual.</li>
+  </ul>
+
+  <div class="pager"><a href="a19-op-anatomy-compilers.html">&larr; 19 How an op is built, and the compiler stack</a><a class="next" href="a21-many-chips.html">21 Many chips: Ethernet, meshes and TT-Fabric &rarr;</a></div>
+</main>
+</body>
+</html>

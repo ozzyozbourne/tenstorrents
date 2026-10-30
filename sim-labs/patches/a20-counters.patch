@@ -1,0 +1,106 @@
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -14,6 +14,18 @@
+ static std::pair<char, uint32_t> coord_to_tile(uint32_t coord);
+ static uint32_t tile_to_coord(char tile_type, uint32_t tile_id);
+ 
++
++// A20 instrumentation: exact traffic counters for NoC commands issued by Tensix tiles.
++struct A20Noc { uint64_t cmds, bytes; };
++A20Noc a20_dram_rd, a20_dram_wr, a20_l1_rd, a20_l1_wr, a20_mcast, a20_mcast_deliv, a20_other_rd, a20_other_wr, a20_atomic, a20_inline;
++static inline void a20_add(A20Noc &c, uint64_t n) { c.cmds++; c.bytes += n; }
++void a20_dump_noc() {
++    auto pr = [](const char *k, const A20Noc &c) { ttsim_printf("A20 noc %-12s cmds=%llu bytes=%llu\n", k, (unsigned long long)c.cmds, (unsigned long long)c.bytes); };
++    pr("dram_read", a20_dram_rd); pr("dram_write", a20_dram_wr); pr("l1_read", a20_l1_rd); pr("l1_write", a20_l1_wr);
++    pr("mcast_sent", a20_mcast); pr("mcast_recv", a20_mcast_deliv); pr("other_read", a20_other_rd); pr("other_write", a20_other_wr);
++    pr("atomic", a20_atomic); pr("inline_wr", a20_inline);
++}
++
+ template<char tile_type>
+ static inline auto get_tile(uint32_t tile_id) {
+     static_assert((tile_type == 'T') || (tile_type == 'E'));
+@@ -1469,6 +1481,7 @@
+         TTSIM_VERIFY((noc_at_len_be >= 1) && (noc_at_len_be <= NOC_MAX_PACKET_SIZE), UnsupportedFunctionality, "multicast: noc_at_len_be=%d", noc_at_len_be);
+         TTSIM_VERIFY(src_tile_type == tile_type, UnimplementedFunctionality, "multicast: src_tile_type=%c", src_tile_type);
+         TTSIM_VERIFY(src_tile_id == tile_id, UnimplementedFunctionality, "multicast: src_tile_id=0x%x", src_tile_id); // write must be from current tile
++        if (tile_type == 'T') a20_add(a20_mcast, noc_at_len_be);
+         TTSIM_VERIFY(src_addr + noc_at_len_be <= sizeof(p_tile->sram), UnsupportedFunctionality, "multicast: src_addr=0x%llx", src_addr);
+ 
+         if (dst_addr < TENSIX_SRAM_SIZE) { // L1 -> L1
+@@ -1507,6 +1520,7 @@
+                 if ((multicast_tile_type == tile_type) && (multicast_tile_id == tile_id) && !bits<17,17>(noc_ctrl)) { // to source tile with BRCST_SRC_INCLUDE not set
+                     continue;
+                 }
++                if (tile_type == 'T') a20_add(a20_mcast_deliv, noc_at_len_be);
+                 tile_wr_bytes(dst_coordinate, dst_addr, &p_tile->sram[src_addr], noc_at_len_be);
+                 if (bits<4,4>(noc_ctrl)) { // nonposted
+                     p_tile->niu_mst_wr_ack_received[noc_instance]++;
+@@ -1535,6 +1549,7 @@
+         TTSIM_VERIFY(dst_addr + 4 <= sizeof(p_tile->sram), UnsupportedFunctionality, "atomic: dst_addr=0x%llx", dst_addr);
+         TTSIM_VERIFY((src_tile_type == 'T') || (src_tile_type == 'E'), UnimplementedFunctionality, "atomic: src_tile_type=%c", src_tile_type);
+ 
++        if (tile_type == 'T') a20_add(a20_atomic, 4);
+         uint32_t noc_at_data = p_tile->noc_at_data[noc_instance][cmd_buf];
+         uint32_t old_data;
+         tile_rd_bytes(src_coordinate, src_addr, &old_data, 4);
+@@ -1571,6 +1586,7 @@
+             }
+ #endif
+         }
++        if (tile_type == 'T') a20_add(a20_inline, 4);
+         uint32_t noc_at_data = p_tile->noc_at_data[noc_instance][cmd_buf];
+         tile_wr_bytes(src_coordinate, src_addr, &noc_at_data, sizeof(noc_at_data));
+         if (bits<4,4>(noc_ctrl)) { // nonposted
+@@ -1588,6 +1604,7 @@
+             UnimplementedFunctionality, "write: dst_tile_type=%c", dst_tile_type);
+         TTSIM_VERIFY((src_addr & 15) == (dst_addr & 15), UndefinedBehavior, "write: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+             src_addr, dst_addr);
++        if (tile_type == 'T') a20_add(dst_tile_type == 'D' ? a20_dram_wr : dst_tile_type == 'T' ? a20_l1_wr : a20_other_wr, noc_at_len_be);
+         tile_wr_bytes(dst_coordinate, dst_addr, &p_tile->sram[src_addr], noc_at_len_be);
+         if (bits<4,4>(noc_ctrl)) { // nonposted
+             p_tile->niu_mst_wr_ack_received[noc_instance]++;
+@@ -1617,6 +1634,7 @@
+             TTSIM_VERIFY((src_addr & 15) == (dst_addr & 15), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                 src_addr, dst_addr);
+         }
++        if (tile_type == 'T') a20_add(src_tile_type == 'D' ? a20_dram_rd : src_tile_type == 'T' ? a20_l1_rd : a20_other_rd, noc_at_len_be);
+         tile_rd_bytes(src_coordinate, src_addr, &p_tile->sram[dst_addr], noc_at_len_be);
+         p_tile->niu_mst_rd_resp_received[noc_instance]++;
+     }
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -5768,9 +5768,19 @@
+     return true;
+ }
+ 
++// A20 instrumentation: retired Tensix instructions per thread (T0 unpack, T1 math, T2 pack) and per opcode.
++static uint64_t a20_inst[TENSIX_INST_PIPES], a20_op[TENSIX_INST_PIPES][256];
++void a20_dump_tensix() {
++    ttsim_printf("A20 tensix T0=%llu T1=%llu T2=%llu\n", (unsigned long long)a20_inst[0], (unsigned long long)a20_inst[1], (unsigned long long)a20_inst[2]);
++    for (uint32_t p = 0; p < TENSIX_INST_PIPES; p++)
++        for (uint32_t o = 0; o < 256; o++)
++            if (a20_op[p][o]) ttsim_printf("A20 op T%u 0x%02x %llu\n", p, o, (unsigned long long)a20_op[p][o]);
++}
+ bool tensix_decode_and_execute(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+     if (p_tensix->wait_block[pipe] && block_mask_holds(p_tensix->wait_block[pipe], inst)) {
+         p_tensix->wait_block[pipe] = 0;
+     }
+-    return tensix_execute_inst(p_tensix, pipe, inst);
++    bool done = tensix_execute_inst(p_tensix, pipe, inst);
++    if (done) { a20_inst[pipe]++; a20_op[pipe][bits<31,24>(inst)]++; }
++    return done;
+ }
+--- a/src/sim.cpp
++++ b/src/sim.cpp
+@@ -51,7 +51,11 @@
+     g_chip = &g_chips[chip_id];
+ }
+ 
++void a20_dump_noc();
++void a20_dump_tensix();
+ void ttsim_exit() {
++    a20_dump_noc();
++    a20_dump_tensix();
+     ttsim_heartbeat();
+     for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+         ttsim_select_chip(chip_id);
