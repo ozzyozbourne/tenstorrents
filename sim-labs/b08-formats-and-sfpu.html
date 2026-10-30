@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B08 · Data formats and SFPU numerics · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  td.n { text-align:right; font-family:var(--mono); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="b07-matmul-fidelity.html">&larr; Prev</a>
+  <a href="../chapters/a08-noc.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B08</span><span class="tag">Prerequisites: A05, A07, B00 (A12 helps)</span>
+  <h1><span class="num">B08.</span> Data formats and SFPU numerics</h1>
+  <p class="subtitle">Push the same numbers through FP32, BF16, BFP8 and BFP4 on the simulated chip and watch exactly which bits fall off. Then write your own SFPI kernel with a four-way <code>v_if</code> and a polynomial <code>sin</code>, see which SFPU lane touched which Dst cell, and measure what "approximate mode" really changes.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. The bracketed clock numbers in the logs below are not silicon performance, and nothing on this page measures speed. What ttsim <i>does</i> model bit for bit is the arithmetic: format conversions in the unpacker and packer, the SFPU's FMA, its rounding and truncation. That is exactly what this lab is about, so a mismatch between your model and ttsim here is a real finding. There is one place where ttsim and tt-metal disagree about what is legal; section 2 shows it.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">0. Setup</a></li>
+      <li><a href="#formats">1. Four formats, one block of sixteen numbers</a></li>
+      <li><a href="#dst">2. What survives the trip into Dst</a></li>
+      <li><a href="#lanes">3. 32 lanes, and which Dst cell each one touches</a></li>
+      <li><a href="#kernel">4. Your own SFPI kernel: a four-way <code>v_if</code></a></li>
+      <li><a href="#poly">5. A polynomial sin, and where its error comes from</a></li>
+      <li><a href="#approx">6. Approximate vs exact built-ins</a></li>
+      <li><a href="#whbh">7. Wormhole vs Blackhole</a></li>
+      <li><a href="#exercises">8. Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here is a function, written in SFPI, the C++ dialect for the vector engine. It is a soft clamp built from two parabolas:</p>
+<pre><code>y = -1          if x &lt; -1
+y = x * (x + 2) if -1 &lt;= x &lt; 0
+y = x * (2 - x) if  0 &lt;= x &lt; 1
+y = 1           otherwise</code></pre>
+  <p>Every input is a BF16 number, every intermediate is exact in FP32 (the product of two 8-bit significands has at most 16 bits), and the output is BF16 again. A careful CPU would return the correctly rounded answer every time. I ran it over 4096 evenly spaced inputs in [&minus;2, 2] on the simulated Wormhole. This is what came back:</p>
+<pre><code>fn=piecewise fmt=bf16 dst32=0 u2d=0 approx=0 expt=0 fold=1 range=[-2,2] n=4096
+max_abs_err=0.00389 (at x=-0.996094) mean_abs_err=0.000812 max_rel_err=0.00715
+ulp vs correctly rounded: exact=3088 1ulp=1008 >1ulp=0 max=1</code></pre>
+  <p>A quarter of the answers are one unit in the last place (ulp) off, and every one of them is off <i>toward zero</i>. Nothing is wrong with the arithmetic. Something between the FP32 lanes and the BF16 output is throwing bits away instead of rounding them. By the end of this lab you will be able to point at the exact instruction, and at the line of the ISA manual and of ttsim that describes it. Along the way you will meet four more places where bits go missing: the shared exponent of block floating point, the 19-bit source registers, the 16-bit Dst, and "approximate mode".</p>
+  <p>All commands below were run in this orb, on the Wormhole model unless the text says Blackhole. Every output is real and trimmed only of tt-metal's log lines.</p>
+
+  <h2 id="setup">0. Setup</h2>
+  <p>This lab uses the workbench from <a href="b00-workbench.html">B00</a>, one Python probe, one host program and one kernel overlay, all in the series repository:</p>
+  <table>
+    <tr><th>File</th><th>What it is</th></tr>
+    <tr><td><code>sim-labs/workbench/py/b08_formats.py</code></td><td>Round-trips one tile through float32, bfloat16, bfloat8_b and bfloat4_b on the host and on the device, and prints values and error statistics.</td></tr>
+    <tr><td><code>sim-labs/workbench/host/b08_sfpu.cpp</code></td><td>A one-core reader/compute/writer program. It fills 4 tiles with evenly spaced inputs, runs one SFPU function chosen by <code>B08_FN</code>, and compares every output with a double-precision reference on the host.</td></tr>
+    <tr><td><code>sim-labs/overlays/b08/b08/sfpu_lab.cpp</code></td><td>The compute kernel, with our SFPI face functions. The host asks for it as <code>"b08/sfpu_lab.cpp"</code>; the reader and writer are the stock <code>custom_sfpi_smoothstep</code> dataflow kernels.</td></tr>
+  </table>
+<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # absolute: env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b08
+source $W/env.sh wh                                   # or bh
+cp -r $W/../overlays/b08/. $LAB_HOME/kernels/          # gives $LAB_HOME/kernels/b08/sfpu_lab.cpp
+cp $W/host/b08_sfpu.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b08_sfpu.cpp   # about 6 s
+B08_FN=piecewise $LAB_HOME/b08_sfpu                     # the run in "The question"
+
+source $TT_METAL_HOME/python_env/bin/activate           # for section 1
+python $W/py/b08_formats.py</code></pre>
+  <p>The host program is driven by environment variables, so one binary covers every experiment:</p>
+  <table>
+    <tr><th>Variable</th><th>Values</th><th>Effect</th></tr>
+    <tr><td><code>B08_FN</code></td><td><code>copy map piecewise sin exp recip</code></td><td>Selects a <code>#define B08_FN_…</code> in the kernel.</td></tr>
+    <tr><td><code>B08_FMT</code></td><td><code>bf16</code>, <code>fp32</code></td><td>Format of both DRAM buffers and both circular buffers.</td></tr>
+    <tr><td><code>B08_DST32</code></td><td>0, 1 (default 1 for fp32)</td><td><code>ComputeConfig::fp32_dest_acc_en</code>: Dst holds 32-bit instead of 16-bit values.</td></tr>
+    <tr><td><code>B08_U2D</code></td><td>0, 1</td><td>Sets <code>UnpackToDestFp32</code> for the input CB, so the unpacker writes FP32 straight into Dst.</td></tr>
+    <tr><td><code>B08_APPROX</code></td><td>0, 1</td><td><code>ComputeConfig::math_approx_mode</code>, which becomes the kernel's <code>APPROX</code> constant.</td></tr>
+    <tr><td><code>B08_EXPT</code>, <code>B08_FOLD</code></td><td>0, 1</td><td>The template argument of <code>exp_tile&lt;&gt;</code>; whether <code>sin</code> folds its input first.</td></tr>
+    <tr><td><code>B08_LO</code>, <code>B08_HI</code>, <code>B08_DUMP</code></td><td>numbers, a path</td><td>Input range; write one <code>x ref got</code> line per element (the plots below come from these dumps).</td></tr>
+  </table>
+  <p>The program prints the maximum and mean absolute error, the maximum relative error, a histogram of the distance in ulps from the correctly rounded (round-to-nearest-even) reference, and an FNV hash of the output bits, so you can tell whether two runs are bit-identical. Each run takes about a second.</p>
+
+  <h2 id="formats">1. Four formats, one block of sixteen numbers</h2>
+  <p>A05 asked whether 16 numbers can share one exponent and stay useful. Let's answer it with numbers chosen to hurt. I put sixteen values spanning five orders of magnitude into face 0, row 0 of a 32&times;32 tile, which is exactly one BFP block. Two of them (3.0 and 2.5) are large, and the rest shrink down to 0.0001. The probe sends the tile through each format twice: on the host with <code>ttnn.from_torch(x, dtype=…)</code>, and on the device with <code>ttnn.typecast</code>, whose packer writes the target format.</p>
+  <div class="filename">sim-labs/workbench/py/b08_formats.py (core lines)</div>
+<pre><code>block = [3.0, 1.2345678, 0.7, -0.4, 0.3, 0.15, -0.1, 0.06, 0.03, 0.012, 0.007, -0.003, 0.0015, 1e-4, 2.5, -1.75]
+x = torch.zeros((32, 32), dtype=torch.float32)
+x[0, :16] = torch.tensor(block)
+def host_rt(x, dt):    # host packer (C++), then back to float32
+    return ttnn.to_torch(ttnn.from_torch(x, dtype=dt, layout=ttnn.TILE_LAYOUT)).float()
+def dev_rt(x, dt):     # FP32 tile on device, device packer writes dt, read back
+    t = ttnn.from_torch(x, dtype=SRC, layout=ttnn.TILE_LAYOUT, device=device)
+    return ttnn.to_torch(t if dt == SRC else ttnn.typecast(t, dt)).float()</code></pre>
+  <p>On <b>Blackhole</b> (<code>source env.sh bh</code>), with an FP32 tile on the device, it printed (host | device in each column):</p>
+<pre><code>    input fp32               float32              bfloat16             bfloat8_b             bfloat4_b
+             3          3|3                   3|3                   3|3                   3|3
+     1.2345678    1.23457|1.23457       1.23438|1.23438          1.25|1.25                1|1
+    0.69999999        0.7|0.7          0.699219|0.699219       0.6875|0.6875            0.5|0.5
+   -0.40000001       -0.4|-0.4        -0.400391|-0.400391    -0.40625|-0.40625         -0.5|0
+    0.30000001        0.3|0.3          0.300781|0.300781       0.3125|0.3125            0.5|0
+    0.15000001       0.15|0.15         0.150391|0.150391      0.15625|0.15625             0|0
+          -0.1       -0.1|-0.1        -0.100098|-0.100098    -0.09375|-0.09375            0|0
+   0.059999999       0.06|0.06        0.0600586|0.0600586      0.0625|0.0625              0|0
+   0.029999999       0.03|0.03        0.0300293|0.0300293     0.03125|0.03125             0|0
+         0.012      0.012|0.012       0.0120239|0.0120239           0|0                   0|0
+  0.0070000002      0.007|0.007      0.00698853|0.00698853          0|0                   0|0
+        -0.003     -0.003|-0.003     -0.00300598|-0.00300598          0|0                   0|0
+        0.0015     0.0015|0.0015     0.00150299|0.00150299          0|0                   0|0
+ 9.9999997e-05     0.0001|0.0001     0.000100136|0.000100136          0|0                   0|0
+           2.5        2.5|2.5               2.5|2.5               2.5|2.5               2.5|2.5
+         -1.75      -1.75|-1.75           -1.75|-1.75           -1.75|-1.75              -2|-1.5</code></pre>
+  <p>Read it column by column before reading any theory.</p>
+  <ul>
+    <li><b>float32</b> is a perfect round trip. DRAM does not care what the bytes mean.</li>
+    <li><b>bfloat16</b> keeps every value, each with its own exponent, to about 3 significant digits: 0.0001 is still there as 0.000100136. The error is <i>relative</i>, at most 2<sup>&minus;8</sup> of each value.</li>
+    <li><b>bfloat8_b</b> keeps the large values well, has 0.03 at one bit, and turns everything from 0.012 down into exactly 0. The error is now relative to the <i>block's largest value</i>, not to each value.</li>
+    <li><b>bfloat4_b</b> keeps only multiples of 0.5. Four of sixteen values survive. And here host and device disagree: &minus;0.4 is &minus;0.5 on the host and 0 on the device, &minus;1.75 is &minus;2 on the host and &minus;1.5 on the device.</li>
+  </ul>
+  <p>Step through the figure to see why each number lands where it does. The values in the right-hand columns are the real device outputs above. The bit strips are computed by the page from the BF16 encoding of each input.</p>
+
+  <div class="viz" id="fig-bits"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-bits");
+    var g = TT.canvas(root, 900, 550), ctx = g.ctx, C = TT.C;
+    var inp = [3.0, 1.2345678, 0.7, -0.4, 0.3, 0.15, -0.1, 0.06, 0.03, 0.012, 0.007, -0.003, 0.0015, 1e-4, 2.5, -1.75];
+    // Real outputs (Blackhole, FP32 source tile; bfloat8_b host == device here).
+    var bfp8 = [3, 1.25, 0.6875, -0.40625, 0.3125, 0.15625, -0.09375, 0.0625, 0.03125, 0, 0, 0, 0, 0, 2.5, -1.75];
+    var b4h = [3, 1, 0.5, -0.5, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2.5, -2];
+    var b4d = [3, 1, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2.5, -1.5];
+    var f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+    function bf16bits(v) { f32[0] = v; var u = u32[0]; var r = ((u >>> 16) & 1) + 0x7fff; return ((u + r) >>> 16) & 0xffff; } // RNE
+    var rows = inp.map(function (v) {
+      var b = bf16bits(v), s = b >> 15, e = (b >> 7) & 255, m = b & 127;
+      return { v: v, b: b, s: s, e: e, m: m };
+    });
+    var Emax = 0; rows.forEach(function (r) { Emax = Math.max(Emax, r.e); });
+    var Y0 = 92, RH = 28, CW = 11, SX = 404, SW = 14;
+    function bitCells(r, x, y, k) {
+      for (var i = 0; i < 16; i++) {
+        var bit = (r.b >> (15 - i)) & 1, fill = i === 0 ? C.red : (i < 9 ? C.blue : C.green);
+        var hl = (k === 1 && i >= 1 && i < 9);
+        TT.box(ctx, x + i * CW, y - 9, CW - 1, 18, { r: 2, fill: fill, alpha: bit ? (hl ? 0.95 : 0.7) : 0.12 });
+        TT.text(ctx, String(bit), x + i * CW + CW / 2 - 0.5, y, { color: bit ? "#000" : C.muted, font: "10px", mono: true, align: "center" });
+      }
+    }
+    var steps = [
+      { dur: 1.4, text: "<b>Sixteen FP32 inputs, one block.</b> First each becomes BF16: 1 sign bit (red), 8 exponent bits (blue), 7 mantissa bits (green). Every value carries its own exponent, so even 0.0001 keeps 8 significant bits. That costs 16 × 16 = 256 bits for the block." },
+      { dur: 1.4, text: "<b>Find the largest exponent.</b> The exponent field of 3.0 and 2.5 is 128 (they lie in [2, 4)). Block floating point stores that byte <i>once</i> as the block's shared exponent. Everyone else's exponent is smaller, by the number shown in the 'shift' column." },
+      { dur: 1.8, text: "<b>Align to the shared exponent.</b> Each value's significand 1.mmmmmmm is shifted right by its distance from the maximum. The strip shows bit weights from 2¹ down to 2⁻¹³. BFP8 keeps the first 7 cells (yellow box), weights 2¹ … 2⁻⁵, so its unit is 2⁻⁵ = 0.03125. Everything to the right of the box is gone, except that rounding can carry one unit back in: 0.03 (leading 1 at 2⁻⁶, just outside) rounds up to 1 × 2⁻⁵. 0.012 has its leading 1 at 2⁻⁷, too far out to round up, so it becomes 0." },
+      { dur: 1.6, text: "<b>BFP8 result (real device output).</b> Sign plus a 7-bit magnitude per value: 1.2345678 becomes 40 × 2⁻⁵ = 1.25 (rounded), 0.03 becomes 1 × 2⁻⁵. Small values are not stored 'less precisely'; they are stored as a few units of the <i>big</i> value's last place, or as zero. Cost: 16 × 8 + 8 = 136 bits." },
+      { dur: 1.8, text: "<b>BFP4 keeps only the first 3 cells</b> (orange box): multiples of 2⁻¹ = 0.5. Host and device now differ. The host rounds straight to 3 bits: −1.75/0.5 = 3.5 is a tie, and ties-to-even gives 4, so −2. The device packer first rounds to BFP8 (magnitude 56) and then <i>truncates</i> to 3 bits: 56 >> 4 = 3, so −1.5. Likewise −0.4: host rounds 0.8 up to 1 (−0.5), device gets 13 >> 4 = 0." },
+      { dur: 1.4, text: "<b>Bytes per block.</b> BF16: 32 bytes. BFP8_b: 16 + 1 = 17. BFP4_b: 8 + 1 = 9. A whole tile has 64 blocks (one per face row), and tt-metal sizes it as tile_hw + 64 exponent bytes: 2048, 1088 and 576 bytes (tile.cpp:136-145). Half the bandwidth, but only for data whose blocks are not dominated by one outlier." }
+    ];
+    TT.stepper({ root: root, steps: steps, draw: function (k, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "input", 14, 60, { color: C.muted }); TT.text(ctx, "BF16: s | exp | man", 112, 60, { color: C.muted });
+      if (k >= 1) TT.text(ctx, "exp  shift", 300, 60, { color: C.muted });
+      if (k >= 2) TT.text(ctx, "aligned: 2¹ … 2⁻¹³", SX, 60, { color: C.muted });
+      if (k >= 3) TT.text(ctx, "BFP8", 628, 60, { color: C.yellow });
+      if (k >= 4) TT.text(ctx, "BFP4 host | device", 720, 60, { color: C.orange });
+      TT.text(ctx, k >= 1 ? "shared exponent byte = " + Emax + "  (2^" + (Emax - 127) + ")" : "one BFP block = face 0, row 0, columns 0–15", 14, 26, { color: C.yellow, font: "14px", mono: true });
+      rows.forEach(function (r, i) {
+        var y = Y0 + i * RH;
+        TT.text(ctx, String(r.v), 14, y, { mono: true, font: "12px" });
+        bitCells(r, 112, y, k);
+        if (k >= 1) {
+          var sh = Emax - r.e;
+          TT.text(ctx, String(r.e), 300, y, { mono: true, font: "12px", color: r.e === Emax ? C.yellow : C.fg });
+          TT.text(ctx, sh ? "−" + sh : "0", 346, y, { mono: true, font: "12px", color: sh ? C.orange : C.yellow });
+        }
+        if (k >= 2) {
+          var sh2 = Emax - r.e, reveal = k === 2 ? t : 1;
+          for (var c = 0; c < 15; c++) {
+            var kbit = c - sh2, bit = 0;
+            if (kbit === 0) bit = 1; else if (kbit >= 1 && kbit <= 7) bit = (r.m >> (7 - kbit)) & 1;
+            var inBox = c < 7, in4 = c < 3;
+            var fill = kbit >= 0 && kbit <= 7 ? (inBox ? C.green : C.red) : C.bg3;
+            var a = (kbit >= 0 && kbit <= 7) ? (bit ? (inBox ? 0.8 : 0.45) : 0.12) : 0.5;
+            if (c / 15 > reveal) a *= 0.2;
+            TT.box(ctx, SX + c * SW, y - 9, SW - 2, 18, { r: 2, fill: fill, alpha: a });
+            if (kbit >= 0 && kbit <= 7) TT.text(ctx, String(bit), SX + c * SW + SW / 2 - 1, y, { color: bit ? "#000" : C.muted, font: "10px", mono: true, align: "center" });
+          }
+        }
+        if (k >= 3) {
+          var q = bfp8[i];
+          TT.text(ctx, String(q), 628, y, { mono: true, font: "12px", color: q === 0 ? C.red : C.fg });
+        }
+        if (k >= 4) {
+          var differ = b4h[i] !== b4d[i];
+          TT.text(ctx, b4h[i] + " | " + b4d[i], 720, y, { mono: true, font: "12px", color: differ ? C.orange : (b4h[i] === 0 ? C.red : C.fg) });
+        }
+      });
+      if (k >= 2) {
+        var top = Y0 - 16, h = 16 * RH + 6;
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.strokeRect(SX - 2, top, 7 * SW + 1, h);
+        if (k >= 4) { ctx.strokeStyle = C.orange; ctx.lineWidth = 2; ctx.strokeRect(SX - 4, top - 3, 3 * SW + 3, h + 6); }
+      }
+      if (k === 5) {
+        var bx = 520, by = 120;
+        TT.box(ctx, bx, by, 360, 170, { fill: C.bg2, stroke: C.border, alpha: 0.96 });
+        TT.text(ctx, "bits for this block", bx + 16, by + 22, { color: C.muted });
+        [["BF16", 256, C.blue], ["BFP8_b", 136, C.yellow], ["BFP4_b", 72, C.orange]].forEach(function (b, j) {
+          var yy = by + 52 + j * 38;
+          TT.text(ctx, b[0], bx + 16, yy, { mono: true });
+          TT.box(ctx, bx + 90, yy - 11, 250 * b[1] / 256, 22, { r: 3, fill: b[2], alpha: 0.7, label: b[1] + " bits", color: "#000", font: "12px" });
+        });
+      }
+    }});
+  })();
+  </script>
+
+  <div class="callout key">BF16 error is relative to <b>each value</b>. BFP error is relative to the <b>largest value in the block</b>: a value 2<sup>n</sup> below the block maximum keeps 7&minus;n bits in BFP8 and 3&minus;n bits in BFP4. At n = 7 (or 3) no bits are left, and the value survives only if rounding carries it up to one unit, as 0.03 did in BFP8 (and 0.3 in the host's BFP4; the device truncates it to 0). From n = 8 (or 4) on it is exactly 0. Nothing is lost gracefully below that.</div>
+
+  <h3>Where it hurts in a real tensor</h3>
+  <p>A single hand-made block exaggerates. The second half of the probe uses a random N(0,1) tile (seed 0), then the same tile with one value replaced by 64, at element [0,0]. "blk0" is the rest of that element's block (row 0, columns 1&ndash;15) and "blk1" is the neighbouring block (columns 16&ndash;31). Blackhole, FP32 source (the float32 rows, all zero error, and the BF16 rows of the outlier run are omitted):</p>
+<pre><code>Part 2: random N(0,1)
+    format   path    max_abs   mean_rel       PCC  blk0 mean_rel  blk1 mean_rel
+  bfloat16   host    0.00777    0.00141  0.999999         0.0015       0.000812
+  bfloat16 device    0.00777    0.00141  0.999999         0.0015       0.000812
+ bfloat8_b   host     0.0251     0.0309  0.999972         0.0124        0.00631
+ bfloat8_b device     0.0251     0.0309  0.999972         0.0124        0.00631
+ bfloat4_b   host      0.463      0.295  0.992346          0.431          0.129
+ bfloat4_b device      0.935      0.425  0.981965          0.625          0.219
+
+Part 2: same + outlier 64 at [0,0]
+ bfloat8_b   host      0.434     0.0399  0.999894          0.621        0.00631
+ bfloat8_b device      0.434     0.0399  0.999894          0.621        0.00631
+ bfloat4_b   host       2.12      0.304  0.997269              1          0.129
+ bfloat4_b device       2.12      0.431  0.993985              1          0.219</code></pre>
+  <p>Three things to take away. First, one outlier ruins its own block (BFP8 relative error in block 0 jumps from 1.2% to 62%) and leaves the neighbouring block untouched (0.63% before and after): the damage is exactly 16 values wide. Second, PCC barely notices: BFP8 goes from 0.999972 to 0.999894 while fifteen values were wrecked, the trap A05 warned about. Third, BFP4 is much worse on the device than on the host (mean relative error 0.425 vs 0.295), because the device rounds to BFP8 and then truncates, as the figure showed. The ISA states this directly for the packer (<code>Packers/FormatConversion.md:71</code>, cited in A05).</p>
+
+  <div class="callout warn"><b>FP32 into <code>ttnn.typecast</code> does not run on Wormhole ttsim.</b> The same probe under <code>env.sh wh</code> stops at the first device typecast:
+<pre><code>[4420] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
+  Section 2 finds the cause (an unpack-to-Dst workaround in the Wormhole LLK that ttsim treats as undefined behaviour). For Wormhole I reran the probe with a BF16 source tile (<code>B08_SRC=bf16 python $W/py/b08_formats.py</code>). With that source, the Wormhole and Blackhole outputs were identical line for line (checked with <code>diff</code>).</div>
+
+  <h2 id="dst">2. What survives the trip into Dst</h2>
+  <p>The probe treated the device as a black box. Now open it. A compute kernel never touches L1 data directly. The unpacker converts a tile from its CB format into a register format, either into SrcA (for the FPU) or straight into Dst, and the SFPU only ever sees Dst (A07). The simplest experiment is the identity: <code>B08_FN=copy</code> does <code>copy_tile</code>, no math, then <code>pack_tile</code>. Feed it FP32 values in [1, 2) and change only how Dst is configured:</p>
+<pre><code>$ B08_FN=copy B08_FMT=fp32 B08_DST32=0 $LAB_HOME/b08_sfpu
+max_abs_err=0.00781 (at x=1.99219) mean_abs_err=0.0039 max_rel_err=0.00751
+ulp vs correctly rounded: exact=2 1ulp=0 >1ulp=4094 max=65520
+
+$ B08_FN=copy B08_FMT=fp32 B08_DST32=1 $LAB_HOME/b08_sfpu
+max_abs_err=0.000976 (at x=1.99902) mean_abs_err=0.000488 max_rel_err=0.000732
+ulp vs correctly rounded: exact=2 1ulp=0 >1ulp=4094 max=8190</code></pre>
+  <p>An FP32 tile in, an FP32 tile out, no arithmetic, and only 2 of 4096 values survive either way. The dump shows what happened to individual bit patterns:</p>
+<pre><code>input        Dst 16-bit   Dst 32-bit (via SrcA)
+3fbffc00 -&gt;  3fbf0000     3fbfe000
+3f801802 -&gt;  3f800000     3f800000</code></pre>
+  <p>With a 16-bit Dst, the low 16 bits are simply cleared: 0x3fbffc00 becomes 0x3fbf0000, the BF16 value just below it, although 0x3fc00000 is closer. With a 32-bit Dst the value still went through SrcA, which holds at most 19 bits (TF32: sign, 8 exponent bits, 10 mantissa bits), and the low 13 bits are cleared. ttsim's unpacker says exactly this:</p>
+  <div class="filename">ttsim/src/tensix.cpp:3472-3482 @b3620244</div>
+<pre><code>            } else if (out_data_format == 4) { // tf32
+                if (unpack_to_dst) {
+                    value = dst_encode_fp32(value);
+                } else {
+                    value &amp;= 0xFFFFE000; // drop low 13 bits of mantissa (no rounding)
+                }
+            } else if (out_data_format == 5) { // bf16
+                ...
+                value &amp;= 0xFFFF0000; // drop low 16 bits of mantissa (no rounding)</code></pre>
+  <p>tt-metal knows this too. A test comment says it outright: "a plain Float32 CB is lowered to Tf32 in SrcA under fp32_dest_acc_en and would round the right-hand side before the solve sees it" (<code>tests/tt_metal/tt_metal/llk/test_triangle_solve.cpp:315-318</code>). (The comment says "round", but the measurement and ttsim both show truncation.) The fix the test uses is <code>UnpackToDestMode::UnpackToDestFp32</code>, which makes the unpacker skip SrcA and write FP32 into Dst. That is <code>B08_U2D=1</code>. On Blackhole:</p>
+<pre><code>$ source $W/env.sh bh; B08_FN=copy B08_FMT=fp32 B08_U2D=1 $LAB_HOME/b08_sfpu
+max_abs_err=0 (at x=0) mean_abs_err=0 max_rel_err=0
+ulp vs correctly rounded: exact=4096 1ulp=0 >1ulp=0 max=0</code></pre>
+  <p>All 4096 values are exact. On Wormhole the same run stops:</p>
+<pre><code>$ source $W/env.sh wh; B08_FN=copy B08_FMT=fp32 B08_U2D=1 $LAB_HOME/b08_sfpu
+[4513] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
+  <p>I instrumented a copy of ttsim (<code>build_ttsim.sh u2d wh</code>) to print which unpacker raised it and to count the successful FP32 unpack-to-Dst datums before it. The answer was unpacker 0, with the thread-override bit set, after exactly <b>1024</b> good datums: one full tile went into Dst correctly, and then something else unpacked FP32 into SrcA. That something is a deliberate hardware workaround in the Wormhole LLK:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cunpack_common.h:981-983 @7aad8aac</div>
+<pre><code>    // Due to a hardware bug (TEN-3868), we need to have one unpack-to-srcA instruction after the last unpack-to-dest instruction.
+    TTI_SETADCXX(p_setadc::UNP_A, FACE_C_DIM - 1, 0x0);
+    TT_UNPACR(SrcA, 0, 0, context_id, 0, 1 /* Set OvrdThreadId*/, 0 /*Set Dvalid*/, p_unpacr::RAREFYB_DISABLE, 1, 0, 0, 0, 1);</code></pre>
+  <p>ttsim rejects an FP32-to-FP32 unpack into SrcA as undefined behaviour (<code>tensix.cpp:3456-3458</code>). That check is exactly the one that fires, and it follows the ISA: the unpacker table offers FP32 into SrcA only with an output format of TF32, BF16 or FP16 (<code>Unpackers/FormatConversion.md:29</code>), and the dummy unpack leaves the output format at FP32 from the unpack-to-Dst setup. So ttsim is not contradicting the ISA here. It is strict about a configuration the ISA does not define, which the LLK uses on purpose and whose SrcA data it never marks valid. I then tried relaxing ttsim step by step. Allowing that unpack led to <code>UntestedFunctionality: zero_write2=1</code>, and allowing that led to <code>UnsupportedFunctionality: src_a row=64</code>. So the dummy unpack uses several features ttsim does not model. I stopped there, and the patched simulator is not part of the lab. The same gap is why <code>ttnn.typecast</code> from FP32 fails on Wormhole ttsim in section 1: typecast also unpacks FP32 inputs straight to Dst. This is a real disagreement between the two sources: the LLK says silicon needs this instruction, and ttsim says it is undefined. Neither is "wrong" about its own domain, but the consequence is that <b>on Wormhole ttsim you cannot test a bit-exact FP32 path through Dst</b>; use Blackhole for that.</p>
+
+  <h3>The way out: SFPSTORE truncates</h3>
+  <p>Back to the opening question. In the piecewise run, the input reached Dst as BF16 (lossless) and the SFPU computed in FP32 (exactly, as argued). The last step is <code>SFPSTORE</code> writing an FP32 lane into a 16-bit Dst. The ISA:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/SFPSTORE.md:38 @be833101</div>
+<pre><code>As part of the conversion to FP32 / FP16 / BF16, denormals will be flushed to zero. Additionally, when
+converting to FP16 / BF16, mantissa will be truncated towards zero.</code></pre>
+  <div class="filename">ttsim/src/tensix.cpp:4134-4136 @b3620244</div>
+<pre><code>        } else if (instr_mod0 == 2) {
+            value = denormals_as_zeros(value);
+            sfpu_write_cell16(p_tensix, cell_bank, row, col, dst_encode_bf16(value &gt;&gt; 16));</code></pre>
+  <p><code>value &gt;&gt; 16</code> keeps the top 16 bits: truncation toward zero. I checked the dump: none of the 4096 piecewise outputs is larger in magnitude than the exact answer. 3920 of them equal the exact answer truncated to BF16. The other 176 are also below it, by one more step, because their FP32 intermediate was already a hair under the exact value. That accounts for the 1008 one-ulp results.</p>
+  <div class="callout key">Bits are cut at three places, and none of them rounds: the unpacker into SrcA (to 19 bits) or into a 16-bit Dst (to BF16), and <code>SFPSTORE</code> into a 16-bit Dst (to BF16). The packer does round when it writes BFP formats, ties away from zero (A05); whether it rounds FP32 to BF16 I did not test here (the ISA's late-conversion table says it truncates, <code>Packers/FormatConversion.md:67</code>). If you want correctly rounded BF16 out of an SFPU kernel, you have to round in the lanes yourself before the store. The precise reciprocal in section 6 does exactly that.</div>
+  <p>With FP32 throughout (Blackhole, <code>B08_FMT=fp32 B08_U2D=1</code>), the same piecewise kernel gives <code>max_abs_err=8.77e-08</code>, with every output within 1 FP32 ulp of correct. The algorithm was never the problem.</p>
+
+  <h2 id="lanes">3. 32 lanes, and which Dst cell each one touches</h2>
+  <p>A07 drew the SFPU as 32 lanes. Check that against the primary sources. The Wormhole ISA: "It can be considered as a general-purpose SIMD engine, consisting of 32 lanes of 32 bits" (<code>VectorUnit.md:3</code>, the same sentence in the Blackhole manual). LReg 15 is read-only and "lane <code>i</code> contains the integer value <code>i*2</code>" (<code>LReg.md:15</code>). ttsim implements the register file as</p>
+  <div class="filename">ttsim/src/sim.h:283-292 @b3620244</div>
+<pre><code>    uint32_t l_regs[16][32]; // only 8 fully usable regs, but 16 sources easier to implement this way
+    ...
+    bool cc_en;
+    uint32_t cc;
+    bool cc_en_stack[CC_STACK_SIZE];
+    uint32_t cc_stack[CC_STACK_SIZE];</code></pre>
+  <p>So: 32 lanes, one 32-bit flag word <code>cc</code> holding each lane's predicate bit, and a stack of saved flag words. (The ISA lists 17 LRegs; ttsim stores 16 and leaves out LReg 16, which only <code>SFPLOADMACRO</code> can reach. ttsim does not implement that instruction anyway, which is why <code>env.sh</code> sets <code>TT_METAL_DISABLE_SFPLOADMACRO=1</code>.)</p>
+  <p>You can make the lanes visible. The <code>map</code> face function ignores its input and writes, into each element, the number of the vector and the lane that stored it:</p>
+  <div class="filename">sim-labs/overlays/b08/b08/sfpu_lab.cpp:22-28</div>
+<pre><code>inline void b08_map_face() {
+    for (int i = 0; i &lt; 8; i++) {
+        // LReg15 (vConstTileId) holds 2*lane; turn it into a float and halve it.
+        sfpi::vFloat lane = sfpi::convert&lt;sfpi::vFloat&gt;(sfpi::as&lt;sfpi::vSMag&gt;(sfpi::vConstTileId), sfpi::RoundMode::Nearest);
+        sfpi::dst_reg[i] = lane * 0.5f + float(32 * i);
+    }
+}</code></pre>
+  <p>32 &times; vector + lane is at most 255, so it is exact in BF16. <code>B08_FN=map</code> prints face 0 of the output tile as <code>vector.lane</code> (first four rows shown):</p>
+<pre><code>face 0 of tile 0, each cell = vector.lane (value = 32*vector + lane)
+ 0.0   1.0   0.1   1.1   0.2   1.2   0.3   1.3   0.4   1.4   0.5   1.5   0.6   1.6   0.7   1.7
+ 0.8   1.8   0.9   1.9   0.10  1.10  0.11  1.11  0.12  1.12  0.13  1.13  0.14  1.14  0.15  1.15
+ 0.16  1.16  0.17  1.17  0.18  1.18  0.19  1.19  0.20  1.20  0.21  1.21  0.22  1.22  0.23  1.23
+ 0.24  1.24  0.25  1.25  0.26  1.26  0.27  1.27  0.28  1.28  0.29  1.29  0.30  1.30  0.31  1.31
+ 2.0   3.0   2.1   3.1   ...
+faces 1..3 identical to face 0: yes</code></pre>
+  <p>The whole printed face is in the figure. Step through the eight vectors.</p>
+
+  <div class="viz" id="fig-map"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-map");
+    var g = TT.canvas(root, 900, 420), ctx = g.ctx, C = TT.C;
+    var M = [0,32,1,33,2,34,3,35,4,36,5,37,6,38,7,39,8,40,9,41,10,42,11,43,12,44,13,45,14,46,15,47,16,48,17,49,18,50,19,51,20,52,21,53,22,54,23,55,24,56,25,57,26,58,27,59,28,60,29,61,30,62,31,63,64,96,65,97,66,98,67,99,68,100,69,101,70,102,71,103,72,104,73,105,74,106,75,107,76,108,77,109,78,110,79,111,80,112,81,113,82,114,83,115,84,116,85,117,86,118,87,119,88,120,89,121,90,122,91,123,92,124,93,125,94,126,95,127,128,160,129,161,130,162,131,163,132,164,133,165,134,166,135,167,136,168,137,169,138,170,139,171,140,172,141,173,142,174,143,175,144,176,145,177,146,178,147,179,148,180,149,181,150,182,151,183,152,184,153,185,154,186,155,187,156,188,157,189,158,190,159,191,192,224,193,225,194,226,195,227,196,228,197,229,198,230,199,231,200,232,201,233,202,234,203,235,204,236,205,237,206,238,207,239,208,240,209,241,210,242,211,243,212,244,213,245,214,246,215,247,216,248,217,249,218,250,219,251,220,252,221,253,222,254,223,255];
+    var cols = [C.blue, C.orange, C.green, C.pink, C.yellow, C.teal, C.purple, C.red];
+    var GX = 30, GY = 40, CS = 22;
+    var steps = [];
+    for (var i = 0; i < 8; i++) (function (i) {
+      var r0 = 4 * Math.floor(i / 2);
+      steps.push({ dur: 1.1, text: "<b>dst_reg[" + i + "]</b> is <code>SFPLOAD</code> with address " + (2 * i) + ": Dst rows " + r0 + "–" + (r0 + 3) + ", " + (i % 2 ? "odd" : "even") + " columns. Lane L takes row " + r0 + " + L/8, column 2·(L mod 8)" + (i % 2 ? " + 1" : "") + ". Every number in the coloured cells was written by the simulated SFPU (real output)." });
+    })(i);
+    steps.push({ dur: 1.4, text: "<b>Eight vectors cover the face exactly once</b>, as the ISA's SFPLOAD model says (row = (Addr &amp; ~3) + Lane/8, column = (Lane &amp; 7)·2, +1 when Addr bit 1 is set; SFPLOAD.md:81-89). The LLK then moves the Dst base 16 rows on and calls the same function for faces 1–3, and the program confirmed all three are identical to face 0. 4 faces × 8 vectors = 32 SFPU vectors per tile." });
+    TT.stepper({ root: root, steps: steps, draw: function (k, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "Dst face 0 (16 rows × 16 columns), cell label = lane, colour = vector", GX, 20, { color: C.muted });
+      for (var r = 0; r < 16; r++) for (var c = 0; c < 16; c++) {
+        var v = M[r * 16 + c], vec = v >> 5, lane = v & 31;
+        var on = k === 8 || vec === k, past = k < 8 && vec < k;
+        TT.box(ctx, GX + c * CS, GY + r * CS, CS - 2, CS - 2, { r: 2, fill: cols[vec], alpha: on ? (k === 8 ? 0.55 : 0.35 + 0.5 * t) : (past ? 0.18 : 0.06) });
+        if (on || past) TT.text(ctx, String(lane), GX + c * CS + CS / 2 - 1, GY + r * CS + CS / 2 - 1, { font: "10px", mono: true, align: "center", color: on ? "#000" : C.muted });
+      }
+      // LReg view
+      var LX = 440, LY = 70, LW = 52, LH = 40;
+      var vk = k === 8 ? 7 : k;
+      TT.text(ctx, k === 8 ? "LReg after the last load (vector 7)" : "LReg after dst_reg[" + k + "]: 32 lanes as 4×8", LX, 40, { color: C.muted });
+      for (var l = 0; l < 32; l++) {
+        var x = LX + (l & 7) * (LW + 4), y = LY + (l >> 3) * (LH + 4);
+        var r0 = 4 * Math.floor(vk / 2) + (l >> 3), c0 = (l & 7) * 2 + (vk % 2);
+        TT.box(ctx, x, y, LW, LH, { r: 3, fill: cols[vk], alpha: 0.3, stroke: cols[vk] });
+        TT.text(ctx, "L" + l, x + 4, y + 11, { font: "10px", color: C.muted });
+        TT.text(ctx, "r" + r0 + " c" + c0, x + LW / 2, y + 27, { font: "11px", mono: true, align: "center" });
+      }
+      TT.text(ctx, "row = 4·⌊i/2⌋ + L/8,   col = 2·(L mod 8) + (i mod 2)", LX, LY + 4 * (LH + 4) + 18, { mono: true, font: "12px", color: C.yellow });
+      TT.text(ctx, "(r, c) = the Dst cell this lane reads and writes", LX, LY + 4 * (LH + 4) + 40, { font: "12px", color: C.muted });
+    }});
+  })();
+  </script>
+  <p>This is the same picture A07 derived from the ISA and a disassembly, now confirmed by data written by the simulated device. It also settles, with an experiment, the disagreement A07 flagged with the Metalium guide: one face is <code>dst_reg[0..7]</code>, not <code>dst_reg[0..3]</code>. ttsim's <code>SFPLOAD</code> uses the same two lines as the ISA (<code>tensix.cpp:3989-3990</code>), and it skips lanes whose flag is off (<code>for_each_lane(mask, …)</code>, line 3988), as the ISA's <code>if (LaneEnabled[Lane] …)</code> does.</p>
+
+  <h2 id="kernel">4. Your own SFPI kernel: a four-way <code>v_if</code></h2>
+  <p>The starting point is <code>custom_sfpi_smoothstep</code>, the stock example whose face function loads, computes and stores eight vectors (<code>tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/experimental/llk_sfpu/ckernel_sfpu_smoothstep.h:13-22</code>). Our kernel keeps its structure. Here is the piecewise face function:</p>
+  <div class="filename">sim-labs/overlays/b08/b08/sfpu_lab.cpp:30-46</div>
+<pre><code>inline void b08_piecewise_face() {
+    for (int i = 0; i &lt; 8; i++) {
+        sfpi::vFloat x = sfpi::dst_reg[i];
+        sfpi::vFloat y;
+        v_if (x &lt; -1.0f) {             // region A: flat at -1
+            y = -1.0f;
+        } v_elseif (x &lt; 0.0f) {        // region B: x(x+2), from -1 up to 0
+            y = x * (x + 2.0f);
+        } v_elseif (x &lt; 1.0f) {        // region C: x(2-x), from 0 up to 1
+            y = x * (2.0f - x);
+        } v_else {                     // region D: flat at +1
+            y = 1.0f;
+        }
+        v_endif;
+        sfpi::dst_reg[i] = y;
+    }
+}</code></pre>
+  <p>And the call from the kernel body, between <code>copy_tile</code> and <code>tile_regs_commit</code>, exactly where <code>my_smoothstep_tiles</code> sits in the stock example:</p>
+  <div class="filename">sim-labs/overlays/b08/b08/sfpu_lab.cpp (kernel_main, abridged)</div>
+<pre><code>    compute_kernel_hw_startup(cb_in, cb_out);
+    copy_init(cb_in);
+    for (uint32_t t = 0; t &lt; n_tiles; t++) {
+        cb_wait_front(cb_in, 1);
+        tile_regs_acquire();
+        copy_tile(cb_in, 0, 0);   // UNPACK + MATH: tile -&gt; Dst[0]
+        MATH(SFPU_UNARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE, b08_piecewise_face, 0, VectorMode::RC));
+        tile_regs_commit();
+        ...</code></pre>
+  <p><code>MATH(…)</code> keeps the call on the math TRISC only (A12 explains the three TRISCs). The macro hands the face function to the LLK, which runs it once per face:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_sfpu_common.h:51-60 @7aad8aac</div>
+<pre><code>    if (vector_mode == VectorMode::RC)
+    {
+        // Do all four faces, and iterate through all 4 blocks of 4 rows each
+#pragma GCC unroll 0
+        for (int face = 0; face &lt; 4; face++)
+        {
+            sfpu_func(args...);
+            _llk_math_eltwise_sfpu_inc_dst_face_addr_();
+        }
+    }</code></pre>
+  <p>(<code>_inc_dst_face_addr_</code> is two <code>inc_dst_addr&lt;8&gt;()</code>, 16 rows, lines 32-36.) What did the compiler make of four regions with no branches? This is the face function from the JIT cache (<code>~/.cache/tt-metal-cache/…/sfpu_lab/…/trisc1/trisc1.elf</code>), disassembled with the SFPI toolchain's <code>riscv-tt-elf-objdump</code>. The comments are mine:</p>
+  <div class="filename">output: objdump of the piecewise trisc1.elf (Wormhole), one vector of the loop</div>
+<pre><code>lui  a0,0x7000c ... sw a3,0(a4)   # SFPLOAD L0 &lt;- dst_reg[i]: the RISC-V builds the word 0x7000c000+2i
+sfpmad    L1,L11,L11,L0,0         # L1 = (-1)(-1) + x = x + 1        (L11 holds -1.0)
+sfpnop                            # MAD latency on Wormhole
+sfpsetcc  L1,0x000,0              # flag = (x+1 &lt; 0)             -&gt; region A
+sfpcompc                          # flag = !A                     v_elseif ...
+sfppushc  0                       # save !A on the flag stack
+sfpsetcc  L0,0x000,0              # flag = (x &lt; 0) among !A       -&gt; region B
+sfpmov    L2,L0,2                 # L2 = x            (mode 2: ALL lanes, ignore flags)
+sfpaddi   L2,16384,0              # L2 = x + 2.0      (B lanes; 16384 = 0x4000 = bf16 2.0)
+sfpmov    L1,L11,2                # L1 = -1.0         (ALL lanes: region A's answer, everywhere)
+sfpmul    L1,L0,L2,0              # L1 = x(x+2)       (B lanes overwrite it)
+sfpcompc                          # flag = !A and !B  = C or D
+sfppushc  0
+sfpmad    L2,L11,L10,L0,0         # L2 = (-1)(1) + x = x - 1
+sfpnop
+sfpsetcc  L2,0x000,0              # flag = (x-1 &lt; 0) among C|D   -&gt; region C
+sfpmov    L2,L0,1                 # L2 = -x           (mode 1: negate)
+sfpaddi   L2,16384,0              # L2 = 2 - x
+sfpnop
+sfpmul    L1,L0,L2,0              # L1 = x(2-x)       (C lanes)
+sfpcompc                          # flag = D
+sfpmov    L0,L1,2                 # L0 = L1           (ALL lanes)
+sfpmov    L0,L10,0                # L0 = 1.0          (D lanes; L10 holds 1.0)
+sfppopc   0
+sfppopc   0                       # flags restored
+sfpencc   0x003,10                # all lanes on again
+... sw a3,0(a4)                   # SFPSTORE L0 -&gt; dst_reg[i]  (word 0x7200c000+2i)</code></pre>
+  <p>Three things are worth seeing. Every comparison is against zero (<code>sfpsetcc</code> only tests the sign or zero-ness of an LReg, <code>SFPSETCC.md</code> functional model), so <code>x &lt; -1</code> becomes "is x + 1 negative". The <code>v_elseif</code> chain is <code>sfpcompc</code> then <code>sfppushc</code>: <code>SFPCOMPC</code> computes <code>LaneFlags = Top.LaneFlags &amp;&amp; !LaneFlags</code> (<code>SFPCOMPC.md:33</code>), so "else" only ever re-enables lanes that were enabled one level up. And the compiler used <code>SFPMOV</code> mode 2, <code>SFPMOV_MOD1_ALL_LANES_ENABLED</code> (<code>SFPMOV.md:64</code>; ttsim <code>tensix.cpp:4569-4570</code>), to write region A's &minus;1 and the merged result into <i>every</i> lane, ignoring the masks, then let the later regions overwrite their own lanes. Because the SFPLOAD/SFPSTORE address depends on <code>i</code>, the RISC-V core builds those two instruction words in a register and stores them into the instruction buffer (<code>sw</code> to <code>0xffe40000</code>); the rest are fixed <code>sfp*</code> words.</p>
+  <p>Count them: 25 <code>sfp*</code> instructions plus the load and the store, 27 per vector, of which 3 are <code>sfpnop</code>. A lane does about 3 useful operations for its own region. Step through the figure to see what each lane does on each instruction. The 32 inputs are real samples from the run's input range, one per lane in a fixed shuffled order (on the device, neighbouring lanes hold neighbouring values, which would make the picture boringly tidy). The page replays the instruction sequence above in FP32 for these inputs and checks the stored results against the device's outputs for the same x values.</p>
+
+  <div class="viz" id="fig-pred"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-pred");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    var D = {lanes:[[-1.9375,-1.0],[-1.8125,-1.0],[-1.6875,-1.0],[-1.5625,-1.0],[-1.4375,-1.0],[-1.3125,-1.0],[-1.1875,-1.0],[-1.0625,-1.0],[-0.9375,-0.99609375],[-0.8125,-0.96484375],[-0.6875,-0.90234375],[-0.5625,-0.80859375],[-0.4375,-0.68359375],[-0.3125,-0.52734375],[-0.1875,-0.33984375],[-0.0620117188,-0.120117188],[0.0629882812,0.121582031],[0.188476562,0.33984375],[0.3125,0.52734375],[0.4375,0.68359375],[0.5625,0.80859375],[0.6875,0.90234375],[0.8125,0.96484375],[0.9375,0.99609375],[1.0625,1.0],[1.1875,1.0],[1.3125,1.0],[1.4375,1.0],[1.5625,1.0],[1.6875,1.0],[1.8125,1.0],[1.9375,1.0]]};
+    var lanes = [];
+    for (var l = 0; l < 32; l++) { var s = D.lanes[(l * 13 + 5) % 32]; lanes.push({ x: s[0], dev: s[1] }); }
+    var fr = Math.fround, f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+    function trunc16(v) { f32[0] = v; u32[0] = u32[0] & 0xffff0000; return f32[0]; }
+    // Steps: [label, asm, kind]
+    var P = [
+      ["SFPLOAD", "x = dst_reg[i]"],
+      ["SFPMAD", "L1 = x + 1"],
+      ["SFPSETCC", "flag = x+1<0 → A"],
+      ["COMPC, PUSHC", "flag = !A; push"],
+      ["SFPSETCC", "flag = x<0 → B"],
+      ["MOV(all), ADDI", "L2 = x; L2 += 2 (B)"],
+      ["MOV(all)", "L1 = −1, all lanes"],
+      ["SFPMUL", "L1 = x·(x+2) (B)"],
+      ["COMPC, PUSHC", "flag = C|D; push"],
+      ["MAD, SETCC", "flag = x−1<0 → C"],
+      ["MOV(neg),ADDI,MUL", "L1 = x·(2−x) (C)"],
+      ["SFPCOMPC", "flag = D"],
+      ["MOV(all), MOV", "L0 = L1; L0 = 1 (D)"],
+      ["POPC×2, ENCC", "all lanes on"],
+      ["SFPSTORE", "L0 → BF16 (truncate)"]
+    ];
+    var NINS = [1, 2, 1, 2, 1, 2, 1, 1, 2, 3, 4, 1, 2, 3, 1]; // machine instructions per step (incl. sfpnop)
+    function region(x) { return x < -1 ? 0 : x < 0 ? 1 : x < 1 ? 2 : 3; }
+    // state after step k for lane
+    function state(L, k) {
+      var x = L.x, R = region(x), st = { flag: true, en: true, L1: null, L0: x, L2: null, depth: 0, active: false };
+      if (k >= 1) st.L1 = fr(x + 1);
+      if (k >= 2) { st.flag = R === 0; }
+      if (k >= 3) { st.flag = R !== 0; st.depth = 1; }
+      if (k >= 4) { st.flag = R === 1; }
+      if (k >= 5) { st.L2 = x; if (R === 1) st.L2 = fr(x + 2); }
+      if (k >= 6) st.L1 = -1;
+      if (k >= 7 && R === 1) st.L1 = fr(x * fr(x + 2));
+      if (k >= 8) { st.flag = R >= 2; st.depth = 2; }
+      if (k >= 9) { st.flag = R === 2; if (R >= 2) st.L2 = fr(x - 1); }
+      if (k >= 10 && R === 2) { st.L2 = fr(2 - x); st.L1 = fr(x * fr(2 - x)); }
+      if (k >= 11) st.flag = R === 3;
+      if (k >= 12) { st.L0 = st.L1; if (R === 3) st.L0 = 1; }
+      if (k >= 13) { st.flag = true; st.depth = 0; }
+      st.out = k >= 14 ? trunc16(st.L0) : null;
+      // which lanes write on step k
+      var w = { 0: true, 1: true, 2: true, 3: true, 4: R !== 0, 5: R === 1, 6: true, 7: R === 1, 8: R !== 0, 9: R >= 2, 10: R === 2, 11: R >= 2, 12: true, 13: true, 14: true };
+      st.active = !!w[k];
+      st.enabled = (k <= 2) || (k === 3) || (k === 4 ? R !== 0 : true);
+      if (k === 5 || k === 7) st.enabled = R === 1;
+      if (k === 6 || k === 12 || k >= 13) st.enabled = true;
+      if (k === 8 || k === 9) st.enabled = R >= 1 && (k === 8 ? R !== 0 : R >= 2);
+      if (k === 10) st.enabled = R === 2;
+      if (k === 11) st.enabled = R >= 2;
+      return st;
+    }
+    var regCol = [C.purple, C.blue, C.orange, C.green];
+    var regName = ["A", "B", "C", "D"];
+    var texts = [
+      "<b>SFPLOAD.</b> One instruction fills all 32 lanes with their own x. Lane colours mark which region each x falls in (A: x < −1, B: [−1, 0), C: [0, 1), D: x ≥ 1). The SFPU does not know these colours; it will have to discover them with flags.",
+      "<b>L1 = x + 1</b>, computed as (−1)·(−1) + x with the constant −1.0 in LReg 11. Wormhole can only compare against zero, so 'x < −1' becomes 'x + 1 < 0'. All 32 lanes work.",
+      "<b>SFPSETCC.</b> Each lane sets its flag from the sign of x + 1. Lit lanes (flag = 1) are region A. Nothing has been computed for them yet: the compiler will hoist A's constant later.",
+      "<b>v_elseif = SFPCOMPC then SFPPUSHC.</b> The flags invert within the enclosing context (the stack is empty, so every lane counts), giving 'not A', and that mask is pushed. A lanes are now disabled (grey) until the matching pop.",
+      "<b>SFPSETCC on x.</b> Only enabled lanes update their flag: among 'not A', the negative ones are region B. A lanes are untouched because they are disabled, not because their flag was tested.",
+      "<b>L2 = x in all lanes (SFPMOV mode 2 ignores the mask), then L2 += 2.0</b> in the B lanes only. SFPADDI takes a 16-bit BF16 immediate: 0x4000 = 2.0.",
+      "<b>L1 = −1 in every lane.</b> The compiler's trick: region A's answer is written everywhere, ignoring flags. Lanes in B, C and D will overwrite L1 later; A lanes will keep it.",
+      "<b>SFPMUL: L1 = x·(x+2)</b>, written only by the B lanes. The other " + "lanes receive the same instruction and do nothing with it. They still spend the issue slot.",
+      "<b>Second v_elseif.</b> SFPCOMPC gives 'enabled one level up AND not B' = C or D, which is pushed. The flag stack is now two deep.",
+      "<b>L2 = x − 1; SFPSETCC.</b> Among C|D lanes, the ones with x − 1 < 0 are region C.",
+      "<b>L2 = −x (SFPMOV mode 1 negates), L2 += 2, L1 = x·(2−x)</b>, all in the C lanes only. Three instructions plus a nop for 8 or so lanes.",
+      "<b>v_else = SFPCOMPC.</b> 'C|D and not C' = D. The D lanes light up.",
+      "<b>Merge: L0 = L1 in all lanes, then L0 = 1.0 in the D lanes.</b> Now every lane holds its own region's answer in L0.",
+      "<b>Two SFPPOPCs and SFPENCC</b> put the flags back and re-enable all lanes (v_endif).",
+      "<b>SFPSTORE.</b> Each FP32 lane is truncated to BF16 on its way into Dst. The bottom of each lane shows the replayed result; the counter shows how many match the simulated device's output for the same x."
+    ];
+    var steps = texts.map(function (t) { return { dur: 1.3, text: t }; });
+    TT.stepper({ root: root, steps: steps, draw: function (k, t) {
+      TT.clear(ctx, g.W, g.H);
+      // program list
+      for (var p = 0; p < P.length; p++) {
+        var y = 24 + p * 24;
+        if (p === k) TT.box(ctx, 8, y - 11, 308, 22, { r: 3, fill: C.blue, alpha: 0.25 });
+        TT.text(ctx, P[p][0], 14, y, { mono: true, font: "11px", color: p <= k ? C.fg : C.muted });
+        TT.text(ctx, P[p][1], 182, y, { font: "11px", color: p <= k ? C.yellow : C.muted });
+      }
+      var GX = 330, GY = 14, W = 64, H = 84, G = 3, match = 0, issued = 0, useful = 0;
+      for (var q = 0; q <= k; q++) issued += NINS[q];
+      lanes.forEach(function (L, l) {
+        var st = state(L, k), R = region(L.x);
+        var x = GX + (l & 7) * (W + G), y = GY + (l >> 3) * (H + G);
+        var col = regCol[R];
+        TT.box(ctx, x, y, W, H, { r: 4, fill: st.enabled ? C.bg2 : C.bg3, stroke: st.active && st.enabled ? col : C.border, lw: st.active && st.enabled ? 2.5 : 1 });
+        if (!st.enabled) { ctx.save(); ctx.beginPath(); ctx.rect(x, y, W, H); ctx.clip(); ctx.strokeStyle = "#3a4452"; ctx.lineWidth = 1; for (var hh = -H; hh < W; hh += 9) { ctx.beginPath(); ctx.moveTo(x + hh, y + H); ctx.lineTo(x + hh + H, y); ctx.stroke(); } ctx.restore(); }
+        TT.box(ctx, x + 3, y + 3, 16, 14, { r: 2, fill: col, alpha: 0.8, label: regName[R], color: "#000", font: "10px" });
+        TT.box(ctx, x + W - 19, y + 3, 16, 14, { r: 2, fill: st.flag ? C.yellow : C.bg, stroke: C.yellow, alpha: st.flag ? 0.9 : 1, label: st.flag ? "1" : "0", color: st.flag ? "#000" : C.muted, font: "10px" });
+        TT.text(ctx, "x=" + (+L.x.toPrecision(3)), x + 4, y + 30, { font: "11px", mono: true });
+        if (k >= 1 && k <= 13) TT.text(ctx, "L1=" + (st.L1 === null ? "–" : +st.L1.toPrecision(3)), x + 4, y + 46, { font: "10px", mono: true, color: C.muted });
+        if (k >= 12 && k <= 13) TT.text(ctx, "L0=" + (+st.L0.toPrecision(3)), x + 4, y + 62, { font: "11px", mono: true, color: C.green });
+        if (st.out !== null) {
+          var ok = Math.abs(st.out - L.dev) <= 1e-8 * Math.max(1, Math.abs(L.dev)); if (ok) match++; // the dump prints 9 significant digits
+          TT.text(ctx, "y=" + (+st.out.toPrecision(4)), x + 4, y + 62, { font: "10px", mono: true, color: ok ? C.green : C.red });
+          TT.text(ctx, ok ? "= device" : "≠ " + L.dev, x + 4, y + 77, { font: "10px", color: ok ? C.muted : C.red });
+        }
+        if (st.active && st.enabled && k >= 1 && k <= 13) useful++;
+      });
+      var BY = GY + 4 * (H + G) + 22;
+      TT.text(ctx, "flag stack depth: " + state(lanes[0], k).depth, GX, BY, { mono: true, color: C.yellow });
+      TT.text(ctx, "instructions issued so far (incl. sfpnop): " + issued + " of 27", GX, BY + 22, { mono: true });
+      if (k === 14) TT.text(ctx, "replayed results equal to device output: " + match + " / 32", GX, BY + 44, { mono: true, color: match === 32 ? C.green : C.red });
+      else { TT.text(ctx, "yellow box = flag after this step; hatched = lane disabled while it runs;", GX, BY + 44, { font: "12px", color: C.muted }); TT.text(ctx, "bright border = lane writes", GX, BY + 62, { font: "12px", color: C.muted }); }
+    }});
+  })();
+  </script>
+
+  <div class="callout gpu">This is warp divergence with the decision made in advance. A GPU warp with four-way divergence also runs all four paths with lanes masked off. But a GPU skips a path that no thread takes. The SFPU's instruction stream was pushed by a RISC-V core that never sees the flags, so all 27 instructions are issued even if every lane lands in region A (A07 shows this with its "All x &ge; 0" button). Divergent SFPU code costs the sum of all its branches, always.</div>
+
+  <h2 id="poly">5. A polynomial sin, and where its error comes from</h2>
+  <p>Wormhole's SFPU has no transcendental instructions (A07); everything is built from multiply-adds, exponent tricks and masks. The textbook first attempt at sin is its Taylor series, cut off after x<sup>7</sup> and evaluated in Horner form so that it costs four FMAs. A second version first folds the input into [&minus;&pi;/2, &pi;/2] with a <code>v_if</code>/<code>v_elseif</code>, using sin(x) = sin(&pi; &minus; x):</p>
+  <div class="filename">sim-labs/overlays/b08/b08/sfpu_lab.cpp:48-65</div>
+<pre><code>inline void b08_sin_face() {
+    for (int i = 0; i &lt; 8; i++) {
+        sfpi::vFloat x = sfpi::dst_reg[i];
+#if B08_FOLD
+        v_if (x &gt; 1.57079637f) {           // sin(x) = sin(pi - x)
+            x = 3.14159274f - x;
+        } v_elseif (x &lt; -1.57079637f) {    // sin(x) = sin(-pi - x)
+            x = -3.14159274f - x;
+        }
+        v_endif;
+#endif
+        sfpi::vFloat x2 = x * x;           // Horner: x(1 + x2(-1/6 + x2(1/120 + x2(-1/5040))))
+        sfpi::vFloat p = x2 * -1.98412698e-4f + 8.33333377e-3f;
+        p = p * x2 - 0.166666672f;
+        p = p * x2 + 1.0f;
+        sfpi::dst_reg[i] = x * p;
+    }
+}</code></pre>
+  <p>Before running anything, predict. The first omitted Taylor term bounds the error: |x|<sup>9</sup>/9!. On [&minus;&pi;, &pi;] that is &pi;<sup>9</sup>/362880 &asymp; 0.082. After folding, |x| &le; &pi;/2 and the bound becomes (&pi;/2)<sup>9</sup>/9! &asymp; 1.6&times;10<sup>&minus;4</sup>. BF16 has an ulp of 2<sup>&minus;8</sup> &asymp; 0.0039 just below 1, so the folded polynomial should be invisible in BF16 and visible in FP32. Four runs over [&minus;&pi;, &pi;]:</p>
+<pre><code>$ B08_FN=sin B08_FOLD=0 $LAB_HOME/b08_sfpu                       # Wormhole, BF16
+max_abs_err=0.0747 (at x=-3.14062) mean_abs_err=0.00927 max_rel_err=77.2
+$ B08_FN=sin B08_FOLD=1 $LAB_HOME/b08_sfpu                       # Wormhole, BF16
+max_abs_err=0.00398 (at x=-1.69531) mean_abs_err=0.00164 max_rel_err=0.00759
+ulp vs correctly rounded: exact=1642 1ulp=2454 &gt;1ulp=0 max=1
+$ B08_FN=sin B08_FOLD=1 B08_FMT=fp32 $LAB_HOME/b08_sfpu          # Wormhole, FP32 CBs + 32-bit Dst
+max_abs_err=0.00195 (at x=-3.08789) mean_abs_err=0.000366 max_rel_err=0.904
+$ B08_FN=sin B08_FOLD=1 B08_FMT=fp32 B08_U2D=1 $LAB_HOME/b08_sfpu   # Blackhole, FP32 unpacked to Dst
+max_abs_err=0.000157 (at x=-1.57041) mean_abs_err=1.58e-05 max_rel_err=0.000157</code></pre>
+  <p>The first, second and fourth lines match the predictions: 0.075, at most one BF16 ulp, and 1.57&times;10<sup>&minus;4</sup> exactly at &plusmn;&pi;/2 where the remainder bound peaks. The third line is the surprise. FP32 should be better than BF16, yet its worst error, 0.00195, is twelve times the polynomial's. The value 0.00195 = 2<sup>&minus;9</sup> is one TF32 ulp for |x| in [2, 4): the input was truncated in SrcA (section 2), and near &pi; the fold <code>&pi; &minus; x</code> passes that input error straight through to the output (the slope of sin is &plusmn;1 there). (The <code>max_rel_err</code> values near 1 or 77 come from outputs near zero, where a tiny absolute error is a large relative one. They are not a separate bug.)</p>
+  <p>The figure plots the signed error of every run, from the dumps. Each dot is the worst element in a bucket of 16 consecutive inputs, so peaks are kept.</p>
+
+  <div class="viz" id="fig-err"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-err");
+    var g = TT.canvas(root, 900, 440), ctx = g.ctx, C = TT.C;
+    var D = {S:{"sin_f0_bf16":[[-3.14062,0.0747],[-3.10938,0.06859],[-3.09375,0.06565],[-3.0625,0.06009],[-3.04688,0.05747],[-3.01562,0.05288],[-3.0,0.0503],[-2.96875,0.04601],[-2.9375,0.04155],[-2.92188,0.04022],[-2.89062,0.03643],[-2.875,0.03493],[-2.84375,0.03174],[-2.82812,0.03102],[-2.79688,0.02738],[-2.76562,0.02538],[-2.75,0.02424],[-2.71875,0.02168],[-2.6875,0.02068],[-2.67188,0.01904],[-2.64062,0.01738],[-2.625,0.0154],[-2.59375,0.01694],[-2.5625,0.01601],[-2.53125,0.01455],[-2.53125,0.01455],[-2.48438,0.01326],[-2.48438,0.01326],[-2.4375,0.01062],[-2.42188,0.01073],[-2.40625,0.01069],[-2.375,0.01009],[-2.35938,0.009542],[-2.32812,0.007924],[-2.28125,0.008066],[-2.28125,0.008066],[-2.23438,0.006543],[-2.23438,0.006543],[-2.20312,0.005872],[-2.15625,0.005336],[-2.14062,0.006056],[-2.14062,0.006056],[-2.09375,0.003067],[-2.09375,0.003067],[-2.03125,0.005226],[-2.03125,0.005226],[-2.01562,0.004247],[-1.97656,0.004738],[-1.94531,0.004903],[-1.91406,0.00416],[-1.91406,0.00416],[-1.89062,0.003977],[-1.85156,0.003812],[-1.82031,0.004188],[-1.80469,0.004022],[-1.78906,0.003618],[-1.75,0.003517],[-1.72656,0.003518],[-1.69531,0.003977],[-1.69531,0.003977],[-1.66406,0.003466],[-1.61719,0.00283],[-1.59375,0.003643],[-1.57031,0.003906],[-1.57031,0.003906],[-1.54688,0.00362],[-1.52344,0.002785],[-1.47656,0.003376],[-1.44531,0.003856],[-1.44531,0.003856],[-1.41406,0.003367],[-1.39062,0.003344],[-1.35156,0.003408],[-1.33594,0.003797],[-1.30469,0.003864],[-1.28906,0.003544],[-1.25,0.003672],[-1.22656,0.003834],[-1.22656,0.003834],[-1.20312,0.003479],[-1.17188,0.003512],[-1.13281,0.003265],[-1.125,0.00383],[-1.07812,0.002166],[-1.05469,0.002559],[-1.04688,0.002583],[-1.03125,0.002473],[-0.99609,0.003417],[-0.96875,0.003866],[-0.94141,0.003699],[-0.92188,0.003767],[-0.90234,0.003532],[-0.85938,0.003528],[-0.83594,0.003644],[-0.82422,0.003549],[-0.78516,0.003811],[-0.78516,0.003811],[-0.75781,0.00374],[-0.73047,0.003156],[-0.69922,0.002995],[-0.67969,0.00355],[-0.66016,0.003865],[-0.62109,0.0038],[-0.60156,0.003431],[-0.57812,0.003486],[-0.55078,0.003822],[-0.52734,0.00324],[-0.50781,0.001892],[-0.47461,0.001913],[-0.45703,0.001833],[-0.4375,0.001801],[-0.41406,0.001941],[-0.39062,0.00186],[-0.36328,0.001828],[-0.33008,0.001851],[-0.29492,0.001603],[-0.28711,0.001931],[-0.25391,0.001187],[-0.22754,0.0009713],[-0.19727,0.0006762],[-0.18066,0.0009719],[-0.14844,0.0004321],[-0.12695,0.0006358],[-0.09912,0.0003261],[-0.07422,0.0004202],[-0.06348,0.0004457],[-0.03149,0.0002389],[-0.01611,0.0001214],[0.01611,-0.0001214],[0.03149,-0.0002389],[0.06348,-0.0004457],[0.07422,-0.0004202],[0.09912,-0.0003261],[0.12695,-0.0006358],[0.14844,-0.0004321],[0.18066,-0.0009719],[0.19727,-0.0006762],[0.22754,-0.0009713],[0.25391,-0.001187],[0.28711,-0.001931],[0.29492,-0.001603],[0.33008,-0.001851],[0.36328,-0.001828],[0.39062,-0.00186],[0.41406,-0.001941],[0.4375,-0.001801],[0.45703,-0.001833],[0.47461,-0.001913],[0.50781,-0.001892],[0.52734,-0.00324],[0.55078,-0.003822],[0.57812,-0.003486],[0.60156,-0.003431],[0.62109,-0.0038],[0.66016,-0.003865],[0.67969,-0.00355],[0.69922,-0.002995],[0.73047,-0.003156],[0.75781,-0.00374],[0.78516,-0.003811],[0.78516,-0.003811],[0.82422,-0.003549],[0.83594,-0.003644],[0.85938,-0.003528],[0.90234,-0.003532],[0.92188,-0.003767],[0.94141,-0.003699],[0.96875,-0.003866],[0.99609,-0.003417],[1.03125,-0.002473],[1.04688,-0.002583],[1.05469,-0.002559],[1.07812,-0.002166],[1.125,-0.00383],[1.13281,-0.003265],[1.17188,-0.003512],[1.20312,-0.003479],[1.22656,-0.003834],[1.22656,-0.003834],[1.25,-0.003672],[1.28906,-0.003544],[1.30469,-0.003864],[1.33594,-0.003797],[1.35156,-0.003408],[1.39062,-0.003344],[1.41406,-0.003367],[1.44531,-0.003856],[1.44531,-0.003856],[1.47656,-0.003376],[1.52344,-0.002785],[1.54688,-0.00362],[1.57031,-0.003906],[1.57031,-0.003906],[1.59375,-0.003643],[1.61719,-0.00283],[1.66406,-0.003466],[1.69531,-0.003977],[1.69531,-0.003977],[1.72656,-0.003518],[1.75,-0.003517],[1.78906,-0.003618],[1.80469,-0.004022],[1.82031,-0.004188],[1.85156,-0.003812],[1.89062,-0.003977],[1.91406,-0.00416],[1.91406,-0.00416],[1.94531,-0.004903],[1.97656,-0.004738],[2.01562,-0.004247],[2.03125,-0.005226],[2.03125,-0.005226],[2.09375,-0.003067],[2.09375,-0.003067],[2.14062,-0.006056],[2.14062,-0.006056],[2.15625,-0.005336],[2.20312,-0.005872],[2.23438,-0.006543],[2.23438,-0.006543],[2.28125,-0.008066],[2.28125,-0.008066],[2.32812,-0.007924],[2.35938,-0.009542],[2.375,-0.01009],[2.40625,-0.01069],[2.42188,-0.01073],[2.4375,-0.01062],[2.48438,-0.01326],[2.48438,-0.01326],[2.53125,-0.01455],[2.53125,-0.01455],[2.5625,-0.01601],[2.59375,-0.01694],[2.625,-0.0154],[2.64062,-0.01738],[2.67188,-0.01904],[2.6875,-0.02068],[2.71875,-0.02168],[2.75,-0.02424],[2.76562,-0.02538],[2.79688,-0.02738],[2.82812,-0.03102],[2.84375,-0.03174],[2.875,-0.03493],[2.89062,-0.03643],[2.92188,-0.04022],[2.9375,-0.04155],[2.96875,-0.04601],[3.0,-0.0503],[3.01562,-0.05288],[3.04688,-0.05747],[3.0625,-0.06009],[3.09375,-0.06565],[3.10938,-0.06859],[3.14062,-0.0747]],"sin_f1_bf16":[[-3.125,0.0001124],[-3.10938,0.0002297],[-3.07812,0.0004368],[-3.0625,0.0003969],[-3.01562,0.0006348],[-3.01562,0.0006348],[-3.0,0.000495],[-2.95312,0.0008305],[-2.9375,0.0005303],[-2.90625,0.0007543],[-2.875,0.001727],[-2.875,0.001727],[-2.82812,0.001719],[-2.82812,0.001719],[-2.78125,0.001032],[-2.76562,0.001938],[-2.73438,0.001525],[-2.70312,0.0007244],[-2.67188,0.001463],[-2.65625,0.001668],[-2.64062,0.001759],[-2.60938,0.003539],[-2.57812,0.002871],[-2.57812,0.002871],[-2.53125,0.002836],[-2.51562,0.00385],[-2.48438,0.001541],[-2.45312,0.002542],[-2.4375,0.002811],[-2.42188,0.002922],[-2.40625,0.002873],[-2.375,0.002279],[-2.35938,0.001729],[-2.3125,0.002944],[-2.3125,0.002944],[-2.26562,0.002538],[-2.23438,0.002637],[-2.23438,0.002637],[-2.1875,0.003289],[-2.1875,0.003289],[-2.14062,0.00215],[-2.10938,0.00297],[-2.09375,0.003067],[-2.09375,0.003067],[-2.0625,0.002624],[-2.03125,0.00132],[-2.0,0.003047],[-1.96875,0.003887],[-1.9375,0.003827],[-1.9375,0.003827],[-1.90625,0.002855],[-1.86719,0.003272],[-1.85156,0.003812],[-1.82812,0.00223],[-1.78906,0.003618],[-1.78906,0.003618],[-1.75,0.003517],[-1.72656,0.003518],[-1.69531,0.003977],[-1.69531,0.003977],[-1.66406,0.003466],[-1.61719,0.00283],[-1.59375,0.003643],[-1.57031,0.003906],[-1.57031,0.003906],[-1.54688,0.00362],[-1.52344,0.002785],[-1.47656,0.003376],[-1.44531,0.003856],[-1.44531,0.003856],[-1.41406,0.003367],[-1.39062,0.003344],[-1.35156,0.003408],[-1.33594,0.003797],[-1.30469,0.003864],[-1.28906,0.003544],[-1.25,0.003672],[-1.22656,0.003834],[-1.22656,0.003834],[-1.20312,0.003479],[-1.17188,0.003512],[-1.13281,0.003265],[-1.125,0.00383],[-1.07812,0.002166],[-1.05469,0.002559],[-1.04688,0.002583],[-1.03125,0.002473],[-0.99609,0.003417],[-0.96875,0.003866],[-0.94141,0.003699],[-0.92188,0.003767],[-0.90234,0.003532],[-0.85938,0.003528],[-0.83594,0.003644],[-0.82422,0.003549],[-0.78516,0.003811],[-0.78516,0.003811],[-0.75781,0.00374],[-0.73047,0.003156],[-0.69922,0.002995],[-0.67969,0.00355],[-0.66016,0.003865],[-0.62109,0.0038],[-0.60156,0.003431],[-0.57812,0.003486],[-0.55078,0.003822],[-0.52734,0.00324],[-0.50781,0.001892],[-0.47461,0.001913],[-0.45703,0.001833],[-0.4375,0.001801],[-0.41406,0.001941],[-0.39062,0.00186],[-0.36328,0.001828],[-0.33008,0.001851],[-0.29492,0.001603],[-0.28711,0.001931],[-0.25391,0.001187],[-0.22754,0.0009713],[-0.19727,0.0006762],[-0.18066,0.0009719],[-0.14844,0.0004321],[-0.12695,0.0006358],[-0.09912,0.0003261],[-0.07422,0.0004202],[-0.06348,0.0004457],[-0.03149,0.0002389],[-0.01611,0.0001214],[0.01611,-0.0001214],[0.03149,-0.0002389],[0.06348,-0.0004457],[0.07422,-0.0004202],[0.09912,-0.0003261],[0.12695,-0.0006358],[0.14844,-0.0004321],[0.18066,-0.0009719],[0.19727,-0.0006762],[0.22754,-0.0009713],[0.25391,-0.001187],[0.28711,-0.001931],[0.29492,-0.001603],[0.33008,-0.001851],[0.36328,-0.001828],[0.39062,-0.00186],[0.41406,-0.001941],[0.4375,-0.001801],[0.45703,-0.001833],[0.47461,-0.001913],[0.50781,-0.001892],[0.52734,-0.00324],[0.55078,-0.003822],[0.57812,-0.003486],[0.60156,-0.003431],[0.62109,-0.0038],[0.66016,-0.003865],[0.67969,-0.00355],[0.69922,-0.002995],[0.73047,-0.003156],[0.75781,-0.00374],[0.78516,-0.003811],[0.78516,-0.003811],[0.82422,-0.003549],[0.83594,-0.003644],[0.85938,-0.003528],[0.90234,-0.003532],[0.92188,-0.003767],[0.94141,-0.003699],[0.96875,-0.003866],[0.99609,-0.003417],[1.03125,-0.002473],[1.04688,-0.002583],[1.05469,-0.002559],[1.07812,-0.002166],[1.125,-0.00383],[1.13281,-0.003265],[1.17188,-0.003512],[1.20312,-0.003479],[1.22656,-0.003834],[1.22656,-0.003834],[1.25,-0.003672],[1.28906,-0.003544],[1.30469,-0.003864],[1.33594,-0.003797],[1.35156,-0.003408],[1.39062,-0.003344],[1.41406,-0.003367],[1.44531,-0.003856],[1.44531,-0.003856],[1.47656,-0.003376],[1.52344,-0.002785],[1.54688,-0.00362],[1.57031,-0.003906],[1.57031,-0.003906],[1.59375,-0.003643],[1.61719,-0.00283],[1.66406,-0.003466],[1.69531,-0.003977],[1.69531,-0.003977],[1.72656,-0.003518],[1.75,-0.003517],[1.78906,-0.003618],[1.78906,-0.003618],[1.82812,-0.00223],[1.85156,-0.003812],[1.86719,-0.003272],[1.90625,-0.002855],[1.9375,-0.003827],[1.9375,-0.003827],[1.96875,-0.003887],[2.0,-0.003047],[2.03125,-0.00132],[2.0625,-0.002624],[2.09375,-0.003067],[2.09375,-0.003067],[2.10938,-0.00297],[2.14062,-0.00215],[2.1875,-0.003289],[2.1875,-0.003289],[2.23438,-0.002637],[2.23438,-0.002637],[2.26562,-0.002538],[2.3125,-0.002944],[2.3125,-0.002944],[2.35938,-0.001729],[2.375,-0.002279],[2.40625,-0.002873],[2.42188,-0.002922],[2.4375,-0.002811],[2.45312,-0.002542],[2.48438,-0.001541],[2.51562,-0.00385],[2.53125,-0.002836],[2.57812,-0.002871],[2.57812,-0.002871],[2.60938,-0.003539],[2.64062,-0.001759],[2.65625,-0.001668],[2.67188,-0.001463],[2.70312,-0.0007244],[2.73438,-0.001525],[2.76562,-0.001938],[2.78125,-0.001032],[2.82812,-0.001719],[2.82812,-0.001719],[2.875,-0.001727],[2.875,-0.001727],[2.90625,-0.0007543],[2.9375,-0.0005303],[2.95312,-0.0008305],[3.0,-0.000495],[3.01562,-0.0006348],[3.01562,-0.0006348],[3.0625,-0.0003969],[3.07812,-0.0004368],[3.10938,-0.0002297],[3.125,-0.0001124]],"sin_f1_fp32_wh":[[-3.13085,-0.001946],[-3.10937,-0.001948],[-3.08789,-0.00195],[-3.0526,-0.001812],[-3.03112,-0.001811],[-3.00964,-0.00181],[-2.98816,-0.001807],[-2.96668,-0.001804],[-2.9452,-0.0018],[-2.90223,-0.00179],[-2.88075,-0.001783],[-2.85927,-0.001776],[-2.83779,-0.001767],[-2.81631,-0.001758],[-2.79483,-0.001748],[-2.77335,-0.001738],[-2.73039,-0.001713],[-2.7089,-0.0017],[-2.68742,-0.001686],[-2.66594,-0.001671],[-2.64446,-0.001655],[-2.62298,-0.001638],[-2.6015,-0.00162],[-2.55854,-0.001583],[-2.53706,-0.001563],[-2.51558,-0.001542],[-2.49409,-0.00152],[-2.47261,-0.001498],[-2.45113,-0.001474],[-2.42965,-0.00145],[-2.38669,-0.0014],[-2.36521,-0.001374],[-2.34373,-0.001347],[-2.32225,-0.001319],[-2.30077,-0.00129],[-2.27928,-0.001261],[-2.2578,-0.001231],[-2.21484,-0.001169],[-2.20103,-0.001066],[-2.17955,-0.001036],[-2.15807,-0.001005],[-2.11511,-0.0009416],[-2.09363,-0.0009086],[-2.07215,-0.0008751],[-2.05067,-0.0008409],[-2.02919,-0.0008061],[-2.0077,-0.0007705],[-1.98622,-0.0003414],[-1.954,-0.0003145],[-1.93252,-0.000296],[-1.91104,-0.0002767],[-1.88956,-0.0002569],[-1.85734,-0.0002258],[-1.83586,-0.000204],[-1.81438,-0.0001815],[-1.78215,-0.0001459],[-1.76067,-0.0001211],[-1.73919,-9.505e-05],[-1.71771,-6.785e-05],[-1.67782,7.459e-05],[-1.6456,9.48e-05],[-1.62412,0.0001104],[-1.60263,0.0001277],[-1.57195,0.000156],[-1.5566,0.0001576],[-1.52438,0.0001636],[-1.5029,0.0001698],[-1.48142,0.0001777],[-1.4492,0.0001923],[-1.42772,0.0002036],[-1.40624,0.0002161],[-1.38476,0.0002297],[-1.35253,0.0002517],[-1.33105,0.0002673],[-1.3065,0.0002496],[-1.28502,0.0002637],[-1.2528,0.000286],[-1.23132,0.0003014],[-1.20984,0.0003172],[-1.18836,0.0003334],[-1.15614,0.0003582],[-1.13466,0.000375],[-1.11317,0.0003918],[-1.08095,0.0004176],[-1.05947,0.0004349],[-1.03799,0.0004522],[-1.01651,0.0004695],[-1.00577,0.0004782],[-0.96434,0.0002729],[-0.94286,0.0002829],[-0.91064,0.0002979],[-0.88916,0.000308],[-0.86614,0.0002735],[-0.84466,0.0002825],[-0.81244,0.0002958],[-0.79096,0.0003047],[-0.76948,0.0003136],[-0.73726,0.000327],[-0.71578,0.0003358],[-0.6943,0.0003446],[-0.67281,0.0003533],[-0.64059,0.0003662],[-0.61911,0.0003748],[-0.59763,0.0003832],[-0.56541,0.0003957],[-0.54393,0.0004039],[-0.52245,0.000412],[-0.50097,0.00042],[-0.46875,0.0002138],[-0.44726,0.0002192],[-0.41965,0.0001942],[-0.39817,0.0001991],[-0.37668,0.000204],[-0.34446,0.0002113],[-0.32298,0.0002161],[-0.3015,0.0002209],[-0.28002,0.0002256],[-0.25854,0.0002302],[-0.22632,0.000118],[-0.20177,0.0001054],[-0.18029,0.0001092],[-0.14807,0.0001148],[-0.12658,0.0001185],[-0.11584,5.974e-05],[-0.08209,5.658e-05],[-0.07135,5.831e-05],[-0.03299,2.964e-05],[-0.01918,1.44e-05],[0.01918,-1.44e-05],[0.03299,-2.964e-05],[0.07135,-5.831e-05],[0.08209,-5.658e-05],[0.11584,-5.974e-05],[0.12658,-0.0001185],[0.14807,-0.0001148],[0.18029,-0.0001092],[0.20177,-0.0001054],[0.22632,-0.000118],[0.25854,-0.0002302],[0.28002,-0.0002256],[0.3015,-0.0002209],[0.32298,-0.0002161],[0.34446,-0.0002113],[0.37668,-0.000204],[0.39817,-0.0001991],[0.41965,-0.0001942],[0.44726,-0.0002192],[0.46875,-0.0002138],[0.50097,-0.00042],[0.52245,-0.000412],[0.54393,-0.0004039],[0.56541,-0.0003957],[0.59763,-0.0003832],[0.61911,-0.0003748],[0.64059,-0.0003662],[0.67281,-0.0003533],[0.6943,-0.0003446],[0.71578,-0.0003358],[0.73726,-0.000327],[0.76948,-0.0003136],[0.79096,-0.0003047],[0.81244,-0.0002958],[0.84466,-0.0002825],[0.86614,-0.0002735],[0.88916,-0.000308],[0.91064,-0.0002979],[0.94286,-0.0002829],[0.96434,-0.0002729],[1.00577,-0.0004782],[1.01651,-0.0004695],[1.03799,-0.0004522],[1.05947,-0.0004349],[1.08095,-0.0004176],[1.11317,-0.0003918],[1.13466,-0.000375],[1.15614,-0.0003582],[1.18836,-0.0003334],[1.20984,-0.0003172],[1.23132,-0.0003014],[1.2528,-0.000286],[1.28502,-0.0002637],[1.3065,-0.0002496],[1.33105,-0.0002673],[1.35253,-0.0002517],[1.38476,-0.0002297],[1.40624,-0.0002161],[1.42772,-0.0002036],[1.4492,-0.0001923],[1.48142,-0.0001777],[1.5029,-0.0001698],[1.52438,-0.0001636],[1.5566,-0.0001576],[1.57195,-0.000156],[1.60263,-0.0001277],[1.62412,-0.0001104],[1.6456,-9.48e-05],[1.67782,-7.459e-05],[1.71771,6.785e-05],[1.73919,9.505e-05],[1.76067,0.0001211],[1.78215,0.0001459],[1.81438,0.0001815],[1.83586,0.000204],[1.85734,0.0002258],[1.88956,0.0002569],[1.91104,0.0002767],[1.93252,0.000296],[1.954,0.0003145],[1.98622,0.0003414],[2.0077,0.0007705],[2.02919,0.0008061],[2.05067,0.0008409],[2.07215,0.0008751],[2.09363,0.0009086],[2.11511,0.0009416],[2.15807,0.001005],[2.17955,0.001036],[2.20103,0.001066],[2.21484,0.001169],[2.2578,0.001231],[2.27928,0.001261],[2.30077,0.00129],[2.32225,0.001319],[2.34373,0.001347],[2.36521,0.001374],[2.38669,0.0014],[2.42965,0.00145],[2.45113,0.001474],[2.47261,0.001498],[2.49409,0.00152],[2.51558,0.001542],[2.53706,0.001563],[2.55854,0.001583],[2.6015,0.00162],[2.62298,0.001638],[2.64446,0.001655],[2.66594,0.001671],[2.68742,0.001686],[2.7089,0.0017],[2.73039,0.001713],[2.77335,0.001738],[2.79483,0.001748],[2.81631,0.001758],[2.83779,0.001767],[2.85927,0.001776],[2.88075,0.001783],[2.90223,0.00179],[2.9452,0.0018],[2.96668,0.001804],[2.98816,0.001807],[3.00964,0.00181],[3.03112,0.001811],[3.0526,0.001812],[3.08789,0.00195],[3.10937,0.001948],[3.13085,0.001946]],"sin_f1_fp32u_bh":[[-3.12625,-8.78e-08],[-3.1017,-8.83e-08],[-3.07255,-9.16e-08],[-3.05874,-9.07e-08],[-3.03572,-9e-08],[-2.99736,-9.6e-08],[-2.98355,-9.6e-08],[-2.95287,-9.5e-08],[-2.93906,-9.6e-08],[-2.92065,-9.6e-08],[-2.88075,-9.2e-08],[-2.87155,-1.01e-07],[-2.83319,-1.01e-07],[-2.80557,-9.6e-08],[-2.77642,-9.9e-08],[-2.77335,-1.05e-07],[-2.74113,-1.01e-07],[-2.71197,-9.9e-08],[-2.68282,-9.9e-08],[-2.66594,-8.8e-08],[-2.6506,-9.7e-08],[-2.61377,-9e-08],[-2.59383,-9.1e-08],[-2.57081,-7.9e-08],[-2.5478,-8.5e-08],[-2.52171,-7.2e-08],[-2.4987,-4.2e-08],[-2.45727,5.7e-08],[-2.43579,9e-08],[-2.40664,1.27e-07],[-2.39129,1.77e-07],[-2.35754,2.72e-07],[-2.33606,3.69e-07],[-2.30997,4.83e-07],[-2.28389,6.39e-07],[-2.25934,8.42e-07],[-2.23786,1.081e-06],[-2.21024,1.393e-06],[-2.18569,1.808e-06],[-2.16114,2.283e-06],[-2.13659,2.779e-06],[-2.11204,3.494e-06],[-2.08749,4.35e-06],[-2.06294,5.324e-06],[-2.03839,6.597e-06],[-2.01384,8.016e-06],[-1.98929,9.758e-06],[-1.96474,1.171e-05],[-1.94019,1.417e-05],[-1.91564,1.701e-05],[-1.89109,2.028e-05],[-1.86654,2.415e-05],[-1.84199,2.871e-05],[-1.81744,3.388e-05],[-1.79289,4.007e-05],[-1.76834,4.709e-05],[-1.74379,5.513e-05],[-1.71925,6.449e-05],[-1.6947,7.517e-05],[-1.67015,8.742e-05],[-1.6456,0.0001014],[-1.62105,0.0001173],[-1.5965,0.0001355],[-1.57195,0.0001559],[-1.57041,0.0001566],[-1.54586,0.000136],[-1.52131,0.0001178],[-1.49676,0.0001018],[-1.47221,8.777e-05],[-1.44766,7.556e-05],[-1.42311,6.484e-05],[-1.39856,5.542e-05],[-1.37402,4.735e-05],[-1.34947,4.021e-05],[-1.32492,3.411e-05],[-1.30037,2.885e-05],[-1.27582,2.431e-05],[-1.25127,2.045e-05],[-1.22672,1.711e-05],[-1.20217,1.429e-05],[-1.17762,1.189e-05],[-1.15307,9.835e-06],[-1.12852,8.109e-06],[-1.10397,6.675e-06],[-1.07942,5.422e-06],[-1.05487,4.429e-06],[-1.03032,3.566e-06],[-1.00577,2.837e-06],[-0.98122,2.321e-06],[-0.95667,1.841e-06],[-0.93212,1.457e-06],[-0.90604,1.166e-06],[-0.87995,8.92e-07],[-0.8554,6.81e-07],[-0.82932,5.46e-07],[-0.80784,4.3e-07],[-0.78175,3.39e-07],[-0.76027,2.7e-07],[-0.73419,2.19e-07],[-0.69583,1.49e-07],[-0.68509,1.35e-07],[-0.66207,9.4e-08],[-0.61911,8e-08],[-0.61298,5.9e-08],[-0.58689,5.6e-08],[-0.547,4.4e-08],[-0.53012,5e-08],[-0.51324,2.6e-08],[-0.47181,3e-08],[-0.44266,2.4e-08],[-0.43959,2.8e-08],[-0.39356,-2.1e-08],[-0.39203,-2.2e-08],[-0.34753,2.1e-08],[-0.32605,-2e-08],[-0.29997,-2.1e-08],[-0.29383,2e-08],[-0.26161,-1.7e-08],[-0.23552,-1e-08],[-0.20177,1e-08],[-0.19563,-1e-08],[-0.15113,1.1e-08],[-0.14193,9e-09],[-0.10357,-7e-09],[-0.08823,-5.6e-09],[-0.07135,-3.1e-09],[-0.04373,-2.8e-09],[-0.01918,1.4e-09],[0.01918,-1.4e-09],[0.04373,2.8e-09],[0.07135,3.1e-09],[0.08823,5.6e-09],[0.10357,7e-09],[0.14193,-9e-09],[0.15113,-1.1e-08],[0.19563,1e-08],[0.20177,-1e-08],[0.23552,1e-08],[0.26161,1.7e-08],[0.29383,-2e-08],[0.29997,2.1e-08],[0.32605,2e-08],[0.34753,-2.1e-08],[0.39203,2.2e-08],[0.39356,2.1e-08],[0.43959,-2.8e-08],[0.44266,-2.4e-08],[0.47181,-3e-08],[0.51324,-2.6e-08],[0.53012,-5e-08],[0.547,-4.4e-08],[0.58689,-5.6e-08],[0.61298,-5.9e-08],[0.61911,-8e-08],[0.66207,-9.4e-08],[0.68509,-1.35e-07],[0.69583,-1.49e-07],[0.73419,-2.19e-07],[0.76027,-2.7e-07],[0.78175,-3.39e-07],[0.80784,-4.3e-07],[0.82932,-5.46e-07],[0.8554,-6.81e-07],[0.87995,-8.92e-07],[0.90604,-1.166e-06],[0.93212,-1.457e-06],[0.95667,-1.841e-06],[0.98122,-2.321e-06],[1.00577,-2.837e-06],[1.03032,-3.566e-06],[1.05487,-4.429e-06],[1.07942,-5.422e-06],[1.10397,-6.675e-06],[1.12852,-8.109e-06],[1.15307,-9.835e-06],[1.17762,-1.189e-05],[1.20217,-1.429e-05],[1.22672,-1.711e-05],[1.25127,-2.045e-05],[1.27582,-2.431e-05],[1.30037,-2.885e-05],[1.32492,-3.411e-05],[1.34947,-4.021e-05],[1.37402,-4.735e-05],[1.39856,-5.542e-05],[1.42311,-6.484e-05],[1.44766,-7.556e-05],[1.47221,-8.777e-05],[1.49676,-0.0001018],[1.52131,-0.0001178],[1.54586,-0.000136],[1.57041,-0.0001566],[1.57195,-0.0001559],[1.5965,-0.0001355],[1.62105,-0.0001173],[1.6456,-0.0001014],[1.67015,-8.742e-05],[1.6947,-7.517e-05],[1.71925,-6.449e-05],[1.74379,-5.513e-05],[1.76834,-4.709e-05],[1.79289,-4.007e-05],[1.81744,-3.388e-05],[1.84199,-2.871e-05],[1.86654,-2.415e-05],[1.89109,-2.028e-05],[1.91564,-1.701e-05],[1.94019,-1.417e-05],[1.96474,-1.171e-05],[1.98929,-9.758e-06],[2.01384,-8.016e-06],[2.03839,-6.597e-06],[2.06294,-5.324e-06],[2.08749,-4.35e-06],[2.11204,-3.494e-06],[2.13659,-2.779e-06],[2.16114,-2.283e-06],[2.18569,-1.808e-06],[2.21024,-1.393e-06],[2.23786,-1.081e-06],[2.25934,-8.42e-07],[2.28389,-6.39e-07],[2.30997,-4.83e-07],[2.33606,-3.69e-07],[2.35754,-2.72e-07],[2.39129,-1.77e-07],[2.40664,-1.27e-07],[2.43579,-9e-08],[2.45727,-5.7e-08],[2.4987,4.2e-08],[2.52171,7.2e-08],[2.5478,8.5e-08],[2.57081,7.9e-08],[2.59383,9.1e-08],[2.61377,9e-08],[2.6506,9.7e-08],[2.66594,8.8e-08],[2.68282,9.9e-08],[2.71197,9.9e-08],[2.74113,1.01e-07],[2.77335,1.05e-07],[2.77642,9.9e-08],[2.80557,9.6e-08],[2.83319,1.01e-07],[2.87155,1.01e-07],[2.88075,9.2e-08],[2.92065,9.6e-08],[2.93906,9.6e-08],[2.95287,9.5e-08],[2.98355,9.6e-08],[2.99736,9.6e-08],[3.02345,9e-08],[3.05874,9.07e-08],[3.07255,9.16e-08],[3.1017,8.83e-08],[3.12471,8.78e-08]],"sin_f0_fp32u_bh":[[-3.14159,0.07522],[-3.11704,0.07019],[-3.09249,0.06545],[-3.06794,0.061],[-3.04339,0.05682],[-3.01884,0.0529],[-2.99429,0.04921],[-2.96974,0.04576],[-2.9452,0.04252],[-2.92065,0.03948],[-2.8961,0.03664],[-2.87155,0.03398],[-2.847,0.03149],[-2.82245,0.02917],[-2.7979,0.02699],[-2.77335,0.02497],[-2.7488,0.02307],[-2.72425,0.02131],[-2.6997,0.01966],[-2.67515,0.01813],[-2.6506,0.01671],[-2.62605,0.01538],[-2.6015,0.01415],[-2.57695,0.01301],[-2.5524,0.01195],[-2.52785,0.01097],[-2.5033,0.01006],[-2.47875,0.009212],[-2.4542,0.008432],[-2.42965,0.007711],[-2.4051,0.007045],[-2.38055,0.00643],[-2.356,0.005863],[-2.33145,0.005341],[-2.3069,0.004861],[-2.28235,0.004419],[-2.2578,0.004013],[-2.23325,0.003641],[-2.2087,0.003299],[-2.18415,0.002986],[-2.15961,0.0027],[-2.13506,0.002438],[-2.11051,0.002199],[-2.08596,0.001981],[-2.06141,0.001783],[-2.03686,0.001602],[-2.01231,0.001438],[-1.98776,0.001288],[-1.96321,0.001153],[-1.93866,0.00103],[-1.91411,0.0009196],[-1.88956,0.0008194],[-1.86501,0.0007289],[-1.84046,0.0006477],[-1.81591,0.0005743],[-1.79136,0.0005084],[-1.76681,0.0004496],[-1.74226,0.0003966],[-1.71771,0.0003493],[-1.69316,0.0003071],[-1.66861,0.0002695],[-1.64406,0.000236],[-1.61951,0.0002063],[-1.59496,0.0001798],[-1.57041,0.0001566],[-1.54586,0.000136],[-1.52131,0.0001178],[-1.49676,0.0001018],[-1.47221,8.777e-05],[-1.44766,7.556e-05],[-1.42311,6.484e-05],[-1.39856,5.542e-05],[-1.37402,4.735e-05],[-1.34947,4.021e-05],[-1.32492,3.411e-05],[-1.30037,2.885e-05],[-1.27582,2.431e-05],[-1.25127,2.045e-05],[-1.22672,1.711e-05],[-1.20217,1.429e-05],[-1.17762,1.189e-05],[-1.15307,9.835e-06],[-1.12852,8.109e-06],[-1.10397,6.675e-06],[-1.07942,5.422e-06],[-1.05487,4.429e-06],[-1.03032,3.566e-06],[-1.00577,2.837e-06],[-0.98122,2.321e-06],[-0.95667,1.841e-06],[-0.93212,1.457e-06],[-0.90604,1.166e-06],[-0.87995,8.92e-07],[-0.8554,6.81e-07],[-0.82932,5.46e-07],[-0.80784,4.3e-07],[-0.78175,3.39e-07],[-0.76027,2.7e-07],[-0.73419,2.19e-07],[-0.69583,1.49e-07],[-0.68509,1.35e-07],[-0.66207,9.4e-08],[-0.61911,8e-08],[-0.61298,5.9e-08],[-0.58689,5.6e-08],[-0.547,4.4e-08],[-0.53012,5e-08],[-0.51324,2.6e-08],[-0.47181,3e-08],[-0.44266,2.4e-08],[-0.43959,2.8e-08],[-0.39356,-2.1e-08],[-0.39203,-2.2e-08],[-0.34753,2.1e-08],[-0.32605,-2e-08],[-0.29997,-2.1e-08],[-0.29383,2e-08],[-0.26161,-1.7e-08],[-0.23552,-1e-08],[-0.20177,1e-08],[-0.19563,-1e-08],[-0.15113,1.1e-08],[-0.14193,9e-09],[-0.10357,-7e-09],[-0.08823,-5.6e-09],[-0.07135,-3.1e-09],[-0.04373,-2.8e-09],[-0.01918,1.4e-09],[0.01918,-1.4e-09],[0.04373,2.8e-09],[0.07135,3.1e-09],[0.08823,5.6e-09],[0.10357,7e-09],[0.14193,-9e-09],[0.15113,-1.1e-08],[0.19563,1e-08],[0.20177,-1e-08],[0.23552,1e-08],[0.26161,1.7e-08],[0.29383,-2e-08],[0.29997,2.1e-08],[0.32605,2e-08],[0.34753,-2.1e-08],[0.39203,2.2e-08],[0.39356,2.1e-08],[0.43959,-2.8e-08],[0.44266,-2.4e-08],[0.47181,-3e-08],[0.51324,-2.6e-08],[0.53012,-5e-08],[0.547,-4.4e-08],[0.58689,-5.6e-08],[0.61298,-5.9e-08],[0.61911,-8e-08],[0.66207,-9.4e-08],[0.68509,-1.35e-07],[0.69583,-1.49e-07],[0.73419,-2.19e-07],[0.76027,-2.7e-07],[0.78175,-3.39e-07],[0.80784,-4.3e-07],[0.82932,-5.46e-07],[0.8554,-6.81e-07],[0.87995,-8.92e-07],[0.90604,-1.166e-06],[0.93212,-1.457e-06],[0.95667,-1.841e-06],[0.98122,-2.321e-06],[1.00577,-2.837e-06],[1.03032,-3.566e-06],[1.05487,-4.429e-06],[1.07942,-5.422e-06],[1.10397,-6.675e-06],[1.12852,-8.109e-06],[1.15307,-9.835e-06],[1.17762,-1.189e-05],[1.20217,-1.429e-05],[1.22672,-1.711e-05],[1.25127,-2.045e-05],[1.27582,-2.431e-05],[1.30037,-2.885e-05],[1.32492,-3.411e-05],[1.34947,-4.021e-05],[1.37402,-4.735e-05],[1.39856,-5.542e-05],[1.42311,-6.484e-05],[1.44766,-7.556e-05],[1.47221,-8.777e-05],[1.49676,-0.0001018],[1.52131,-0.0001178],[1.54586,-0.000136],[1.57041,-0.0001566],[1.59496,-0.0001798],[1.61951,-0.0002063],[1.64406,-0.000236],[1.66861,-0.0002695],[1.69316,-0.0003071],[1.71771,-0.0003493],[1.74226,-0.0003966],[1.76681,-0.0004496],[1.79136,-0.0005084],[1.81591,-0.0005743],[1.84046,-0.0006477],[1.86501,-0.0007289],[1.88956,-0.0008194],[1.91411,-0.0009196],[1.93866,-0.00103],[1.96321,-0.001153],[1.98776,-0.001288],[2.01231,-0.001438],[2.03686,-0.001602],[2.06141,-0.001783],[2.08596,-0.001981],[2.11051,-0.002199],[2.13506,-0.002438],[2.15961,-0.0027],[2.18415,-0.002986],[2.2087,-0.003299],[2.23325,-0.003641],[2.2578,-0.004013],[2.28235,-0.004419],[2.3069,-0.004861],[2.33145,-0.005341],[2.356,-0.005863],[2.38055,-0.00643],[2.4051,-0.007045],[2.42965,-0.007711],[2.4542,-0.008432],[2.47875,-0.009212],[2.5033,-0.01006],[2.52785,-0.01097],[2.5524,-0.01195],[2.57695,-0.01301],[2.6015,-0.01415],[2.62605,-0.01538],[2.6506,-0.01671],[2.67515,-0.01813],[2.6997,-0.01966],[2.72425,-0.02131],[2.7488,-0.02307],[2.77335,-0.02497],[2.7979,-0.02699],[2.82245,-0.02917],[2.847,-0.03149],[2.87155,-0.03398],[2.8961,-0.03664],[2.92065,-0.03948],[2.9452,-0.04252],[2.96974,-0.04576],[2.99429,-0.04921],[3.01884,-0.0529],[3.04339,-0.05682],[3.06794,-0.061],[3.09249,-0.06545],[3.11704,-0.07019],[3.14159,-0.07522]],"exp_exact":[[-7.96875,0.002965],[-7.9375,-0.001187],[-7.875,0.003527],[-7.8125,0.004004],[-7.8125,0.004004],[-7.75,0.0007388],[-7.6875,-0.001656],[-7.625,-0.003527],[-7.625,-0.003527],[-7.53125,-0.00375],[-7.53125,-0.00375],[-7.46875,-0.003945],[-7.4375,-0.002194],[-7.34375,-0.002996],[-7.34375,-0.002996],[-7.28125,0.003103],[-7.25,-0.0009022],[-7.15625,0.002614],[-7.15625,0.002614],[-7.0625,0.001953],[-7.0625,0.001953],[-6.96875,0.00149],[-6.9375,-0.001813],[-6.875,-0.003222],[-6.875,-0.003222],[-6.78125,0.001696],[-6.75,-0.003059],[-6.6875,-0.002249],[-6.65625,-0.003283],[-6.59375,0.00321],[-6.59375,0.00321],[-6.5,-0.0002983],[-6.46875,0.003374],[-6.40625,0.002649],[-6.375,0.003149],[-6.34375,0.002669],[-6.3125,0.001269],[-6.21875,0.003599],[-6.21875,0.003599],[-6.125,-0.002507],[-6.125,-0.002507],[-6.0625,-0.003966],[-6.03125,-0.002855],[-5.96875,0.002362],[-5.90625,-0.002319],[-5.84375,0.0004193],[-5.84375,0.0004193],[-5.78125,0.00411],[-5.71875,0.00368],[-5.65625,-0.0003828],[-5.625,0.002709],[-5.5625,-0.002399],[-5.5625,-0.002399],[-5.46875,-0.001203],[-5.4375,-0.003873],[-5.375,0.001674],[-5.34375,-0.003595],[-5.3125,-0.003298],[-5.28125,0.002038],[-5.21875,-0.002305],[-5.15625,0.0007896],[-5.125,0.0007922],[-5.0625,0.002834],[-5.0,0.0009554],[-5.0,0.0009554],[-4.90625,0.002106],[-4.90625,0.002106],[-4.8125,-0.001211],[-4.78125,-0.002826],[-4.75,0.001768],[-4.71875,-0.001702],[-4.65625,-0.004376],[-4.625,-0.003879],[-4.53125,-0.002324],[-4.53125,-0.002324],[-4.4375,0.001298],[-4.4375,0.001298],[-4.375,0.003665],[-4.3125,0.002069],[-4.28125,0.002142],[-4.25,0.001261],[-4.15625,0.005162],[-4.15625,0.005162],[-4.09375,0.002822],[-4.03125,-0.002925],[-3.98438,-0.002654],[-3.9375,0.001762],[-3.89062,-0.002292],[-3.84375,-0.002375],[-3.78125,0.001446],[-3.75,0.001778],[-3.73438,0.001578],[-3.67188,0.003301],[-3.59375,0.003377],[-3.59375,0.003377],[-3.51562,0.001882],[-3.45312,0.002897],[-3.45312,0.002897],[-3.35938,-0.002561],[-3.34375,-0.004194],[-3.29688,-0.003605],[-3.26562,-0.002283],[-3.20312,-0.00265],[-3.15625,-0.002458],[-3.07812,0.002108],[-3.0625,0.002232],[-2.98438,0.004156],[-2.98438,0.004156],[-2.92188,0.002274],[-2.84375,0.00245],[-2.84375,0.00245],[-2.78125,-0.003122],[-2.70312,-0.001512],[-2.67188,-0.003976],[-2.60938,-0.004598],[-2.60938,-0.004598],[-2.51562,-0.003044],[-2.51562,-0.003044],[-2.46875,-0.002574],[-2.375,0.002658],[-2.375,0.002658],[-2.28125,0.003746],[-2.28125,0.003746],[-2.20312,0.003462],[-2.17188,0.00258],[-2.10938,-0.001814],[-2.04688,-0.001793],[-2.0,-0.004209],[-2.0,-0.004209],[-1.92969,-0.004562],[-1.89062,-0.003887],[-1.82812,-0.003474],[-1.80469,-0.002816],[-1.75781,0.002494],[-1.67188,0.003098],[-1.67188,0.003098],[-1.61719,0.003843],[-1.57812,0.003245],[-1.52344,0.003618],[-1.45312,0.002295],[-1.4375,-0.0009099],[-1.38281,0.00431],[-1.34375,0.003271],[-1.25,-0.004707],[-1.25,-0.004707],[-1.17188,-0.003847],[-1.11719,-0.003138],[-1.09375,-0.002907],[-1.01562,0.003052],[-0.98438,0.003552],[-0.93359,0.003543],[-0.89062,0.004167],[-0.84375,0.003595],[-0.8125,0.003527],[-0.77734,0.002855],[-0.72656,-0.002371],[-0.64453,-0.002802],[-0.62109,-0.004094],[-0.57812,-0.004199],[-0.52344,-0.00445],[-0.47852,-0.004059],[-0.44922,-0.002206],[-0.36133,-0.002064],[-0.32812,0.003309],[-0.28125,0.003938],[-0.25586,0.003995],[-0.20215,0.004087],[-0.15527,0.00373],[-0.12305,0.002823],[-0.0498,0.001797],[0.00293,0.004864],[0.02637,0.004414],[0.1084,-0.004591],[0.14941,-0.004223],[0.16992,-0.004661],[0.20801,-0.003785],[0.28711,0.002527],[0.33789,0.003041],[0.38086,0.003559],[0.4375,0.003782],[0.4668,0.004192],[0.48633,0.003984],[0.54688,0.003779],[0.61328,0.002752],[0.66797,-0.002543],[0.69531,0.005633],[0.75781,-0.004033],[0.80859,-0.004621],[0.83594,-0.004378],[0.89453,-0.003552],[0.91406,-0.004033],[0.98047,0.002314],[1.03125,0.002828],[1.08594,0.002206],[1.14062,0.003804],[1.14062,0.003804],[1.20312,0.003976],[1.25,0.002767],[1.28906,0.003098],[1.32812,0.001932],[1.39062,0.003457],[1.42188,0.002742],[1.51562,-0.004616],[1.51562,-0.004616],[1.5625,-0.004346],[1.625,-0.003135],[1.67969,0.002073],[1.71875,0.002904],[1.78906,0.002701],[1.84375,0.003727],[1.84375,0.003727],[1.90625,0.003298],[1.96094,0.002676],[2.0,0.002327],[2.0625,-0.002779],[2.07812,-0.002594],[2.17188,-0.002817],[2.1875,-0.004253],[2.23438,-0.003013],[2.28125,-0.003975],[2.3125,-0.003678],[2.40625,0.002949],[2.40625,0.002949],[2.48438,0.0005318],[2.54688,0.003553],[2.54688,0.003553],[2.64062,0.002891],[2.64062,0.002891],[2.71875,0.001724],[2.73438,-0.001631],[2.82812,-0.002289],[2.85938,-0.004333],[2.92188,-0.004096],[2.92188,-0.004096],[3.0,0.001965],[3.04688,-0.00235],[3.09375,0.002963],[3.10938,-0.00143],[3.17188,0.0009573],[3.25,0.003283],[3.29688,0.003587],[3.29688,0.003587],[3.39062,0.002207],[3.39062,0.002207],[3.46875,0.004779],[3.48438,0.004538],[3.53125,0.00244],[3.59375,-0.003305],[3.64062,-0.003034],[3.67188,-0.001922],[3.73438,-0.002672],[3.78125,0.002944],[3.85938,0.001356],[3.875,0.001397],[3.9375,0.00409],[3.95312,0.002919]],"exp_approx":[[-7.96875,0.03052],[-7.9375,0.02552],[-7.90625,0.02503],[-7.84375,0.02128],[-7.8125,0.01343],[-7.75,0.005167],[-7.6875,-0.005816],[-7.625,-0.02307],[-7.59375,-0.0304],[-7.5625,-0.01618],[-7.53125,-0.01087],[-7.4375,0.01724],[-7.40625,0.01735],[-7.34375,0.0265],[-7.3125,0.02923],[-7.28125,0.03081],[-7.25,0.02596],[-7.1875,0.02435],[-7.15625,0.02218],[-7.09375,0.01079],[-7.0625,0.006406],[-6.96875,-0.01473],[-6.9375,-0.02146],[-6.90625,-0.02872],[-6.875,-0.01799],[-6.78125,0.008418],[-6.75,0.01649],[-6.6875,0.02224],[-6.65625,0.02638],[-6.59375,0.03108],[-6.59375,0.03108],[-6.53125,0.0262],[-6.5,0.02507],[-6.4375,0.01541],[-6.40625,0.01189],[-6.3125,-0.007145],[-6.28125,-0.01323],[-6.21875,-0.02705],[-6.21875,-0.02705],[-6.15625,-0.01402],[-6.09375,0.007368],[-6.03125,0.0162],[-6.0,0.02187],[-5.9375,0.02935],[-5.9375,0.02935],[-5.84375,0.02675],[-5.84375,0.02675],[-5.78125,0.02389],[-5.75,0.01636],[-5.6875,0.00883],[-5.625,-0.005753],[-5.5625,-0.0183],[-5.53125,-0.02539],[-5.5,-0.02177],[-5.46875,-0.01568],[-5.375,0.01485],[-5.34375,0.01557],[-5.28125,0.02604],[-5.25,0.02936],[-5.1875,0.02709],[-5.15625,0.02727],[-5.125,0.02645],[-5.09375,0.02472],[-5.03125,0.01404],[-5.0,0.01001],[-4.90625,-0.01027],[-4.875,-0.01673],[-4.8125,-0.03125],[-4.8125,-0.03125],[-4.75,-0.005287],[-4.6875,0.01397],[-4.625,0.02102],[-4.59375,0.02582],[-4.5625,0.02935],[-4.5,0.02742],[-4.46875,0.02776],[-4.4375,0.02711],[-4.375,0.01821],[-4.34375,0.01508],[-4.28125,0.006556],[-4.21875,-0.008808],[-4.15625,-0.02211],[-4.125,-0.03332],[-4.09375,-0.01914],[-4.0625,-0.006748],[-3.96875,0.01418],[-3.92188,0.02321],[-3.875,0.02929],[-3.875,0.02929],[-3.78125,0.02822],[-3.78125,0.02822],[-3.73438,0.02713],[-3.6875,0.0191],[-3.64062,0.01431],[-3.59375,0.007817],[-3.5,-0.01365],[-3.45312,-0.02796],[-3.4375,-0.03164],[-3.40625,-0.02094],[-3.32812,0.0076],[-3.26562,0.0169],[-3.21875,0.02526],[-3.1875,0.02921],[-3.125,0.02797],[-3.09375,0.02866],[-3.07812,0.02862],[-3.03125,0.02199],[-2.98438,0.01864],[-2.9375,0.01345],[-2.84375,-0.005938],[-2.79688,-0.01544],[-2.75,-0.02997],[-2.75,-0.02997],[-2.70312,-0.01609],[-2.60938,0.008674],[-2.5625,0.01947],[-2.51562,0.02717],[-2.51562,0.02717],[-2.42188,0.02877],[-2.39062,0.02911],[-2.375,0.02891],[-2.32812,0.02186],[-2.28125,0.01808],[-2.23438,0.01251],[-2.14062,-0.007502],[-2.09375,-0.01729],[-2.04688,-0.03204],[-2.04688,-0.03204],[-1.99219,-0.01196],[-1.91406,0.01311],[-1.85938,0.02189],[-1.82812,0.02691],[-1.77344,0.02979],[-1.75781,0.03081],[-1.70312,0.02958],[-1.66406,0.02623],[-1.61719,0.02353],[-1.57812,0.01744],[-1.52344,0.008099],[-1.44531,-0.009649],[-1.39062,-0.02312],[-1.35938,-0.03036],[-1.33594,-0.02682],[-1.28906,-0.007591],[-1.21094,0.01617],[-1.15625,0.02416],[-1.11719,0.02671],[-1.07031,0.03095],[-1.01562,0.03002],[-1.01562,0.03002],[-0.96094,0.02626],[-0.91797,0.02222],[-0.875,0.01671],[-0.82031,0.006962],[-0.74609,-0.01153],[-0.69141,-0.02514],[-0.66016,-0.03245],[-0.63281,-0.02178],[-0.55469,0.006745],[-0.5,0.01757],[-0.45703,0.02413],[-0.42578,0.0285],[-0.4043,0.03005],[-0.35547,0.03112],[-0.28516,0.02865],[-0.25781,0.02618],[-0.21387,0.02076],[-0.16992,0.01391],[-0.11719,0.005749],[-0.03223,-0.01566],[0.01172,-0.02709],[0.03223,-0.03171],[0.06445,-0.01847],[0.15527,0.01003],[0.19922,0.01781],[0.24609,0.02618],[0.26758,0.02828],[0.33789,0.0309],[0.34961,0.02991],[0.39258,0.0288],[0.45703,0.02394],[0.49023,0.01921],[0.53906,0.01165],[0.61328,-0.00571],[0.67188,-0.0184],[0.71094,-0.02915],[0.72656,-0.03286],[0.76953,-0.01564],[0.85938,0.01225],[0.90625,0.02272],[0.94531,0.02604],[0.98828,0.02941],[1.03125,0.03068],[1.07031,0.0287],[1.10156,0.02821],[1.14062,0.02378],[1.19531,0.01658],[1.24219,0.01063],[1.32812,-0.01049],[1.375,-0.02025],[1.41406,-0.03119],[1.42969,-0.0275],[1.46875,-0.0144],[1.5625,0.01531],[1.60156,0.02051],[1.64844,0.02787],[1.70312,0.03008],[1.71875,0.03092],[1.75781,0.02914],[1.79688,0.02599],[1.84375,0.0235],[1.89844,0.01585],[1.9375,0.008446],[2.03125,-0.01211],[2.07812,-0.02215],[2.10938,-0.02949],[2.14062,-0.02261],[2.17188,-0.00994],[2.26562,0.0182],[2.3125,0.02108],[2.35938,0.02746],[2.40625,0.03112],[2.40625,0.03112],[2.45312,0.02692],[2.5,0.02606],[2.54688,0.01824],[2.59375,0.01365],[2.64062,0.007348],[2.73438,-0.01381],[2.78125,-0.02411],[2.79688,-0.02781],[2.82812,-0.02446],[2.92188,0.009362],[2.96875,0.01451],[3.01562,0.02319],[3.0625,0.02895],[3.07812,0.03027],[3.15625,0.02737],[3.15625,0.02737],[3.20312,0.02603],[3.25,0.01782],[3.29688,0.01284],[3.39062,-0.006215],[3.4375,-0.01556],[3.48438,-0.02613],[3.5,-0.03368],[3.53125,-0.01951],[3.625,0.01267],[3.67188,0.01715],[3.71875,0.02517],[3.76562,0.03031],[3.76562,0.03031],[3.84375,0.02783],[3.85938,0.02771],[3.90625,0.02591],[3.95312,0.01732]],"recip_precise":[[0.52344,0.001892],[0.53906,-0.001892],[0.58594,-0.002075],[0.59375,0.001953],[0.62891,0.002319],[0.67188,0.002563],[0.67578,-0.002167],[0.73438,-0.001709],[0.74219,-0.002686],[0.77344,-0.002991],[0.8125,0.00293],[0.82812,0.002808],[0.86719,0.002686],[0.89844,-0.003296],[0.9375,0.003418],[0.94531,-0.002991],[0.99609,0.003876],[1.02344,-0.0005493],[1.04688,0.001892],[1.07812,-0.001892],[1.10156,-0.001709],[1.14062,-0.001953],[1.17188,-0.002075],[1.17188,-0.002075],[1.21094,-0.001923],[1.25781,0.002319],[1.28906,0.002045],[1.28906,0.002045],[1.34375,0.002563],[1.35156,-0.002167],[1.38281,-0.0007019],[1.4375,-0.0004883],[1.46875,-0.001709],[1.48438,-0.002686],[1.5,0.001953],[1.54688,-0.002991],[1.58594,-0.002594],[1.58594,-0.002594],[1.625,0.00293],[1.65625,0.002808],[1.67969,-0.002686],[1.71094,0.002502],[1.73438,0.002686],[1.75781,0.002502],[1.79688,-0.003296],[1.83594,-0.003143],[1.875,0.003418],[1.875,0.003418],[1.92969,0.002533],[1.96094,0.003448],[1.99219,0.003876],[1.99219,0.003876],[2.04688,-0.0005493],[2.07812,-0.001526],[2.09375,0.001892],[2.10938,0.001129],[2.15625,-0.001892],[2.20312,-0.001709],[2.20312,-0.001709],[2.25,0.001953],[2.28125,-0.001953],[2.28125,-0.001953],[2.34375,-0.002075],[2.34375,-0.002075],[2.375,0.001953],[2.42188,-0.001923],[2.46875,-0.001892],[2.46875,-0.001892],[2.51562,0.002319],[2.51562,0.002319],[2.57812,0.002045],[2.57812,0.002045],[2.60938,-0.001099],[2.67188,0.001953],[2.6875,0.002563],[2.70312,-0.002167],[2.73438,-0.001312],[2.75,-0.0009766],[2.78125,-0.0004883],[2.8125,-0.0002441],[2.875,-0.0004883],[2.90625,-0.0009766],[2.9375,-0.001709],[2.95312,-0.002167],[2.96875,-0.002686],[2.98438,0.002563],[3.01562,0.001282],[3.07812,-0.002014],[3.09375,-0.002991],[3.10938,0.002045],[3.17188,-0.002594],[3.17188,-0.002594],[3.20312,0.0009766],[3.25,0.00293],[3.25,0.00293],[3.3125,0.002808],[3.3125,0.002808],[3.35938,-0.002686],[3.40625,-0.002075],[3.42188,0.002502],[3.45312,-0.001831],[3.46875,0.002686],[3.51562,0.002502],[3.51562,0.002502],[3.54688,-0.002441],[3.59375,-0.003296],[3.64062,0.002594],[3.64062,0.002594],[3.67188,-0.003143],[3.71875,0.002319],[3.75,0.003418],[3.75,0.003418],[3.78125,-0.002991],[3.8125,-0.002197],[3.85938,0.002533],[3.89062,0.003052],[3.92188,0.003448],[3.95312,0.003723],[3.98438,0.003876],[3.98438,0.003876],[4.03125,-6.104e-05],[4.0625,-0.0002441],[4.09375,-0.0005493],[4.125,-0.0009766],[4.15625,-0.001526],[4.1875,0.001892],[4.1875,0.001892],[4.21875,0.001129],[4.28125,-0.0007629],[4.3125,-0.001892],[4.3125,-0.001892],[4.34375,0.001099],[4.40625,-0.001709],[4.40625,-0.001709],[4.4375,0.001038],[4.46875,-0.0006409],[4.5,0.001953],[4.5,0.001953],[4.5625,-0.001953],[4.5625,-0.001953],[4.625,-0.001831],[4.625,-0.001831],[4.6875,-0.002075],[4.6875,-0.002075],[4.75,0.001953],[4.75,0.001953],[4.8125,0.001038],[4.84375,-0.001923],[4.84375,-0.001923],[4.90625,0.001373],[4.9375,-0.001892],[4.9375,-0.001892],[4.96875,-0.0004272],[5.0,0.0009766],[5.03125,0.002319],[5.03125,0.002319],[5.0625,-0.001343],[5.125,0.0009766],[5.15625,0.002045],[5.15625,0.002045],[5.1875,-0.002014],[5.21875,-0.001099],[5.28125,0.0005493],[5.3125,0.001282],[5.34375,0.001953],[5.375,0.002563],[5.375,0.002563],[5.40625,-0.002167],[5.4375,-0.001709],[5.4375,-0.001709],[5.46875,-0.001312],[5.5,-0.0009766],[5.53125,-0.0007019],[5.5625,-0.0004883],[5.59375,-0.0003357],[5.625,-0.0002441],[5.6875,-0.0002441],[5.71875,-0.0003357],[5.75,-0.0004883],[5.78125,-0.0007019],[5.8125,-0.0009766],[5.84375,-0.001312],[5.875,-0.001709],[5.875,-0.001709],[5.90625,-0.002167],[5.9375,-0.002686],[5.9375,-0.002686],[5.96875,0.002563],[6.0,0.001953],[6.03125,0.001282],[6.0625,0.0005493],[6.125,-0.001099],[6.15625,-0.002014],[6.1875,-0.002991],[6.1875,-0.002991],[6.21875,0.002045],[6.25,0.0009766],[6.3125,-0.001343],[6.34375,-0.002594],[6.34375,-0.002594],[6.375,0.002319],[6.375,0.002319],[6.40625,0.0009766],[6.46875,-0.001892],[6.5,0.00293],[6.5,0.00293],[6.53125,0.001373],[6.59375,-0.001923],[6.625,0.002808],[6.625,0.002808],[6.65625,0.001038],[6.71875,-0.002686],[6.71875,-0.002686],[6.75,0.001953],[6.8125,-0.002075],[6.8125,-0.002075],[6.84375,0.002502],[6.84375,0.002502],[6.90625,-0.001831],[6.9375,0.002686],[6.9375,0.002686],[7.0,-0.001953],[7.03125,0.002502],[7.03125,0.002502],[7.09375,-0.002441],[7.09375,-0.002441],[7.125,0.001953],[7.1875,-0.003296],[7.1875,-0.003296],[7.25,-0.001709],[7.28125,0.002594],[7.28125,0.002594],[7.3125,-0.0002441],[7.34375,-0.003143],[7.34375,-0.003143],[7.40625,-0.001892],[7.4375,0.002319],[7.4375,0.002319],[7.5,0.003418],[7.5,0.003418],[7.5625,-0.002991],[7.5625,-0.002991],[7.625,-0.002197],[7.625,-0.002197],[7.65625,0.001892],[7.71875,0.002533],[7.71875,0.002533],[7.75,-0.0009766],[7.78125,0.003052],[7.78125,0.003052],[7.84375,0.003448],[7.84375,0.003448],[7.90625,0.003723],[7.90625,0.003723],[7.96875,0.003876],[7.96875,0.003876]],"recip_approx":[[0.50391,-0.003998],[0.53125,-0.003906],[0.56641,-0.004364],[0.58984,-0.004639],[0.64062,-0.004028],[0.66016,-0.004608],[0.67578,-0.002167],[0.73438,-0.001709],[0.75781,-0.005371],[0.78125,-0.005127],[0.80078,-0.00528],[0.84766,-0.006653],[0.87109,-0.006409],[0.88281,-0.006836],[0.92188,-0.006104],[0.94141,-0.007111],[0.97266,-0.004547],[1.00781,-0.003998],[1.05469,-0.002991],[1.0625,-0.003906],[1.10938,-0.003296],[1.13281,-0.004364],[1.16406,-0.004181],[1.17969,-0.004639],[1.20312,-0.003662],[1.25,-0.003906],[1.28125,-0.004028],[1.32031,-0.004608],[1.32031,-0.004608],[1.35156,-0.002167],[1.38281,-0.0007019],[1.4375,-0.0004883],[1.46875,-0.001709],[1.49219,-0.003265],[1.51562,-0.005371],[1.55469,-0.004028],[1.5625,-0.005127],[1.60156,-0.00528],[1.63281,-0.005005],[1.66406,-0.005463],[1.69531,-0.006653],[1.71875,-0.006348],[1.74219,-0.006409],[1.76562,-0.006836],[1.80469,-0.006012],[1.84375,-0.006104],[1.85938,-0.004944],[1.88281,-0.007111],[1.91406,-0.005585],[1.94531,-0.004547],[1.97656,-0.003998],[2.01562,-0.003998],[2.04688,-0.0005493],[2.07812,-0.001526],[2.10938,-0.002991],[2.125,-0.003906],[2.17188,-0.003143],[2.17188,-0.003143],[2.21875,-0.003296],[2.25,-0.002441],[2.26562,-0.004364],[2.29688,-0.004089],[2.32812,-0.004181],[2.35938,-0.004639],[2.40625,-0.003662],[2.40625,-0.003662],[2.45312,-0.003418],[2.46875,-0.001892],[2.5,-0.003906],[2.51562,-0.002594],[2.5625,-0.004028],[2.57812,-0.002991],[2.64062,-0.004608],[2.64062,-0.004608],[2.67188,-0.003265],[2.70312,-0.002167],[2.73438,-0.001312],[2.75,-0.0009766],[2.78125,-0.0004883],[2.8125,-0.0002441],[2.875,-0.0004883],[2.90625,-0.0009766],[2.9375,-0.001709],[2.95312,-0.002167],[2.98438,-0.003265],[3.01562,-0.004608],[3.03125,-0.005371],[3.07812,-0.002014],[3.10938,-0.004028],[3.125,-0.005127],[3.17188,-0.002594],[3.1875,-0.003906],[3.20312,-0.00528],[3.25,-0.003418],[3.26562,-0.005005],[3.3125,-0.003662],[3.32812,-0.005463],[3.375,-0.004639],[3.39062,-0.006653],[3.42188,-0.004181],[3.4375,-0.006348],[3.48438,-0.006409],[3.48438,-0.006409],[3.53125,-0.006836],[3.5625,-0.005005],[3.60938,-0.006012],[3.60938,-0.006012],[3.64062,-0.004517],[3.6875,-0.006104],[3.6875,-0.006104],[3.71875,-0.004944],[3.76562,-0.007111],[3.79688,-0.006287],[3.82812,-0.005585],[3.85938,-0.005005],[3.89062,-0.004547],[3.92188,-0.004211],[3.92188,-0.004211],[3.95312,-0.003998],[3.98438,-0.003906],[4.03125,-0.003998],[4.03125,-0.003998],[4.09375,-0.0005493],[4.125,-0.0009766],[4.15625,-0.001526],[4.1875,-0.002197],[4.21875,-0.002991],[4.25,-0.003906],[4.25,-0.003906],[4.3125,-0.001892],[4.34375,-0.003143],[4.34375,-0.003143],[4.40625,-0.001709],[4.4375,-0.003296],[4.4375,-0.003296],[4.46875,-0.0006409],[4.5,-0.002441],[4.53125,-0.004364],[4.53125,-0.004364],[4.59375,-0.004089],[4.59375,-0.004089],[4.65625,-0.004181],[4.65625,-0.004181],[4.71875,-0.004639],[4.71875,-0.004639],[4.75,-0.002686],[4.8125,-0.003662],[4.8125,-0.003662],[4.84375,-0.001923],[4.90625,-0.003418],[4.90625,-0.003418],[4.9375,-0.001892],[4.96875,-0.0004272],[5.0,-0.003906],[5.0,-0.003906],[5.03125,-0.002594],[5.0625,-0.001343],[5.125,-0.004028],[5.125,-0.004028],[5.15625,-0.002991],[5.1875,-0.002014],[5.21875,-0.001099],[5.28125,-0.004608],[5.28125,-0.004608],[5.3125,-0.003906],[5.34375,-0.003265],[5.375,-0.002686],[5.40625,-0.002167],[5.4375,-0.001709],[5.4375,-0.001709],[5.46875,-0.001312],[5.5,-0.0009766],[5.53125,-0.0007019],[5.5625,-0.0004883],[5.59375,-0.0003357],[5.625,-0.0002441],[5.6875,-0.0002441],[5.71875,-0.0003357],[5.75,-0.0004883],[5.78125,-0.0007019],[5.8125,-0.0009766],[5.84375,-0.001312],[5.875,-0.001709],[5.875,-0.001709],[5.90625,-0.002167],[5.9375,-0.002686],[5.96875,-0.003265],[6.0,-0.003906],[6.03125,-0.004608],[6.0625,-0.005371],[6.0625,-0.005371],[6.125,-0.001099],[6.15625,-0.002014],[6.1875,-0.002991],[6.21875,-0.004028],[6.25,-0.005127],[6.25,-0.005127],[6.3125,-0.001343],[6.34375,-0.002594],[6.34375,-0.002594],[6.375,-0.003906],[6.40625,-0.00528],[6.40625,-0.00528],[6.46875,-0.001892],[6.5,-0.003418],[6.53125,-0.005005],[6.53125,-0.005005],[6.59375,-0.001923],[6.625,-0.003662],[6.65625,-0.005463],[6.65625,-0.005463],[6.71875,-0.002686],[6.75,-0.004639],[6.78125,-0.006653],[6.78125,-0.006653],[6.8125,-0.002075],[6.84375,-0.004181],[6.875,-0.006348],[6.875,-0.006348],[6.9375,-0.004089],[6.96875,-0.006409],[6.96875,-0.006409],[7.03125,-0.004364],[7.0625,-0.006836],[7.0625,-0.006836],[7.125,-0.005005],[7.125,-0.005005],[7.1875,-0.003296],[7.21875,-0.006012],[7.21875,-0.006012],[7.28125,-0.004517],[7.28125,-0.004517],[7.3125,-0.0002441],[7.34375,-0.003143],[7.375,-0.006104],[7.375,-0.006104],[7.4375,-0.004944],[7.4375,-0.004944],[7.5,-0.003906],[7.53125,-0.007111],[7.53125,-0.007111],[7.59375,-0.006287],[7.59375,-0.006287],[7.65625,-0.005585],[7.65625,-0.005585],[7.71875,-0.005005],[7.71875,-0.005005],[7.75,-0.0009766],[7.78125,-0.004547],[7.78125,-0.004547],[7.84375,-0.004211],[7.84375,-0.004211],[7.90625,-0.003998],[7.90625,-0.003998],[7.96875,-0.003906],[7.96875,-0.003906]]}};
+    function taylor(x) { var x2 = x * x; return x * (1 + x2 * (-1 / 6 + x2 * (1 / 120 + x2 * (-1 / 5040)))); }
+    function fold(x) { return x > Math.PI / 2 ? Math.PI - x : x < -Math.PI / 2 ? -Math.PI - x : x; }
+    var views = [
+      { s: ["sin_f0_bf16"], col: [C.red], lab: ["device: Taylor-7, no fold, BF16 (WH)"], curve: function (x) { return taylor(x) - Math.sin(x); }, unit: "abs error", text: "<b>Taylor-7 on [−π, π], BF16.</b> The dots follow the remainder x⁹/9! (line, computed by this page): tiny near 0, then 0.075 at ±π. Truncation adds a ±0.004 fuzz you cannot see at this scale." },
+      { s: ["sin_f1_bf16"], col: [C.blue], lab: ["device: folded, BF16 (WH)"], unit: "abs error", text: "<b>Folded, BF16.</b> The polynomial error (≤ 1.6e-4) is now far below one BF16 ulp, so what you see is pure output quantization: the staircase of ulps (2⁻⁹ below 0.5, 2⁻⁸ up to 1) and its sign. Errors are negative where sin > 0 and positive where sin < 0: SFPSTORE truncates toward zero." },
+      { s: ["sin_f1_fp32_wh"], col: [C.orange], lab: ["device: folded, FP32 CB + 32-bit Dst via SrcA (WH)"], unit: "abs error", text: "<b>FP32, but the input went through SrcA.</b> The worst errors (2⁻⁹ ≈ 0.002) sit near ±π, where the fold π − x copies the TF32 truncation of x into the result. Near 0 the input truncation is small in absolute terms, so the error shrinks with |x|." },
+      { s: ["sin_f1_fp32u_bh"], col: [C.green], lab: ["device: folded, FP32 unpacked to Dst (BH)"], curve: function (x) { return taylor(fold(x)) - Math.sin(x); }, unit: "abs error", text: "<b>FP32 all the way (Blackhole, unpack-to-Dst).</b> Now the device dots lie on the Taylor remainder curve itself, peaking at 1.57e-4 at ±π/2 where the folded argument is largest. This is the polynomial's true error, measured on the device." },
+      { s: ["exp_exact", "exp_approx"], col: [C.blue, C.red], lab: ["exp_tile<false> (default, WH)", "exp_tile<true> (WH)"], unit: "rel error", text: "<b>Built-in exp, relative error, BF16.</b> The default exp stays within one ulp (≤ 0.56%); exp_tile&lt;true&gt; wanders up to 3.4%, in a pattern that repeats every ln 2 ≈ 0.69 in x, i.e. once per binade of the output, as expected from the bit trick in section 6. Setting math_approx_mode alone gives exactly the blue dots." },
+      { s: ["recip_precise", "recip_approx"], col: [C.blue, C.red], lab: ["recip_tile, APPROX=0 (WH)", "recip_tile, APPROX=1 (WH)"], unit: "rel error", text: "<b>Built-in reciprocal, relative error, BF16.</b> The precise path is correctly rounded (all 4096 outputs exact); its dots show only the rounding error of BF16 itself. With APPROX=1 every one of the 4096 results lies below the exact value: one Newton step from below, then SFPSTORE truncation. 1822 of them are one ulp under the correctly rounded answer." }
+    ];
+    var steps = views.map(function (v) { return { dur: 1.6, text: v.text }; });
+    TT.stepper({ root: root, steps: steps, draw: function (k, t) {
+      TT.clear(ctx, g.W, g.H);
+      var v = views[k], PX = 80, PY = 50, PW = 790, PH = 320;
+      var all = [];
+      v.s.forEach(function (n) { all = all.concat(D.S[n]); });
+      var xmin = Infinity, xmax = -Infinity, ymax = 0;
+      all.forEach(function (p) { xmin = Math.min(xmin, p[0]); xmax = Math.max(xmax, p[0]); ymax = Math.max(ymax, Math.abs(p[1])); });
+      ymax *= 1.15;
+      function X(x) { return PX + (x - xmin) / (xmax - xmin) * PW; }
+      function Y(y) { return PY + PH / 2 - y / ymax * PH / 2; }
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.strokeRect(PX, PY, PW, PH);
+      ctx.beginPath(); ctx.moveTo(PX, Y(0)); ctx.lineTo(PX + PW, Y(0)); ctx.stroke();
+      [-1, -0.5, 0.5, 1].forEach(function (f) { TT.text(ctx, (f * ymax).toExponential(1), PX - 6, Y(f * ymax), { align: "right", font: "11px", mono: true, color: C.muted }); });
+      TT.text(ctx, "0", PX - 6, Y(0), { align: "right", font: "11px", mono: true, color: C.muted });
+      for (var i = 0; i <= 4; i++) { var xx = xmin + (xmax - xmin) * i / 4; TT.text(ctx, xx.toFixed(2), X(xx), PY + PH + 14, { align: "center", font: "11px", mono: true, color: C.muted }); }
+      TT.text(ctx, v.unit + " (device − reference)", PX, 20, { color: C.muted });
+      TT.text(ctx, "x", PX + PW / 2, PY + PH + 34, { color: C.muted, align: "center" });
+      if (v.curve) {
+        ctx.strokeStyle = C.yellow; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8; ctx.beginPath();
+        for (var j = 0; j <= 400; j++) { var x = xmin + (xmax - xmin) * j / 400, yv = v.curve(x); if (j) ctx.lineTo(X(x), Y(yv)); else ctx.moveTo(X(x), Y(yv)); }
+        ctx.stroke(); ctx.globalAlpha = 1;
+      }
+      v.s.forEach(function (n, si) {
+        var pts = D.S[n], m = Math.floor(pts.length * Math.min(1, t * 1.05));
+        ctx.fillStyle = v.col[si];
+        for (var q = 0; q < m; q++) { ctx.beginPath(); ctx.arc(X(pts[q][0]), Y(pts[q][1]), 2.2, 0, 7); ctx.fill(); }
+      });
+      var nl = v.s.length + (v.curve ? 1 : 0), LX = PX + PW - 390, LY = PY + 4;
+      TT.box(ctx, LX, LY, 386, 12 + nl * 20, { r: 4, fill: C.bg2, alpha: 0.9 });
+      v.s.forEach(function (n, si) {
+        TT.box(ctx, LX + 6, LY + 6 + si * 20, 12, 12, { r: 2, fill: v.col[si] });
+        TT.text(ctx, v.lab[si], LX + 24, LY + 12 + si * 20, { font: "12px" });
+      });
+      if (v.curve) { var ly = LY + 12 + v.s.length * 20; ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(LX + 6, ly); ctx.lineTo(LX + 18, ly); ctx.stroke(); TT.text(ctx, "Taylor remainder, computed by this page", LX + 24, ly, { font: "12px", color: C.yellow }); }
+    }});
+  })();
+  </script>
+
+  <div class="callout key">An SFPU result's error has up to three separate sources: the <b>algorithm</b> (here the Taylor remainder), the <b>input format</b> (TF32 in SrcA, or BF16), and the <b>output store</b> (truncation to BF16). To measure the first, remove the other two: FP32 unpacked to Dst, a 32-bit Dst, and an FP32 output CB. In this simulator that is only possible on Blackhole.</div>
+
+  <h2 id="approx">6. Approximate vs exact built-ins</h2>
+  <p><code>ComputeConfig::math_approx_mode</code> becomes a <code>constexpr bool APPROX</code> in the kernel's generated descriptors (<code>tt_metal/jit_build/genfiles.cpp:1159</code>). A12 shows from the headers that <code>exp_tile</code> does not read it. Check two built-ins by measurement.</p>
+  <h3>exp: APPROX does nothing; the template argument does everything</h3>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/eltwise_unary/exp.h:80-85 @7aad8aac</div>
+<pre><code>template &lt;
+    bool approx = false,
+    bool scale_en = false,
+    InputClamping input_clamping = InputClamping::ClampToNegative,
+    int iterations = 8, bool is_fp32_dest_acc_en = DST_ACCUM_MODE&gt;
+ALWI void exp_tile(uint32_t idst, VectorMode vector_mode = VectorMode::RC, uint16_t scale = p_sfpu::kCONST_1_FP16B) {</code></pre>
+  <p>Three runs over [&minus;8, 4], BF16:</p>
+<pre><code>$ B08_FN=exp B08_APPROX=0 B08_EXPT=0 $LAB_HOME/b08_sfpu
+max_abs_err=0.21 (at x=3.9375) mean_abs_err=0.00718 max_rel_err=0.00563
+ulp vs correctly rounded: exact=3271 1ulp=825 &gt;1ulp=0 max=1
+result_hash=e81d3c04686cc383
+$ B08_FN=exp B08_APPROX=1 B08_EXPT=0 $LAB_HOME/b08_sfpu
+max_abs_err=0.21 (at x=3.9375) mean_abs_err=0.00718 max_rel_err=0.00563
+ulp vs correctly rounded: exact=3271 1ulp=825 &gt;1ulp=0 max=1
+result_hash=e81d3c04686cc383
+$ B08_FN=exp B08_APPROX=0 B08_EXPT=1 $LAB_HOME/b08_sfpu
+max_abs_err=1.32 (at x=3.875) mean_abs_err=0.085 max_rel_err=0.0337
+ulp vs correctly rounded: exact=211 1ulp=580 &gt;1ulp=3305 max=6
+result_hash=c4cce016957fc383</code></pre>
+  <p>The first two hashes are identical: <code>math_approx_mode = true</code> did not change a single bit. Only <code>exp_tile&lt;true&gt;</code> changes the result, from within 1 ulp to up to 6 ulps, 3.4% relative error. With <code>DISABLE_SFPLOADMACRO</code> (which <code>env.sh</code> sets because ttsim lacks <code>SFPLOADMACRO</code>), the approximate path is this loop:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_exp.h:539-552 @7aad8aac</div>
+<pre><code>    } else if constexpr (APPROXIMATION_MODE &amp;&amp; CLAMP_NEGATIVE) {
+#ifdef DISABLE_SFPLOADMACRO
+        for (int d = 0; d &lt; ITERATIONS; d++) {
+            TTI_SFPLOAD(p_sfpu::LREG0, 0, ADDR_MOD_3, 0);
+            TTI_SFPSWAP(0, p_sfpu::LREG14, p_sfpu::LREG0, 9);
+            TTI_SFPNOP;  // SFPMAD must not read LREG0 before the SFPSWAP result lands (SFPSWAP + SFPNOP costs no cycle)
+            TTI_SFPMAD(p_sfpu::LREG12, p_sfpu::LREG0, p_sfpu::LREG13, p_sfpu::LREG0, 0);
+            TTI_SFPNOP;  // no WH SFPU scoreboard: SFP_STOCH_RND must not read LREG0 the cycle after SFPMAD writes it
+            TTI_SFP_STOCH_RND(
+                0, 0, p_sfpu::LCONST_0, p_sfpu::LREG0, p_sfpu::LREG0, sfpi::SFPSTOCHRND_MOD1_FP32_TO_UINT16);
+            TTI_SFPSHFT(15, p_sfpu::LREG0, p_sfpu::LREG0, 1);
+            TTI_SFPSTORE(p_sfpu::LREG0, 0, ADDR_MOD_3, 0);</code></pre>
+  <p>Clamp the input from below (<code>SFPSWAP</code> against a constant), compute <code>a&middot;x + b</code> with one <code>SFPMAD</code>, turn it into an integer, shift it left by 15 bits and store the integer bits as if they were a BF16 float. The integer lands in the exponent field (and the top of the mantissa), so it <i>is</i> 2<sup>a&middot;x+b</sup>, with the fraction interpolated linearly between powers of two. That linear interpolation is the sawtooth in the figure's fifth view. This is Schraudolph's 1999 trick, done 32 lanes at a time: 8 instructions per vector (two of them <code>SFPNOP</code>), against 20 for the accurate path (A07). The LLK does not name Schraudolph; the identification is mine, from the code.</p>
+  <h3>recip: APPROX is honoured</h3>
+  <p><code>recip_tile</code> is different. Its approximation argument defaults to the kernel's <code>APPROX</code>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/eltwise_unary/recip.h:70-74 @7aad8aac</div>
+<pre><code>    MATH(SFPU_UNARY_CALL(
+        DST_SYNC_MODE,
+        is_fp32_dest_acc_en,
+        calculate_reciprocal,
+        (approximation == ReciprocalApproxMode::Default ? APPROX : approximation == ReciprocalApproxMode::Approximate,</code></pre>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_recip.h:114-120 @7aad8aac</div>
+<pre><code>        if constexpr (APPROXIMATION_MODE) {
+            out = sfpu_reciprocal_iter&lt;0&gt;(in);
+        } else if constexpr (is_fp32_dest_acc_en) {
+            out = sfpu_reciprocal_iter&lt;2&gt;(in);
+        } else {
+            out = sfpu_reciprocal_iter&lt;1 /*max_iter*/, true /*round_to_bf16*/&gt;(in);
+        }</code></pre>
+  <p>Over [0.5, 8] in BF16:</p>
+<pre><code>$ B08_FN=recip B08_APPROX=0 $LAB_HOME/b08_sfpu
+max_abs_err=0.00389 (at x=0.996094) mean_abs_err=0.000492 max_rel_err=0.00388
+ulp vs correctly rounded: exact=4096 1ulp=0 &gt;1ulp=0 max=0
+result_hash=bea9749a504fc383
+$ B08_FN=recip B08_APPROX=1 $LAB_HOME/b08_sfpu
+max_abs_err=0.00793 (at x=0.503906) mean_abs_err=0.000947 max_rel_err=0.00711
+ulp vs correctly rounded: exact=2274 1ulp=1822 &gt;1ulp=0 max=1
+result_hash=9642fd7776bdc383</code></pre>
+  <p>The precise path is <b>correctly rounded on every element</b>, as its comment promises ("correctly rounds BF16 inputs with normal BF16 reciprocals (&le;0.5 ULP)", <code>ckernel_sfpu_recip.h:20-21</code>). It gets there by rounding in the lanes, with <code>convert&lt;vFloat16b&gt;(y, RoundMode::Nearest)</code>, before <code>SFPSTORE</code> can truncate. That is the fix for this lab's opening question. The approximate path does one Newton step with a different seed and no rounding. All 4096 results came out below the exact value (2957 of them equal to the exact value truncated to BF16), and 1822 are one ulp under the correctly rounded answer. Note what "approximate" means here: <code>max_iter = 0</code> does not mean zero Newton steps. The header says "max_iter = 0: this has the same effect as max_iter=1 at the moment; it may be replaced with a cheaper approximation in future" (<code>ckernel_sfpu_recip.h:22-23</code>). On Wormhole, today, the price of APPROX is the final rounding, not the iteration.</p>
+  <div class="callout warn"><b>Check every op's header before trusting APPROX.</b> At this commit: <code>exp_tile</code> ignores it (template argument instead); <code>recip_tile</code> honours it; <code>log_tile</code> passes it to the LLK, but the Wormhole LLK's <code>calculate_log</code> documents both <code>APPROXIMATION_MODE</code> and <code>FAST_APPROX</code> as "Ignored" (<code>ckernel_sfpu_log.h:377-378</code>; the reason is at line 262). So APPROX reaches <code>log_tile</code>'s signature, as A12 says, but does not change its behaviour. A kernel that branches on APPROX itself has another trap, in exercise 3.</div>
+
+  <h2 id="whbh">7. Wormhole vs Blackhole</h2>
+  <p>Every SFPI run above was repeated under <code>source $W/env.sh bh</code>. The hashes:</p>
+  <table>
+    <tr><th>Run</th><th>Wormhole</th><th>Blackhole</th><th></th></tr>
+    <tr><td>map</td><td class="n">e5c90bd9f3573383</td><td class="n">e5c90bd9f3573383</td><td>same lanes and rows</td></tr>
+    <tr><td>piecewise, BF16</td><td class="n">0c2d7c3dfaffc383</td><td class="n">0c2d7c3dfaffc383</td><td>identical</td></tr>
+    <tr><td>sin, no fold / fold, BF16</td><td class="n">7476dd4c… / c25b3881…</td><td class="n">7476dd4c… / c25b3881…</td><td>identical</td></tr>
+    <tr><td>sin fold, FP32 via SrcA</td><td class="n">c34ef6aa7d5b5ec5</td><td class="n">c34ef6aa7d5b5ec5</td><td>identical</td></tr>
+    <tr><td>exp, default and <code>&lt;true&gt;</code></td><td class="n">e81d3c04… / c4cce016…</td><td class="n">e81d3c04… / c4cce016…</td><td>identical</td></tr>
+    <tr><td>recip, APPROX=0</td><td class="n">bea9749a504fc383</td><td class="n">bea9749a504fc383</td><td>identical (both correctly rounded)</td></tr>
+    <tr><td>recip, APPROX=1</td><td class="n">9642fd7776bdc383</td><td class="n">f183c3669d93c383</td><td><b>different</b></td></tr>
+    <tr><td>anything with <code>B08_U2D=1</code></td><td>UndefinedBehavior</td><td>exact</td><td>section 2</td></tr>
+  </table>
+  <p>The one numeric difference is the approximate reciprocal, and it is a different algorithm, not a different FMA. Blackhole has a hardware approximate reciprocal, <code>SFPARECIP</code> ("This instruction is new in Blackhole", <code>BlackholeA0/…/SFPARECIP.md</code>), and its LLK uses it on its own for approximate mode:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_recip.h:386-395 @7aad8aac</div>
+<pre><code>template &lt;bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, int ITERATIONS = 8&gt;
+inline void calculate_reciprocal() {
+    if constexpr (APPROXIMATION_MODE) {
+        _calculate_reciprocal_fast_7b_(ITERATIONS);
+    } else if constexpr (is_fp32_dest_acc_en) {
+        _calculate_reciprocal_fast_24b_5c_(ITERATIONS);
+    } else {
+        _calculate_reciprocal_fast_8b_3c_(ITERATIONS);
+    }
+}</code></pre>
+  <p>With FP32 throughout on Blackhole the difference is stark: precise gives <code>max_rel_err=6.9e-08</code> (within 1 FP32 ulp), approximate gives <code>max_rel_err=0.00542</code>, about 7.5 bits, which matches the name <code>fast_7b</code>. Everything else, including the FMA rounding that A07 showed ttsim models separately for each architecture, produced the same bits on these inputs. That does not prove the FMAs are identical: these kernels never hit the Wormhole sticky-bit corner case from A07.</p>
+
+  <h2 id="exercises">8. Exercises, with answers</h2>
+  <p>Each answer below was checked by running it in this orb.</p>
+  <details class="quiz"><summary>1. Run the folded sin over [&minus;6.3, 6.3] (<code>B08_LO=-6.3 B08_HI=6.3</code>). Predict the worst error before running.</summary><p>The fold maps |x| in (&pi;/2, 3&pi;/2) into [&minus;&pi;/2, &pi;/2], but beyond 3&pi;/2 &asymp; 4.71 the folded argument leaves that range again, reaching about 6.3 &minus; &pi; &asymp; 3.16 in magnitude at the ends. The Taylor polynomial there is as bad as the unfolded one at &pi;. The run gave <code>max_abs_err=0.0815 (at x=-6.3125)</code>, with 632 outputs more than one ulp off. A real implementation reduces modulo 2&pi; first, which needs an integer part of x/(2&pi;), more <code>exexp</code>/<code>setexp</code> work, the kind of code in A07's exp.</p></details>
+  <details class="quiz"><summary>2. <code>B08_FN=map B08_FMT=fp32</code> makes Dst 32-bit. Does the lane-to-cell map change?</summary><p>No. The run printed the same <code>result_hash=e5c90bd9f3573383</code> as the BF16 run (the program hashes the FP32 value of each output, so the two formats are comparable). <code>SFPLOAD</code> addresses rows and columns of Dst, and with a 32-bit Dst the same row/column formula applies to 32-bit cells (<code>SFPLOAD.md</code>, the <code>MOD0_FMT_FP32</code> case reads <code>Dst32b[Row][Column]</code>). What changes is how many tiles Dst holds, not the face layout.</p></details>
+  <details class="quiz"><summary>3. Make the kernel's exp follow <code>math_approx_mode</code> by replacing <code>B08_EXPT</code> with <code>APPROX</code> in <code>exp_tile_init&lt;&gt;</code> and <code>exp_tile&lt;&gt;</code>. What happens?</summary><p>The JIT build fails: <code>error: 'APPROX' was not declared in this scope</code> in the trisc0 compile. The generated <code>chlkc_descriptors.h</code> declares <code>APPROX</code> only under <code>UCK_CHLKC_MATH</code> and <code>UCK_CHLKC_PACK</code>, but the same kernel source is also compiled for the unpack TRISC, where <code>exp_tile&lt;APPROX&gt;</code> must still parse even though <code>MATH(…)</code> removes its body. Declaring <code>constexpr bool APPROX = false;</code> under <code>#ifndef TRISC_MATH</code> fails too (redefinition on the pack TRISC). This works:
+<code>#ifdef TRISC_UNPACK constexpr bool APPROX = false; #endif</code>. Then <code>B08_APPROX=1</code> gives <code>result_hash=c4cce016957fc383</code>, the same bits as <code>exp_tile&lt;true&gt;</code>, and <code>B08_APPROX=0</code> gives <code>e81d3c04686cc383</code>.</p></details>
+  <details class="quiz"><summary>4. How many SFPU instructions does the piecewise kernel issue per tile, and how many of them does a typical lane need?</summary><p>27 per vector (25 <code>sfp*</code> in the loop body plus <code>SFPLOAD</code> and <code>SFPSTORE</code>, 3 of them <code>sfpnop</code>), 8 vectors per face, 4 faces: 27 &times; 32 = 864 per tile. A lane in region B needs roughly load, add, multiply and store; the remaining 20-odd slots are flag management and other regions' work. This is an instruction count from the binary, not a timing measurement: ttsim is not a timing model.</p></details>
+  <details class="quiz"><summary>5. In section 1, &minus;1.75 became &minus;2 in BFP4 on the host and &minus;1.5 on the device. Reproduce both by hand.</summary><p>The shared exponent is that of 3.0 (2<sup>1</sup>), so BFP4's unit is 2<sup>1&minus;2</sup> = 0.5 and BFP8's is 2<sup>1&minus;6</sup> = 2<sup>&minus;5</sup>. Host: 1.75 / 0.5 = 3.5, an exact tie; ties-to-even gives 4, so &minus;2. Device: first BFP8, 1.75 / 2<sup>&minus;5</sup> = 56 exactly, then keep the top 3 of 7 magnitude bits, 56 &gt;&gt; 4 = 3, so &minus;1.5. The same arithmetic gives &minus;0.4 &rarr; host 0.8 &rarr; 1 (&minus;0.5), device round(0.400391 &times; 32) = 13, 13 &gt;&gt; 4 = 0.</p></details>
+  <details class="quiz"><summary>6. Make the piecewise kernel correctly rounded. What do you change, and what should the program print?</summary><p>Round each lane to BF16 before the store, as the precise reciprocal does. Replace the store with <code>sfpi::dst_reg[i] = sfpi::convert&lt;sfpi::vFloat16b&gt;(y, sfpi::RoundMode::Nearest);</code>. That emits an <code>SFPSTOCHRND</code> in nearest mode, so the later truncation in <code>SFPSTORE</code> has nothing left to cut. The run printed <code>ulp vs correctly rounded: exact=4096 1ulp=0 &gt;1ulp=0</code> and <code>max_abs_err=0.00195</code> (half an ulp at 0.5), on Wormhole and on Blackhole, with the same hash <code>dde6989bc14dc383</code>. One caveat: on Wormhole and Blackhole <code>RoundMode::Nearest</code> means <code>NearestAway</code> (<code>sfpi_lib.h:839-842</code>), ties away from zero rather than to even. None of these 4096 inputs produced a tie that would expose the difference.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>BF16</b> loses precision relative to each value; <b>BFP8/BFP4</b> lose it relative to the largest of 16 values sharing one exponent. A value 8 (BFP8) or 4 (BFP4) or more binades below its block's maximum is exactly 0; at 7 (or 3) only rounding up to one unit can save it. One outlier ruins exactly one 16-value block, and PCC hides it.</li>
+    <li>On this simulator the device BFP4 packer rounds to BFP8 and then truncates; the host rounds once. Host and device BFP4 tensors can differ by a full step.</li>
+    <li>Bits are cut, not rounded, at three places: unpacking to SrcA (TF32, 19 bits), unpacking FP32 to a 16-bit Dst, and <code>SFPSTORE</code> to a 16-bit Dst. That is why a quarter of the exact piecewise results came back 1 ulp low, all toward zero.</li>
+    <li>The SFPU is 32 lanes of 32 bits. <code>dst_reg[i]</code> is four Dst rows, every other column; eight vectors make a face, 32 a tile. The map kernel showed it with data written by the simulated device.</li>
+    <li><code>v_if</code>/<code>v_elseif</code>/<code>v_else</code> compile to compare-against-zero, <code>SFPCOMPC</code>, <code>SFPPUSHC</code>/<code>SFPPOPC</code>, and all-lane <code>SFPMOV</code>s. Every region is issued to every lane: 27 instructions per vector for a four-region function.</li>
+    <li>To measure an algorithm's own error, remove format error first: FP32 unpacked to Dst (Blackhole only in ttsim), 32-bit Dst, FP32 output. The folded Taylor sin then matched its predicted remainder, 1.6&times;10<sup>&minus;4</sup> at &plusmn;&pi;/2.</li>
+    <li><code>math_approx_mode</code> changed nothing for <code>exp_tile</code> (identical hash) and changed the reciprocal from correctly rounded to 1-ulp-truncated on Wormhole, or to a 7-bit hardware estimate on Blackhole.</li>
+    <li>Wormhole ttsim cannot run the LLK's unpack-to-Dst FP32 path: the TEN-3868 dummy unpack is UndefinedBehavior to ttsim.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A BFP8_b block holds 8.0 and 0.05. What does 0.05 become, and why?</summary><p>8.0 has exponent 2<sup>3</sup>, so the BFP8 unit is 2<sup>3&minus;6</sup> = 0.125. 0.05 / 0.125 = 0.4, which rounds to 0. The value is 7.3 binades below the block maximum, more than BFP8's 7 bits can reach. In BF16 it would have kept 8 significant bits.</p></details>
+  <details class="quiz"><summary>2. You pass an FP32 CB into a compute kernel with <code>fp32_dest_acc_en = true</code> and see errors of about 10<sup>&minus;3</sup> relative even for <code>copy_tile</code>. What is happening, and what is the fix?</summary><p>The unpacker writes into SrcA, which holds TF32 (10 mantissa bits), and drops the low 13 mantissa bits without rounding (ttsim <code>tensix.cpp:3476</code>). The datacopy then moves those truncated values into the 32-bit Dst. Set <code>UnpackToDestMode::UnpackToDestFp32</code> for that CB so the unpacker writes Dst directly. In ttsim that works on Blackhole; on Wormhole the LLK's workaround instruction hits UndefinedBehavior.</p></details>
+  <details class="quiz"><summary>3. A <code>v_if</code> has an expensive branch that only 1 of 32 lanes takes. How much does it cost compared with all 32 lanes taking it?</summary><p>The same. The instruction stream is fixed at compile time and pushed by a RISC-V that never sees the flags, so the branch's instructions are issued in full; the 31 other lanes simply do not write. Even if no lane takes it, it is issued.</p></details>
+  <details class="quiz"><summary>4. Why does the compiler implement <code>x &lt; -1.0f</code> as <code>sfpmad L1 = L11*L11 + L0</code> followed by <code>sfpsetcc</code>?</summary><p>Wormhole's <code>SFPSETCC</code> only tests an LReg against zero (sign, zero or non-zero). So the comparison is rewritten as x + 1 &lt; 0, and x + 1 is computed as (&minus;1)&middot;(&minus;1) + x using the constant &minus;1.0 that the SFPI compiler keeps in LReg 11, which costs no load. Blackhole adds comparison instructions (A07 shows <code>sfpgt</code> in the Blackhole build of a similar kernel).</p></details>
+  <details class="quiz"><summary>5. A colleague sets <code>math_approx_mode = true</code> to speed up a softmax that uses <code>exp_tile</code> and <code>recip_tile</code>, and the results change slightly. Which op changed?</summary><p>Only the reciprocal. <code>exp_tile</code> reads its own template argument, so its output is bit-identical with or without <code>math_approx_mode</code> (same hash in section 6). <code>recip_tile</code>'s default follows <code>APPROX</code>: on Wormhole it switches from correctly rounded BF16 to a truncated one-step Newton result; on Blackhole to the 7-bit <code>SFPARECIP</code> estimate. To get the fast exp you must write <code>exp_tile&lt;true&gt;</code>.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/VectorUnit.md">Wormhole Vector Unit (SFPU)</a>: lanes, lane enables, the flag stack and every instruction's latency.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SFPLOAD.md"><code>SFPLOAD</code></a> and <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SFPSTORE.md"><code>SFPSTORE</code></a>: the Dst row/column pattern and the BF16 truncation, in functional pseudocode.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SFPCOMPC.md"><code>SFPCOMPC</code></a>: the exact semantics of "else" on a lane-flag stack.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Packers/FormatConversion.md">Packer format conversion</a>: how the device rounds into BFP8 and why BFP4 goes through BFP8 first.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/TensixCoprocessor/SFPARECIP.md">Blackhole <code>SFPARECIP</code></a>: the hardware reciprocal/exp estimate behind Blackhole's approximate reciprocal.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/data_formats/data_formats.md">tt-metal tech report: data formats</a>: BFP layouts, shared exponents and host-side rounding.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/custom_sfpi_smoothstep"><code>custom_sfpi_smoothstep</code></a>: the stock example this lab's kernel is built on.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/custom_sfpi_add.html">Metalium docs: custom SFPI add</a>: the official walkthrough of writing an SFPI kernel.</li>
+    <li><a href="https://github.com/tenstorrent/sfpi">tenstorrent/sfpi</a>: the SFPI compiler and headers (<code>v_if</code>, <code>vFloat</code>, <code>convert</code>).</li>
+    <li><a href="https://nic.schraudolph.org/pubs/Schraudolph99.pdf">Schraudolph, "A Fast, Compact Approximation of the Exponential Function" (1999)</a>: the bit trick behind the approximate exp loop.</li>
+    <li><a href="https://proceedings.neurips.cc/paper/2020/hash/747e32ab0fea7fbd2ad9ec03daa3f840-Abstract.html">Rouhani et al., MSFP (NeurIPS 2020)</a>: the block floating point format closest to BFP8_b.</li>
+    <li><a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html">Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic"</a>: ulps, rounding and truncation from first principles.</li>
+  </ul>
+
+  <div class="pager"><a href="b07-matmul-fidelity.html">&larr; B07 Matmul and math fidelity, bit for bit</a><a class="next" href="../chapters/a08-noc.html">A08 The Network-on-Chip &rarr;</a></div>
+</main>
+</body>
+</html>
