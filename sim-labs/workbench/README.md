@@ -70,17 +70,21 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 
 - `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=0|2|3|4` (numeric: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; names silently mean LoFi) and `MM_SEED`;
   prints `mean_abs_err` and `result_hash`.
+- `host/run_twice.cpp` (chapter A12): the stock `add_2_integers_in_compute` host program with the enqueue run twice on the same core;
+  prints `run 1 finished`, `run 2 finished`, then the usual result check. Pair it with a kernel overlay.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
   `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
 - `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
   on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
+- `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
+  built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
 
 ## Common errors
 
 - `YAML::BadFile ... soc_descriptor.yaml`: there is no descriptor next to the `.so`.
 - `TT_FATAL: Root Directory is not set.`: `TT_METAL_RUNTIME_ROOT` is unset (source `env.sh`).
 - An edit has no effect: the cwd contains a `tt_metal/` tree; `cd $LAB_HOME/run`.
-- The JIT cache is `~/.cache/tt-metal-cache/`. Edited kernels get new hash directories, so it rarely
-  needs clearing.
+- The JIT cache is `~/.cache/tt-metal-cache/`. Kernel hash directories are keyed on the kernel path, args and config
+  (not file contents); edits are detected through `.dephash` sidecar files, so it rarely needs clearing.

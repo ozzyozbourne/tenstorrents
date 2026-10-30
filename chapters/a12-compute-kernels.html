@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A12 · Compute kernels: one source, three cores · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a11-dataflow-and-cbs.html">&larr; Prev</a>
+  <a href="a13-llk-mops-jit.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 12</span><span class="tag">Prerequisites: A04, A06, A07, A11</span>
+  <h1><span class="num">12.</span> Compute kernels: one source, three cores</h1>
+  <p class="subtitle">How one C++ file becomes three programs on TRISC0, TRISC1 and TRISC2, how those three agree on who owns the Dst register, and how to write, break and debug a compute kernel in the simulator.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#three">Three copies of one file</a></li>
+      <li><a href="#macros">The macros that grey out lines</a></li>
+      <li><a href="#cbs">Who owns the circular buffers</a></li>
+      <li><a href="#dst">The Dst handshake</a></li>
+      <li><a href="#break">Breaking the handshake in ttsim</a></li>
+      <li><a href="#init">Startup and init functions</a></li>
+      <li><a href="#paths">FPU ops and SFPU ops</a></li>
+      <li><a href="#config">Fidelity, approximation and Dst configuration</a></li>
+      <li><a href="#sfpi">A first SFPI kernel</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here is a complete compute kernel from tt-metal's examples. It adds two bf16 tiles. Read the comments on the right of each line:</p>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp:18-49 @7aad8aac (comments trimmed)</div>
+<pre><code>    // Metalium API Calls                              Involved Cores
+    compute_kernel_hw_startup(cb_in0, cb_in1, cb_out0);  // Unpack, Math, Pack
+    add_init(cb_in0, cb_in1);                  // Unpack, Math
+
+    cb_wait_front(cb_in0, 1);  // Unpack
+    cb_wait_front(cb_in1, 1);  // Unpack
+
+    tile_regs_acquire();  // Math
+    add_tiles(cb_in0, cb_in1, 0, 0, 0);  // Unpack, Math
+    tile_regs_commit();  // Math
+
+    tile_regs_wait();  // Pack
+    pack_tile(0, cb_out0);  // Pack
+    tile_regs_release();  // Pack
+
+    cb_pop_front(cb_in0, 1);  // Unpack
+    cb_pop_front(cb_in1, 1);  // Unpack
+
+    cb_push_back(cb_out0, 1);  // Pack</code></pre>
+
+  <p>Every line names one, two or three "cores". In <a href="a04-inside-tensix.html">A04</a> you met them: TRISC0, TRISC1 and TRISC2, three baby RISC-V CPUs that each push instructions into one thread of the Tensix coprocessor. TRISC0 drives the unpackers, TRISC1 the matrix and vector engines, TRISC2 the packers. They have separate program counters, separate instruction caches and separate 2&nbsp;KiB data RAMs. There is no OS on them and no thread library.</p>
+  <p>Yet there is one <code>kernel_main()</code>. So:</p>
+  <div class="callout key">How can one source file run on three CPUs at once, with some lines on one CPU, some on two, and some on all three?</div>
+  <p>And once it does, how do three CPUs that share no variables agree that the result in Dst is finished and safe to pack? That's this chapter. We'll answer the first question with the C preprocessor, the second with one 4-bit semaphore, and then use the simulator to look at the generated files, print from each TRISC, and break the agreement on purpose.</p>
+
+  <h2 id="three">Three copies of one file</h2>
+  <p>Before thinking about macros, look at what the JIT compiler actually builds. When the host calls <code>CreateKernel(program, "…/add_2_tiles.cpp", core, ComputeConfig{…})</code>, tt-metal doesn't compile that file directly. It first writes small wrapper files, one per TRISC, into the kernel's directory in the JIT cache:</p>
+
+  <div class="filename">tt-metal/tt_metal/jit_build/genfiles.cpp:814-843 @7aad8aac (trimmed)</div>
+<pre><code>    const string unpack_cpp = out_dir + "chlkc_unpack.cpp";
+    const string math_cpp = out_dir + "chlkc_math.cpp";
+    const string pack_cpp = out_dir + "chlkc_pack.cpp";
+    const string isolate_sfpu_cpp = out_dir + "chlkc_isolate_sfpu.cpp";
+
+    const string unpack_prolog = build_trisc_prolog("TRISC_UNPACK", is_metal2, ...);
+    const string math_prolog = build_trisc_prolog("TRISC_MATH", is_metal2, ...);
+    const string pack_prolog = build_trisc_prolog("TRISC_PACK", is_metal2, ...);
+    ...
+    // All TRISCs get the same kernel source (differentiated by TRISC_* defines)
+    const string kernel_src_to_include = get_kernel_source_to_include(kernel_src);
+    ...
+    // Generate the four TRISC source files (fourth only used on Quasar)
+    write_file(unpack_cpp, unpack_prolog + kernel_src_to_include + tt_kernel_shim);
+    write_file(math_cpp, math_prolog + kernel_src_to_include + tt_kernel_shim);
+    write_file(pack_cpp, pack_prolog + kernel_src_to_include + tt_kernel_shim);
+    write_file(isolate_sfpu_cpp, isolate_sfpu_prolog + kernel_src_to_include + tt_kernel_shim);</code></pre>
+
+  <p><code>build_trisc_prolog</code> (genfiles.cpp:78-97) emits one line, <code>#define TRISC_UNPACK</code> (or <code>_MATH</code> or <code>_PACK</code>), followed by <code>#include "defines_generated.h"</code>. <code>get_kernel_source_to_include</code> (genfiles.cpp:62-73) adds a declaration of <code>kernel_main</code> and an <code>#include</code> of your file. There is also a fourth file, <code>chlkc_isolate_sfpu.cpp</code>. The comment says it's only used on Quasar, Tenstorrent's next architecture. Wormhole and Blackhole build three.</p>
+  <p>You don't have to take the code's word for it. I ran the stock example in ttsim in this orb, with the JIT cache pointed at a private directory, and then listed the kernel's cache directory:</p>
+
+  <div class="filename">output: Wormhole ttsim run in this orb, $LAB_HOME = ~/ttlab/a12</div>
+<pre><code>$ export LAB_HOME=$HOME/ttlab/a12
+$ source sim-labs/workbench/env.sh wh
+$ export TT_METAL_CACHE=$LAB_HOME/cache
+$ $EX/metal_example_add_2_integers_in_compute
+Success: Result matches expected value!
+[4682] 0.3 seconds (13.9 KHz)
+
+$ cd $LAB_HOME/cache/tt-metal-cache13101861097061555864/kernels/add_2_tiles/15221009478522750518
+$ ls
+chlkc_descriptors.h  chlkc_isolate_sfpu.cpp  chlkc_math.cpp  chlkc_pack.cpp  chlkc_unpack.cpp
+defines_generated.h  trisc0  trisc1  trisc2
+$ cat chlkc_unpack.cpp
+#define TRISC_UNPACK
+#include "defines_generated.h"
+void kernel_main();
+#include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp"
+$ cat chlkc_math.cpp
+#define TRISC_MATH
+#include "defines_generated.h"
+void kernel_main();
+#include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp"
+$ cat chlkc_pack.cpp
+#define TRISC_PACK
+#include "defines_generated.h"
+void kernel_main();
+#include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp"</code></pre>
+
+  <p>That's the whole trick: three four-line files that differ in their first line, each including the same source. Each one is compiled into its own ELF, in <code>trisc0/</code>, <code>trisc1/</code> and <code>trisc2/</code>. (A small quirk: when <code>TT_METAL_CACHE</code> is set, the build key is glued onto the <code>tt-metal-cache</code> directory name without a slash. The default is <code>~/.cache/tt-metal-cache/&lt;key&gt;/</code>.)</p>
+  <p>How does each ELF pick up its own <code>chlkc_*.cpp</code>? The compile command for processor <i>i</i> of the compute class gets a different <code>-D</code> flag:</p>
+
+  <div class="filename">tt-metal/tt_metal/llrt/hal/tt-1xx/hal_1xx_common.cpp:42-50 @7aad8aac</div>
+<pre><code>                case HalProcessorClassType::COMPUTE: {
+                    switch (params.processor_id) {
+                        case 0: defines.push_back("UCK_CHLKC_UNPACK"); break;
+                        case 1: defines.push_back("UCK_CHLKC_MATH"); break;
+                        case 2: defines.push_back("UCK_CHLKC_PACK"); break;
+                        default: TT_THROW("Invalid processor id {}", params.processor_id);
+                    }
+                    defines.push_back(fmt::format("COMPILE_FOR_TRISC={}", params.processor_id));</code></pre>
+
+  <p>All three are compiled from the same firmware stub, <code>trisck.cc</code>, which includes <code>chlkc_list.h</code>. That header picks the matching wrapper and defines the entry point the firmware calls after the "go" message:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/common/chlkc_list.h:14-41 @7aad8aac</div>
+<pre><code>#ifdef UCK_CHLKC_MATH
+#include "chlkc_descriptors.h"
+#include "chlkc_math.cpp"
+#endif
+...
+#ifdef UCK_CHLKC_UNPACK
+#include "chlkc_descriptors.h"
+#include "chlkc_unpack.cpp"
+#endif
+
+uint run_kernel() {
+#ifdef UCK_CHLKC_MATH
+    zeroacc();
+#endif
+
+#ifdef UCK_CHLKC_UNPACK
+    zerosrc();
+#endif
+
+    kernel_main();
+
+    return 0;
+}</code></pre>
+
+  <p>Note the two lines before <code>kernel_main()</code>. Before your code runs, the MATH copy clears Dst and the UNPACK copy clears the Src registers. Keep that in mind for the matmul section: Dst starts at zero.</p>
+  <p>So the build is three compilations of the same translation unit with different defines. The design is close to the oldest trick in embedded C: one source, conditional compilation, several binaries. What makes it powerful here is the API built on top of it.</p>
+
+  <h2 id="macros">The macros that grey out lines</h2>
+  <p>Every compute API header includes <code>common_globals.h</code>. Here is the part that matters:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/common_globals.h:14-35 @7aad8aac</div>
+<pre><code>#ifdef TRISC_MATH
+#include "llk_math_common_api.h"
+#define MATH(...) __VA_ARGS__
+#define MAIN math_main()
+#else
+#define MATH(...)
+#endif
+
+#ifdef TRISC_PACK
+#define PACK(...) __VA_ARGS__
+#define MAIN pack_main()
+#else
+#define PACK(...)
+#endif
+
+#ifdef TRISC_UNPACK
+#include "llk_unpack_common_api.h"
+#define UNPACK(...) __VA_ARGS__
+#define MAIN unpack_main()
+#else
+#define UNPACK(...)
+#endif</code></pre>
+
+  <p>In the math build, <code>MATH(x)</code> becomes <code>x</code> and <code>UNPACK(x)</code> and <code>PACK(x)</code> become nothing. The other two builds work the same way. Now every compute API function is written as a list of per-thread pieces. <code>add_tiles</code> is two lines:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/eltwise_binary.h:265-275 @7aad8aac</div>
+<pre><code>template &lt;bool is_fp32_dest_acc_en = DST_ACCUM_MODE&gt;
+ALWI void add_tiles(
+    std::uint32_t icb0, std::uint32_t icb1, std::uint32_t itile0, std::uint32_t itile1, std::uint32_t idst) {
+    UNPACK((llk_unpack_AB(icb0, icb1, itile0, itile1)));
+    MATH((llk_math_eltwise_binary&lt;
+          EltwiseBinaryType::ELWADD,
+          BroadcastType::NONE,
+          is_fp32_dest_acc_en,
+          MathFidelity::LoFi,
+          EltwiseBinaryReuseDestType::NONE&gt;(icb0, icb1, idst, true /* clear_fp32_dst_acc */)));
+}</code></pre>
+
+  <p>On TRISC0 this function is "unpack tile <code>itile0</code> of CB <code>icb0</code> into SrcA and tile <code>itile1</code> of <code>icb1</code> into SrcB". On TRISC1 it is "run ELWADD into Dst tile <code>idst</code>". On TRISC2 it's an empty inline function, and the compiler deletes it. (The double parentheses let a template argument list with commas pass through the macro as a single argument.) <code>ALWI</code> is <code>inline __attribute__((always_inline))</code> (common_globals.h:7), so no call remains either.</p>
+  <p>Now picture the source shown three times, once per TRISC, with each copy's dead lines greyed out. Then let the three programs run. That's the figure below. The kernel is the loop from the <code>eltwise_binary</code> example (tiles_add.cpp:27-57), with short names.</p>
+
+  <div class="viz" id="fig-split"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-split");
+    var g = TT.canvas(root, 960, 470), ctx = g.ctx, C = TT.C;
+    var col = { U: C.blue, M: C.yellow, P: C.green };
+    var names = { U: "TRISC0 · UNPACK", M: "TRISC1 · MATH", P: "TRISC2 · PACK" };
+    var files = { U: "chlkc_unpack.cpp", M: "chlkc_math.cpp", P: "chlkc_pack.cpp" };
+    var L = [
+      ["compute_kernel_hw_startup(in0,in1,out);", "UMP"],
+      ["add_init(in0, in1);", "UM"],
+      ["for (uint32_t i = 0; i < n; i++) {", "*"],
+      ["  cb_wait_front(in0, 1);", "U"],
+      ["  cb_wait_front(in1, 1);", "U"],
+      ["  tile_regs_acquire();", "M"],
+      ["  add_tiles(in0, in1, 0, 0, 0);", "UM"],
+      ["  tile_regs_commit();", "M"],
+      ["  tile_regs_wait();", "P"],
+      ["  cb_reserve_back(out, 1);", "P"],
+      ["  pack_tile(0, out);", "P"],
+      ["  cb_push_back(out, 1);", "P"],
+      ["  cb_pop_front(in0, 1);", "U"],
+      ["  cb_pop_front(in1, 1);", "U"],
+      ["  tile_regs_release();", "P"],
+      ["}", "*"]
+    ];
+    var K = ["U", "M", "P"];
+    function owns(k, l) { return l[1] === "*" || l[1].indexOf(k) >= 0; }
+    var colW = 300, gap = 18, top = 70, lh = 22;
+    var finalX = [12, 12 + colW + gap, 12 + 2 * (colW + gap)];
+    var centerX = (960 - colW) / 2;
+    // pipeline schedule (illustrative durations: unpack 1, math 1, pack 2.2)
+    var N = 5, du = 1, dm = 1, dp = 2.2, U = [], M = [], P = [];
+    for (var t = 0; t < N; t++) {
+      var us = Math.max(t ? U[t - 1][1] : 0, t >= 2 ? M[t - 2][1] : 0);
+      U.push([us, us + du]);
+      var ms = Math.max(U[t][1], t ? M[t - 1][1] : 0, t >= 2 ? P[t - 2][1] : 0);
+      M.push([ms, ms + dm]);
+      var ps = Math.max(M[t][1], t ? P[t - 1][1] : 0);
+      P.push([ps, ps + dp]);
+    }
+    var Tend = P[N - 1][1];
+    var x0 = 150, x1 = 940, sc = (x1 - x0) / Tend;
+    function X(tt) { return x0 + tt * sc; }
+    var laneY = { U: 120, M: 220, P: 320 }, laneH = 56;
+
+    function drawCode(i, t) {
+      for (var c = 0; c < 3; c++) {
+        var k = K[c];
+        var cx = i === 0 ? centerX : (i === 1 ? TT.lerp(centerX, finalX[c], t) : finalX[c]);
+        if (i === 0 && c !== 1) continue;
+        var showHead = i >= 1;
+        TT.box(ctx, cx, top - 8, colW, L.length * lh + 16, { fill: C.bg2, stroke: showHead ? col[k] : C.border, lw: showHead ? 1.5 : 1 });
+        if (showHead) {
+          ctx.globalAlpha = i === 1 ? t : 1;
+          TT.text(ctx, files[k], cx + 8, top - 40, { color: col[k], mono: true, font: "13px" });
+          TT.text(ctx, names[k], cx + 8, top - 22, { color: C.muted, font: "12px" });
+          ctx.globalAlpha = 1;
+        } else {
+          TT.text(ctx, "tiles_add.cpp: one file", cx + 8, top - 22, { color: C.muted, font: "12px" });
+        }
+        var row = 0;
+        for (var j = 0; j < L.length; j++) {
+          var o = owns(k, L[j]);
+          var a = 1, y = top + 6 + j * lh;
+          if (i === 2 && !o) a = TT.lerp(1, 0.16, t);
+          if (i >= 3 && !o) a = i === 3 ? TT.lerp(0.16, 0, t) : 0;
+          if (i >= 3) {
+            var yc = top + 6 + row * lh;
+            y = i === 3 ? TT.lerp(y, yc, t) : yc;
+          }
+          if (o) row++;
+          if (a <= 0.01) continue;
+          ctx.globalAlpha = a;
+          var colr = C.fg;
+          if (i >= 2 && o && L[j][1] !== "*") colr = col[k];
+          TT.text(ctx, L[j][0], cx + 8, y + 8, { mono: true, font: "11px", color: colr });
+          if (i === 0) {
+            // owner badges
+            var bx = cx + colW + 8;
+            var s = L[j][1] === "*" ? "UMP" : L[j][1];
+            for (var q = 0; q < s.length; q++) {
+              TT.box(ctx, bx + q * 20, y, 17, 16, { fill: col[s[q]], alpha: L[j][1] === "*" ? 0.25 : 0.8, r: 3, label: s[q], color: C.bg, font: "bold 11px" });
+            }
+          }
+          ctx.globalAlpha = 1;
+        }
+      }
+      if (i === 0) {
+        TT.text(ctx, "U / M / P = which TRISC keeps the line (faded = control flow, kept by all three)", centerX - 40, top + L.length * lh + 30, { color: C.muted, font: "12px" });
+      }
+      if (i >= 3) {
+        TT.text(ctx, "What each TRISC actually compiled. Loop and braces are in all three.", 12, 456, { color: C.muted, font: "12px" });
+      }
+    }
+
+    function drawPipe(i, t) {
+      var T;
+      if (i === 4) T = 0;
+      else if (i === 5) T = TT.lerp(0, P[0][1], t);
+      else if (i === 6) T = TT.lerp(P[0][1], Tend, t);
+      else T = Tend;
+      // axis
+      TT.text(ctx, "time (illustrative units)", x0, 410, { color: C.muted, font: "12px" });
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x0, 390); ctx.lineTo(x1, 390); ctx.stroke();
+      K.forEach(function (k) {
+        var y = laneY[k];
+        TT.box(ctx, 10, y, 130, laneH, { fill: col[k], alpha: 0.15, stroke: col[k], label: names[k], font: "12px" });
+        ctx.strokeStyle = C.border; ctx.setLineDash([3, 5]);
+        ctx.beginPath(); ctx.moveTo(x0, y + laneH / 2); ctx.lineTo(x1, y + laneH / 2); ctx.stroke(); ctx.setLineDash([]);
+      });
+      var lbl = { U: "wait·unpack·pop", M: "acq·ELWADD·commit", P: "wait·pack·release·push" };
+      function seg(k, s, e, label, fill, alpha) {
+        if (T <= s) return;
+        var ee = Math.min(e, T);
+        var w = (ee - s) * sc;
+        TT.box(ctx, X(s), laneY[k] + 6, Math.max(w - 2, 1), laneH - 12, { fill: C.bg, r: 4 });
+        TT.box(ctx, X(s), laneY[k] + 6, Math.max(w - 2, 1), laneH - 12, { fill: fill, alpha: alpha, stroke: fill, r: 4 });
+        if (w > 30 && label) TT.text(ctx, label, X(s) + 5, laneY[k] + laneH / 2, { color: C.fg, font: "12px" });
+      }
+      for (var t2 = 0; t2 < N; t2++) {
+        seg("U", U[t2][0], U[t2][1], "t" + t2, col.U, 0.55);
+        seg("M", M[t2][0], M[t2][1], "t" + t2, col.M, 0.55);
+        seg("P", P[t2][0], P[t2][1], "t" + t2, col.P, 0.55);
+        // waits
+        var mprev = t2 ? M[t2 - 1][1] : U[t2][1];
+        var mready = Math.max(U[t2][1], t2 ? M[t2 - 1][1] : 0);
+        if (M[t2][0] > mready + 1e-6 && i >= 6) seg("M", mready, M[t2][0], "SEMWAIT", C.red, 0.35);
+        var uready = t2 ? U[t2 - 1][1] : 0;
+        if (U[t2][0] > uready + 1e-6 && i >= 6) seg("U", uready, U[t2][0], "Src busy", C.purple, 0.35);
+        if (t2 === 0) seg("P", 0, P[0][0], "SEMWAIT", C.red, 0.25);
+      }
+      if (i >= 7) {
+        // handshake arrows for tile 2
+        TT.arrow(ctx, X(U[2][1]), laneY.U + laneH, X(U[2][1]) + 2, laneY.M + 6, { color: C.blue, lw: 1.5, head: 6 });
+        TT.arrow(ctx, X(P[0][1]), laneY.P + 4, X(M[2][0]), laneY.M + laneH - 4, { color: C.red, lw: 1.5, head: 7 });
+        TT.text(ctx, "release of t0 → MATH may take that half again", X(P[0][1]) + 8, laneY.P - 12, { color: C.red, font: "12px" });
+        TT.text(ctx, "SrcA/SrcB valid (hardware)", X(U[2][1]) + 6, laneY.U + laneH + 14, { color: C.blue, font: "12px" });
+      }
+      // cursor
+      if (i >= 5 && i <= 6) {
+        ctx.strokeStyle = C.fg; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(X(T), 100); ctx.lineTo(X(T), 392); ctx.stroke();
+      }
+      TT.text(ctx, "Three programs, running at the same time; a block = one tile's work on that TRISC's coprocessor thread", 10, 40, { color: C.muted, font: "13px" });
+      TT.text(ctx, "unpack: " + lbl.U + "   math: " + lbl.M + "   pack: " + lbl.P, 10, 62, { color: C.muted, font: "12px", mono: true });
+    }
+
+    var steps = [
+      { dur: 1.2, text: "<b>One file.</b> This is the compute loop you write. The badges show which TRISC each line ends up on, read off the <code>UNPACK(…)</code>, <code>MATH(…)</code> and <code>PACK(…)</code> wrappers inside each API function. <code>add_tiles</code> and <code>add_init</code> have pieces on two TRISCs; startup has pieces on all three." },
+      { dur: 1.4, text: "<b>Three copies.</b> The JIT writes <code>chlkc_unpack.cpp</code>, <code>chlkc_math.cpp</code> and <code>chlkc_pack.cpp</code>. Each one is a <code>#define TRISC_…</code> line followed by <code>#include</code> of the same file." },
+      { dur: 1.4, text: "<b>The preprocessor runs.</b> In each copy, the wrappers for the other two TRISCs expand to nothing. The <code>for</code> loop, its counter and its braces aren't wrapped, so they survive in all three: <b>control flow is replicated, work is not</b>." },
+      { dur: 1.4, text: "<b>What each TRISC compiled.</b> TRISC0 waits for input, unpacks and pops. TRISC1 acquires Dst, runs ELWADD and commits. TRISC2 waits for Dst, reserves output space, packs, pushes and releases. Three small programs with no shared variables." },
+      { dur: 1.0, text: "<b>Now run them.</b> Each TRISC pushes instructions into its own coprocessor thread (A04). The lanes show when each thread works on tile <i>t</i>. The durations are made up (pack set to 2.2× unpack). The ordering rules are real." },
+      { dur: 3.0, text: "<b>Tile 0 flows through.</b> MATH can start only when the unpacker has handed it SrcA/SrcB (a hardware check, no software needed). PACK starts when MATH's commit posts the semaphore. At the start, PACK is parked at its <code>tile_regs_wait</code> (red)." },
+      { dur: 5.0, text: "<b>The pipeline fills.</b> UNPACK runs ahead to tile 1 while MATH works on tile 0 (SrcA/SrcB are double-banked). MATH runs ahead into the second half of Dst. With pack the slowest stage, MATH soon blocks at <code>tile_regs_acquire</code> (red), because both halves of Dst are full. UNPACK then waits for a free Src bank (purple)." },
+      { dur: 1.2, text: "<b>Who unblocks whom.</b> Blue: the SrcA/SrcB valid handoff from UNPACK to MATH is in hardware. Red: MATH's acquire for t2 waits for PACK's release of t0, through the MATH_PACK semaphore. That handshake is the next section. In steady state the pipeline runs at the speed of its slowest stage, here pack." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        if (i <= 3) drawCode(i, t); else drawPipe(i, t);
+      }
+    });
+  })();
+  </script>
+
+  <p>The phrase to keep from the figure is that <b>control flow is replicated and work is not</b>. Anything not inside an <code>UNPACK</code>, <code>MATH</code> or <code>PACK</code> wrapper runs on all three TRISCs. That includes your <code>for</code> loops, <code>get_arg_val</code> calls, local variables and <code>if</code> statements. Each TRISC computes them independently in its own registers and RAM. The API calls inside the loop then contribute different instructions on each core.</p>
+  <p>That leads to the first rule of compute kernels. <b>All three copies must take the same path through the control flow.</b> If TRISC1 loops 8 times and TRISC2 loops 7 times, the eighth commit has no matching wait. Nothing crashes, but someone waits forever. Runtime arguments and compile-time arguments are safe to branch on, because all three cores see the same values. A value only one thread can see is not safe. An example is something MATH reads out of Dst, or a CB value that only UNPACK has waited for.</p>
+
+  <div class="callout gpu">The nearest GPU idea is <i>warp specialization</i>. In a Hopper GEMM, one kernel source has an <code>if (warp_role == producer) … else …</code> split: producer warps issue TMA loads and consumer warps run tensor-core MMAs, and they synchronize through barriers in shared memory. Tensix does the split at compile time instead, with the preprocessor, and the roles are fixed by hardware: TRISC0 can only usefully drive the unpackers, because its pushes go to thread 0. The analogy breaks in two places. A GPU's specialized warps run genuinely different code paths that you write. Here the three paths are mechanically derived from one, and their loop structure must match exactly. And a GPU barrier waits for <i>threads</i>, while the Dst semaphore below waits for <i>coprocessor instructions</i>, which may finish long after the RISC-V that pushed them has moved on.</div>
+
+  <h3>Seeing the split from inside: DPRINT per TRISC</h3>
+  <p>Debug printing uses the same mechanism. <code>DPRINT</code> prints on every RISC that compiles it. <code>DPRINT_UNPACK</code>, <code>DPRINT_MATH</code> and <code>DPRINT_PACK</code> forward to <code>DEVICE_PRINT_UNPACK</code>, <code>_MATH</code> and <code>_PACK</code> (tt_metal/hw/inc/api/debug/dprint.h:105-107), which are defined only under <code>UCK_CHLKC_UNPACK</code>, <code>_MATH</code> and <code>_PACK</code> (tt_metal/hw/inc/api/debug/device_print.h:142-157). I put an overlay copy of <code>add_2_tiles.cpp</code> at <code>$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/</code> with these additions:</p>
+
+  <div class="filename">$LAB_HOME/kernels/…/add_2_tiles.cpp (my overlay, additions only)</div>
+<pre><code>#include "api/debug/dprint.h"
+...
+    DPRINT("plain DPRINT: every TRISC runs this line\n");
+...
+    DPRINT_UNPACK("UNPACK: both input tiles are in the CBs\n");      // after the two cb_wait_front
+...
+    tile_regs_commit();
+    DPRINT_MATH("MATH: pushed ELWADD and SEMPOST; MATH_PACK reads {}\n",
+                ckernel::semaphore_read(ckernel::semaphore::MATH_PACK));
+...
+    tile_regs_release();
+    DPRINT_PACK("PACK: pushed PACR and release; MATH_PACK reads {}\n",
+                ckernel::semaphore_read(ckernel::semaphore::MATH_PACK));</code></pre>
+
+  <div class="filename">output: TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_compute (Wormhole ttsim, this orb)</div>
+<pre><code>0:0-0:TR1: plain DPRINT: every TRISC runs this line
+0:0-0:TR0: plain DPRINT: every TRISC runs this line
+0:0-0:TR1: MATH: pushed ELWADD and SEMPOST; MATH_PACK reads 0
+0:0-0:TR2: plain DPRINT: every TRISC runs this line
+0:0-0:TR0: UNPACK: both input tiles are in the CBs
+0:0-0:TR2: PACK: pushed PACR and release; MATH_PACK reads 0
+Success: Result matches expected value!
+[7734] 0.6 seconds (12.3 KHz)</code></pre>
+
+  <p>The plain <code>DPRINT</code> appears three times, tagged TR0, TR1 and TR2. Each targeted print appears once, on its own core. Two cautions about reading this log:</p>
+  <ul>
+    <li><b>Line order across cores isn't time order.</b> Each RISC writes its own print buffer, and the host server drains the buffers in its own order. Order is meaningful only within one TR tag.</li>
+    <li><b>A TRISC's view of the semaphore is a snapshot of the coprocessor, not of the program.</b> TRISC1 read <code>MATH_PACK = 0</code> right after <code>tile_regs_commit()</code>. Commit had only <i>pushed</i> a STALLWAIT and a SEMPOST into the math thread's FIFO. Those may not have executed yet. They might also have executed, and the packer may already have taken the count back. The TRISC can't tell which. This is A04's "the RISC-V runs ahead", seen from a kernel.</li>
+  </ul>
+
+  <div class="callout sim">Reproduce the per-TRISC prints, then add your own in <a href="../sim-labs/b06-cbs-and-semaphores.html">B06 · Circular buffers and semaphores</a>, which also traces SEMPOST/SEMGET as ttsim executes them.</div>
+
+  <h2 id="cbs">Who owns the circular buffers</h2>
+  <p>In <a href="a11-dataflow-and-cbs.html">A11</a>, a CB had a consumer side (<code>cb_wait_front</code>, <code>cb_pop_front</code>) and a producer side (<code>cb_reserve_back</code>, <code>cb_push_back</code>). In a data-movement kernel all four run on one RISC. In a compute kernel they're split by role:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/cb_api.h:44, 76, 92-98, 130-136 @7aad8aac (trimmed)</div>
+<pre><code>ALWI void cb_wait_front(uint32_t cbid, uint32_t ntiles) { UNPACK((llk_wait_tiles(cbid, ntiles))); }
+
+ALWI void cb_pop_front(uint32_t cbid, uint32_t ntiles) { UNPACK((llk_pop_tiles(cbid, ntiles))); }
+
+ALWI void cb_reserve_back(uint32_t cbid, uint32_t ntiles) {
+    PACK((llk_wait_for_free_tiles&lt;false, false, false&gt;(cbid, ntiles)));
+}
+
+ALWI void cb_push_back(uint32_t cbid, uint32_t ntiles) {
+    PACK((llk_push_tiles&lt;false, false&gt;(cbid, ntiles)));
+}</code></pre>
+
+  <p>This makes sense once you ask who touches each side. Only the unpacker reads input CBs, so only TRISC0 needs to know when input is ready and when it's done with it. Only the packer writes output CBs, so only TRISC2 needs to know about free space and new tiles. TRISC1 never waits on a CB at all. It doesn't need to, because its ELWADD can't pass the wait gate until the unpacker has handed SrcA/SrcB to the matrix unit (A04).</p>
+  <p>The pop and push have a subtle detail worth reading. TRISC0 may run <code>cb_pop_front</code> while its UNPACR is still queued, so the "tiles acked" counter in L1 can't be updated with a plain RISC-V store. Instead, the TRISC pushes the update into its own Tensix thread, behind a stall:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_io/llk_io_unpack.h:99-102 and llk_io_pack.h:60-70 @7aad8aac (trimmed)</div>
+<pre><code>    // pop (TRISC0)
+    get_local_cb_interface(input).tiles_acked += num_tiles;
+    TT_SETDMAREG(0, get_local_cb_interface(input).tiles_acked, 0, LO_16(4));
+    TTI_STALLWAIT(p_stall::STALL_THCON, p_stall::UNPACK);
+    TT_STOREREG(4, tiles_acked_addr_tensix);
+
+    // push (TRISC2)
+    get_local_cb_interface(output).tiles_received += num_tiles;
+    ...
+    TT_SETDMAREG(0, tiles_received_new, 0, LO_16(p_gpr_pack::NUM_MSGS_RECEIVED));
+    TTI_STALLWAIT(p_stall::STALL_THCON, p_stall::PACK);  // wait for pack to finish
+    TT_STOREREG(p_gpr_pack::NUM_MSGS_RECEIVED, tiles_received_addr_tensix);</code></pre>
+
+  <p>The counter is written by a STOREREG that waits for the unpacker (or packer) to go idle. So the reader kernel on another RISC never sees "tile consumed" before the unpacker has actually read it, and the writer never sees "tile ready" before the packer has written it. You get this for free. It's also why calling pop or push early in source order is not a race.</p>
+
+  <div class="callout warn"><b>Source order between different TRISCs doesn't matter. Source order within one TRISC does.</b> The docs' recommended loop calls <code>cb_wait_front</code> before <code>tile_regs_acquire</code>. The <code>eltwise_sfpu</code> example does the opposite (eltwise_sfpu.cpp:23-31). Both are correct, because wait_front compiles only into TRISC0 and acquire only into TRISC1. They're never in the same program. What would break things is reordering two lines that land on the <i>same</i> TRISC, such as <code>tile_regs_release</code> before <code>pack_tile</code>, which are both on PACK.</div>
+
+  <h2 id="dst">The Dst handshake</h2>
+  <p>Unpack-to-math needed no software. Math-to-pack does, because Dst has no hardware ownership (A04): the packer will happily read Dst halfway through an ELWADD. So the API gives four calls, two per side:</p>
+  <table>
+    <tr><th>Call</th><th>Runs on</th><th>Means</th><th>Becomes (Wormhole LLK)</th></tr>
+    <tr><td><code>tile_regs_acquire()</code></td><td>MATH</td><td>"I want a section of Dst to write"</td><td><code>SEMWAIT</code> MATH_PACK, block while Value ≥ Max</td></tr>
+    <tr><td><code>tile_regs_commit()</code></td><td>MATH</td><td>"My section is finished"</td><td><code>STALLWAIT</code> (math and SFPU done), <code>SEMPOST</code> MATH_PACK; flip to the other half</td></tr>
+    <tr><td><code>tile_regs_wait()</code></td><td>PACK</td><td>"I want a finished section to read"</td><td><code>SEMWAIT</code> MATH_PACK, block while Value = 0</td></tr>
+    <tr><td><code>tile_regs_release()</code></td><td>PACK</td><td>"I've packed it; take it back"</td><td><code>STALLWAIT</code> (pack done), <code>ZEROACC</code> that section, <code>SEMGET</code> MATH_PACK; flip to the other half</td></tr>
+  </table>
+  <p>The wrappers are as thin as you'd hope. On Wormhole the <code>UNPACK</code> pieces of acquire and commit are empty functions (llk_unpack_common_api.h:374-377); the comments say they matter only for Quasar's unpack-to-dest.</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/reg_api.h:50-56, 63-65, 96-100, 106-108 @7aad8aac (comments trimmed)</div>
+<pre><code>ALWI void tile_regs_acquire() {
+    UNPACK((llk_unpack_wait_for_dest_available()));
+    MATH((llk_math_wait_for_dest_available()));
+}
+ALWI void tile_regs_wait() {
+    PACK((llk_packer_wait_for_math_done()));
+}
+ALWI void tile_regs_commit() {
+    UNPACK((llk_unpack_dest_section_done&lt;is_fp32_dest_acc_en&gt;()));
+    MATH((llk_math_dest_section_done&lt;is_fp32_dest_acc_en&gt;()));
+}
+ALWI void tile_regs_release() {
+    PACK((llk_pack_dest_section_done&lt;is_fp32_dest_acc_en&gt;()));
+}</code></pre>
+
+  <p>One layer down, the MATH side waits "on max" and posts:</p>
+
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cmath_common.h:237-241, 307-310 and llk_lib/llk_math_common.h:84-93 @7aad8aac</div>
+<pre><code>inline void set_math_semaphores()
+{
+    // Tell packer that it has something to pack
+    t6_semaphore_post&lt;p_stall::MATH | p_stall::WAIT_SFPU&gt;(semaphore::MATH_PACK);
+}
+inline void math_dest_wait()
+{
+    TTI_SEMWAIT(p_stall::STALL_MATH | p_stall::STALL_SFPU | p_stall::STALL_SYNC, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_MAX);
+}
+
+template &lt;DstSync Dst, bool is_fp32_dest_acc_en&gt;
+inline void _llk_math_dest_section_done_()
+{
+    set_math_semaphores();
+    if constexpr (Dst == DstSync::SyncHalf)
+    {
+        math_sync_tile_dst_index = 0;
+        dest_section_flip();
+    }
+}</code></pre>
+
+  <p>The PACK side waits "on zero", and its release clears what it just packed before handing it back:</p>
+
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_pack_common.h:26-29, 58-83 @7aad8aac (comments trimmed; the SEMGET annotation is mine)</div>
+<pre><code>inline void _llk_packer_wait_for_math_done_()
+{
+    TTI_SEMWAIT(p_stall::STALL_TDMA, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO);
+}
+
+template &lt;DstSync Dst, bool is_fp32_dest_acc_en&gt;
+inline void _llk_pack_dest_section_done_()
+{
+    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::PACK); // wait for pack to finish
+    if constexpr (Dst == DstSync::SyncFull)
+    {
+        constexpr std::uint32_t CLEAR_MODE = is_fp32_dest_acc_en ? p_zeroacc::CLR_ALL_32B : p_zeroacc::CLR_ALL;
+        TTI_ZEROACC(CLEAR_MODE, ADDR_MOD_1, 0);
+    }
+    else
+    {
+        constexpr std::uint32_t CLEAR_MODE = is_fp32_dest_acc_en ? p_zeroacc::CLR_HALF_32B : p_zeroacc::CLR_HALF;
+        TT_ZEROACC(CLEAR_MODE, ADDR_MOD_1, (dest_offset_id) % 2);
+    }
+    _llk_packer_set_math_semaphore_&lt;p_stall::NONE&gt;();   // SEMGET MATH_PACK
+    if constexpr (Dst == DstSync::SyncHalf)
+    {
+        flip_packer_dest_offset_id();
+        select_packer_dest_registers&lt;Dst&gt;();
+    }
+}</code></pre>
+
+  <p>And the semaphore's maximum is set once, at startup, from the sync mode. The comment says it directly: max 1 for full sync, 2 for half sync.</p>
+
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_common.h:104-124 @7aad8aac (trimmed)</div>
+<pre><code>inline void _llk_math_pack_sync_init_()
+{
+    tensix_sync();
+    while (semaphore_read(semaphore::MATH_PACK) &gt; 0)
+    {
+    } // Wait for previous packs to finish before claiming all dest
+    if constexpr (Dst == DstSync::SyncFull)
+    {
+        TTI_SEMINIT(1, 0, p_stall::SEMAPHORE_1);
+        ...
+    }
+    else
+    {
+        TTI_SEMINIT(2, 0, p_stall::SEMAPHORE_1);
+        ...</code></pre>
+
+  <p>Read the semaphore's Value as "number of Dst sections full of finished results that the packer hasn't released yet". MATH may start a new section while that number is below Max. PACK may start reading while it's above zero. With Max = 2, MATH can be one whole section ahead of PACK. That's double buffering, the same idea as two-page CBs and the two SrcA banks, applied a third time. Step through it:</p>
+
+  <div class="viz" id="fig-dst"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-dst");
+    var g = TT.canvas(root, 960, 430), ctx = g.ctx, C = TT.C;
+    // half state: 'zero' | 'math' (being written) | 'done' (committed) | 'pack' (being packed)
+    var S = [
+      { sem: 0, max: 2, A: "zero", B: "zero", m: "A", p: "A", ms: "idle", ps: "idle", mi: "SEMINIT max=2 value=0", pi: "",
+        text: "<b>Startup.</b> <code>compute_kernel_hw_startup</code> runs <code>_llk_math_pack_sync_init_</code> on MATH: <code>SEMINIT</code> MATH_PACK with Max = 2 (half sync) and Value = 0. Both threads point at half A. Dst is all zeros (<code>run_kernel</code> ran <code>zeroacc()</code>)." },
+      { sem: 0, max: 2, A: "math", B: "zero", m: "A", p: "A", ms: "run", ps: "wait", mi: "acquire: SEMWAIT on max → 0 < 2, pass", pi: "wait: SEMWAIT on zero → blocked",
+        text: "<b>tile_regs_acquire / tile_regs_wait.</b> MATH's SEMWAIT blocks only while Value ≥ Max, so it passes and ELWADD writes tile t0 into half A. PACK's SEMWAIT blocks while Value = 0, so the packer thread stalls (red). Its TRISC has long since moved on and pushed the PACR that sits behind the wait." },
+      { sem: 1, max: 2, A: "done", B: "zero", m: "B", p: "A", ms: "idle", ps: "run", mi: "commit: STALLWAIT, SEMPOST 0→1, flip to B", pi: "SEMWAIT passes (1 ≠ 0) → PACR from half A",
+        text: "<b>tile_regs_commit.</b> MATH stalls until its ELWADDs have finished, then SEMPOSTs: Value 0 → 1. In half-sync mode it also flips its Dst base to half B. PACK's wait now passes, and the packer reads half A." },
+      { sem: 1, max: 2, A: "pack", B: "math", m: "B", p: "A", ms: "run", ps: "run", mi: "acquire: 1 < 2, pass → ELWADD t1 into B", pi: "packing half A",
+        text: "<b>Overlap.</b> MATH's next acquire sees Value 1 &lt; Max 2 and passes. It writes tile t1 into half B while the packer drains half A. This is the whole point of half sync." },
+      { sem: 2, max: 2, A: "pack", B: "done", m: "A", p: "A", ms: "idle", ps: "run", mi: "commit: SEMPOST (1→2), flip to A", pi: "still packing half A",
+        text: "<b>Both halves full.</b> MATH commits t1: Value 1 → 2 = Max. Its base flips back to half A, which the packer hasn't released yet." },
+      { sem: 2, max: 2, A: "pack", B: "done", m: "A", p: "A", ms: "wait", ps: "run", mi: "acquire: SEMWAIT on max → 2 ≥ 2, blocked", pi: "still packing half A",
+        text: "<b>MATH blocks.</b> The acquire for t2 sees Value = Max and stalls the math thread. Without this, the next ELWADD would overwrite half A while the packer is still reading it." },
+      { sem: 1, max: 2, A: "math", B: "pack", m: "A", p: "B", ms: "run", ps: "run", mi: "SEMWAIT passes (1 < 2) → ELWADD t2 into A", pi: "release: ZEROACC A, SEMGET 2→1, flip to B",
+        text: "<b>tile_regs_release.</b> PACK waits for its PACRs to finish, ZEROACCs half A, and SEMGETs: Value 2 → 1. MATH's wait passes and t2 goes into a freshly zeroed half A. The packer, flipped to half B, finds t1 waiting (Value 1 ≠ 0) and starts on it." },
+      { sem: 2, max: 2, A: "done", B: "pack", m: "B", p: "B", ms: "wait", ps: "run", mi: "commit t2 (1→2); acquire t3 blocked", pi: "packing half B (t1)",
+        text: "<b>Steady state.</b> MATH commits t2 (Value 1 → 2), flips to half B, and its acquire for t3 blocks again until PACK releases B. The two halves ping-pong: MATH writes one while PACK drains the other, and Value moves between 0, 1 and 2. When pack is slower than math, as in the previous figure, MATH spends its spare time blocked at acquire." },
+      { sem: 0, max: 2, A: "zero", B: "zero", m: "B", p: "B", ms: "idle", ps: "idle", mi: "last commit was matched", pi: "last release: SEMGET → 0",
+        text: "<b>The end of the kernel.</b> Every SEMPOST was matched by a SEMGET, so Value is back to 0. That's an invariant the <i>next</i> kernel relies on: its <code>_llk_math_pack_sync_init_</code> spins while Value &gt; 0, and the semaphore is not reset between programs. We'll break this invariant in ttsim shortly." },
+      { sem: 0, max: 1, A: "full", B: "full", m: "A", p: "A", ms: "run", ps: "wait", mi: "acquire: 0 < 1 → whole Dst", pi: "wait: blocked",
+        text: "<b>Full sync, for contrast</b> (<code>dst_full_sync_en = true</code>). SEMINIT gives Max = 1. MATH owns the whole of Dst (16 bf16 tiles instead of 8), but after its commit it can't acquire again until PACK releases. Math and pack take turns instead of overlapping. Release ZEROACCs all of Dst." }
+    ];
+    var colr = { zero: C.bg3, math: C.yellow, done: C.green, pack: C.orange, full: C.yellow };
+    var word = { zero: "zeroed / free", math: "MATH writing", done: "committed, waiting for PACK", pack: "PACK reading", full: "one 16-tile section" };
+    function half(x, y, w, h, name, st, rows, tiles, alpha) {
+      TT.box(ctx, x, y, w, h, { fill: colr[st], alpha: st === "zero" ? 1 : 0.35, stroke: st === "zero" ? C.border : colr[st], lw: 2 });
+      TT.text(ctx, name, x + 10, y + 16, { font: "bold 13px" });
+      TT.text(ctx, rows, x + 10, y + 34, { color: C.muted, font: "12px", mono: true });
+      TT.text(ctx, word[st], x + 10, y + h - 14, { color: st === "zero" ? C.muted : C.fg, font: "13px" });
+      var n = tiles, tw = (w - 20) / n;
+      for (var k = 0; k < n; k++) TT.box(ctx, x + 10 + k * tw, y + 46, tw - 3, 26, { fill: k === 0 && st !== "zero" ? colr[st] : C.bg2, alpha: k === 0 && st !== "zero" ? 0.9 : 1, stroke: C.border, lw: 1, r: 3 });
+    }
+    function thread(x, y, name, status, inst, c) {
+      var sc = status === "wait" ? C.red : (status === "run" ? c : C.border);
+      TT.box(ctx, x, y, 330, 70, { fill: C.bg2, stroke: sc, lw: 2 });
+      TT.text(ctx, name, x + 10, y + 16, { color: c, font: "bold 13px" });
+      TT.text(ctx, status === "wait" ? "BLOCKED" : (status === "run" ? "running" : "idle"), x + 320, y + 16, { color: sc, font: "12px", align: "right" });
+      TT.text(ctx, inst, x + 10, y + 44, { font: "12px", mono: true });
+    }
+    TT.stepper({
+      root: root, steps: S.map(function (s) { return { dur: 1.6, text: s.text }; }),
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var s = S[i], prev = S[Math.max(0, i - 1)];
+        TT.text(ctx, s.max === 2 ? "Dst, bf16, half sync (default): 2 sections × 8 tiles" : "Dst, bf16, full sync: 1 section × 16 tiles", 20, 22, { color: C.muted, font: "13px" });
+        if (s.max === 2) {
+          half(20, 40, 430, 120, "Half A", s.A, "rows 0–511 · tiles 0–7", 8);
+          half(20, 180, 430, 120, "Half B", s.B, "rows 512–1023 · tiles 8–15", 8);
+          // pointers
+          var my = s.m === "A" ? 70 : 210, py = s.p === "A" ? 120 : 260;
+          TT.arrow(ctx, 520, my, 455, my, { color: C.yellow, lw: 2 });
+          TT.text(ctx, "MATH base", 525, my, { color: C.yellow, font: "12px" });
+          TT.arrow(ctx, 520, py, 455, py, { color: C.orange, lw: 2 });
+          TT.text(ctx, "PACK base", 525, py, { color: C.orange, font: "12px" });
+        } else {
+          TT.box(ctx, 20, 40, 430, 260, { fill: C.yellow, alpha: 0.25, stroke: C.yellow, lw: 2 });
+          TT.text(ctx, "Whole Dst: rows 0–1023 · tiles 0–15", 30, 60, { font: "bold 13px" });
+          TT.text(ctx, "MATH writes it all, then PACK reads it all; no overlap", 30, 85, { color: C.muted, font: "12px" });
+          for (var k = 0; k < 16; k++) TT.box(ctx, 30 + (k % 8) * 51, 110 + Math.floor(k / 8) * 40, 46, 30, { fill: C.bg2, stroke: C.border, lw: 1, r: 3 });
+        }
+        // semaphore gauge
+        var gx = 640, gy = 50, gh = 220, gw = 60;
+        TT.text(ctx, "MATH_PACK (Sync unit sem 1)", gx - 40, 30, { color: C.muted, font: "12px" });
+        TT.box(ctx, gx, gy, gw, gh, { fill: C.bg2, stroke: C.border });
+        var v = (i > 0 && prev.max === s.max) ? TT.lerp(prev.sem, s.sem, t) : s.sem;
+        var unit = gh / 2;
+        if (v > 0) TT.box(ctx, gx + 4, gy + gh - v * unit, gw - 8, v * unit - 4, { fill: C.teal, alpha: 0.7, r: 3 });
+        for (var q = 0; q <= 2; q++) {
+          var yy = gy + gh - q * unit;
+          TT.text(ctx, String(q), gx - 10, yy, { color: C.muted, font: "12px", align: "right" });
+        }
+        var my2 = gy + gh - s.max * unit;
+        ctx.strokeStyle = C.red; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(gx - 4, my2); ctx.lineTo(gx + gw + 4, my2); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, "Max = " + s.max, gx + gw + 10, my2, { color: C.red, font: "12px" });
+        TT.text(ctx, "Value = " + s.sem, gx + gw + 10, gy + gh - 10, { color: C.teal, font: "bold 16px" });
+        TT.text(ctx, "MATH may acquire while Value < Max", gx - 40, gy + gh + 22, { color: C.yellow, font: "12px" });
+        TT.text(ctx, "PACK may wait-through while Value > 0", gx - 40, gy + gh + 40, { color: C.orange, font: "12px" });
+        thread(20, 320, "MATH thread (TRISC1)", s.ms, s.mi, C.yellow);
+        thread(370, 320, "PACK thread (TRISC2)", s.ps, s.pi, C.orange);
+        // legend
+        var lx = 720, ly = 330;
+        ["zero", "math", "done", "pack"].forEach(function (k, n) {
+          TT.box(ctx, lx, ly + n * 20, 14, 14, { fill: colr[k], alpha: k === "zero" ? 1 : 0.6, stroke: C.border, lw: 1, r: 2 });
+          TT.text(ctx, word[k], lx + 22, ly + n * 20 + 7, { font: "12px", color: C.muted });
+        });
+      }
+    });
+  })();
+  </script>
+
+  <h3>Proof from the binaries</h3>
+  <p>The SFPI toolchain's <code>objdump</code> decodes Tensix instructions, including the rotated <code>.ttinsn</code> encoding from A04. Disassembling the three ELFs the JIT built for the stock <code>add_2_tiles.cpp</code> shows the handshake exactly where the LLK code puts it, and only in the threads that should have it:</p>
+
+  <div class="filename">output: riscv-tt-elf-objdump -d trisc1/trisc1.elf and trisc2/trisc2.elf (add_2_tiles, Wormhole, this orb; Tensix lines only)</div>
+<pre><code>trisc1 (MATH)
+    6a70:  40620000   ttzeroacc   3,1,0        &lt;- run_kernel(): zeroacc() before kernel_main
+    6a98:  8c800022   ttseminit   2,0,2        &lt;- Max 2, Value 0, semaphore mask 0b10 = MATH_PACK
+    6b94:  9a84002a   ttsemwait   322,2,2      &lt;- acquire: stall MATH|SFPU|SYNC (0x142), STALL_ON_MAX
+    6bb8:  06000000   ttmop       1,0,0        &lt;- add_tiles: the MOP that expands to 8 ELWADDs (A04)
+    6bbc:  dc000010   ttsetrwc    0,0,0,0,0,4
+    6bc0:  88050202   ttstallwait 2,16512      &lt;- commit: wait for math/SFPU to finish...
+    6bc4:  90000022   ttsempost   2            &lt;- ...then Value += 1
+
+trisc2 (PACK)
+    744c:  98020026   ttsemwait   1,2,1        &lt;- wait: stall TDMA (0x1), STALL_ON_ZERO
+    74b8:  04043c09   ttpacr      2,0,15,0,0,1,0
+    74c4:  06000000   ttmop       1,0,0        &lt;- pack_tile
+    74c8:  888001e2   ttstallwait 64,120       &lt;- release: wait for pack to finish
+    74cc:  40420000   ttzeroacc   2,1,0        &lt;- clear the half just packed (CLR_HALF)
+    74d0:  94000022   ttsemget    2            &lt;- Value -= 1</code></pre>
+
+  <p>The operands decode cleanly against <code>ckernel_instr_params.h:241-254</code>: STALL_TDMA = 0x1, STALL_SYNC = 0x2, STALL_MATH = 0x40, STALL_SFPU = 0x100, STALL_ON_ZERO = 1 and STALL_ON_MAX = 2. TRISC0's binary contains no MATH_PACK instructions at all. Its only semaphore instructions are two SEMGETs on mask 32 (semaphore 5, <code>UNPACK_SYNC</code>), which the unpacker uses to double-buffer its own configuration (llk_unpack_AB.h:264-280). That machinery belongs to A13.</p>
+
+  <h3>How many tiles fit</h3>
+  <p>Dst is 1024 rows of 16 datums (A06), and a 32×32 tile takes 64 rows in 16-bit mode. The LLK computes capacity from exactly two switches, the sync mode and the accumulator width (<code>get_dest_max_tiles</code>, tt-llk ckernel.h:652-658, with <code>DEST_REGISTER_FULL_SIZE = 64 * 16</code> rows in tensix_types.h:192):</p>
+  <table>
+    <tr><th></th><th>bf16 Dst (<code>fp32_dest_acc_en = false</code>)</th><th>fp32 Dst (<code>fp32_dest_acc_en = true</code>)</th></tr>
+    <tr><td>Half sync (default, <code>dst_full_sync_en = false</code>)</td><td><b>8 tiles</b> per acquire</td><td><b>4 tiles</b></td></tr>
+    <tr><td>Full sync (<code>dst_full_sync_en = true</code>)</td><td><b>16 tiles</b></td><td><b>8 tiles</b></td></tr>
+  </table>
+  <p>The tile index you pass to <code>add_tiles(…, idst)</code> or <code>pack_tile(idst, …)</code> is relative to the current section, so index 0 means "the first tile of whichever half I currently own". That's why the eltwise loop can use <code>dst_reg = 0</code> every iteration and still ping-pong.</p>
+  <div class="callout warn">Some comments in the sources are stale. reg_api.h's doc comment calls Dst "an array of 16 tiles", and three examples' comments say each acquire gives you 8 tile registers, regardless of configuration (add_2_tiles.cpp:26, eltwise_binary and custom_sfpi_add tiles_add.cpp). The examples' own comment in custom_sfpi_add even says commit "transfer[s] register ownership to the unpacker". It goes to the packer. Trust the table, which follows the code.</div>
+
+  <h2 id="break">Breaking the handshake in ttsim</h2>
+  <p>A04 removed <code>tile_regs_wait</code> and watched ttsim stop at a SEMGET on a zero semaphore, and then removed wait and release together and got a tile of zeros. Here are two different mistakes, each one an extra call rather than a missing one. Both are easy to make when refactoring a loop. Every run below used the overlay directory and the stock Wormhole ttsim.</p>
+
+  <h3>Experiment 1: release twice</h3>
+  <div class="filename">$LAB_HOME/kernels/…/add_2_tiles.cpp (overlay; one line added after the stock tile_regs_release)</div>
+<pre><code>    tile_regs_release();  // Pack
+    tile_regs_release();  // A12: deliberate second release</code></pre>
+  <div class="filename">output: $EX/metal_example_add_2_integers_in_compute; echo EXIT=$?</div>
+<pre><code>[0] 0.1 seconds (0.0 KHz)
+[4531] ERROR: NonContractualBehavior: tensix_semget: sem=0 sem_max=2
+EXIT=1</code></pre>
+  <p>ttsim stops the whole process. The first release brought MATH_PACK from 1 to 0. The second one's SEMGET found Value already at 0, and ttsim's Sync-unit model refuses to continue:</p>
+  <div class="filename">ttsim/src/tensix.cpp:5544-5553 @b3620244 (trimmed)</div>
+<pre><code>TENSIX_EXECUTE_SEMGET() {
+    ...
+    uint32_t sem_index = __builtin_ctz(sem_sel);
+    ...
+    TTSIM_VERIFY(p_tensix-&gt;sem[sem_index], NonContractualBehavior, "sem=%d sem_max=%d", p_tensix-&gt;sem[sem_index], p_tensix-&gt;sem_max[sem_index]);
+    p_tensix-&gt;sem[sem_index]--;
+    return true;
+}</code></pre>
+  <p>In the message, <code>sem=0</code> is the semaphore's <i>value</i>, not its index. On silicon there would be no error. The ISA says that decrementing a zero semaphore is NonContractualBehavior and that "current silicon leaves the Value at zero" (SEMGET.md). Your kernel would keep running. In this one-tile kernel it would even give the right answer. In a loop, the extra release also flips the packer's half pointer an extra time, so the packer and the math thread would then disagree about which half is which. ttsim refusing is the friendlier outcome. (The silicon behaviour here is from the ISA documentation; I can only run ttsim.)</p>
+
+  <h3>Experiment 2: commit twice</h3>
+  <div class="filename">$LAB_HOME/kernels/…/add_2_tiles.cpp (overlay; one line added after the stock tile_regs_commit)</div>
+<pre><code>    tile_regs_commit();  // Math
+    tile_regs_commit();  // A12: deliberate second commit</code></pre>
+  <div class="filename">output: $EX/metal_example_add_2_integers_in_compute; echo EXIT=$?</div>
+<pre><code>[0] 0.0 seconds (0.0 KHz)
+Success: Result matches expected value!
+[4682] 0.3 seconds (17.6 KHz)
+EXIT=0</code></pre>
+  <p>Silence, and a correct answer. The extra SEMPOST took Value from 1 to 2, which is legal because Max is 2, so ttsim had nothing to flag. The packer waited, packed and released once, which left Value at <b>1</b> when the kernel ended. The handshake is now unbalanced, and nothing in this program can notice.</p>
+  <p>The next program can, though. Recall that <code>_llk_math_pack_sync_init_</code> spins until MATH_PACK is 0 and that nothing resets it between programs (the only init is in BRISC's boot code, brisc.cc:262). To check, I built a small host program, <code>sim-labs/workbench/host/run_twice.cpp</code>: the stock host code with the enqueue in a two-iteration loop. To reproduce, copy it to <code>$LAB_HOME/host/</code> and build it there with <code>$W/build_host.sh $LAB_HOME/host/run_twice.cpp</code>, where <code>$W</code> is the absolute path of <code>sim-labs/workbench</code> (its README explains why it must be absolute). Then I added a <code>DPRINT</code> of the semaphore at the very top of the kernel:</p>
+  <div class="filename">output: TT_METAL_DPRINT_CORES=0,0 $LAB_HOME/host/run_twice (double-commit overlay plus a DPRINT, Wormhole ttsim)</div>
+<pre><code>0:0-0:TR1: kernel start: MATH_PACK = 0
+0:0-0:TR0: kernel start: MATH_PACK = 0
+0:0-0:TR2: kernel start: MATH_PACK = 0
+run 1 finished
+0:0-0:TR1: kernel start: MATH_PACK = 1
+0:0-0:TR0: kernel start: MATH_PACK = 1
+0:0-0:TR2: kernel start: MATH_PACK = 1
+run 2 finished
+Error: Result does not match expected value!
+[7765] 0.5 seconds (16.1 KHz)</code></pre>
+  <p>Without the DPRINT the failure looks like this (first and last lines of 1022 mismatches):</p>
+  <div class="filename">output: $LAB_HOME/host/run_twice (double-commit overlay, Wormhole ttsim; trimmed)</div>
+<pre><code>Mismatch at index 0: expected 9.0625, got 0
+Mismatch at index 1: expected 17.53125, got 0
+...
+Mismatch at index 1023: expected 18.78125, got 0
+run 1 finished
+run 2 finished
+Error: Result does not match expected value!</code></pre>
+  <p>Every element of the second run's output is 0. The two elements not listed had expected sums within the example's 0.3 tolerance of 0. A control run of the same host program with the stock kernel printed "run 1 finished", "run 2 finished" and "Success". Here is what the leaked count did. The second program started with Value = 1. Its PACK thread's <code>tile_regs_wait</code> saw 1 ≠ 0 and went straight through, so the packer copied Dst, which was all zeros from <code>run_kernel</code>'s <code>zeroacc()</code>, before MATH had done anything. Its release took Value back to 0. That freed MATH's startup spin loop, and MATH then did the add into a Dst that nobody would ever pack again. The program "finished" normally. The bug from program 1 corrupted program 2.</p>
+  <div class="callout warn"><b>Unbalanced handshakes are time bombs.</b> ttsim catches a SEMGET at zero and a SEMPOST at or above Max (tensix.cpp:5538-5539), because the ISA calls those NonContractualBehavior. An extra commit that stays within Max is legal hardware behaviour. No simulator check can flag it, and it surfaces as wrong data in a <i>different</i> kernel. The rule is mechanical: per loop iteration, MATH does exactly one acquire and one commit, and PACK exactly one wait and one release. The docs add that you must commit and release even if you pack nothing (compute_engines_and_dataflow_within_tensix.rst:118-120).</div>
+
+  <div class="callout sim">Trace the SEMINIT/SEMWAIT/SEMPOST/SEMGET stream instruction by instruction, and write your own reader/compute/writer kernel, in <a href="../sim-labs/b06-cbs-and-semaphores.html">B06</a>. To follow the MOPs above as they expand into ELWADDs and PACRs per pipe, see <a href="../sim-labs/b04-tensix-instructions.html">B04 · Following Tensix instructions</a>.</div>
+
+  <h2 id="init">Startup and init functions</h2>
+  <p>Every compute kernel begins with <code>compute_kernel_hw_startup</code>, called once. It's the clearest example of a function spread across all three cores:</p>
+
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/compute_kernel_hw_startup.h:59-80 @7aad8aac (Wormhole/Blackhole branch)</div>
+<pre><code>template &lt;SrcOrder src_order = SrcOrder::Regular&gt;
+ALWI void compute_kernel_hw_startup(uint32_t icb0, uint32_t icb1, uint32_t ocb) {
+    ...
+    constexpr bool reverse = (src_order == SrcOrder::Reverse);
+    const uint32_t src_a_cb = reverse ? icb1 : icb0;
+    const uint32_t src_b_cb = reverse ? icb0 : icb1;
+    UNPACK((llk_unpack_hw_configure&lt;DST_ACCUM_MODE&gt;(src_a_cb, src_b_cb)));
+
+    MATH((llk_math_pack_sync_init&lt;DST_ACCUM_MODE&gt;()));
+    MATH((llk_math_hw_configure&lt;DST_ACCUM_MODE&gt;(src_a_cb, src_b_cb)));
+
+    PACK((llk_pack_hw_configure&lt;DST_ACCUM_MODE&gt;(ocb)));
+    PACK((llk_pack_init&lt;PackMode::Default&gt;(ocb)));
+    PACK((llk_pack_dest_init&lt;DST_ACCUM_MODE, PackMode::Default&gt;(ocb)));
+    ...
+}</code></pre>
+
+  <p>TRISC0 programs the unpackers with the input CBs' formats and tile shapes. TRISC1 initializes the MATH_PACK semaphore (the SEMINIT you saw in the disassembly) and programs the ALU's source formats. TRISC2 programs the packer for the output CB's format and sets up its Dst offset registers. Those formats come from the host's CB configuration. The JIT bakes them into <code>chlkc_descriptors.h</code> as arrays indexed by CB number; in the add example, CBs 0, 1 and 16 have format 5 (Float16_b) and tile size 2048 bytes.</p>
+  <p><code>SrcOrder::Reverse</code> exists for one operation. A06 showed that a matmul's in0 goes to SrcB and in1 to SrcA, so the matmul example starts with <code>compute_kernel_hw_startup&lt;SrcOrder::Reverse&gt;(cb_in0, cb_in1, cb_out)</code> (mm.cpp:50). The header's doc comment warns that the function does slow MMIO-style configuration writes that need idle engines, so it is "unsafe to call this function in the middle of a kernel" (compute_kernel_hw_startup.h:43-46).</p>
+  <p>After startup comes an operation-specific init: <code>add_init</code>, <code>copy_init</code>, <code>matmul_init</code>, <code>exp_tile_init</code> and so on. These are also split by thread (for example, <code>add_init</code> runs <code>llk_math_eltwise_binary_init</code> on MATH and <code>llk_unpack_AB_init</code> on UNPACK, eltwise_binary.h:37-47). What they program is mostly the per-thread MOP templates and address modes that the per-tile calls then fire, plus, for SFPU ops, constants in the SFPU's programmable registers. How a MOP works is <a href="a13-llk-mops-jit.html">A13</a>'s subject. For now, think of an init as loading the instrument and the per-tile call as pulling the trigger. If you switch operations mid-kernel, you need the new op's init first.</p>
+  <p>How much does a forgotten init matter? I removed one init at a time from the <code>sfpu_eltwise_chain</code> kernel (which computes softplus, below) and ran it. The example checks its output against a CPU golden with Pearson correlation and requires PCC &gt; 0.999:</p>
+  <table>
+    <tr><th>Kernel variant (overlay)</th><th>Result in ttsim (Wormhole)</th></tr>
+    <tr><td>stock</td><td><code>Metalium vs Golden -- PCC = 0.99985933</code></td></tr>
+    <tr><td>without <code>log_tile_init()</code></td><td><code>TT_FATAL: PCC not high enough. Result PCC: 0.8050929</code></td></tr>
+    <tr><td>without <code>exp_tile_init()</code></td><td><code>TT_FATAL: PCC not high enough. Result PCC: -nan</code></td></tr>
+    <tr><td>without <code>add_binary_tile_init()</code></td><td><code>Metalium vs Golden -- PCC = 0.9998576</code> (passes)</td></tr>
+  </table>
+  <p>The kernel ran to completion in all four cases, and ttsim raised no error. The wrong answers came only from the host's numerical check. (Inputs are random per run, so the two passing PCCs differ in the last digits, and the failing ones move too: a rerun without <code>log_tile_init()</code> gave 0.824.) Leaving out the add init happened to be harmless in this chain, presumably because what it programs was already in place. You can't know that in general without reading the LLK. exp.h says it bluntly: "Interleaving ops without their inits silently returns wrong values; there is no assert" (exp.h:61-62). Call every init.</p>
+
+  <h2 id="paths">FPU ops and SFPU ops</h2>
+  <p>Compute API calls come in two shapes, and the shape tells you which engine runs them.</p>
+  <ul>
+    <li><b>FPU ops take CB arguments.</b> <code>add_tiles(cb_a, cb_b, i, j, idst)</code>, <code>mul_tiles</code> and <code>matmul_tiles</code> unpack straight from L1 into SrcA/SrcB and have the matrix unit (A06) write Dst. One call does unpack and math.</li>
+    <li><b>SFPU ops take only Dst indices.</b> <code>exp_tile(idst)</code>, <code>log_tile(idst)</code> and <code>add_binary_tile(i0, i1, iout)</code> have no CB argument, because the vector unit (A07) can only see Dst. Their data has to be put in Dst first, with <code>copy_tile(cb, i, idst)</code>.</li>
+  </ul>
+  <p><code>copy_tile</code> is itself an FPU op. On TRISC0 it unpacks to SrcA; on TRISC1 it runs a datacopy that, for a bf16 Dst, uses <code>MOVA2D</code> to move SrcA into Dst eight rows at a time. With an fp32 Dst or some integer formats it falls back to ELWADD or unpacks straight to Dst (tile_move_copy.h:126-134; llk_math_eltwise_unary_datacopy.h:343-384). Step through both paths for one tile:</p>
+
+  <div class="viz" id="fig-paths"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-paths");
+    var g = TT.canvas(root, 960, 470), ctx = g.ctx, C = TT.C;
+    var bw = 92, bh = 56;
+    var xs = { cb: 14, unp: 134, src: 254, fpu: 374, dst: 494, sfpu: 614, pck: 734, out: 854 };
+    var rowY = [70, 300];
+    function cx(k) { return xs[k] + bw / 2; }
+    var lab = { cb: "CB (L1)", unp: "Unpacker", src: "SrcA / SrcB", fpu: "FPU", dst: "Dst", sfpu: "SFPU + LRegs", pck: "Packer", out: "CB out (L1)" };
+    var tri = { unp: "TRISC0", src: "", fpu: "TRISC1", dst: "", sfpu: "TRISC1", pck: "TRISC2", cb: "", out: "" };
+    var trc = { TRISC0: C.blue, TRISC1: C.yellow, TRISC2: C.green };
+    // steps: row, active boxes, tokens [{from,to,label,dy}], caption
+    var S = [
+      { row: 0, act: ["cb"], tok: [{ a: "cb", b: "cb", l: "A", dy: -14 }, { a: "cb", b: "cb", l: "B", dy: 14 }], cap: "add_tiles(cb0, cb1, 0, 0, 0)",
+        text: "<b>FPU path: <code>add_tiles</code>.</b> Two bf16 tiles, A in CB 0 and B in CB 1, sit in L1. On UNPACK, <code>cb_wait_front</code> has confirmed they've arrived." },
+      { row: 0, act: ["cb", "unp", "src"], tok: [{ a: "cb", b: "src", l: "A", dy: -14 }, { a: "cb", b: "src", l: "B", dy: 14 }], cap: "UNPACK: llk_unpack_AB → UNPACR",
+        text: "<b>Unpack (TRISC0).</b> The unpackers read A into SrcA and B into SrcB, converting formats on the way (A05). Then the banks are handed to the matrix unit, and the hardware lets MATH's instructions through its wait gate." },
+      { row: 0, act: ["src", "fpu", "dst"], tok: [{ a: "src", b: "dst", l: "A+B", dy: 0 }], cap: "MATH: MOP → 8 × ELWADD",
+        text: "<b>Math (TRISC1).</b> One MOP expands into 8 ELWADDs, each adding 8 rows × 16 columns (A04's count). The sum lands in Dst tile 0 of the current half. <code>add_tiles</code> is the whole of this and the previous step: one API call, two TRISCs." },
+      { row: 0, act: ["dst", "pck", "out"], tok: [{ a: "dst", b: "out", l: "A+B", dy: 0 }], cap: "commit → wait → pack_tile → release",
+        text: "<b>Pack (TRISC2).</b> After the handshake, the packer converts Dst tile 0 back to the CB's format and writes it into the output CB. The SFPU never took part." },
+      { row: 1, act: ["cb"], tok: [{ a: "cb", b: "cb", l: "x", dy: 0 }], cap: "copy_tile(cb0, 0, 0); exp_tile(0)",
+        text: "<b>SFPU path: <code>exp_tile</code>.</b> One input tile x in CB 0. <code>exp_tile(0)</code> takes only a Dst index, so x first has to get into Dst." },
+      { row: 1, act: ["cb", "unp", "src"], tok: [{ a: "cb", b: "src", l: "x", dy: -14 }], cap: "copy_tile, UNPACK half: UNPACR → SrcA",
+        text: "<b>copy_tile, unpack half (TRISC0).</b> Same unpacker, same SrcA as before. Only one operand this time." },
+      { row: 1, act: ["src", "fpu", "dst"], tok: [{ a: "src", b: "dst", l: "x", dy: 0 }], cap: "copy_tile, MATH half: MOVA2D (8 rows each)",
+        text: "<b>copy_tile, math half (TRISC1).</b> The FPU acts as a mover: MOVA2D copies SrcA into Dst. So even a pure-SFPU kernel uses the unpacker and the matrix unit to load its data." },
+      { row: 1, act: ["dst", "sfpu"], tok: [{ a: "dst", b: "sfpu", l: "x", dy: 0 }], cap: "exp_tile: SFPLOAD × 32 → exp → SFPSTORE × 32",
+        text: "<b>exp_tile (TRISC1).</b> The SFPU loads Dst 32 elements at a time into LRegs (8 vectors per face × 4 faces, A07), runs the exp program (about 20 instructions per vector for bf16, A07) and stores each result back to Dst tile 0. These instructions come from the same TRISC as the FPU's." },
+      { row: 1, act: ["dst", "sfpu"], tok: [{ a: "sfpu", b: "dst", l: "eˣ", dy: 0 }], cap: "chain in Dst: add_binary_tile(0,1,0); log_tile(0)",
+        text: "<b>Chaining stays in Dst.</b> Softplus = log(1 + eˣ). The <code>sfpu_eltwise_chain</code> example copies a tile of ones into Dst tile 1, then runs exp, an SFPU add of tiles 0 and 1, and log, all in Dst with no L1 round trip in between." },
+      { row: 1, act: ["dst", "pck", "out"], tok: [{ a: "dst", b: "out", l: "y", dy: 0 }], cap: "commit → wait → pack_tile → release",
+        text: "<b>Pack (TRISC2).</b> Same as before. From the packer's point of view, Dst is Dst; it doesn't care which engine filled it." }
+    ];
+    TT.stepper({
+      root: root, steps: S.map(function (s) { return { dur: 1.5, text: s.text }; }),
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var s = S[i];
+        for (var r = 0; r < 2; r++) {
+          var y = rowY[r], on = r === s.row;
+          TT.text(ctx, r === 0 ? "FPU op: add_tiles (reads CBs directly)" : "SFPU op: copy_tile then exp_tile (works in Dst)", 14, y - 34, { color: on ? C.fg : C.muted, font: "bold 14px" });
+          for (var k in xs) {
+            var dim = (r === 0 && k === "sfpu");
+            var act = on && s.act.indexOf(k) >= 0;
+            var c = k === "sfpu" ? C.purple : (k === "fpu" ? C.orange : (k === "dst" ? C.teal : (k === "cb" || k === "out" ? C.muted : C.blue)));
+            ctx.globalAlpha = dim ? 0.25 : (on ? 1 : 0.45);
+            TT.box(ctx, xs[k], y, bw, bh, { fill: c, alpha: act ? 0.45 : 0.12, stroke: c, lw: act ? 2.5 : 1, label: lab[k], font: "12px" });
+            if (tri[k]) TT.text(ctx, tri[k], xs[k] + bw / 2, y + bh + 14, { color: trc[tri[k]], font: "11px", align: "center" });
+            ctx.globalAlpha = 1;
+          }
+          // flow arrows
+          ctx.globalAlpha = on ? 0.6 : 0.2;
+          var seq = ["cb", "unp", "src", "fpu", "dst"];
+          for (var q = 0; q < seq.length - 1; q++) {
+            TT.arrow(ctx, xs[seq[q]] + bw, y + bh / 2, xs[seq[q + 1]], y + bh / 2, { color: C.muted, lw: 1, head: 5 });
+          }
+          if (r === 0) {
+            ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(cx("dst"), y + bh); ctx.lineTo(cx("dst"), y + bh + 30); ctx.lineTo(xs.pck + bw - 10, y + bh + 30); ctx.stroke();
+            TT.arrow(ctx, xs.pck + bw - 10, y + bh + 30, xs.pck + bw - 10, y + bh, { color: C.muted, lw: 1, head: 5 });
+            TT.arrow(ctx, xs.pck + bw, y + bh / 2, xs.out, y + bh / 2, { color: C.muted, lw: 1, head: 5 });
+          }
+          if (r === 1) {
+            TT.arrow(ctx, xs.dst + bw, y + bh / 2 - 8, xs.sfpu, y + bh / 2 - 8, { color: C.purple, lw: 1, head: 5 });
+            TT.arrow(ctx, xs.sfpu, y + bh / 2 + 8, xs.dst + bw, y + bh / 2 + 8, { color: C.purple, lw: 1, head: 5 });
+            // dst to packer goes under sfpu
+            ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(cx("dst"), y + bh); ctx.lineTo(cx("dst"), y + bh + 30); ctx.lineTo(xs.pck + bw - 10, y + bh + 30); ctx.stroke();
+            TT.arrow(ctx, xs.pck + bw - 10, y + bh + 30, xs.pck + bw - 10, y + bh, { color: C.muted, lw: 1, head: 5 });
+            TT.arrow(ctx, xs.pck + bw, y + bh / 2, xs.out, y + bh / 2, { color: C.muted, lw: 1, head: 5 });
+          }
+          ctx.globalAlpha = 1;
+        }
+        // tokens
+        var y0 = rowY[s.row] + bh / 2;
+        s.tok.forEach(function (tk) {
+          var x = TT.lerp(cx(tk.a), cx(tk.b), t);
+          var yy = y0 + tk.dy;
+          TT.box(ctx, x - 18, yy - 11, 36, 22, { fill: C.yellow, stroke: C.bg, lw: 1, r: 4, label: tk.l, color: C.bg, font: "bold 12px" });
+        });
+        TT.text(ctx, s.cap, 480, 455, { mono: true, font: "13px", align: "center", color: C.yellow });
+      }
+    });
+  })();
+  </script>
+
+  <p>Here's the real chain from the example. Notice the init before each SFPU op, and that two <code>copy_tile</code>s fill two different Dst slots:</p>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/sfpu_eltwise_chain/kernels/compute/compute.cpp:35-57 @7aad8aac (comments trimmed)</div>
+<pre><code>    cb_wait_front(src_cb_index, one_tile);
+    cb_wait_front(ones_cb_index, one_tile);
+    copy_tile(src_cb_index, /*offset*/ 0, /*register_offset*/ 0);
+    copy_tile(ones_cb_index, /*offset*/ 0, /*register_offset*/ 1);
+
+    exp_tile_init();
+    exp_tile(0);  // exp(input)
+
+    add_binary_tile_init();
+    add_binary_tile(0, 1, 0);  // exp(input) + 1
+
+    log_tile_init();
+    log_tile(0);  // log(exp(input) + 1)
+
+    tile_regs_commit();
+    tile_regs_wait();</code></pre>
+
+  <div class="filename">output: $EX/metal_example_sfpu_eltwise_chain (Wormhole ttsim, this orb)</div>
+<pre><code>[0] 0.1 seconds (0.0 KHz)
+Metalium vs Golden -- PCC = 0.99985933
+[8699] 0.4 seconds (24.8 KHz)</code></pre>
+
+  <p>The golden is <code>bfloat16(std::log1p(std::exp(x)))</code> on uniform inputs in [0, 1) (sfpu_eltwise_chain.cpp:41, 114). Counting instruction kinds in the three ELFs the JIT built for this kernel shows the division of labour cleanly:</p>
+  <table>
+    <tr><th>ELF</th><th>SFPU instructions (<code>sfp*</code>)</th><th><code>ttunpacr</code></th><th><code>ttpacr</code></th><th>semaphore instructions</th></tr>
+    <tr><td>trisc0 (UNPACK)</td><td>0</td><td>8</td><td>0</td><td>2 × SEMGET (UNPACK_SYNC)</td></tr>
+    <tr><td>trisc1 (MATH)</td><td>129</td><td>0</td><td>0</td><td>SEMINIT, SEMWAIT, SEMPOST</td></tr>
+    <tr><td>trisc2 (PACK)</td><td>0</td><td>0</td><td>3</td><td>SEMWAIT, SEMGET</td></tr>
+  </table>
+  <p>These are static counts in the binary, with many SFPU bodies sitting inside replay sequences and loops, so don't read them as executed counts. Lab B04 follows the dynamic stream. The point is where the instructions live: every SFPU instruction is in the MATH binary.</p>
+
+  <h3>Matmul accumulates</h3>
+  <p>Unlike <code>add_tiles</code>, which overwrites Dst, <code>matmul_tiles</code> is documented as "accumulates the result to DST (DST += C)" (matmul.h:150-151). A matmul loop therefore acquires once, calls <code>matmul_tiles</code> Kt times into the same Dst tile, then commits:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/kernels/compute/mm.cpp:50-80 @7aad8aac (comments trimmed)</div>
+<pre><code>    compute_kernel_hw_startup&lt;SrcOrder::Reverse&gt;(cb_in0, cb_in1, cb_out);
+    matmul_init(cb_in0, cb_in1);
+    for (uint32_t mt = 0; mt &lt; Mt; ++mt) {
+        for (uint32_t nt = 0; nt &lt; Nt; ++nt) {
+            tile_regs_acquire();
+            for (uint32_t kt = 0; kt &lt; Kt; kt++) {
+                cb_wait_front(cb_in0, 1);
+                cb_wait_front(cb_in1, 1);
+                matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+                cb_pop_front(cb_in0, 1);
+                cb_pop_front(cb_in1, 1);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            cb_reserve_back(cb_out, 1);
+            pack_tile(0, cb_out);
+            ...</code></pre>
+  <p>Who zeroes the accumulator between output tiles? Nobody in this file. The previous section's release did it: <code>_llk_pack_dest_section_done_</code> ZEROACCs the section it just packed, and the very first section was cleared by <code>run_kernel</code>'s <code>zeroacc()</code>. The handshake is also the accumulator reset. That's one more reason a mismatched release is dangerous.</p>
+
+  <h2 id="config">Fidelity, approximation and Dst configuration</h2>
+  <p>A compute kernel's numeric settings come from the host, in <code>ComputeConfig</code>:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/kernel_types.hpp:106-112 @7aad8aac</div>
+<pre><code>struct ComputeConfig {
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    bool dst_full_sync_en = false;
+    std::vector&lt;UnpackToDestMode&gt; unpack_to_dest_mode;
+    bool bfp8_pack_precise = false;
+    bool math_approx_mode = false;</code></pre>
+  <p>They reach the kernel as compile-time constants in the generated <code>chlkc_descriptors.h</code> (genfiles.cpp:1138-1160). Here is the file from the add run, which asked for HiFi4 and no approximation:</p>
+  <div class="filename">output: chlkc_descriptors.h from the add_2_tiles cache directory (excerpt)</div>
+<pre><code>#if defined(UCK_CHLKC_MATH)
+#include "llk_defs.h"
+constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast&lt;ckernel::MathFidelity&gt;(4);
+constexpr bool APPROX = false;
+#endif
+...
+constexpr bool DST_ACCUM_MODE = false;
+#define DST_SYNC_MODE DstSync::SyncHalf</code></pre>
+  <p>Because they're <code>constexpr</code>, changing fidelity means a different binary. The kernel's cache hash includes all four settings (<code>ComputeKernel::config_hash</code>, impl/kernels/kernel.cpp:662-686), so each combination is compiled and cached separately. Four facts about how they are used, each read from the API headers:</p>
+  <ul>
+    <li><b>Fidelity only affects multiplies.</b> <code>add_tiles</code> and <code>sub_tiles</code> pass <code>MathFidelity::LoFi</code> as a literal (eltwise_binary.h:269-274, shown above), because addition doesn't multiply. <code>mul_tiles</code> and <code>matmul_tiles</code> pass <code>MATH_FIDELITY</code> (eltwise_binary.h:239-244; matmul.h:175). What the phases mean for precision, with measurements in ttsim, is in <a href="a06-matrix-engine.html">A06</a>.</li>
+    <li><b><code>APPROX</code> is a default, not a switch.</b> Many SFPU APIs pass <code>APPROX</code> into their LLK. <code>log_tile_init</code> and <code>log_tile</code> do (compute_kernel_api.h:308-337), and so does <code>add_binary_tile</code> (eltwise_binary_sfpu.h:115-124). But <code>exp_tile</code> has its own template parameter, <code>template &lt;bool approx = false, …&gt;</code> (exp.h:36-44, 80-85), and never reads <code>APPROX</code>. With <code>math_approx_mode = true</code>, <code>exp_tile(0)</code> is still the accurate exp; you'd write <code>exp_tile_init&lt;true&gt;()</code> and <code>exp_tile&lt;true&gt;(0)</code> to get the fast one. Check each op's header.</li>
+    <li><b><code>fp32_dest_acc_en</code></b> sets <code>DST_ACCUM_MODE</code>, which halves Dst's tile capacity (the table above) and changes several LLK code paths, such as datacopy's choice of MOVA2D versus ELWADD.</li>
+    <li><b><code>dst_full_sync_en</code></b> selects <code>DstSync::SyncFull</code>: the SEMINIT Max becomes 1, and you trade overlap for twice the tiles per acquire.</li>
+  </ul>
+  <div class="callout warn">The approximate SFPU paths are where ttsim and silicon can part ways. Approximate exp uses <code>SFPLOADMACRO</code> unless <code>DISABLE_SFPLOADMACRO</code> is defined, and ttsim doesn't implement that instruction, so the workbench sets <code>TT_METAL_DISABLE_SFPLOADMACRO=1</code> (A07). In the simulator you then test a different instruction sequence from the one silicon runs by default.</div>
+
+  <h2 id="sfpi">A first SFPI kernel</h2>
+  <p>The SFPU ops so far came from tt-metal's library. The <code>custom_sfpi_add</code> example shows how to write your own and plug it into a compute kernel. A07 took apart what the lanes do. Here we look at the plumbing: how a function written in SFPI ends up on exactly one TRISC.</p>
+  <p>Layer 1 is the per-face function, written in SFPI, the C++ dialect for the vector unit. It lives in a header that only the math build should see:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/experimental/llk_sfpu/ckernel_sfpu_custom_add.h:14-26 @7aad8aac</div>
+<pre><code>inline void my_add_tile_face(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
+    constexpr uint32_t n_vector_in_tile = 32;
+
+    const uint32_t in0_base_idx = dst_index_in0 * n_vector_in_tile;
+    const uint32_t in1_base_idx = dst_index_in1 * n_vector_in_tile;
+    const uint32_t out_base_idx = dst_index_out * n_vector_in_tile;
+
+    for (size_t i = 0; i &lt; 8; i++) {
+        sfpi::vFloat a = sfpi::dst_reg[in0_base_idx + i];
+        sfpi::vFloat b = sfpi::dst_reg[in1_base_idx + i];
+        sfpi::dst_reg[out_base_idx + i] = a + b;
+    }
+}</code></pre>
+  <p>Read it with small numbers. A tile is 32 SFPU vectors of 32 lanes (A07), so Dst tile 1 starts at vector 32. One face is 8 vectors, hence the loop of 8. The function handles one face. Something outside it must call it four times and move the Dst base between calls.</p>
+  <p>Layer 2 is the compute kernel, which includes that header only under <code>TRISC_MATH</code> and wraps the call in <code>MATH(…)</code>:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/custom_sfpi_add/kernels/compute/tiles_add.cpp:12-14, 38-41, 65-76 @7aad8aac (comments trimmed)</div>
+<pre><code>#ifdef TRISC_MATH
+#include "experimental/llk_sfpu/ckernel_sfpu_custom_add.h"
+#endif
+
+inline void my_add_tile(uint32_t idx_dst0, uint32_t idx_dst1, uint32_t idx_out0) {
+    MATH(SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+        DST_SYNC_MODE, DST_ACCUM_MODE, my_add_tile_face, idx_dst0, idx_dst1, idx_out0, VectorMode::RC));
+}
+...
+        tile_regs_acquire();
+        copy_tile(cb_in0, 0, 0);
+        copy_tile(cb_in1, 0, 1);
+        my_add_tile(0, 1, 0);  // &lt;-- The custom SFPU addition happens here
+        tile_regs_commit();
+        tile_regs_wait();
+        cb_reserve_back(cb_out0, 1);
+        pack_tile(0, cb_out0);</code></pre>
+  <p>Three details, each a consequence of the three-way compile:</p>
+  <ol>
+    <li><b>The <code>#ifdef TRISC_MATH</code> include.</b> The SFPI header uses <code>sfpi::vFloat</code>, which only means something to the math build. The other two builds never see it. Guarding the include is optional for correctness, since the <code>MATH(…)</code> wrapper already deletes the call, but it keeps the unpack and pack builds from parsing SFPU code.</li>
+    <li><b>The <code>MATH(…)</code> wrapper makes <code>my_add_tile</code> a no-op on TRISC0 and TRISC2</b>, exactly like a library function. You've written your own compute API function.</li>
+    <li><b><code>SFPU_BINARY_CALL_NO_TEMPLATE_ARGS</code></b> expands to a bounds check and <code>_llk_math_eltwise_binary_sfpu_params_(my_add_tile_face, …, VectorMode::RC)</code> (llk_math_eltwise_binary_sfpu_macros.h:59-62). That LLK function does the face loop: it calls your function for each of the four faces and advances the Dst base 16 rows between calls (A07). It also handles the per-section base, so tile indices are relative to the half you acquired, just like for <code>add_tiles</code>.</li>
+  </ol>
+  <div class="filename">output: $EX/metal_example_custom_sfpi_add (Wormhole ttsim, this orb)</div>
+<pre><code>[0] 0.1 seconds (0.0 KHz)
+Test Passed
+[4797] 0.2 seconds (20.3 KHz)</code></pre>
+  <p>To make it yours, copy <code>tiles_add.cpp</code> into the overlay directory and change <code>a + b</code> to something else. That's the A07 exercise with <code>v_if</code>. The overlay rebuilds without touching tt-metal. Change both the kernel and the host check if you change the maths, because the example's host side checks for a sum.</p>
+  <div class="callout warn">The "init" lesson applies here too, quietly. This example has no SFPU init beyond <code>copy_init</code>, and it passes in ttsim. Its face function uses only loads, an add and stores, so it doesn't depend on the programmable constants or macros that library inits set up. As soon as your SFPI function uses <code>vConstFloatPrgm0</code> or similar, it needs an init that programs them, and any other SFPU op in the same kernel may have overwritten them.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>One source, three binaries.</b> The JIT writes <code>chlkc_unpack.cpp</code>, <code>chlkc_math.cpp</code> and <code>chlkc_pack.cpp</code>, each a <code>#define TRISC_…</code> plus <code>#include</code> of your kernel. Each is compiled with <code>-DUCK_CHLKC_…</code> into trisc0/1/2.elf. You can read all of them in the kernel cache. Before <code>kernel_main</code>, MATH clears Dst and UNPACK clears Src.</li>
+    <li><b><code>UNPACK(x)</code>, <code>MATH(x)</code> and <code>PACK(x)</code></b> expand to <code>x</code> on one TRISC and to nothing on the other two. Every compute API call is a list of such pieces. Control flow is replicated and work is not, so all three copies must take the same path through loops and branches.</li>
+    <li><b>CB calls are split by role.</b> <code>cb_wait_front</code> and <code>cb_pop_front</code> run on UNPACK; <code>cb_reserve_back</code> and <code>cb_push_back</code> run on PACK. Their counter updates go through STALLWAIT and STOREREG so they never run ahead of the engines. MATH needs no CB calls: SrcA/SrcB validity is enforced in hardware.</li>
+    <li><b>The Dst handshake</b> is one 4-bit Sync-unit semaphore, MATH_PACK. Acquire = SEMWAIT while Value ≥ Max; commit = STALLWAIT + SEMPOST; wait = SEMWAIT while Value = 0; release = STALLWAIT + ZEROACC + SEMGET. Max is 2 in half sync (ping-pong, 8 bf16 / 4 fp32 tiles per acquire) and 1 in full sync (16 / 8 tiles).</li>
+    <li><b>Unbalanced handshakes</b>: a double release made ttsim stop with <code>NonContractualBehavior: tensix_semget: sem=0</code>, though silicon would silently continue. A double commit passed silently, left MATH_PACK at 1, and made the <i>next</i> program pack an all-zero tile.</li>
+    <li><b><code>compute_kernel_hw_startup</code></b> configures all three engines and seeds the semaphore, once. <code>*_init</code> functions reprogram the engines (MOPs, address modes, SFPU constants) for an op. A missing SFPU init gave PCC around 0.8 or NaN with no error.</li>
+    <li><b>FPU ops</b> (<code>add_tiles</code>, <code>mul_tiles</code>, <code>matmul_tiles</code>) read CBs. <b>SFPU ops</b> read Dst only, so they need <code>copy_tile</code>, which is itself an unpack plus an FPU MOVA2D. SFPU chains (softplus = exp, add, log) stay in Dst. <code>matmul_tiles</code> accumulates, relying on release's ZEROACC for a clean start.</li>
+    <li><b>Config</b> becomes <code>constexpr</code> MATH_FIDELITY, APPROX, DST_ACCUM_MODE and DST_SYNC_MODE. Add/sub always use LoFi. <code>exp_tile</code> ignores APPROX in favour of its own template parameter.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A kernel puts <code>DPRINT("i={}\n", i);</code> inside its tile loop, which runs 4 times. How many lines appear, and why?</summary><p>Twelve: four from each of TR0, TR1 and TR2. <code>DPRINT</code> isn't wrapped in a per-thread macro, and neither is the loop, so all three binaries contain the loop and the print. Use <code>DPRINT_MATH</code> (or <code>_UNPACK</code> or <code>_PACK</code>) to print once per iteration, from one TRISC. Expect the lines from different TRISCs to be interleaved in no meaningful order, because each RISC has its own print buffer.</p></details>
+  <details class="quiz"><summary>2. Someone "optimizes" a compute kernel by wrapping the whole loop in <code>if (n_tiles_from_cb_value &gt; 0)</code>, where the value is read from a tile in an input CB right after <code>cb_wait_front</code>. What goes wrong?</summary><p><code>cb_wait_front</code> runs only on TRISC0. TRISC1 and TRISC2 skip the wait and read the CB location before the data has necessarily arrived, so they can see a different value from TRISC0 and take a different branch. The three copies then disagree on how many acquire/commit and wait/release pairs to execute, and one thread blocks forever on a semaphore. Branch only on values all three TRISCs see identically, such as runtime and compile-time arguments.</p></details>
+  <details class="quiz"><summary>3. In half-sync mode with a bf16 Dst, MATH has committed two sections and PACK hasn't released either. What is MATH_PACK's value, and what happens at MATH's next <code>tile_regs_acquire</code>?</summary><p>Value 2, equal to Max (SEMINIT 2 in <code>_llk_math_pack_sync_init_</code>). The acquire's SEMWAIT uses STALL_ON_MAX, so the math thread blocks until PACK's release does a SEMGET (2 → 1). Note that the TRISC1 <i>RISC-V</i> doesn't necessarily block. It may keep pushing instructions until its FIFO is full. It's the coprocessor's math thread that waits at the gate.</p></details>
+  <details class="quiz"><summary>4. Why can a matmul kernel call <code>matmul_tiles</code> Kt times into Dst tile 0 for each output tile without ever zeroing Dst?</summary><p><code>matmul_tiles</code> accumulates (Dst += in0·in1). The previous output tile's section was cleared by <code>tile_regs_release</code>, whose LLK issues a ZEROACC on the section it just packed before the SEMGET. The very first sections were cleared by <code>run_kernel</code>'s <code>zeroacc()</code> before <code>kernel_main</code>. So every acquire hands MATH a zeroed section, provided every acquire was matched by a release.</p></details>
+  <details class="quiz"><summary>5. A double <code>tile_regs_commit</code> passed in ttsim, but a double <code>tile_regs_release</code> was stopped. Why the asymmetry?</summary><p>ttsim checks what the ISA calls NonContractualBehavior: SEMPOST when Value is already at Max, and SEMGET when Value is 0. In a one-tile kernel with Max = 2, a second SEMPOST takes Value from 1 to 2, which is legal, so nothing fires. A second SEMGET takes it from 0 to below zero, which isn't. The legal but unbalanced commit leaves Value = 1 after the kernel, and the next program's pack wait passes immediately, which is exactly what produced the all-zero tile in the run_twice experiment.</p></details>
+  <details class="quiz"><summary>6. You set <code>math_approx_mode = true</code> and <code>math_fidelity = LoFi</code> for an <code>add_tiles</code> + <code>exp_tile</code> kernel and see no change in results. Is the config broken?</summary><p>No. <code>add_tiles</code> hard-codes <code>MathFidelity::LoFi</code> because addition uses no multiplier phases, so the fidelity setting has nothing to change. <code>exp_tile</code> takes its approximation mode from its own template parameter (default <code>false</code>) and doesn't read <code>APPROX</code>, so it stays accurate. You'd need <code>exp_tile_init&lt;true&gt;()</code> and <code>exp_tile&lt;true&gt;(i)</code>. Fidelity would matter for <code>mul_tiles</code> or <code>matmul_tiles</code>, and <code>APPROX</code> for ops such as <code>log_tile</code>.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute Engines and Data Flow within Tensix</a>: the official guide to Dst, the <code>tile_regs_*</code> pattern, and the Dst capacity table.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/compute/compute.html">Compute APIs</a>: the reference for every compute kernel call used here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/eltwise_sfpu.html">Eltwise SFPU example</a>: a walkthrough of a copy_tile + exp_tile kernel and its host program.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/custom_sfpi_add.html">Vector addition using SFPI</a>: the official walkthrough of the custom_sfpi_add example.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/sfpu/llk.html">Low Level Kernels (SFPI guide)</a>: vFloat, dst_reg, v_if and the SFPI library.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_print.html">Device Debug Print</a>: DPRINT, the per-TRISC variants, and the environment variables that select cores.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">Sync Unit (ISA)</a>: the eight semaphores behind the Dst handshake, and how SEMWAIT, SEMPOST and SEMGET behave.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SEMGET.md">SEMGET (ISA)</a>: the functional model, including what silicon does on a decrement at zero.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Dst.md">Dst (ISA)</a>: the register file both engines write and the packer reads.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/tt-llk">tt-metal/tt_metal/tt-llk</a>: the low-level kernel library where <code>_llk_math_dest_section_done_</code> and friends live. (The standalone <a href="https://github.com/tenstorrent/tt-llk">tenstorrent/tt-llk</a> repository is now frozen; development moved into tt-metal.)</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/sfpu_eltwise_chain">sfpu_eltwise_chain example</a>: the softplus chain run in this chapter.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/matrix_engine/matrix_engine.md">Matrix engine tech report</a>: Dst capacity under half sync, and fidelity from the FPU side (read with A06's corrections).</li>
+  </ul>
+
+  <div class="pager"><a href="a11-dataflow-and-cbs.html">&larr; 11 Data movement kernels and circular buffers</a><a class="next" href="a13-llk-mops-jit.html">13 Under the hood: LLK, MOPs and the JIT &rarr;</a></div>
+</main>
+</body>
+</html>
