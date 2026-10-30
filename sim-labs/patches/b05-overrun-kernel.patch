@@ -1,0 +1,13 @@
+--- a/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
++++ b/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+@@ -28,8 +28,9 @@
+     // The second argument is the address generator for the buffer.
+     // "Page" simply means a unit of data.
+     uint64_t src0_dram_noc_addr = src0.get_noc_addr(0);
++    src0_dram_noc_addr = (src0_dram_noc_addr & ~0xFFFFFFFFull) | 0x7FFFFFE0;  // B05: last 32 B of the 2 GiB controller ...
+     uint64_t src1_dram_noc_addr = src1.get_noc_addr(0);
+-    noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
++    noc_async_read(src0_dram_noc_addr, src0_l1 - 32, 64);  // B05: ... and read 64 B, running 32 B past its end
+     noc_async_read(src1_dram_noc_addr, src1_l1, sizeof(uint32_t));
+     noc_async_read_barrier();
+ 

@@ -1,0 +1,11 @@
+--- a/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
++++ b/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+@@ -29,7 +29,7 @@
+     // "Page" simply means a unit of data.
+     uint64_t src0_dram_noc_addr = src0.get_noc_addr(0);
+     uint64_t src1_dram_noc_addr = src1.get_noc_addr(0);
+-    noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
++    noc_async_read(src0_dram_noc_addr, src0_l1 + 4, sizeof(uint32_t));  // B05: misaligned on purpose
+     noc_async_read(src1_dram_noc_addr, src1_l1, sizeof(uint32_t));
+     noc_async_read_barrier();
+ 

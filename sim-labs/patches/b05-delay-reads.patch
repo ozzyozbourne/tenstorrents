@@ -1,0 +1,67 @@
+--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
+@@ -241,7 +241,9 @@
+     g_chip->t_tile_cores_paused = false;
+ }
+ 
++void ttsim_b05_complete_reads(); // B05: tile.cpp
+ static void clock_current_chip() {
++    ttsim_b05_complete_reads(); // B05
+     if (g_chip->t_tile_cores_paused && !(g_clock % PAUSE_CLOCKS)) {
+         resume_paused_cores();
+     }
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -3,6 +3,7 @@
+ 
+ // Per-tile infrastructure: tile init, NOC routing, TDMA, Ethernet, DRAM, debug/config registers.
+ #include "sim.h"
++#include <vector> // B05
+ #include "topology.h"
+ #include "eth_fw_blob.h" // generated
+ 
+@@ -1394,6 +1395,31 @@
+     }
+ }
+ 
++// B05: optionally complete Tensix NoC reads TTSIM_NOC_READ_DELAY clocks after they are issued, instead of at once.
++// The data copy and the NIU_MST_RD_RESP_RECEIVED increment both wait, as they would on silicon, and the read counts
++// as outstanding for its transaction ID until then (noc_async_read_barrier_with_trid polls NIU_MST_REQS_OUTSTANDING_ID).
++struct PendingRead { uint64_t due, issued; uint32_t chip, tile_id, noc, txn_id, src_coord; uint64_t src_addr, dst_addr; uint32_t len; };
++static std::vector<PendingRead> s_pending_reads;
++static uint32_t noc_read_delay() {
++    static int delay = -1;
++    if (delay < 0) { const char *e = getenv("TTSIM_NOC_READ_DELAY"); delay = e ? atoi(e) : 0; }
++    return delay;
++}
++void ttsim_b05_complete_reads() { // called once per clock from clock_current_chip()
++    for (size_t i = 0; i < s_pending_reads.size();) {
++        PendingRead r = s_pending_reads[i];
++        if ((r.chip != g_current_chip_id) || (r.due > g_clock)) { i++; continue; }
++        s_pending_reads.erase(s_pending_reads.begin() + i);
++        TensixTile *p_tile = &g_t_tiles[r.tile_id];
++        tile_rd_bytes(r.src_coord, r.src_addr, &p_tile->sram[r.dst_addr], r.len);
++        p_tile->niu_mst_rd_resp_received[r.noc]++;
++        p_tile->niu_mst_reqs_outstanding[r.noc][r.txn_id]--;
++        uint32_t me = tile_to_coord('T', r.tile_id);
++        ttsim_printf("NOCLOG   done   READ issued at [%llu] core=T(%u,%u) dst=0x%llx len=%u\n",
++            (unsigned long long)r.issued, me & 63, me >> 6, (unsigned long long)r.dst_addr, r.len);
++    }
++}
++
+ template<char tile_type>
+ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
+     auto *p_tile = get_tile<tile_type>(tile_id);
+@@ -1632,6 +1658,12 @@
+             TTSIM_VERIFY((src_addr & 15) == (dst_addr & 15), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                 src_addr, dst_addr);
+         }
++        if ((tile_type == 'T') && noc_read_delay()) { // B05: deliver the data and bump the counter later
++            s_pending_reads.push_back({g_clock + noc_read_delay(), g_clock, g_current_chip_id, tile_id, noc_instance, txn_id,
++                src_coordinate, src_addr, dst_addr, noc_at_len_be});
++            p_tile->niu_mst_reqs_outstanding[noc_instance][txn_id]++;
++            return;
++        }
+         tile_rd_bytes(src_coordinate, src_addr, &p_tile->sram[dst_addr], noc_at_len_be);
+         p_tile->niu_mst_rd_resp_received[noc_instance]++;
+     }

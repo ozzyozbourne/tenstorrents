@@ -1,0 +1,11 @@
+--- a/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp
++++ b/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp
+@@ -31,7 +31,7 @@
+         // Issue a read to the NoC and write to the L1 buffer. This operation is asynchronous.
+         // thus a barrier is needed to ensure that the read is complete before the write.
+         noc_async_read_page(i, in0, l1_buffer_addr);
+-        noc_async_read_barrier();
++        // noc_async_read_barrier();  // B05: removed on purpose
+         // Write back the tile to the destination DRAM buffer.
+         // Again, this is an asynchronous operation, so we need a barrier to ensure the write
+         // is complete before the next iteration.

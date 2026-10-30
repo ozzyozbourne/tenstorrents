@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B05 · NoC transactions, DRAM and the alignment trap · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  table.t td.n { text-align: right; font-family: var(--mono); }
+  .sliderbar { display:flex; gap:.8rem; align-items:center; padding:.6rem .8rem; background:var(--bg2); border-top:1px solid var(--border); font-size:14px; flex-wrap:wrap; }
+  .sliderbar input[type=range] { flex:1; min-width:200px; }
+  .sliderbar label { color:var(--muted); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a09-memory.html">&larr; Prev</a>
+  <a href="../chapters/a10-first-program.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B05</span><span class="tag">Prerequisites: A08, A09, B00</span>
+  <h1><span class="num">B05.</span> NoC transactions, DRAM and the alignment trap</h1>
+  <p class="subtitle">Make ttsim print every NoC transfer, watch A09's page interleaving happen one tile at a time, misalign a read and see two separate safety nets catch it, and then patch the simulator so that a missing barrier finally breaks a kernel.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. Every NoC transfer in stock ttsim completes inside the store instruction that starts it, so the bracketed clock numbers below say nothing about how long a transfer takes on silicon. The routes drawn in the first figure are what NoC 0 would do on a real Wormhole. They are computed from the coordinates ttsim logged, not measured. Section 5 changes the simulator on purpose to model one kind of delay. That patched ttsim is a teaching tool, not a timing model either.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">0. Setup</a></li>
+      <li><a href="#log">1. Build a NoC-logging simulator</a></li>
+      <li><a href="#loopback">2. Loopback: 100 transfers and 12 banks</a></li>
+      <li><a href="#mcast">3. Multicast: one packet, three receivers</a></li>
+      <li><a href="#align">4. The alignment trap, caught twice</a></li>
+      <li><a href="#barrier">5. The missing barrier that ttsim cannot see</a></li>
+      <li><a href="#overrun">6. Optional: running off the end of DRAM</a></li>
+      <li><a href="#exercises">7. Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Take the <code>loopback</code> example's kernel. It copies 50 tiles from one DRAM buffer to another through a 2 KiB slot in L1, and after each read it calls <code>noc_async_read_barrier()</code>. Delete that one line and run it in ttsim. It passes. Run it again, and again: it passes every time, with exactly the same result.</p>
+  <p>Now add 4 to a destination address in a different kernel, so that a 4-byte DRAM read lands at <code>l1 + 4</code>. Nothing about the data is wrong. Every byte goes where you asked. ttsim stops dead with <code>UndefinedBehavior</code>.</p>
+  <p>So the simulator lets through a kernel that is genuinely broken, and refuses one that looks harmless. This lab explains both outcomes from ttsim's source. Along the way it turns the NoC from A08 and the interleaving from A09 into a log you can read line by line. By the end, a missing barrier will make a kernel fail, in a ttsim you patched yourself.</p>
+  <p>A08 already showed a NoC log from an instrumented ttsim. This lab builds a slightly different logger: the format is easier to parse, multicast receivers get their own lines, and it then puts the log to work. All commands below were run in this orb on the Wormhole model, and every output shown is real, trimmed only where marked.</p>
+
+  <h2 id="setup">0. Setup</h2>
+<pre><code>export LAB_HOME=$HOME/ttlab/b05
+source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
+P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches</code></pre>
+  <p><code>env.sh</code> points tt-metal at the stock Wormhole simulator, turns on slow dispatch, sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code> for kernel overlays, and changes into <code>$LAB_HOME/run</code>. <a href="b00-workbench.html">B00</a> explains each variable. Patches for this lab live in <code>sim-labs/patches/b05-*.patch</code>: two for ttsim and three for kernels.</p>
+
+  <h2 id="log">1. Build a NoC-logging simulator</h2>
+  <p>Every NoC transfer in ttsim passes through one function. A RISC-V core writes 1 into a command buffer's <code>NOC_CMD_CTRL</code> register, and ttsim's register handler calls <code>noc_cmd_ctrl&lt;tile_type&gt;(tile_id, noc_instance, cmd_buf)</code> (<code>tile.cpp:1708-1717</code>; A08 walks through it). The function runs from line 1397 to 1623. It reads the command buffer's registers, checks dozens of rules, translates coordinates, and then branches on the request kind. Just after translation, at line 1466, it knows everything we want to log:</p>
+  <ul>
+    <li><code>noc_ctrl</code>: the request bits (bit 5 multicast, bit 0 atomic, bit 3 inline, bit 1 write, otherwise read; bit 4 means non-posted, so an ack is expected);</li>
+    <li><code>src_coordinate</code>, <code>dst_coordinate</code>: NoC 0 physical (x, y), packed as <code>x | y &lt;&lt; 6</code>, already translated from whatever the kernel wrote;</li>
+    <li><code>dst_coordinate_start</code>: the other corner of a multicast rectangle;</li>
+    <li><code>src_addr</code>, <code>dst_addr</code>: the local addresses at each end, and <code>noc_at_len_be</code>: the length in bytes (for an atomic, the opcode).</li>
+  </ul>
+  <p>Make an editable copy of ttsim and apply the patch:</p>
+<pre><code>$W/build_ttsim.sh noclog wh                 # first run copies ttsim to $LAB_HOME/ttsim-noclog
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch)
+$W/build_ttsim.sh noclog wh                 # rebuild: about 1.5 s
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
+  <div class="filename">sim-labs/patches/b05-noclog.patch (against ttsim/src/tile.cpp @b3620244, inserted after line 1466)</div>
+<pre><code>+    { // B05: log every NoC command (coordinates are NoC 0 physical, after translation)
++        uint32_t me = tile_to_coord(tile_type, tile_id);
++        bool mc = bits&lt;5,5&gt;(noc_ctrl), at = bits&lt;0,0&gt;(noc_ctrl), in = bits&lt;3,3&gt;(noc_ctrl), wr = bits&lt;1,1&gt;(noc_ctrl);
++        const char *kind = mc ? "MCAST" : at ? "ATOMIC" : in ? "INLINE" : wr ? "WRITE" : "READ";
++        ttsim_printf("NOCLOG %-6s noc=%u core=%c(%u,%u) buf=%u %s src=%c(%u,%u):0x%llx dst=%c(%u,%u):0x%llx %s=%u",
++            kind, noc_instance, tile_type, me &amp; 63, me &gt;&gt; 6, cmd_buf, bits&lt;4,4&gt;(noc_ctrl) ? "ack " : "post",
++            src_tile_type, src_coordinate &amp; 63, src_coordinate &gt;&gt; 6, (unsigned long long)src_addr,
++            dst_tile_type, dst_coordinate &amp; 63, dst_coordinate &gt;&gt; 6, (unsigned long long)dst_addr,
++            at ? "op" : "len", noc_at_len_be);
++        if (mc) {
++            printf(" rect=(%u,%u)-(%u,%u)", dst_coordinate_start &amp; 63, dst_coordinate_start &gt;&gt; 6, dst_coordinate &amp; 63, dst_coordinate &gt;&gt; 6);
++        }
++        printf("\n");
++    }
+...
++                ttsim_printf("NOCLOG   recv T(%u,%u)\n", dst_x, dst_y); // B05: one line per multicast receiver
+                 tile_wr_bytes(dst_coordinate, dst_addr, &amp;p_tile-&gt;sram[src_addr], noc_at_len_be);</code></pre>
+  <p>What each piece does:</p>
+  <ul>
+    <li><code>tile_to_coord(tile_type, tile_id)</code> turns ttsim's internal tile index back into the NoC 0 position of the core that issued the command. A08's logger printed ttsim's tile number (<code>T0</code>); this one prints <code>T(1,1)</code>, which you can find on the A03 map.</li>
+    <li>The <code>kind</code> chain tests the bits in the same order as the branches below it, so the label always matches the branch that will run. Multicast comes first because a multicast write also has the write bit set.</li>
+    <li><code>ttsim_printf</code> prefixes the current simulator clock in brackets (<code>common.cpp:24-31</code>). The plain <code>printf</code> calls continue the same line.</li>
+    <li>ttsim sets <code>src_addr</code> from <code>NOC_TARG_ADDR</code> and <code>dst_addr</code> from <code>NOC_RET_ADDR</code> (<code>tile.cpp:1436-1451</code>). Because of the naming quirk from A08, TARG is where the data comes from for both reads and writes, so for a read "src" is the remote DRAM or L1 and "dst" is this core's L1, and for a write it is the other way round. Either way the log reads "from src to dst". Atomics and inline writes are the exceptions: ttsim calls the remote tile "src" for both (<code>tile.cpp:1526</code>, <code>1550</code>).</li>
+    <li>The second hunk sits inside the multicast loop (<code>tile.cpp:1498-1517</code>), after ttsim has skipped columns and rows that the router configuration masks out, and after it has skipped the sender itself. So every <code>recv</code> line is a tile that really received the data.</li>
+  </ul>
+  <div class="callout key">Logging at one function is enough because ttsim has exactly one door for NoC traffic: the store to <code>NOC_CMD_CTRL</code>. Kernels, firmware and dispatch all go through it.</div>
+
+  <h2 id="loopback">2. Loopback: 100 transfers and 12 banks</h2>
+<pre><code>$EX/metal_example_loopback &gt; $LAB_HOME/loopback.log 2&gt;&amp;1
+grep -c NOCLOG $LAB_HOME/loopback.log            # 100
+grep -v '| info' $LAB_HOME/loopback.log | head</code></pre>
+<pre><code>[0] 0.1 seconds (0.0 KHz)
+[4373] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,11):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+[4393] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,11):0x2d7440 len=2048
+[4429] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,1):0x402d4c40 dst=T(1,1):0x16d800 len=2048
+[4449] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,1):0x402d7440 len=2048
+[4485] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,5):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+[4505] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,5):0x2d7440 len=2048
+[4541] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,7):0x402d4c40 dst=T(1,1):0x16d800 len=2048
+[4561] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,7):0x402d7440 len=2048
+[4597] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(5,1):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+...
+Test Passed
+[7313] 0.2 seconds (32.9 KHz)</code></pre>
+  <p>The kernel is short, and the log is that kernel unrolled:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp:30-40 @7aad8aac</div>
+<pre><code>    for (uint32_t i = 0; i &lt; num_tiles; i++) {
+        // Issue a read to the NoC and write to the L1 buffer. This operation is asynchronous.
+        // thus a barrier is needed to ensure that the read is complete before the write.
+        noc_async_read_page(i, in0, l1_buffer_addr);
+        noc_async_read_barrier();
+        ...
+        noc_async_write_page(i, out0, l1_buffer_addr);
+        noc_async_write_barrier();
+    }</code></pre>
+  <p>The host creates two DRAM buffers of 50 bf16 tiles with <code>page_size = 2048</code> and one 2 KiB L1 buffer, then runs the kernel on logical core (0,0) with <code>NOC::RISCV_0_default</code> (<code>loopback.cpp:42-91</code>). Read the log against that:</p>
+  <ul>
+    <li><b>One core, one NoC.</b> Every line has <code>core=T(1,1)</code> and <code>noc=0</code>. Logical (0,0) is NoC 0 tile (1,1) on ttsim's unharvested Wormhole (A09).</li>
+    <li><b>One L1 slot.</b> Every read lands at <code>0x16d800</code> and every write leaves from it. That is the 2 KiB L1 buffer, allocated top-down just under 0x16E000, the top of the allocatable L1 (A09).</li>
+    <li><b>Strict alternation.</b> READ, WRITE, READ, WRITE: 50 of each, because each barrier holds the core until the previous transfer has completed. In stock ttsim that wait takes no time at all. Section 5 returns to this.</li>
+    <li><b>Command buffers.</b> Reads use <code>buf=1</code> and writes <code>buf=0</code>, tt-metal's fixed assignment (A08). All are <code>ack</code> (non-posted), so the write barrier has acks to count.</li>
+    <li><b>Two bases.</b> Reads start at <code>0x2d4c40</code> and writes at <code>0x2d7440</code>. The output buffer was allocated after the input: ⌈50/12⌉ = 5 pages × 2048 B = 0x2800 later in every bank, which is A09's lockstep allocation.</li>
+  </ul>
+
+  <h3>Which bank, in what order?</h3>
+  <p>The DRAM tiles in the log are (0,11), (0,1), (0,5), (0,7), (5,1), … and the addresses alternate between <code>0x2d…</code> and <code>0x402d…</code>. A09 says page <i>p</i> of an interleaved buffer lives in bank <i>p</i> mod 12, at row ⌊<i>p</i>/12⌋, and that odd Wormhole banks are the second 1 GiB view of a controller. Rather than check 100 lines by eye, check them with a script. <code>noc_banks.py</code> reads the bank table (tile and 1 GiB offset per bank) from the same <code>soc_descriptor</code> sections the allocator uses, maps every DRAM end in the log to a bank, and tests the rule:</p>
+<pre><code>python3 -I /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/py/noc_banks.py $LAB_HOME/loopback.log</code></pre>
+<pre><code>100 DRAM transfers: 50 reads, 50 writes
+
+bank  tile    half   reads  bytes_rd  writes  bytes_wr
+   0  (0,11)  +0         5     10240       5     10240
+   1  (0,1 )  +1GiB      5     10240       5     10240
+   2  (0,5 )  +0         4      8192       4      8192
+   3  (0,7 )  +1GiB      4      8192       4      8192
+   4  (5,1 )  +0         4      8192       4      8192
+   5  (5,11)  +1GiB      4      8192       4      8192
+   6  (5,2 )  +0         4      8192       4      8192
+   7  (5,9 )  +1GiB      4      8192       4      8192
+   8  (5,8 )  +0         4      8192       4      8192
+   9  (5,3 )  +1GiB      4      8192       4      8192
+  10  (5,5 )  +0         4      8192       4      8192
+  11  (5,7 )  +1GiB      4      8192       4      8192
+
+read bank order: 0 1 2 3 4 5 6 7 8 9 10 11 0 1 2 3 4 5 6 7 8 9 10 11 ...
+  page p -&gt; bank p % 12, address base + (p // 12) * 2048  (base 0x2d4c40): holds for all 50 pages
+
+write bank order: 0 1 2 3 4 5 6 7 8 9 10 11 0 1 2 3 4 5 6 7 8 9 10 11 ...
+  page p -&gt; bank p % 12, address base + (p // 12) * 2048  (base 0x2d7440): holds for all 50 pages</code></pre>
+  <p>Three things to take from the table. First, 50 = 4 × 12 + 2, so banks 0 and 1 get a fifth page and the others get four. Every bank still reserves five page slots (the 0x2800 gap between the two buffers), which is A09's lockstep cost. Second, the bank order is exactly the table A09 printed from the allocator: bank 0 is tile (0,11) at +0, bank 1 is (0,1) at +1 GiB, and so on. Third, banks 0 and 1 are the same controller and the same memory: ttsim keeps one 2 GiB array per controller (<code>config.h:14,35</code>), and the +1 GiB simply indexes its upper half (<code>tile.cpp:2785-2786</code>). The log shows the address the kernel computed. The bank number is the allocator's bookkeeping, and the script recovers it from the (tile, half) pair.</p>
+
+  <p>The figure replays the captured log. The 100 transfers, their clock stamps, tiles and addresses are embedded in the page exactly as logged. Each packet is drawn on the route NoC 0 would use on silicon (right first, then down, wrapping at the edges, as in A08), and the hop count is computed from that rule. The bars accumulate bytes per bank.</p>
+
+  <div class="viz" id="fig-replay"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-replay");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    // [clock, 0=READ 1=WRITE, dram x, dram y, dram address (hex)] -- the 100 NOCLOG lines of $LAB_HOME/loopback.log
+    var LOG = [[4373,0,0,11,"2d4c40"],[4393,1,0,11,"2d7440"],[4429,0,0,1,"402d4c40"],[4449,1,0,1,"402d7440"],[4485,0,0,5,"2d4c40"],[4505,1,0,5,"2d7440"],[4541,0,0,7,"402d4c40"],[4561,1,0,7,"402d7440"],[4597,0,5,1,"2d4c40"],[4617,1,5,1,"2d7440"],[4653,0,5,11,"402d4c40"],[4673,1,5,11,"402d7440"],[4709,0,5,2,"2d4c40"],[4729,1,5,2,"2d7440"],[4765,0,5,9,"402d4c40"],[4785,1,5,9,"402d7440"],[4821,0,5,8,"2d4c40"],[4841,1,5,8,"2d7440"],[4877,0,5,3,"402d4c40"],[4897,1,5,3,"402d7440"],[4933,0,5,5,"2d4c40"],[4953,1,5,5,"2d7440"],[4989,0,5,7,"402d4c40"],[5009,1,5,7,"402d7440"],[5045,0,0,11,"2d5440"],[5065,1,0,11,"2d7c40"],[5101,0,0,1,"402d5440"],[5121,1,0,1,"402d7c40"],[5157,0,0,5,"2d5440"],[5177,1,0,5,"2d7c40"],[5213,0,0,7,"402d5440"],[5233,1,0,7,"402d7c40"],[5269,0,5,1,"2d5440"],[5289,1,5,1,"2d7c40"],[5325,0,5,11,"402d5440"],[5345,1,5,11,"402d7c40"],[5381,0,5,2,"2d5440"],[5401,1,5,2,"2d7c40"],[5437,0,5,9,"402d5440"],[5457,1,5,9,"402d7c40"],[5493,0,5,8,"2d5440"],[5513,1,5,8,"2d7c40"],[5549,0,5,3,"402d5440"],[5569,1,5,3,"402d7c40"],[5605,0,5,5,"2d5440"],[5625,1,5,5,"2d7c40"],[5661,0,5,7,"402d5440"],[5681,1,5,7,"402d7c40"],[5717,0,0,11,"2d5c40"],[5737,1,0,11,"2d8440"],[5773,0,0,1,"402d5c40"],[5793,1,0,1,"402d8440"],[5829,0,0,5,"2d5c40"],[5849,1,0,5,"2d8440"],[5885,0,0,7,"402d5c40"],[5905,1,0,7,"402d8440"],[5941,0,5,1,"2d5c40"],[5961,1,5,1,"2d8440"],[5997,0,5,11,"402d5c40"],[6017,1,5,11,"402d8440"],[6053,0,5,2,"2d5c40"],[6073,1,5,2,"2d8440"],[6109,0,5,9,"402d5c40"],[6129,1,5,9,"402d8440"],[6165,0,5,8,"2d5c40"],[6185,1,5,8,"2d8440"],[6221,0,5,3,"402d5c40"],[6241,1,5,3,"402d8440"],[6277,0,5,5,"2d5c40"],[6297,1,5,5,"2d8440"],[6333,0,5,7,"402d5c40"],[6353,1,5,7,"402d8440"],[6389,0,0,11,"2d6440"],[6409,1,0,11,"2d8c40"],[6445,0,0,1,"402d6440"],[6465,1,0,1,"402d8c40"],[6501,0,0,5,"2d6440"],[6521,1,0,5,"2d8c40"],[6557,0,0,7,"402d6440"],[6577,1,0,7,"402d8c40"],[6613,0,5,1,"2d6440"],[6633,1,5,1,"2d8c40"],[6669,0,5,11,"402d6440"],[6689,1,5,11,"402d8c40"],[6725,0,5,2,"2d6440"],[6745,1,5,2,"2d8c40"],[6781,0,5,9,"402d6440"],[6801,1,5,9,"402d8c40"],[6837,0,5,8,"2d6440"],[6857,1,5,8,"2d8c40"],[6893,0,5,3,"402d6440"],[6913,1,5,3,"402d8c40"],[6949,0,5,5,"2d6440"],[6969,1,5,5,"2d8c40"],[7005,0,5,7,"402d6440"],[7025,1,5,7,"402d8c40"],[7061,0,0,11,"2d6c40"],[7081,1,0,11,"2d9440"],[7117,0,0,1,"402d6c40"],[7137,1,0,1,"402d9440"]];
+    // bank table from wormhole_b0_80_arch.yaml dram_views (as printed by noc_banks.py)
+    var BANK = { "0,11,0": 0, "0,1,1": 1, "0,5,0": 2, "0,7,1": 3, "5,1,0": 4, "5,11,1": 5, "5,2,0": 6, "5,9,1": 7, "5,8,0": 8, "5,3,1": 9, "5,5,0": 10, "5,7,1": 11 };
+    var DRAM = ["0-0","0-1","0-11","0-5","0-6","0-7","5-0","5-1","5-11","5-2","5-9","5-10","5-3","5-4","5-8","5-5","5-6","5-7"];
+    var NX = 10, NY = 12, CS = 33, OX = 46, OY = 44, CORE = [1, 1];
+    function kind(x, y) {
+      if (DRAM.indexOf(x + "-" + y) >= 0) return "D";
+      if (x === 0 && y === 3) return "P";
+      if (x === 0 && y === 10) return "A";
+      if (x === 0) return "R";
+      if (y === 0 || y === 6) return "E";
+      return "T";
+    }
+    function bankOf(e) { var hi = parseInt(e[4], 16) >= 0x40000000 ? 1 : 0; return BANK[e[2] + "," + e[3] + "," + hi]; }
+    // NoC 0 route: x first (rightwards, wrapping), then y (downwards, wrapping). Returns list of cells.
+    function route(sx, sy, dx, dy) {
+      var p = [[sx, sy]], x = sx, y = sy;
+      while (x !== dx) { x = (x + 1) % NX; p.push([x, y]); }
+      while (y !== dy) { y = (y + 1) % NY; p.push([x, y]); }
+      return p;
+    }
+    function cx(x) { return OX + x * CS + CS / 2; }
+    function cy(y) { return OY + y * CS + CS / 2; }
+    function ends(e) { return e[1] === 0 ? [e[2], e[3], CORE[0], CORE[1]] : [CORE[0], CORE[1], e[2], e[3]]; }
+    var steps = LOG.map(function (e, i) {
+      var b = bankOf(e), en = ends(e), hops = route(en[0], en[1], en[2], en[3]).length - 1, page = i >> 1;
+      var txt = "<b>[" + e[0] + "] " + (e[1] ? "WRITE" : "READ") + " page " + page + "</b> → bank " + b +
+        " (" + page + " mod 12), row " + Math.floor(page / 12) + ". " +
+        (e[1] ? "T(1,1):0x16d800 → D(" + e[2] + "," + e[3] + "):0x" + e[4]
+              : "D(" + e[2] + "," + e[3] + "):0x" + e[4] + " → T(1,1):0x16d800") +
+        ", 2048 B. On silicon the data would take <b>" + hops + (hops === 1 ? " hop" : " hops") + "</b> on NoC 0" +
+        (e[1] ? " (a write carries data on the request leg)." : " (the read's data rides the response leg).") +
+        (i === 0 ? " In ttsim it arrived in zero clocks." : "");
+      return { dur: 0.55, text: txt };
+    });
+    function drawGrid(hiTile) {
+      for (var y = 0; y < NY; y++) for (var x = 0; x < NX; x++) {
+        var k = kind(x, y), col = { D: C.orange, T: C.blue, E: C.purple, P: C.green, A: C.red, R: C.border }[k];
+        var hi = hiTile && hiTile[0] === x && hiTile[1] === y;
+        TT.box(ctx, OX + x * CS + 2, OY + y * CS + 2, CS - 4, CS - 4,
+          { fill: col, alpha: k === "R" ? 0.15 : (hi ? 0.75 : 0.22), stroke: hi ? C.yellow : null, lw: 2, r: 4 });
+        if (k === "D") {
+          var lab = [];
+          for (var key in BANK) { var a = key.split(","); if (+a[0] === x && +a[1] === y) lab.push(BANK[key]); }
+          TT.text(ctx, lab.length ? "b" + lab[0] : "D", cx(x), cy(y), { align: "center", font: "11px", color: lab.length ? C.fg : C.muted });
+        }
+      }
+      TT.box(ctx, OX + 1 * CS + 2, OY + 1 * CS + 2, CS - 4, CS - 4, { stroke: C.yellow, lw: 2.5, r: 4 });
+      TT.text(ctx, "core", cx(1), cy(1) - 6, { align: "center", font: "10px" });
+      TT.text(ctx, "(1,1)", cx(1), cy(1) + 7, { align: "center", font: "10px" });
+      for (var i = 0; i < NX; i++) TT.text(ctx, "" + i, cx(i), OY - 10, { align: "center", font: "11px", color: C.muted });
+      for (var j = 0; j < NY; j++) TT.text(ctx, "" + j, OX - 12, cy(j), { align: "center", font: "11px", color: C.muted });
+      TT.text(ctx, "Wormhole NoC 0 grid (x right, y down)", OX, 18, { font: "13px", color: C.muted });
+      var lx = OX, ly = OY + NY * CS + 18;
+      [["DRAM (bank no.)", C.orange, 0], ["Tensix", C.blue, 104], ["Ethernet", C.purple, 160], ["PCIe", C.green, 226], ["ARC", C.red, 276]].forEach(function (L) {
+        TT.box(ctx, lx + L[2], ly - 6, 10, 10, { fill: L[1], alpha: 0.6, r: 2 });
+        TT.text(ctx, L[0], lx + L[2] + 14, ly, { font: "10px", color: C.muted });
+      });
+    }
+    function drawPath(cells, t, col) {
+      var n = cells.length - 1, pos = t * n;
+      ctx.lineWidth = 3; ctx.strokeStyle = col; ctx.globalAlpha = 0.8;
+      for (var h = 0; h < n && h < pos; h++) {
+        var a = cells[h], b = cells[h + 1], f = Math.min(1, pos - h);
+        var wrap = Math.abs(a[0] - b[0]) > 1 || Math.abs(a[1] - b[1]) > 1;
+        ctx.beginPath();
+        if (wrap) { // draw stubs off the edge and back in
+          if (a[0] !== b[0]) { ctx.moveTo(cx(a[0]), cy(a[1])); ctx.lineTo(OX + NX * CS + 6, cy(a[1])); ctx.moveTo(OX - 6, cy(b[1])); ctx.lineTo(TT.lerp(OX - 6, cx(b[0]), f), cy(b[1])); }
+          else { ctx.moveTo(cx(a[0]), cy(a[1])); ctx.lineTo(cx(a[0]), OY + NY * CS + 4); ctx.moveTo(cx(b[0]), OY - 4); ctx.lineTo(cx(b[0]), TT.lerp(OY - 4, cy(b[1]), f)); }
+        } else {
+          ctx.moveTo(cx(a[0]), cy(a[1])); ctx.lineTo(TT.lerp(cx(a[0]), cx(b[0]), f), TT.lerp(cy(a[1]), cy(b[1]), f));
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      var k = Math.min(n, Math.floor(pos)), c = cells[k], d = cells[Math.min(n, k + 1)], ff = pos - k;
+      var wr = Math.abs(c[0] - d[0]) > 1 || Math.abs(c[1] - d[1]) > 1;
+      var px = wr ? (ff < 0.5 ? cx(c[0]) : cx(d[0])) : TT.lerp(cx(c[0]), cx(d[0]), ff);
+      var py = wr ? (ff < 0.5 ? cy(c[1]) : cy(d[1])) : TT.lerp(cy(c[1]), cy(d[1]), ff);
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 7, 0, 2 * Math.PI); ctx.fill();
+    }
+    function drawBars(done, cur, t) {
+      var bx = 450, by = 60, bw = 420, bh = 300, mx = 10240 * 2;
+      TT.text(ctx, "bytes moved per DRAM bank (read + write)", bx, 30, { font: "13px", color: C.muted });
+      var tot = new Array(12).fill(0), rd = new Array(12).fill(0);
+      for (var i = 0; i < done; i++) { var b = bankOf(LOG[i]); tot[b] += 2048; if (!LOG[i][1]) rd[b] += 2048; }
+      if (cur >= 0 && t >= 1) { var b2 = bankOf(LOG[cur]); tot[b2] += 2048; if (!LOG[cur][1]) rd[b2] += 2048; }
+      var w = bw / 12;
+      for (var k = 0; k < 12; k++) {
+        var h = bh * tot[k] / mx, hr = bh * rd[k] / mx, x = bx + k * w + 4;
+        TT.box(ctx, x, by + bh - h, w - 8, h, { fill: C.orange, alpha: 0.35, r: 2 });
+        TT.box(ctx, x, by + bh - hr, w - 8, hr, { fill: C.blue, alpha: 0.55, r: 2 });
+        var isCur = cur >= 0 && bankOf(LOG[cur]) === k;
+        TT.text(ctx, "" + k, x + (w - 8) / 2, by + bh + 14, { align: "center", font: "12px", color: isCur ? C.yellow : C.muted });
+        if (tot[k]) TT.text(ctx, (tot[k] / 1024) + "K", x + (w - 8) / 2, by + bh - h - 9, { align: "center", font: "10px", color: C.muted });
+      }
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(bx, by + bh); ctx.lineTo(bx + bw, by + bh); ctx.stroke();
+      TT.text(ctx, "bank", bx + bw / 2, by + bh + 32, { align: "center", font: "12px", color: C.muted });
+      TT.box(ctx, bx, by + bh + 46, 10, 10, { fill: C.blue, alpha: 0.55, r: 2 }); TT.text(ctx, "read", bx + 14, by + bh + 51, { font: "11px", color: C.muted });
+      TT.box(ctx, bx + 60, by + bh + 46, 10, 10, { fill: C.orange, alpha: 0.35, r: 2 }); TT.text(ctx, "written", bx + 74, by + bh + 51, { font: "11px", color: C.muted });
+      var nr = 0, nw = 0; for (var q = 0; q < done + (t >= 1 ? 1 : 0); q++) { if (LOG[q][1]) nw++; else nr++; }
+      TT.text(ctx, "transfers done: " + nr + " reads, " + nw + " writes", bx + 150, by + bh + 51, { font: "12px" });
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var e = LOG[i], en = ends(e);
+        drawGrid([e[2], e[3]]);
+        drawPath(route(en[0], en[1], en[2], en[3]), t, e[1] ? C.orange : C.blue);
+        drawBars(i, i, t);
+        TT.text(ctx, "[" + e[0] + "] " + (e[1] ? "WRITE" : "READ") + "  bank " + bankOf(e) + "  0x" + e[4],
+          OX + NX * CS / 2, OY + NY * CS + 40, { align: "center", font: "13px", mono: true, color: e[1] ? C.orange : C.blue });
+      }
+    });
+  })();
+  </script>
+
+  <p>Step through the first dozen transfers and two patterns appear. The reads sweep the banks 0 → 11 and the writes follow them one step behind, so every bank sees one read and one write per pass. And the hop counts are very uneven. Bank 1's data, at (0,1), is 1 hop from core (1,1). Bank 0's data at (0,11) is 3 hops. Every write to the x = 0 column has to go right all the way round the ring (9 hops of x, then 10 of y for (0,11)): 19 hops. Interleaving spreads load evenly across the banks, but it cannot make them all close. That is A09's point, now visible packet by packet.</p>
+  <div class="callout warn">The bracketed clocks step by about 20 between a read and its write and about 36 between iterations. That is the simulator's step count for the RISC-V code between the stores: address arithmetic, the barrier's single poll of the counter, and the loop. It is not a transfer time. On silicon a 2 KiB read from 3 hops away is at least about 100 NoC cycles (A08's derivation), and the barrier would spin for all of them.</div>
+
+  <h2 id="mcast">3. Multicast: one packet, three receivers</h2>
+  <p>The smallest multicast program in the tree is <code>contributed/multicast</code>. Logical core (0,0) reads one identity tile from DRAM and multicasts it to logical cores (1,0)–(3,0) (<code>multicast.cpp:176-187</code>). Each receiver then writes its copy back to DRAM, and the host checks all three. With the logger still loaded:</p>
+<pre><code>$EX/contributed/multicast &gt; $LAB_HOME/mcast.log 2&gt;&amp;1
+grep NOCLOG $LAB_HOME/mcast.log</code></pre>
+<pre><code>[4487] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,11):0x3ffff800 dst=T(1,1):0x19e60 len=2048
+[4531] NOCLOG ATOMIC noc=0 core=T(4,1) buf=3 ack  src=T(1,1):0x8a90 dst=T(4,1):0x4 op=4220
+[4532] NOCLOG ATOMIC noc=0 core=T(3,1) buf=3 ack  src=T(1,1):0x8a90 dst=T(3,1):0x4 op=4220
+[4546] NOCLOG ATOMIC noc=0 core=T(2,1) buf=3 ack  src=T(1,1):0x8a90 dst=T(2,1):0x4 op=4220
+[4573] NOCLOG MCAST  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x19e60 dst=T(4,1):0x19e60 len=2048 rect=(2,1)-(4,1)
+[4573] NOCLOG   recv T(2,1)
+[4573] NOCLOG   recv T(3,1)
+[4573] NOCLOG   recv T(4,1)
+[4593] NOCLOG MCAST  noc=0 core=T(1,1) buf=2 ack  src=T(1,1):0x8aa0 dst=T(4,1):0x8aa0 len=4 rect=(2,1)-(4,1)
+[4593] NOCLOG   recv T(2,1)
+[4593] NOCLOG   recv T(3,1)
+[4593] NOCLOG   recv T(4,1)
+[7238] NOCLOG WRITE  noc=1 core=T(4,1) buf=0 ack  src=T(4,1):0x1a660 dst=D(0,5):0x3ffff000 len=2048
+[7239] NOCLOG WRITE  noc=1 core=T(3,1) buf=0 ack  src=T(3,1):0x1a660 dst=D(0,1):0x7ffff000 len=2048
+[7241] NOCLOG WRITE  noc=1 core=T(2,1) buf=0 ack  src=T(2,1):0x1a660 dst=D(0,11):0x3ffff000 len=2048
+...
+[✅ PASS] All 3 receiver tiles match the golden tile.
+[7374] 0.3 seconds (26.6 KHz)</code></pre>
+  <p>Fifteen lines, and the whole protocol is in them. Match them with the coordinator kernel:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp (condensed) @7aad8aac</div>
+<pre><code>    noc_async_read(src0_dram_noc_addr, tile_l1_addr, ublock_size_bytes);   // line 1 of the log
+    noc_async_read_barrier();
+    ...
+    noc_semaphore_wait(sender_addr_ptr, num_dests);                        // waits for lines 2-4
+    noc_semaphore_set(sender_addr_ptr, 0);
+    ...
+    uint64_t identity_tile_global_multicast_addr =
+            get_noc_multicast_addr(start_x, start_y, end_x, end_y, tile_l1_addr);
+    noc_async_write_multicast(tile_l1_addr, identity_tile_global_multicast_addr, single_tile_size, num_dests);  // line 5
+    *(receiver_addr_ptr) = VALID;
+    uint64_t validity_global_multicast_addr =
+            get_noc_multicast_addr(start_x, start_y, end_x, end_y, receiver_addr);
+    noc_semaphore_set_multicast(receiver_addr, validity_global_multicast_addr, num_dests);                    // line 9
+    noc_async_write_barrier();</code></pre>
+  <ol>
+    <li><b>The read</b> fetches the tile from bank 0, tile (0,11), at <code>0x3ffff800</code>: just under the top of the 1 GiB bank. This example allocates its buffers with <code>.bottom_up = false</code> (<code>multicast.cpp:47</code>), so they come from the top of DRAM, unlike the default bottom-up DRAM allocation in A09. The output buffer of three pages lands at <code>0x3ffff000</code> in banks 0 and 2, and at <code>0x7ffff000</code> (+1 GiB) in bank 1.</li>
+    <li><b>Three atomics</b> are the receivers saying "ready". Each runs <code>noc_semaphore_inc(remote_sender_semaphore_noc_addr, 1)</code> in <code>inbound_kernel.cpp</code>. ttsim's atomic branch calls the remote end "src", so <code>src=T(1,1):0x8a90</code> is the sender's semaphore. <code>dst=…:0x4</code> is where the old value would be returned in the issuing core's L1. <code>op=4220</code> is 0x107C, the increment opcode, the only one ttsim implements (<code>tile.cpp:1528</code>). The three arrive in the order 4, 3, 2 because the receivers are separate cores, and ttsim happened to clock them in that order.</li>
+    <li><b>The tile multicast.</b> One command from T(1,1), command buffer 0, 2048 B, with the rectangle (2,1)–(4,1). ttsim's loop (<code>tile.cpp:1498-1517</code>) writes the same bytes to each tile in the rectangle, so we get three <code>recv</code> lines. The <code>dst</code> field holds the far corner (4,1), because a multicast address packs both corners into the coordinate bits (<code>tile.cpp:1454-1457</code>).</li>
+    <li><b>The flag multicast.</b> The sender sets its own copy of the receiver semaphore to VALID, then multicasts those 4 bytes to the same rectangle through command buffer 2, the buffer tt-metal reserves for small register-sized writes. The receivers spin in <code>noc_semaphore_wait(receiver_addr_ptr, VALID)</code> and then continue.</li>
+    <li><b>Three writes on NoC 1.</b> Each receiver's outbound kernel runs on the second data-movement core with <code>NOC::RISCV_1_default</code> (<code>multicast.cpp:209-212</code>). Receiver T(2,1) writes page 0, T(3,1) page 1 and T(4,1) page 2, which land in banks 0, 1 and 2: the interleaving rule again.</li>
+  </ol>
+  <p>Now count acknowledgements. A non-posted multicast to three receivers bumps <code>niu_mst_wr_ack_received</code> three times in ttsim (once per receiver, <code>tile.cpp:1511-1514</code>), and tt-metal's software counter for <code>noc_async_write_barrier</code> was raised by <code>num_dests</code> = 3 when the multicast was issued (A08). Pass the wrong <code>num_dests</code> and the two counts never match. Too large a value hangs the barrier, even in ttsim. That is one of the few NoC bugs ttsim <em>can</em> show you, because it comes from counting, not from timing.</p>
+  <div class="callout gpu">A GPU has nothing quite like this. Broadcasting a value to many SMs means writing it to global memory and letting each SM read it, perhaps through L2. Here one packet is copied by the routers into each receiver's private memory, and a second tiny multicast tells them it has arrived. A16 builds the same pattern up into a full multicast matmul.</div>
+  <div class="callout warn">On Wormhole, ttsim refuses a multicast without path reservation (<code>tile.cpp:1421-1423</code>). It also refuses one whose rectangle contains a non-Tensix tile (<code>tile.cpp:1506</code>). Try a rectangle that crosses the DRAM column at x = 5 and ttsim stops with <code>UnimplementedFunctionality</code>, which is ttsim's way of saying "real hardware would skip that tile, and I don't model that".</div>
+
+  <h2 id="align">4. The alignment trap, caught twice</h2>
+  <h3>The rule</h3>
+  <p>A NoC transfer does not copy bytes one at a time. It moves 16- or 32-byte chunks, and a chunk read at the source is written as a chunk at the destination. So the two ends must sit at the same offset within a chunk. The ISA documentation gives the exact table for requests whose <code>NOC_AT_LEN_BE</code> holds a length:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/NoC/Alignment.md:14-27</div>
+<pre><code>||Data to MMIO address|Data to L1 address|Data to other address|Data to host via PCIe|
+|**Data from MMIO address**|AL=4|AL≤4 and C4|AL≤4 and C4|AL≤4|
+|**Data from L1 address**|AL=4 and C16|C16|C16|Any|
+|**Data from other address**|AL=4 and C16|C32|C32|Any|
+...
+* **C16:** The two addresses must be congruent mod 16, i.e. `SrcAddress % 16 == DstAddress % 16`.
+* **C32:** The two addresses must be congruent mod 32, i.e. `SrcAddress % 32 == DstAddress % 32`.</code></pre>
+  <p>"Other address" means a DRAM tile, PCIe or ARC. So a DRAM → L1 read must be <b>C32</b>, and anything from L1 must be <b>C16</b>. The document opens with: "Violations of the alignment requirements result in <code>UndefinedBehavior</code>" (line 8). The hardware does not raise an error. It just does something unspecified. The allocator pads every page to 32 B on Wormhole precisely so that normal code never comes near this rule (A09).</p>
+
+  <h3>Layer 2: ttsim's check</h3>
+  <p>ttsim implements the table as a set of <code>TTSIM_VERIFY</code>s. Here is the read branch:</p>
+  <div class="filename">ttsim/src/tile.cpp:1598-1622 @b3620244 (two range checks and a tile-type check elided)</div>
+<pre><code>    } else { // read
+        TTSIM_VERIFY((noc_at_len_be &gt;= 1) &amp;&amp; (noc_at_len_be &lt;= NOC_MAX_PACKET_SIZE), UnsupportedFunctionality, "read: noc_at_len_be=%d", noc_at_len_be);
+        ...
+        TTSIM_VERIFY(dst_addr + noc_at_len_be &lt;= sizeof(p_tile-&gt;sram), UnsupportedFunctionality, "read: dst_addr=0x%llx", dst_addr);
+        ...
+        if (src_tile_type == 'D') { // DRAM -&gt; L1
+#if TT_ARCH_VERSION == 1
+            TTSIM_VERIFY((src_addr &amp; 63) == (dst_addr &amp; 63), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                src_addr, dst_addr);
+#else
+            TTSIM_VERIFY((src_addr &amp; 31) == (dst_addr &amp; 31), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                src_addr, dst_addr);
+#endif
+        } else if ((src_addr &gt;= RISCV_LOCAL_MEM_BASE) &amp;&amp; (src_tile_type != 'P')) { // MMIO -&gt; L1
+            ...
+        } else if (src_tile_type != 'P') { // L1 -&gt; L1
+            TTSIM_VERIFY((src_addr &amp; 15) == (dst_addr &amp; 15), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                src_addr, dst_addr);
+        }
+        tile_rd_bytes(src_coordinate, src_addr, &amp;p_tile-&gt;sram[dst_addr], noc_at_len_be);
+        p_tile-&gt;niu_mst_rd_resp_received[noc_instance]++;</code></pre>
+  <p>The DRAM case is C32 on Wormhole (<code>&amp; 31</code>, line 1610) and C64 on Blackhole (<code>&amp; 63</code>, line 1607), where the DRAM alignment is 64 B. Writes check C16 at line 1589. When a check fails, <code>ttsim_error</code> prints the category and the message, flushes stdout and calls <code>_Exit(1)</code> (<code>common.cpp:33-45</code>). The process ends there, with no unwinding and no chance for tt-metal to react.</p>
+
+  <h3>Spring the trap</h3>
+  <p>Use the smallest kernel that reads DRAM: <code>add_2_integers_in_riscv</code>, which reads two 4-byte integers. The overlay patch moves the first read's destination 4 bytes up:</p>
+  <div class="filename">sim-labs/patches/b05-misalign-kernel.patch (applies to a copy of the stock kernel)</div>
+<pre><code>-    noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
++    noc_async_read(src0_dram_noc_addr, src0_l1 + 4, sizeof(uint32_t));  // B05: misaligned on purpose</code></pre>
+<pre><code>K=$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels
+mkdir -p $K
+cp $TT_METAL_HOME/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp $K/
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-misalign-kernel.patch)
+$EX/metal_example_add_2_integers_in_riscv          # stock ttsim, Watcher off</code></pre>
+<pre><code>[0] 0.0 seconds (0.0 KHz)
+[4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match
+
+real	0m0.740s          (exit status 1)</code></pre>
+  <p>Check the arithmetic: <code>0x2d4c40 &amp; 31 = 0</code>, while <code>0x16dfe4 &amp; 31 = 4</code>. With the logger loaded, the log shows the command reaching ttsim and dying there, on the same clock:</p>
+<pre><code>[4343] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,11):0x2d4c40 dst=T(1,1):0x16dfe4 len=4
+[4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match</code></pre>
+
+  <h3>Layer 1: Watcher</h3>
+  <p>Run the same binary, with the same overlay, with Watcher on:</p>
+<pre><code>TT_METAL_WATCHER=1 $EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code>… | warning  |  Metal | Watcher detected NOC error and stopped device: (watcher_device_reader.cpp:957)
+… | warning  |  Metal | Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): BRISC using noc0 tried to unicast read 4 bytes
+      to local L1[0x16dfe4] from DRAM core w/ virtual coords 0-11 DRAM[addr=0x002d4c40]
+      (invalid address alignment in NOC transaction). (watcher_device_reader.cpp:958)
+… | critical | Always | TT_THROW: Device 0 worker core(x= 0,y= 0) … (invalid address alignment in NOC transaction). (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'
+…
+real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
+  <p>This time ttsim prints no error, and with the logger loaded it prints <b>zero</b> NOCLOG lines (<code>grep -c NOCLOG</code> gives 0). The bad command never reached the NIU. Something stopped the kernel before its store to <code>NOC_CMD_CTRL</code>. That something was compiled into the kernel itself:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_raw.h:41-44 @7aad8aac</div>
+<pre><code>    WAYPOINT("NAOW");
+    DEBUG_SANITIZE_NOC_READ_TRANSACTION(noc, src_noc_addr, dst_local_l1_addr, size);
+    ncrisc_noc_fast_read&lt;noc_mode&gt;(noc, read_cmd_buf, src_noc_addr, dst_local_l1_addr, size, read_req_vc);
+    WAYPOINT("NAOD");</code></pre>
+  <p>With Watcher off, <code>DEBUG_SANITIZE_NOC_READ_TRANSACTION</code> expands to almost nothing (<code>sanitize.h:1140</code>). With Watcher on, tt-metal compiles kernels with sanitizing enabled, and the macro calls <code>debug_sanitize_noc_and_worker_addr</code> (<code>sanitize.h:947-953</code>). For a DRAM target, that picks an alignment mask from <code>NOC_DRAM_READ_ALIGNMENT_BYTES</code>, which is 32 on Wormhole (<code>noc_parameters.h:295</code>), and compares both ends:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/debug/sanitize.h:742-751 @7aad8aac</div>
+<pre><code>        if ((worker_addr &amp; alignment_mask) != (noc_addr &amp; alignment_mask)) {
+            debug_sanitize_post_addr_and_hang(
+                noc_id,
+                noc_addr,
+                worker_addr,
+                len,
+                multicast,
+                dir,
+                DEBUG_SANITIZE_NOC_TARGET,
+                DebugSanitizeNocAlignment);
+        }</code></pre>
+  <p><code>debug_sanitize_post_addr_and_hang</code> writes a record into the core's Watcher mailbox in L1 (the address, length, which RISC and the return code), then enters <code>while (1) {}</code> (<code>sanitize.h:347-407</code>). The core is now parked, deliberately. On the host, Watcher's thread polls every core's mailbox. <code>TT_METAL_WATCHER=1</code> means once per second, and the watcher log shows dumps one second apart. It finds the record, turns <code>DebugSanitizeNocAlignment</code> into the text "invalid address alignment in NOC transaction" (<code>watcher_device_reader.cpp:885-887</code>), and throws. The 7.6 s wall time against 0.74 s is mostly that polling and Watcher's slower setup. (The watcher log, <code>$LAB_HOME/logs/generated/watcher/watcher.log</code>, shows core (0,0)'s BRISC at waypoint <code>R</code>, running, in every dump after the first.)</p>
+
+  <p>The figure plays both runs side by side, as a sequence of who does what.</p>
+  <div class="viz" id="fig-layers"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-layers");
+    var g = TT.canvas(root, 900, 400), ctx = g.ctx, C = TT.C;
+    var LANES = [
+      { name: "BRISC kernel", sub: "reader_writer_add_in_riscv", col: C.blue },
+      { name: "Watcher sanitizer", sub: "sanitize.h, inside the kernel", col: C.green },
+      { name: "NIU registers", sub: "ttsim noc_cmd_ctrl", col: C.orange },
+      { name: "Host", sub: "tt-metal + Watcher thread", col: C.purple }
+    ];
+    var LX = [40, 260, 480, 700], LW = 170;
+    // each step: mode, events [lane from, lane to, label, color], active lanes, log line
+    var S = [
+      { mode: "OFF", ev: [[0, 0, "noc_async_read(D(0,11):0x2d4c40 → L1 0x16dfe4, 4 B)"]], on: [0],
+        log: "", text: "<b>Watcher off.</b> The kernel calls <code>noc_async_read</code> with a destination 4 bytes past a 32-byte boundary. The source DRAM address is 32-byte aligned." },
+      { mode: "OFF", ev: [[0, 1, "macro expands to nothing", "skip"]], on: [0],
+        log: "", text: "Without Watcher, <code>DEBUG_SANITIZE_NOC_READ_TRANSACTION</code> compiles to a length log (<code>sanitize.h:1140</code>). No check runs in the kernel." },
+      { mode: "OFF", ev: [[0, 2, "stores … NOC_CMD_CTRL = 1"]], on: [0, 2],
+        log: "[4343] NOCLOG READ noc=0 core=T(1,1) … src=D(0,11):0x2d4c40 dst=T(1,1):0x16dfe4 len=4",
+        text: "<code>ncrisc_noc_fast_read</code> programs the command buffer and writes 1 to <code>NOC_CMD_CTRL</code>. In ttsim that store calls <code>noc_cmd_ctrl</code> at once, the same code path silicon's NIU would take." },
+      { mode: "OFF", ev: [[2, 2, "(0x40 & 31)=0 ≠ (0xe4 & 31)=4  →  UB"]], on: [2], bad: 2,
+        log: "[4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match",
+        text: "<b>Layer 2 fires.</b> The read branch sees a DRAM source and checks C32 (<code>tile.cpp:1610</code>). It fails, so <code>ttsim_error</code> prints and calls <code>_Exit(1)</code>. The host never gets to react: exit status 1 after 0.74 s." },
+      { mode: "ON", ev: [[0, 0, "noc_async_read(D(0,11):0x2d4c40 → L1 0x16dfe4, 4 B)"]], on: [0],
+        log: "", text: "<b>Watcher on</b> (<code>TT_METAL_WATCHER=1</code>). Same binary, same kernel source; tt-metal recompiles the kernel with sanitizing enabled." },
+      { mode: "ON", ev: [[0, 1, "debug_sanitize_noc_and_worker_addr()"]], on: [0, 1],
+        log: "", text: "Now the macro calls the sanitizer before any NIU register is touched (<code>dataflow_api_raw.h:41-43</code>). The target is DRAM, so the mask is <code>NOC_DRAM_READ_ALIGNMENT_BYTES - 1</code> = 31." },
+      { mode: "ON", ev: [[1, 1, "0x16dfe4 & 31 ≠ 0x2d4c40 & 31  →  hang"]], on: [1], bad: 1,
+        log: "", text: "<b>Layer 1 fires.</b> <code>sanitize.h:742</code> sees the mismatch, writes a record with <code>DebugSanitizeNocAlignment</code> into the core's L1 mailbox, and spins in <code>while (1)</code>. The store to <code>NOC_CMD_CTRL</code> never happens." },
+      { mode: "ON", ev: [[1, 2, "nothing arrives", "skip"]], on: [1],
+        log: "grep -c NOCLOG  →  0", text: "ttsim's check never runs, because no command reaches the NIU. With the logging ttsim loaded, the log has zero NOCLOG lines. Layer 2 is still armed; it just has nothing to inspect." },
+      { mode: "ON", ev: [[3, 1, "polls mailbox (1 s)"], [3, 3, "TT_THROW → abort"]], on: [1, 3], bad: 3,
+        log: "Watcher detected NOC error … BRISC using noc0 tried to unicast read 4 bytes to local L1[0x16dfe4] … (invalid address alignment in NOC transaction).",
+        text: "The host's Watcher thread reads the mailbox over the (simulated) PCIe link, decodes the record into a readable message naming the core, RISC, NoC, addresses and length, and throws. Exit status 134 after 7.6 s." },
+      { mode: "BOTH", ev: [], on: [1, 2],
+        log: "", text: "<b>Two layers.</b> Watcher is software inside your kernel: opt-in, it works on silicon too, it catches the request <em>before</em> it is issued, and it explains it in your terms. ttsim's check is a model of the hardware rule: always on, but only in the simulator, and it covers any path to the NIU, including code built without Watcher. On silicon with Watcher off, there is no layer at all: the NIU just does something undefined." }
+    ];
+    function lane(k, active, bad) {
+      var L = LANES[k], x = LX[k];
+      TT.box(ctx, x, 40, LW, 54, { fill: L.col, alpha: active ? 0.4 : 0.1, stroke: bad ? C.red : (active ? L.col : C.border), lw: bad ? 3 : 1.5 });
+      TT.text(ctx, L.name, x + LW / 2, 60, { align: "center", font: "14px" });
+      TT.text(ctx, L.sub, x + LW / 2, 80, { align: "center", font: "11px", color: C.muted });
+      ctx.strokeStyle = C.border; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x + LW / 2, 96); ctx.lineTo(x + LW / 2, 290); ctx.stroke(); ctx.setLineDash([]);
+    }
+    TT.stepper({
+      root: root, steps: S.map(function (s) { return { dur: 1.6, text: s.text }; }),
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var s = S[i];
+        var title = s.mode === "OFF" ? "Run 1: TT_METAL_WATCHER unset" : s.mode === "ON" ? "Run 2: TT_METAL_WATCHER=1" : "Who catches what";
+        TT.text(ctx, title, 450, 18, { align: "center", font: "15px", color: s.mode === "ON" ? C.green : (s.mode === "OFF" ? C.orange : C.yellow) });
+        for (var k = 0; k < 4; k++) lane(k, s.on.indexOf(k) >= 0, s.bad === k && t > 0.5);
+        if (s.mode === "OFF") { TT.text(ctx, "(not compiled in)", LX[1] + LW / 2, 110, { align: "center", font: "11px", color: C.muted }); }
+        s.ev.forEach(function (e, n) {
+          var y = 140 + n * 60, a = LX[e[0]] + LW / 2, b = LX[e[1]] + LW / 2, skip = e[3] === "skip";
+          if (a === b) {
+            ctx.font = "11px ui-monospace, monospace"; var bw = Math.max(200, ctx.measureText(e[2]).width + 20);
+            var bxl = Math.max(10, Math.min(g.W - 10 - bw, a - bw / 2)); a = bxl + bw / 2;
+            TT.box(ctx, bxl, y - 14, bw, 28, { fill: C.bg3, stroke: s.bad === e[0] ? C.red : C.border, r: 5 });
+            TT.text(ctx, e[2], a, y, { align: "center", font: "11px", mono: true, color: s.bad === e[0] ? C.red : C.fg });
+          } else {
+            var bx = TT.lerp(a, b, t);
+            ctx.globalAlpha = skip ? 0.35 : 1;
+            if (skip) ctx.setLineDash([5, 5]);
+            TT.arrow(ctx, a, y, bx, y, { color: skip ? C.muted : C.yellow, lw: 2 });
+            ctx.setLineDash([]); ctx.globalAlpha = 1;
+            TT.text(ctx, e[2], (a + b) / 2, y - 14, { align: "center", font: "12px", mono: true, color: skip ? C.muted : C.fg });
+            if (skip && t > 0.8) TT.text(ctx, "✕", b - (b > a ? 12 : -12), y, { align: "center", font: "18px", color: C.red });
+          }
+        });
+        if (s.log) {
+          TT.box(ctx, 20, 310, 860, 70, { fill: C.bg2, stroke: C.border, r: 6 });
+          ctx.font = "11.5px ui-monospace, monospace"; ctx.fillStyle = s.bad != null ? C.red : C.fg; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+          var words = s.log.split(" "), line = "", y = 328;
+          words.forEach(function (w) { if (ctx.measureText(line + w).width > 830) { ctx.fillText(line, 34, y); y += 18; line = ""; } line += w + " "; });
+          ctx.fillText(line, 34, y);
+        }
+        if (s.mode === "BOTH") {
+          TT.box(ctx, LX[1] - 10, 120, LW + 20, 160, { stroke: C.green, r: 8 });
+          TT.text(ctx, "layer 1: Watcher", LX[1] + LW / 2, 140, { align: "center", font: "13px", color: C.green });
+          ["opt-in, slow (~10x here)", "also runs on silicon", "stops BEFORE issue", "message names core, RISC", "covers sanitized APIs only"].forEach(function (l, n) {
+            TT.text(ctx, l, LX[1] + LW / 2, 166 + n * 22, { align: "center", font: "11px" });
+          });
+          TT.box(ctx, LX[2] - 10, 120, LW + 20, 160, { stroke: C.orange, r: 8 });
+          TT.text(ctx, "layer 2: ttsim", LX[2] + LW / 2, 140, { align: "center", font: "13px", color: C.orange });
+          ["always on, free", "simulator only", "stops AT the NIU", "message names the rule", "covers every NoC command"].forEach(function (l, n) {
+            TT.text(ctx, l, LX[2] + LW / 2, 166 + n * 22, { align: "center", font: "11px" });
+          });
+        }
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout key">Watcher and ttsim are two independent checks of the same ISA rule, placed at two different points. Watcher checks your <em>arguments</em> inside the kernel, before the request exists. ttsim checks the <em>request</em> as the NIU receives it. Turn Watcher on whenever you debug: it is the only one of the two that will also protect you on real hardware.</div>
+  <div class="callout warn">The trap is easy to set by accident. Any hand-computed L1 offset that is not a multiple of 32 (a 4-byte header in front of a tile, a struct field, a stick of 2 bf16 values) misaligns a DRAM read on Wormhole, and on Blackhole the step is 64 B. On silicon with Watcher off, nothing tells you.</div>
+
+  <h2 id="barrier">5. The missing barrier that ttsim cannot see</h2>
+  <h3>Remove the barrier</h3>
+  <p>Now the other half of the opening puzzle. Remove the stray overlay from section 4, then overlay loopback's kernel without its read barrier:</p>
+  <div class="filename">sim-labs/patches/b05-no-read-barrier.patch</div>
+<pre><code>         noc_async_read_page(i, in0, l1_buffer_addr);
+-        noc_async_read_barrier();
++        // noc_async_read_barrier();  // B05: removed on purpose</code></pre>
+<pre><code>rm $LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+K=$LAB_HOME/kernels/tt_metal/programming_examples/loopback/kernels; mkdir -p $K
+cp $TT_METAL_HOME/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp $K/
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-no-read-barrier.patch)
+export TT_METAL_SIMULATOR=$HOME/sim/wh/libttsim_wh.so      # stock ttsim
+$EX/metal_example_loopback</code></pre>
+<pre><code>Test Passed
+[7213] 0.2 seconds (25.8 KHz)</code></pre>
+  <p>It passes, 100 clocks sooner than with the barrier (7213 against 7313): two clocks per iteration for a barrier poll that is no longer there. The kernel now issues a read and, a few instructions later, a write that copies the same L1 slot to DRAM. On silicon the write could easily go out before the read's data has arrived. Why does ttsim never see that?</p>
+
+  <h3>Why it passes: the counter moves inside the store</h3>
+  <p>Look again at the last two lines of ttsim's read branch above:</p>
+<pre><code>        tile_rd_bytes(src_coordinate, src_addr, &amp;p_tile-&gt;sram[dst_addr], noc_at_len_be);
+        p_tile-&gt;niu_mst_rd_resp_received[noc_instance]++;</code></pre>
+  <p><code>tile_rd_bytes</code> is a <code>memcpy</code> out of the DRAM array (<code>tile.cpp:2769-2786</code>). Both lines run inside <code>noc_cmd_ctrl</code>, which runs inside the handler for the RISC-V store to <code>NOC_CMD_CTRL</code>, which runs inside one <code>rv32_step</code>. By the time the RISC-V core executes its next instruction, the 2048 bytes are in L1 and the response counter has gone up. Now look at what the barrier waits for:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc_nonblocking_api.h:448-452, 461-463 @7aad8aac</div>
+<pre><code>    NOC_CMD_BUF_WRITE_REG(noc, cmd_buf, NOC_CMD_CTRL, NOC_CTRL_SEND_REQ);
+    if constexpr (noc_mode == DM_DEDICATED_NOC) {
+        noc_reads_num_issued[noc] += 1;
+    }
+}
+...
+inline __attribute__((always_inline)) bool ncrisc_noc_reads_flushed(uint32_t noc) {
+    return (NOC_STATUS_READ_REG(noc, NIU_MST_RD_RESP_RECEIVED) == noc_reads_num_issued[noc]);
+}</code></pre>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1919-1931 @7aad8aac (condensed)</div>
+<pre><code>void noc_async_read_barrier(uint8_t noc = noc_index) {
+    WAYPOINT("NRBW");
+    ...
+        while (!ncrisc_noc_reads_flushed(noc));
+    invalidate_l1_cache();
+    WAYPOINT("NRBD");</code></pre>
+  <p>The firmware counts what it issued (<code>noc_reads_num_issued</code>) and spins until the NIU's hardware counter reaches the same value. ttsim answers that counter read from the field it has already incremented (<code>tile.cpp:1354</code>). In stock ttsim the two counts are always equal by the time anyone looks, so the barrier's loop body never runs and removing it changes nothing about the data. The bug is real. ttsim's model has no window in which it could show.</p>
+  <p>On silicon there is a window. The read request travels to the DRAM tile, the controller fetches the data, and 65 flits come back over the NoC, while the RISC-V core keeps executing. A08 estimated about 100 NoC cycles for exactly this read with no congestion, and DRAM latency and traffic only add to that. The write that follows reads the L1 slot through the NIU when it is issued. If the response has not landed yet, the write ships the <em>previous</em> tile, or whatever was in that L1 before. Worse, whether it does depends on traffic, so the kernel might pass a thousand times and then fail in production.</p>
+
+  <h3>Make ttsim honest about one delay</h3>
+  <p>The fix to the model is small: do not finish a Tensix read when it is issued. Queue it, and complete it on a later clock, doing the copy and the counter increment together, as the hardware's response would. Until then the read also counts as outstanding for its transaction ID, the counter that <code>noc_async_read_barrier_with_trid</code> polls (<code>noc_nonblocking_api.h:465-467</code>), so trid barriers wait for it too. That is <code>b05-delay-reads.patch</code>, applied on top of the logging patch:</p>
+<pre><code>$W/build_ttsim.sh lazy wh                     # copy
+(cd $LAB_HOME/ttsim-lazy &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch &amp;&amp; patch -p1 &lt; $P/b05-delay-reads.patch)
+$W/build_ttsim.sh lazy wh                     # rebuild
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-lazy-wh-release/libttsim.so</code></pre>
+  <div class="filename">sim-labs/patches/b05-delay-reads.patch (ttsim/src/tile.cpp and src/libttsim.cpp @b3620244, core of the change)</div>
+<pre><code>+struct PendingRead { uint64_t due, issued; uint32_t chip, tile_id, noc, txn_id, src_coord; uint64_t src_addr, dst_addr; uint32_t len; };
++static std::vector&lt;PendingRead&gt; s_pending_reads;
+...
++void ttsim_b05_complete_reads() { // called once per clock from clock_current_chip()
++    for (size_t i = 0; i &lt; s_pending_reads.size();) {
++        PendingRead r = s_pending_reads[i];
++        if ((r.chip != g_current_chip_id) || (r.due &gt; g_clock)) { i++; continue; }
++        s_pending_reads.erase(s_pending_reads.begin() + i);
++        TensixTile *p_tile = &amp;g_t_tiles[r.tile_id];
++        tile_rd_bytes(r.src_coord, r.src_addr, &amp;p_tile-&gt;sram[r.dst_addr], r.len);
++        p_tile-&gt;niu_mst_rd_resp_received[r.noc]++;
++        p_tile-&gt;niu_mst_reqs_outstanding[r.noc][r.txn_id]--;
++        ttsim_printf("NOCLOG   done   READ issued at [%llu] ...\n", ...);
++    }
++}
+...
+         } else if (src_tile_type != 'P') { // L1 -&gt; L1
+             ...
+         }
++        if ((tile_type == 'T') &amp;&amp; noc_read_delay()) { // B05: deliver the data and bump the counter later
++            s_pending_reads.push_back({g_clock + noc_read_delay(), g_clock, g_current_chip_id, tile_id, noc_instance, txn_id,
++                src_coordinate, src_addr, dst_addr, noc_at_len_be});
++            p_tile-&gt;niu_mst_reqs_outstanding[noc_instance][txn_id]++;
++            return;
++        }
+         tile_rd_bytes(src_coordinate, src_addr, &amp;p_tile-&gt;sram[dst_addr], noc_at_len_be);
+         p_tile-&gt;niu_mst_rd_resp_received[noc_instance]++;
+--- libttsim.cpp
+ static void clock_current_chip() {
++    ttsim_b05_complete_reads(); // B05</code></pre>
+  <p>The delay comes from the environment variable <code>TTSIM_NOC_READ_DELAY</code>, in ttsim clocks, and defaults to 0, which is stock behaviour. All of <code>noc_cmd_ctrl</code>'s checks still run at issue time, so the alignment trap still fires at the same clock. The DRAM range check from section 6 lives inside <code>tile_rd_bytes</code>, so it moves to completion time with the copy. Only reads issued by Tensix tiles are delayed; Ethernet cores and everything else keep the instant path. Completion runs at the top of each clock, before any core steps, so a read due on clock <i>c</i> is visible to every instruction executed on clock <i>c</i>.</p>
+  <p>First, a control. The <b>stock</b> kernel, barrier intact, with a 200-clock delay:</p>
+<pre><code>(remove the loopback overlay)
+TTSIM_NOC_READ_DELAY=200 $EX/metal_example_loopback</code></pre>
+<pre><code>[4373] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,11):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+[4573] NOCLOG   done   READ issued at [4373] core=T(1,1) dst=0x16d800 len=2048
+[4589] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,11):0x2d7440 len=2048
+[4625] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,1):0x402d4c40 dst=T(1,1):0x16d800 len=2048
+[4825] NOCLOG   done   READ issued at [4625] core=T(1,1) dst=0x16d800 len=2048
+[4841] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,1):0x402d7440 len=2048
+...
+Test Passed
+[17113] 0.4 seconds (43.2 KHz)</code></pre>
+  <p>The barrier now has something to do: it spins for 200 clocks, and the write goes out 16 clocks after the data lands. The total grows from 7313 to 17113 clocks, exactly 50 × 196 more. The patch did not break correct code. Now the kernel <b>without</b> the barrier:</p>
+<pre><code>(re-apply b05-no-read-barrier.patch to the overlay)
+TTSIM_NOC_READ_DELAY=200 $EX/metal_example_loopback</code></pre>
+<pre><code>[4373] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,11):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+[4391] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,11):0x2d7440 len=2048
+[4427] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,1):0x402d4c40 dst=T(1,1):0x16d800 len=2048
+[4445] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,1):0x402d7440 len=2048
+[4481] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,5):0x2d4c40 dst=T(1,1):0x16d800 len=2048
+[4499] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,5):0x2d7440 len=2048
+[4535] NOCLOG READ   noc=0 core=T(1,1) buf=1 ack  src=D(0,7):0x402d4c40 dst=T(1,1):0x16d800 len=2048
+[4553] NOCLOG WRITE  noc=0 core=T(1,1) buf=0 ack  src=T(1,1):0x16d800 dst=D(0,7):0x402d7440 len=2048
+[4573] NOCLOG   done   READ issued at [4373] core=T(1,1) dst=0x16d800 len=2048
+...
+… | critical |  Always | TT_THROW: Test Failed (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'</code></pre>
+  <p>There it is. Four reads and four writes go out before the first read's data lands at clock 4573. Each write copies an L1 slot that does not hold its tile yet, and the host's comparison fails. The bug was in the kernel all along. The patched simulator just stopped hiding it.</p>
+  <p>How big must the delay be? Sweep it with the barrier still removed:</p>
+  <table class="t">
+    <tr><th>TTSIM_NOC_READ_DELAY</th><th>0</th><th>1</th><th>5</th><th>10</th><th>17</th><th>18</th><th>19</th><th>20</th><th>50</th><th>200</th></tr>
+    <tr><td>no read barrier</td><td>Passed</td><td>Passed</td><td>Passed</td><td>Passed</td><td>Passed</td><td>Passed</td><td style="color:var(--red)">Failed</td><td style="color:var(--red)">Failed</td><td style="color:var(--red)">Failed</td><td style="color:var(--red)">Failed</td></tr>
+    <tr><td>with barrier (stock kernel)</td><td>Passed, 7313</td><td colspan="5"></td><td>Passed, 8113</td><td></td><td>Passed, 9613</td><td>Passed, 17113</td></tr>
+  </table>
+  <p>The edge is sharp and the log explains it. Without the barrier, each write is issued exactly 18 clocks after its read (4373 → 4391). If the data is due on clock 4391 or earlier, completion runs at the top of that clock and the write copies the right bytes. If it is due on 4392, the write wins the race. On this simulator the race window is 18 clocks, roughly the instructions between the two stores. On silicon there is no fixed number. It is "DRAM latency plus NoC latency, versus however fast your code reaches the next use", and that changes with traffic, placement and the compiler.</p>
+
+  <div class="viz" id="fig-race"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-race");
+    var g = TT.canvas(root, 900, 270), ctx = g.ctx, C = TT.C;
+    var bar = document.createElement("div"); bar.className = "sliderbar";
+    bar.innerHTML = '<label>read delay (ttsim clocks)</label><input type="range" min="0" max="60" value="0" id="race-d"><span id="race-v" style="font-family:var(--mono);min-width:3em"></span>' +
+      '<label><input type="checkbox" id="race-b"> keep noc_async_read_barrier()</label>';
+    root.appendChild(bar);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    var sd = bar.querySelector("#race-d"), sb = bar.querySelector("#race-b"), sv = bar.querySelector("#race-v");
+    var X0 = 80, PX = 11; // pixels per clock, clock 0 = read issued at [4373]
+    function xc(c) { return X0 + c * PX; }
+    function draw() {
+      var d = +sd.value, bar_ = sb.checked;
+      sv.textContent = d;
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "clocks after the read is issued at [4373]", 450, 16, { align: "center", font: "13px", color: C.muted });
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      for (var c = 0; c <= 70; c += 10) { ctx.beginPath(); ctx.moveTo(xc(c), 40); ctx.lineTo(xc(c), 220); ctx.stroke(); TT.text(ctx, "+" + c, xc(c), 235, { align: "center", font: "11px", color: C.muted }); }
+      // lanes
+      TT.text(ctx, "BRISC", 12, 80, { font: "13px" });
+      TT.text(ctx, "NoC / L1", 12, 160, { font: "13px" });
+      // read issue
+      TT.box(ctx, xc(0) - 2, 66, 8, 28, { fill: C.blue, r: 2 });
+      TT.text(ctx, "READ issued", xc(0) + 10, 56, { font: "11px", color: C.blue });
+      // data lands
+      var land = d;
+      TT.box(ctx, xc(0), 150, Math.max(2, land * PX), 20, { fill: C.blue, alpha: 0.18, r: 3 });
+      TT.text(ctx, d === 0 ? "data + counter at once (stock ttsim)" : "response in flight", xc(0) + 6, 140, { font: "11px", color: C.muted });
+      TT.box(ctx, xc(land) - 2, 146, 6, 28, { fill: C.green, r: 2 });
+      TT.text(ctx, "data lands, RD_RESP_RECEIVED++", Math.min(xc(land) + 8, 640), 186, { font: "11px", color: C.green });
+      // write
+      var w, note;
+      if (bar_) {
+        w = d === 0 ? 20 : land + 16;
+        note = "With the barrier the write waits for the counter. Measured: write at +20 for delay 0, +36 (= 19 + 17) for 19, +66 (= 50 + 16) for 50 and +216 for 200. Every run passed.";
+      } else {
+        w = 18;
+        note = "Without the barrier the write is issued at +18 whatever the delay (measured: [4391]). ";
+      }
+      var ok = bar_ || land <= w;
+      TT.box(ctx, xc(Math.min(w, 70)) - 2, 66, 8, 28, { fill: ok ? C.orange : C.red, r: 2 });
+      TT.text(ctx, "WRITE issued, copies L1 0x16d800" + (w > 70 ? " (off scale)" : ""), Math.min(xc(Math.min(w, 70)) + 10, 640), 56, { font: "11px", color: ok ? C.orange : C.red });
+      TT.box(ctx, 700, 190, 180, 34, { fill: ok ? C.green : C.red, alpha: 0.25, stroke: ok ? C.green : C.red, r: 6, label: ok ? "Test Passed" : "Test Failed", font: "15px" });
+      if (!bar_) note += ok ? "The data landed at +" + land + ", no later than the write, so the copy is correct and the bug stays hidden. (Measured: passes up to 18.)"
+                            : "The data lands at +" + land + ", after the write has already copied the slot. The output tile is stale. (Measured: fails from 19 up.)";
+      narr.innerHTML = note;
+    }
+    sd.oninput = draw; sb.onchange = draw; draw();
+  })();
+  </script>
+
+  <div class="callout key">A barrier is not a performance hint. It is the only thing that turns "I asked for the data" into "the data is here". ttsim completes transfers instantly, so it proves your kernel is correct <em>if transfers were instant</em>, which is a weaker claim than "correct".</div>
+
+  <h3>Can Watcher's delays find it instead?</h3>
+  <p>Watcher has a feature that sounds made for this: <code>TT_METAL_WATCHER_DEBUG_DELAY</code> inserts a delay of N cycles before NoC transactions on chosen cores and RISCs (<code>watcher.rst:265-283</code>). I tried it on the barrier-less kernel:</p>
+<pre><code>TT_METAL_WATCHER=1 TT_METAL_WATCHER_DEBUG_DELAY=1000 TT_METAL_READ_DEBUG_DELAY_CORES=0,0 \
+    TT_METAL_READ_DEBUG_DELAY_RISCVS=BR $EX/metal_example_loopback      # stock ttsim</code></pre>
+<pre><code>… | info | Metal | Configured Watcher debug delays for device 0, core 18-18: read_delay_cores_mask=0x1, … Delay cycles: 1000
+Test Passed
+[102877] 13.1 seconds (7.8 KHz)
+real	4m44.401s</code></pre>
+  <p>It passes, and the reason is in the code. The delay is inserted by the sanitizer macro <em>before</em> the request is issued (<code>debug_insert_delay</code> at <code>sanitize.h:951</code>, which runs <code>riscv_wait</code> on the wall clock). It slows the core down. On silicon that perturbs the timing between cores and can expose races between <em>different</em> cores. It cannot open a window between a request and its completion inside ttsim, where that window is zero no matter how long the core waits beforehand. Also note the cost: 4 min 44 s of wall time for 50 tiles, because <code>riscv_wait</code> polls the clock register and every poll is a simulated step.</p>
+
+  <h2 id="overrun">6. Optional: running off the end of DRAM</h2>
+  <p>ttsim also checks the size of the memory a transfer touches. Every DRAM access in <code>tile_rd_bytes</code> and <code>tile_wr_bytes</code> passes through:</p>
+  <div class="filename">ttsim/src/tile.cpp:2785, 2832 @b3620244</div>
+<pre><code>        TTSIM_VERIFY(addr + size &lt;= DRAM_CHANNEL_SIZE, UndefinedBehavior, "DRAM read overrun");
+        TTSIM_VERIFY(addr + size &lt;= DRAM_CHANNEL_SIZE, UndefinedBehavior, "DRAM write overrun");</code></pre>
+  <p><code>DRAM_CHANNEL_SIZE</code> is 2 GiB per controller on Wormhole (<code>config.h:35</code>), matching the ISA's map: <code>0x0_0000_0000</code>–<code>0x0_7FFF_FFFF</code> is GDDR6 channels 0 and 1, and <code>0x0_8000_0000</code> upwards is reserved (<code>WormholeB0/DRAMTile/README.md:40-42</code>). The overlay <code>b05-overrun-kernel.patch</code> aims the first read of <code>add_2_integers_in_riscv</code> at the last 32 bytes of the controller and asks for 64:</p>
+<pre><code>+    src0_dram_noc_addr = (src0_dram_noc_addr &amp; ~0xFFFFFFFFull) | 0x7FFFFFE0;  // B05: last 32 B of the 2 GiB controller ...
+-    noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
++    noc_async_read(src0_dram_noc_addr, src0_l1 - 32, 64);  // B05: ... and read 64 B, running 32 B past its end</code></pre>
+  <p>The destination is <code>src0_l1 - 32</code> because <code>src0_l1</code> is <code>0x16dfe0</code>, the last 32 bytes of the allocatable L1. My first try, reading 64 B into <code>src0_l1</code> itself, ran off the top of L1 first, and both layers reported that instead (ttsim: <code>UnsupportedFunctionality: noc_cmd_ctrl: read: dst_addr=0x16dfe0</code>; Watcher: "Local L1 address overflow"). With the fix:</p>
+<pre><code>$EX/metal_example_add_2_integers_in_riscv
+[4343] ERROR: UndefinedBehavior: tile_rd_bytes: DRAM read overrun
+
+TT_METAL_WATCHER=1 $EX/metal_example_add_2_integers_in_riscv
+[6584] ERROR: UndefinedBehavior: tile_rd_bytes: DRAM read overrun
+real	0m7.665s</code></pre>
+  <p>This time <b>Watcher lets it through</b> and only ttsim catches it. Watcher's DRAM check compares against <code>core_info-&gt;noc_dram_addr_end</code> (<code>sanitize.h:250-263</code>), which the host fills from <code>soc_d.dram_core_size</code> (<code>risc_firmware_initializer.cpp:929-930</code>), defined as <code>num_dram_views_in_descriptor * dram_view_size</code> (<code>metal_soc_descriptor.cpp:375</code>): 12 × 1 GiB = 12 GiB. That is the size of the <em>whole chip's</em> DRAM, used as the bound for an address on <em>one</em> DRAM tile, which can only hold 2 GiB. An address of 0x8000_0000 is reserved on a Wormhole DRAM tile but passes Watcher's check. I found no comment in tt-metal explaining the choice; it looks like a deliberately loose bound rather than a model of one tile. So the two layers are not nested: each catches things the other misses.</p>
+
+  <h2 id="exercises">7. Exercises, with answers</h2>
+  <details class="quiz"><summary>E1. Predict the DRAM tile and NoC address of page 37's read in the loopback log, then find the line.</summary>
+  <p>Bank = 37 mod 12 = 1, row = ⌊37/12⌋ = 3. Bank 1 is tile (0,1) at +1 GiB. Address = 0x2d4c40 + 3 × 0x800 + 0x40000000 = <code>0x402d6440</code>. The log has <code>[6445] NOCLOG READ … src=D(0,1):0x402d6440</code>: the 75th line overall, page 37's read. <code>noc_banks.py</code> checks the same arithmetic for all 50 pages at once.</p></details>
+  <details class="quiz"><summary>E2. Misalign loopback instead (<code>l1_buffer_addr + 4</code> in <code>noc_async_read_page</code>). ttsim reports <code>UnsupportedFunctionality: noc_cmd_ctrl: read: dst_addr=0x16d804</code>, not an alignment error. Why?</summary>
+  <p>The read branch checks the destination range before the alignment (<code>tile.cpp:1602</code> comes before <code>1610</code>). 0x16d804 + 2048 = 0x16e004, past the 0x16e000 end of L1, because loopback's L1 buffer sits right at the top. Checks fire in source order, so the first rule broken is the one reported. A 4-byte read (as in <code>add_2</code>) isolates the alignment rule.</p></details>
+  <details class="quiz"><summary>E3. In section 4, change the offset from +4 to +16, then to +32. Predict, then run.</summary>
+  <p>+16: <code>0x16dff0 &amp; 31 = 16 ≠ 0</code>, so it still breaks C32. Measured: <code>[4343] ERROR: UndefinedBehavior: … dst_addr=0x16dff0 does not match</code>. A +16 offset would be legal for an L1 → L1 read (C16), so this is the DRAM-specific rule. +32: aligned, but <code>0x16e000</code> is one byte past the end of L1. Measured: <code>UnsupportedFunctionality: noc_cmd_ctrl: read: dst_addr=0x16e000</code>. Had the buffer been lower in L1, +32 would pass both checks and the add would simply use the wrong data: perfectly aligned, still a bug.</p></details>
+  <details class="quiz"><summary>E4. In the multicast run, how many times does the sender's <code>NIU_MST_WR_ACK_RECEIVED</code> go up, and what must the firmware's count be for the final <code>noc_async_write_barrier()</code> to return?</summary>
+  <p>Two non-posted multicasts × 3 receivers = 6 increments in ttsim's multicast loop (<code>tile.cpp:1511-1514</code>). The firmware adds <code>num_dests</code> per multicast, so 3 + 3 = 6 (the 4-byte semaphore multicast is counted the same way). The barrier compares the two. If <code>num_dests</code> were 4, the software count would be 8, the hardware count would stop at 6, and the barrier would spin forever, even in ttsim.</p></details>
+  <details class="quiz"><summary>E5. Extend <code>b05-delay-reads.patch</code> to delay writes too (data copy and <code>niu_mst_wr_ack_received</code>). Which barrier in loopback now becomes necessary, and what failure would removing it cause?</summary>
+  <p>I have not run this one; this is the expected result. With writes delayed, <code>noc_async_write_barrier()</code> is what keeps the next iteration's read from overwriting the L1 slot before the delayed write has copied it. Remove it and the read for page <i>i</i>+1 lands while write <i>i</i> is still pending, so DRAM receives tile <i>i</i>+1 in tile <i>i</i>'s slot. One subtlety: in this simple model the copy happens at completion time. Real hardware reads the source L1 as the request's data flits leave, which is earlier than the ack, so the barrier is conservative. That is why tt-metal also has <code>noc_async_writes_flushed()</code> (data sent) as a cheaper alternative to the full ack barrier.</p></details>
+  <details class="quiz"><summary>E6. Why does Watcher catch the misaligned read but not the DRAM overrun, while ttsim catches both?</summary>
+  <p>Watcher's alignment check uses the exact per-target rule (<code>NOC_DRAM_READ_ALIGNMENT_BYTES</code> = 32), but its DRAM range check uses a whole-chip bound (12 views × 1 GiB = 12 GiB) rather than the 2 GiB a single DRAM tile exposes. ttsim stores DRAM per controller (<code>DRAM_CHANNEL_SIZE</code> = 2 GiB) and checks each access against that. A write-up of this mismatch would be a reasonable issue to file upstream.</p></details>
+
+  <div class="callout sim">Next: <a href="b06-cbs-and-semaphores.html">B06</a> follows circular buffers and semaphores with DPRINT, building on the multicast handshake from section 3. The concepts behind this lab are in <a href="../chapters/a08-noc.html">A08</a> (routes, counters, barriers) and <a href="../chapters/a09-memory.html">A09</a> (banks and interleaving). <a href="../chapters/a11-dataflow-and-cbs.html">A11</a> covers <code>noc_async_*</code> and Watcher from the programmer's side.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>All NoC traffic in ttsim passes through <code>noc_cmd_ctrl</code> (<code>tile.cpp:1397-1623</code>), entered from the store to <code>NOC_CMD_CTRL</code>. One <code>printf</code> after coordinate translation logs every transfer's kind, NoC, core, ends, addresses, length and multicast rectangle.</li>
+    <li>Loopback's 100 transfers alternate READ/WRITE on NoC 0 from core (1,1). Pages go to bank <i>p</i> mod 12 at row ⌊<i>p</i>/12⌋ for all 50 pages, banks 0–1 get five pages and 2–11 four, and odd banks appear as +1 GiB addresses on the controller's second tile.</li>
+    <li>The multicast example is a read, three semaphore atomics, a 2 KiB multicast to rectangle (2,1)–(4,1) with three receivers, a 4-byte flag multicast, and three NoC 1 writes back to DRAM. Ack counts scale with the number of receivers.</li>
+    <li>Alignment is an ISA rule (C16 from L1, C32 from DRAM on Wormhole, 64 B on Blackhole), and violating it is undefined behaviour. With Watcher on, the kernel's own sanitizer catches it before the request is issued and the host reports it. Without Watcher, ttsim's model of the NIU catches it as <code>UndefinedBehavior</code> and exits. On silicon without Watcher, nothing catches it.</li>
+    <li>Stock ttsim completes each transfer, data and counter, inside the issuing store, so every barrier is already satisfied and a missing barrier cannot fail. Delaying read completion by 19 or more clocks in a patched ttsim makes the barrier-less loopback fail; 18 or less passes, because the write follows its read by exactly 18 clocks.</li>
+    <li>Watcher's debug delays slow the core before a request, so they cannot expose a request-to-completion race in ttsim. Watcher's DRAM range check uses a 12 GiB bound and misses an overrun of a 2 GiB tile that ttsim catches.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A colleague's kernel passes in ttsim with Watcher on. Name two kinds of NoC bug it could still contain on silicon.</summary><p>Races that depend on timing: missing or misplaced barriers (section 5), and ordering between NoC 0 and NoC 1, or between VCs, which ttsim cannot reorder because every transfer is instant (A08). Also anything Watcher checks loosely, such as DRAM addresses below 12 GiB but beyond one tile's 2 GiB (section 6), if the code was never also run without Watcher on ttsim.</p></details>
+  <details class="quiz"><summary>2. Why does the Watcher run print no NOCLOG line for the misaligned read, even though the logging ttsim was loaded?</summary><p>The sanitizer runs before <code>ncrisc_noc_fast_read</code> and parks the core in <code>while (1)</code>, so the store to <code>NOC_CMD_CTRL</code> never happens and <code>noc_cmd_ctrl</code> is never called. The logger lives in <code>noc_cmd_ctrl</code>.</p></details>
+  <details class="quiz"><summary>3. In stock ttsim, what value does the barrier's first read of <code>NIU_MST_RD_RESP_RECEIVED</code> return, relative to <code>noc_reads_num_issued</code>?</summary><p>Exactly equal. ttsim incremented <code>niu_mst_rd_resp_received</code> inside the issuing store (<code>tile.cpp:1621</code>), and the firmware incremented its count right after that store (<code>noc_nonblocking_api.h:449-451</code>). The loop condition is false on the first test.</p></details>
+  <details class="quiz"><summary>4. Why is the race threshold in section 5 exactly 18/19 clocks, and why is that number meaningless for silicon?</summary><p>The log shows each write issued 18 ttsim clocks after its read, and the patch completes due reads at the start of a clock, before cores step. A read due at +18 is in L1 when the write executes at +18; one due at +19 is not. The 18 counts simulator steps of the RISC-V code between two stores. Silicon's window is set by DRAM and NoC latency and traffic, which ttsim does not model.</p></details>
+  <details class="quiz"><summary>5. Bank 1's tile (0,1) is 1 NoC 0 hop from core (1,1) for read data, but writes to it take far more. How many, and why?</summary><p>A write from (1,1) to (0,1) carries its data on the request leg, from the core to the DRAM tile. NoC 0 only goes right and down: x from 1 to 0 wraps through 2…9, which is 9 hops, and y does not change. So 9 hops, against 1 hop for read data coming from (0,1) to (1,1). Using NoC 1 for the write would make it 1 hop, which is why the convention puts writers on NoC 1 (A08). Loopback uses NoC 0 for both.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Alignment.md">tt-isa-documentation: NoC address alignment</a>: the C4/C16/C32 table this lab's trap is built on.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Counters.md">tt-isa-documentation: NIU counters</a>: which counter moves when, which is what every barrier polls.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Ordering.md">tt-isa-documentation: NoC ordering</a>: why only counters and barriers give you ordering.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/DRAMTile/README.md">tt-isa-documentation: DRAM tiles</a>: the 2 GiB data window per tile and the reserved space above it.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">TT-Metalium docs: Watcher</a>: enabling Watcher, NoC sanitizing, waypoints and debug delays.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/data_movement/ordering.html">TT-Metalium docs: Ordering (NOC, CMD_BUF, VC)</a>: the programmer's view of command buffers and write ordering.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/memory_for_kernel_developers.html">Memory from a kernel developer's perspective</a>: interleaving, pages and alignment from the kernel's side.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/loopback">loopback example</a>: the host program and kernel used in sections 2 and 5.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/contributed/multicast">contributed multicast example</a>: coordinator, inbound and outbound kernels from section 3.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/sim_error_handling.md">ttsim: error handling</a>: what UndefinedBehavior, UnsupportedFunctionality and UnimplementedFunctionality mean.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md">Tech report: Saturating DRAM bandwidth</a>: what the timing ttsim leaves out costs on silicon, and how barriers with transaction IDs help.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a09-memory.html">&larr; 09 Memory: L1, DRAM, interleaving and sharding</a><a class="next" href="../chapters/a10-first-program.html">10 Your first TT-Metalium program &rarr;</a></div>
+</main>
+</body>
+</html>

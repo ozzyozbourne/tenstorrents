@@ -1,0 +1,31 @@
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -1464,6 +1464,20 @@
+     // XXX Apparently on WH, this writes the translated coords back to the ADDR_MID registers -- not the most straightforward
+     auto [src_tile_type, src_tile_id] = coord_to_tile(src_coordinate);
+     auto [dst_tile_type, dst_tile_id] = coord_to_tile(dst_coordinate);
++    { // B05: log every NoC command (coordinates are NoC 0 physical, after translation)
++        uint32_t me = tile_to_coord(tile_type, tile_id);
++        bool mc = bits<5,5>(noc_ctrl), at = bits<0,0>(noc_ctrl), in = bits<3,3>(noc_ctrl), wr = bits<1,1>(noc_ctrl);
++        const char *kind = mc ? "MCAST" : at ? "ATOMIC" : in ? "INLINE" : wr ? "WRITE" : "READ";
++        ttsim_printf("NOCLOG %-6s noc=%u core=%c(%u,%u) buf=%u %s src=%c(%u,%u):0x%llx dst=%c(%u,%u):0x%llx %s=%u",
++            kind, noc_instance, tile_type, me & 63, me >> 6, cmd_buf, bits<4,4>(noc_ctrl) ? "ack " : "post",
++            src_tile_type, src_coordinate & 63, src_coordinate >> 6, (unsigned long long)src_addr,
++            dst_tile_type, dst_coordinate & 63, dst_coordinate >> 6, (unsigned long long)dst_addr,
++            at ? "op" : "len", noc_at_len_be);
++        if (mc) {
++            printf(" rect=(%u,%u)-(%u,%u)", dst_coordinate_start & 63, dst_coordinate_start >> 6, dst_coordinate & 63, dst_coordinate >> 6);
++        }
++        printf("\n");
++    }
+ 
+     if (bits<5,5>(noc_ctrl)) { // multicast
+         TTSIM_VERIFY((noc_at_len_be >= 1) && (noc_at_len_be <= NOC_MAX_PACKET_SIZE), UnsupportedFunctionality, "multicast: noc_at_len_be=%d", noc_at_len_be);
+@@ -1507,6 +1521,7 @@
+                 if ((multicast_tile_type == tile_type) && (multicast_tile_id == tile_id) && !bits<17,17>(noc_ctrl)) { // to source tile with BRCST_SRC_INCLUDE not set
+                     continue;
+                 }
++                ttsim_printf("NOCLOG   recv T(%u,%u)\n", dst_x, dst_y); // B05: one line per multicast receiver
+                 tile_wr_bytes(dst_coordinate, dst_addr, &p_tile->sram[src_addr], noc_at_len_be);
+                 if (bits<4,4>(noc_ctrl)) { // nonposted
+                     p_tile->niu_mst_wr_ack_received[noc_instance]++;
