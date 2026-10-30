@@ -125,7 +125,7 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
   program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
   Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.
-- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
+- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py`, `py/b11_s0_add.py`, `py/b11_s1_probe.py`, `py/b11_s3_hifi.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
   under ttsim, restarting pytest after each simulator abort and reporting pass/fail/skip/abort counts; sweep one op over
   shapes, dtypes, layouts and memory configs with PCC and the JIT-compiled kernel list per case (private
   `TT_METAL_CACHE` per case); and run one matmul per memory config for NoC counting under `../patches/a20-counters.patch`.
@@ -134,7 +134,8 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/a22_decoder_layer.py`, `py/a22_tt_transformers_block.py`, `py/a22_trace_decode_mlp.py` (chapter A22): a tiny
   Llama decoder layer from TT-NN ops (prefill + paged-KV decode, `--precision perf|bf16`, PCC vs PyTorch); the real
   `tt_transformers` `TransformerBlock` (Llama-3.2-1B config, dummy weights, one decode step; needs `PYTHONPATH=$TT_METAL_HOME`
-  and `A22_FP16_DST=1`, because ttsim cannot run kernels built with `fp32_dest_acc_en=True`); and a traced decode MLP
+  and `A22_FP16_DST=1`, because Wormhole ttsim stops on kernels built with `fp32_dest_acc_en=True`, at an LLK
+  hardware-workaround unpack it rejects as undefined; B08 explains it); and a traced decode MLP
   (run with `TT_METAL_SLOW_DISPATCH_MODE` unset, since trace needs fast dispatch).
 
 ## Common errors

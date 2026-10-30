@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A22 · Capstone: running an LLM · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a21-many-chips.html">&larr; Prev</a>
+  <a href="../index.html#series-b">Series B &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 22</span><span class="tag">Prerequisites: A05–A21</span>
+  <h1><span class="num">22.</span> Capstone: running an LLM</h1>
+  <p class="subtitle">By the end you will be able to follow one token through a Llama decoder layer on Tenstorrent hardware. For each step you will know which TT-NN op runs, where its bytes live, which number format and fidelity tt-metal picks for it, and which earlier chapter explains the mechanism. You will also see why prefill and decode are two different programs, and why decoding one token costs about as much as reading every weight once.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#primer">A transformer in one page</a></li>
+      <li><a href="#layer">One token through one layer</a></li>
+      <li><a href="#config">Who chooses the formats: the model config</a></li>
+      <li><a href="#roofline">Prefill vs decode on the roofline</a></li>
+      <li><a href="#kv">The KV cache, in pages</a></li>
+      <li><a href="#trace">Trace: taking the host out of decode</a></li>
+      <li><a href="#chips">Many chips: one layer split in two</a></li>
+      <li><a href="#sim">Run it: a decoder layer under ttsim</a></li>
+      <li><a href="#contradictions">Where the sources disagree</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#map">What you now understand</a></li>
+      <li><a href="#next">Where to go next</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Tenstorrent's own performance table lists Llama-3.1-8B on a single Wormhole n150 at <b>28.3 tokens per second per user</b> in its performance configuration (<code>models/tt_transformers/PERF.md:27</code>). That is about 35 ms per token. In those 35 ms the chip does roughly 15 billion floating-point operations: two per weight, for about 7.5 billion weights. At the HiFi2 rate from <a href="a20-performance.html">A20</a>, 131 TFLOP/s on 64 cores, that arithmetic takes about 0.1 ms. So where do the other 34.9 ms go?</p>
+  <p>Count bytes instead of FLOPs. In that configuration the MLP's W1 and W3 weights are stored in bfp4 (bfp8 in the last layer) and the rest in bfp8, which comes to about 6.1 GB (derived here from the model's shapes and the formats' bytes per tile, not a published figure). To produce one token the chip has to stream all 6.1 GB out of DRAM, because every layer's weights are needed and together they are about sixty times larger than the roughly 100 MB of L1 on the chip's Tensix cores. At the 240 GB/s that a DRAM-sharded matmul reaches on Wormhole (<code>tech_reports/LLMs/llms.md:1845</code>), that takes at least <b>25 ms</b> (again derived, a lower bound). The measured 35 ms is within a factor of 1.4 of that.</p>
+  <p><strong>Why does generating one token take about as long as reading every weight once?</strong> And if the time goes into reading weights, why does Tenstorrent's report say batching 32 users is nearly free, while prefilling a 128-token prompt (a TTFT of 104 ms in the same table) costs only three decode steps' worth of time for 128 tokens' worth of work? This chapter answers both questions by following one token through the real code in <code>models/tt_transformers</code> at commit 7aad8aac. Every piece is something you have already met in A05–A21. Here they all run together.</p>
+
+  <div class="callout key">An LLM in inference is two programs. <b>Prefill</b> pushes a whole prompt through the model at once. It is a big matmul and is compute-bound. <b>Decode</b> pushes one token per user through the model. It is a skinny matmul, so it is DRAM-bound, and almost every optimization in tt_transformers exists to cut weight bytes or to hide everything that is not a weight read.</div>
+
+  <h2 id="primer">A transformer in one page</h2>
+  <p>Here is a decoder-only transformer such as Llama in small numbers. The token "cat" becomes integer 9031. The embedding table turns that integer into a row of <i>d</i> numbers (<i>d</i> = 4096 for Llama-3.1-8B). That row, called the <i>residual stream</i>, then passes through 32 identical <i>decoder layers</i>. Each layer reads the stream and adds a correction to it:</p>
+<pre><code>h = x + Attention(RMSNorm(x))        # look at earlier tokens
+y = h + MLP(RMSNorm(h))              # think about this token alone
+MLP(z) = W2 · ( SiLU(W1 · z) * (W3 · z) )</code></pre>
+  <p>Attention is the only place where tokens talk to each other. The layer multiplies the normalized stream by three matrices to get a <i>query</i> q, a <i>key</i> k and a <i>value</i> v for each head. It rotates q and k by an angle that depends on the token's position (RoPE). It then compares this token's q with the k of every earlier token, turns the scores into weights with a softmax, and takes the weighted sum of their v's. Llama uses grouped-query attention, so 32 query heads share 8 key/value heads (<code>model_params/Llama-3.1-8B-Instruct/config.json</code>). After the last layer, a final RMSNorm and the <i>LM head</i>, a 4096 × 128,256 matmul, give one score (logit) per vocabulary word. A sampler then picks the next token.</p>
+  <p>Notice what generating a <i>second</i> token needs. Its attention compares against the k and v of every earlier token, but those were already computed when the earlier tokens went through the model. If you keep them, you never compute them again. That stash is the <b>KV cache</b>, and it is why inference splits in two:</p>
+  <ul>
+    <li><b>Prefill</b> processes the user's whole prompt in one pass: <i>S</i> tokens through every matmul at once. It fills the KV cache and produces the first new token.</li>
+    <li><b>Decode</b> then produces one token per user per step. Each step runs the new token through the whole model, appends its k and v to the cache, and reads all the cached ones.</li>
+  </ul>
+  <p>The LLM tech report puts the practical consequence in one table: prefill handles one user and a long sequence with activations in DRAM, while decode handles up to 32 users with one token each and activations in L1 (<code>llms.md:1227-1236</code>). The rest of this chapter is about why.</p>
+
+  <h2 id="layer">One token through one layer</h2>
+  <p>Below is the decoder layer as tt_transformers actually runs it, op by op. The concrete numbers are Llama-3.2-1B on an n150 (<i>d</i> = 2048, 32 heads, 8 KV heads, MLP width 8192), because that is the model this chapter's simulator run builds with the real <code>ModelArgs</code>. That run logged "Attention grid: CoreGrid(x=8, y=4)" and "MLP grid: CoreGrid(x=8, y=8)". Switch between decode and prefill to see the same layer turn into a different program.</p>
+
+  <div class="viz" id="fig-layer"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 1 (the "aha"). One decode step (or one prefill) through a Llama decoder layer in tt_transformers. The highlighted op shows its TT-NN call, the formats of its operands, where its output lives, its fidelity, and the chapter that explains the mechanism. The mini-map shows which memory holds the output: DRAM banks, or the L1 of a set of cores. Sources are cited in each step's narration.</div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-layer");
+    var g = TT.canvas(root, 880, 470), ctx = g.ctx, C = TT.C;
+    var mode = "decode";
+    // Each op: name, then per mode: call, fmt, where, fid, ch, src, map {dram: bool, cores: n}
+    var ops = [
+      { n: "token ids → embedding",
+        d: { call: "ttnn.embedding(ids, table, layout=TILE)", fmt: "table row-major in DRAM → bf16 tiles", where: "DRAM, then resharded to L1 width-sharded (residual grid)", fid: "— (a gather, no math)", ch: "A05, A09, A18", src: "embedding.py:69-71; model.py:750-756", map: { cores: 32 } },
+        p: { call: "ttnn.embedding(ids, table, layout=TILE)", fmt: "table row-major in DRAM → bf16 tiles", where: "DRAM interleaved", fid: "—", ch: "A05, A09, A18", src: "embedding.py:69-71", map: { dram: true } } },
+      { n: "attention RMSNorm",
+        d: { call: "ttnn.rms_norm(x, program_config=LayerNormSharded…)", fmt: "bf16 in, gamma bf16", where: "L1, width-sharded on 8×4 cores", fid: "HiFi2", ch: "A07 (rsqrt on the SFPU), A12", src: "rmsnorm.py:117-122,196-203; model_config.py:2357-2391", map: { cores: 32 } },
+        p: { call: "ttnn.rms_norm(x) (interleaved, split over rows)", fmt: "bf16", where: "DRAM interleaved", fid: "HiFi2", ch: "A07, A12", src: "rmsnorm.py:196-203; llms.md:258-264", map: { dram: true } } },
+      { n: "QKV matmul (fused wqkv)",
+        d: { call: "ttnn.linear, DRAM-sharded program config", fmt: "act bf16 × wqkv bfp8 (12 DRAM banks)", where: "L1, width-sharded", fid: "HiFi2 (LI_QKV_DECODE)", ch: "A06, A09, A15, A20", src: "attention.py:886-895; model_config.py:1857-1876", map: { cores: 32, banks: true } },
+        p: { call: "ttnn.experimental.minimal_matmul (S > 128) on 8×8", fmt: "act bf16 × wqkv bfp8", where: "DRAM interleaved", fid: "HiFi2 (LI_QKV_PREFILL)", ch: "A06, A15, A16", src: "attention.py:1208-1214; model_config.py:1878-1886", map: { dram: true } } },
+      { n: "split into heads",
+        d: { call: "nlp_create_qkv_heads_decode", fmt: "bf16 (required by the op)", where: "L1, height-sharded: one user per core", fid: "—", ch: "A09", src: "attention.py:926-951; model_config.py:1989-2013", map: { cores: 32 } },
+        p: { call: "nlp_create_qkv_heads", fmt: "bf16", where: "DRAM interleaved", fid: "—", ch: "A09", src: "attention.py:1250-1266", map: { dram: true } } },
+      { n: "RoPE on q and k",
+        d: { call: "rotary_embedding_llama(…, is_decode_mode=True)", fmt: "cos/sin fetched per position with ttnn.embedding", where: "L1, height-sharded", fid: "(a matmul with a 32×32 transformation tile)", ch: "A06, A12", src: "rope.py:846-868,995-1000; llms.md:79-90", map: { cores: 32 } },
+        p: { call: "rotary_embedding_llama(…, is_decode_mode=False)", fmt: "full cos/sin for S positions", where: "DRAM interleaved", fid: "—", ch: "A06, A12", src: "attention.py:822-839", map: { dram: true } } },
+      { n: "write K, V to cache",
+        d: { call: "paged_update_cache(keys, k, update_idxs_tensor=pos, page_table)", fmt: "KV cache bfp8", where: "DRAM: [blocks, kv_heads, 32, head_dim]", fid: "—", ch: "A05, A09", src: "attention.py:993-998,545-600", map: { dram: true } },
+        p: { call: "paged_fill_cache(keys, k, page_table, batch_idx=user)", fmt: "typecast to bfp8, then write", where: "DRAM: one block per 32 tokens", fid: "—", ch: "A05, A09", src: "attention.py:1293-1355", map: { dram: true } } },
+      { n: "attention (SDPA)",
+        d: { call: "paged_scaled_dot_product_attention_decode", fmt: "q bf16, K/V bfp8 from DRAM", where: "DRAM (then resharded)", fid: "HiFi2 (SDPA_DECODE), 8×8 grid", ch: "A07 (exp), A15, A16", src: "attention.py:1007-1018; model_config.py:1796-1801", map: { dram: true } },
+        p: { call: "scaled_dot_product_attention(is_causal=True)", fmt: "q, K, V bfp8", where: "DRAM interleaved", fid: "HiFi4 (SDPA_PREFILL)", ch: "A07, A15, A16", src: "attention.py:1404-1414; model_config.py:423", map: { dram: true } } },
+      { n: "concat heads + WO",
+        d: { call: "nlp_concat_heads_decode; ttnn.linear (DRAM-sharded)", fmt: "act bf16 × wo bfp8", where: "L1, width-sharded", fid: "HiFi2 (LI_O_DECODE)", ch: "A06, A09, A21 (all-reduce if >1 chip)", src: "attention.py:1040-1044,1133-1163", map: { cores: 32, banks: true } },
+        p: { call: "nlp_concat_heads; ttnn.linear (2D)", fmt: "act bf16 × wo bfp8", where: "DRAM interleaved", fid: "HiFi2 (LI_O_PREFILL)", ch: "A06, A15, A21", src: "attention.py:1432-1474", map: { dram: true } } },
+      { n: "residual add",
+        d: { call: "ttnn.add(residual, attn_out, memory_config=skip_mem_cfg)", fmt: "bf16", where: "L1, width-sharded (never leaves L1)", fid: "— (FPU ELWADD)", ch: "A12, A14", src: "decoder.py:312,352-353; model_config.py:1352-1382", map: { cores: 32 } },
+        p: { call: "ttnn.add(…, memory_config=DRAM)", fmt: "bf16", where: "DRAM interleaved", fid: "—", ch: "A12, A14", src: "model_config.py:1383-1384", map: { dram: true } } },
+      { n: "MLP RMSNorm",
+        d: { call: "ttnn.rms_norm (sharded)", fmt: "bf16", where: "L1, width-sharded", fid: "HiFi2", ch: "A07, A12", src: "decoder.py:362-363", map: { cores: 32 } },
+        p: { call: "ttnn.rms_norm", fmt: "bf16", where: "DRAM interleaved", fid: "HiFi2", ch: "A07, A12", src: "decoder.py:362-363", map: { dram: true } } },
+      { n: "W1 and W3 (gate, up)",
+        d: { call: "ttnn.linear ×2, DRAM-sharded", fmt: "act bf16 × w1/w3 bfp4 (perf) or bfp8 (accuracy)", where: "L1_WIDTH_SHARDED_MEMORY_CONFIG", fid: "LoFi (perf) / HiFi2 FP16-Dst (accuracy)", ch: "A05, A06, A20", src: "mlp.py:207-240; model_config.py:308-338,1421-1460,1554-1569", map: { cores: 64, banks: true } },
+        p: { call: "ttnn.linear (2D) or minimal_matmul; rows chunked by 1024", fmt: "act bf16 × w1/w3 bfp4 or bfp8", where: "DRAM interleaved", fid: "LoFi / HiFi2", ch: "A06, A15, A16", src: "mlp.py:193-195; model_config.py:1461-1475", map: { dram: true } } },
+      { n: "SiLU(W1·x) × (W3·x)",
+        d: { call: "ttnn.mul(a, b, input_tensor_a_activations=[SILU])", fmt: "bf16 in → bfp8 out", where: "L1, width-sharded", fid: "— (SFPU SiLU fused into the FPU multiply)", ch: "A07, A12", src: "mlp.py:318-324", map: { cores: 64 } },
+        p: { call: "ttnn.mul(…, input_tensor_a_activations=[SILU])", fmt: "bf16 in → bfp8 out", where: "DRAM interleaved", fid: "—", ch: "A07, A12", src: "mlp.py:318-324", map: { dram: true } } },
+      { n: "W2 (down)",
+        d: { call: "ttnn.linear, DRAM-sharded; then tt_all_reduce", fmt: "act bfp8 × w2 bfp8", where: "L1, width-sharded", fid: "HiFi2, FP16 Dst (LI_FF2)", ch: "A06, A20, A21", src: "mlp.py:371-412; model_config.py:417", map: { cores: 32, banks: true } },
+        p: { call: "ttnn.linear (2D) or minimal_matmul", fmt: "act bfp8 × w2 bfp8", where: "DRAM interleaved", fid: "HiFi2, FP16 Dst", ch: "A06, A15", src: "mlp.py:362-370", map: { dram: true } } },
+      { n: "residual add → next layer",
+        d: { call: "ttnn.add(residual, mlp_out)", fmt: "bf16", where: "L1, width-sharded", fid: "—", ch: "A12", src: "decoder.py:404-413", map: { cores: 32 } },
+        p: { call: "ttnn.add", fmt: "bf16", where: "DRAM interleaved", fid: "—", ch: "A12", src: "decoder.py:404-413", map: { dram: true } } },
+      { n: "final norm, LM head, sample",
+        d: { call: "rms_norm; ttnn.linear (DRAM-sharded); ttnn.sampling / argmax", fmt: "LM-head weight bfp8; logits bfp8", where: "L1 → token id on device", fid: "HiFi2", ch: "A07, A17, A20", src: "lm_head.py:265; tt_sampling.py:1421-1429; llms.md:1749-1751", map: { cores: 64, banks: true } },
+        p: { call: "ttnn.slice to the last tile, then the same LM head", fmt: "only 32 rows reach the LM head", where: "interleaved → sharded for the LM head", fid: "HiFi2", ch: "A18, A20", src: "llms.md:1220-1225,1033-1070", map: { cores: 64, banks: true } } }
+    ];
+    var steps = ops.map(function (o, i) { return { dur: 1.3, text: "" }; });
+    function narr(i) {
+      var o = ops[i], m = mode === "decode" ? o.d : o.p;
+      return "<b>" + (i + 1) + ". " + o.n + "</b> (" + mode + "). <code>" + m.call + "</code>. Formats: " + m.fmt +
+        ". Output lives in " + m.where + ". Fidelity: " + m.fid + ". Mechanism: " + m.ch + ". Source: <code>" + m.src + "</code>.";
+    }
+    var api;
+    var ctrl = document.createElement("div");
+    ctrl.className = "controls";
+    ctrl.innerHTML = '<label>Mode <select><option value="decode">decode: 32 users × 1 token</option><option value="prefill">prefill: 1 user × S tokens</option></select></label>';
+    root.appendChild(ctrl);
+    ctrl.querySelector("select").onchange = function (e) { mode = e.target.value; refresh(); api.render(); };
+    function refresh() { for (var i = 0; i < steps.length; i++) steps[i].text = narr(i); }
+    refresh();
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var dec = mode === "decode";
+      TT.text(ctx, dec ? "Decode: x is [1, 1, 32 users, 2048], bf16" : "Prefill: x is [1, 1, S tokens, 2048], bf16", 16, 16, { color: C.yellow, font: "13px" });
+      // op chain
+      var x0 = 16, y0 = 34, w = 250, h = 25, gap = 3;
+      for (var k = 0; k < ops.length; k++) {
+        var y = y0 + k * (h + gap), on = k === i, done = k < i;
+        var col = k <= 7 ? C.blue : (k <= 12 ? C.green : C.purple);
+        TT.box(ctx, x0, y, w, h, { fill: on ? col : C.bg3, alpha: on ? 0.35 + 0.3 * t : 1, stroke: on ? col : (done ? col : C.border), lw: on ? 2.5 : 1 });
+        TT.text(ctx, (k + 1) + ". " + ops[k].n, x0 + 8, y + h / 2, { color: on ? C.fg : (done ? C.fg : C.muted), font: "12px" });
+      }
+      // token marker
+      var ty = y0 + i * (h + gap) + h / 2;
+      ctx.fillStyle = C.yellow; ctx.beginPath(); ctx.arc(x0 + w + 12, ty, 6, 0, Math.PI * 2); ctx.fill();
+      // detail panel
+      var o = ops[i], m = dec ? o.d : o.p, px = 300, py = 34;
+      TT.box(ctx, px, py, 564, 196, { fill: C.bg2, stroke: C.border });
+      TT.text(ctx, o.n, px + 14, py + 18, { color: C.yellow, font: "15px" });
+      var rows = [["TT-NN op", m.call], ["formats", m.fmt], ["output in", m.where], ["fidelity", m.fid], ["mechanism", m.ch], ["source", m.src]];
+      rows.forEach(function (r, j) {
+        TT.text(ctx, r[0], px + 14, py + 48 + j * 24, { color: C.muted, font: "12px" });
+        var s = r[1]; if (s.length > 66) s = s.slice(0, 64) + "…";
+        TT.text(ctx, s, px + 100, py + 48 + j * 24, { color: C.fg, font: "12px", mono: j === 0 || j === 5 });
+      });
+      // mini map: 12 DRAM banks + 8x8 Tensix grid
+      var mx = 300, my = 250;
+      TT.text(ctx, "Where the output lives", mx, my, { color: C.muted, font: "12px" });
+      TT.text(ctx, "12 DRAM banks", mx, my + 22, { color: C.muted, font: "11px" });
+      for (var b = 0; b < 12; b++) {
+        var lit = m.map.dram || (m.map.banks && false);
+        TT.box(ctx, mx + 90 + b * 22, my + 13, 18, 18, { fill: m.map.dram ? C.orange : (m.map.banks ? C.orange : C.bg3), alpha: m.map.dram ? 0.8 : (m.map.banks ? 0.25 : 1), stroke: C.orange, r: 3 });
+      }
+      if (m.map.banks) TT.text(ctx, "weights stream from all 12 banks", mx + 90 + 12 * 22 + 8, my + 22, { color: C.orange, font: "11px" });
+      TT.text(ctx, "8×8 Tensix", mx, my + 50, { color: C.muted, font: "11px" });
+      TT.text(ctx, "grid (L1)", mx, my + 64, { color: C.muted, font: "11px" });
+      var n = m.map.cores || 0;
+      for (var r = 0; r < 8; r++) for (var c = 0; c < 8; c++) {
+        var idx = r * 8 + c, litc = idx < n;
+        TT.box(ctx, mx + 90 + c * 22, my + 42 + r * 20, 18, 16, { fill: litc ? C.green : C.bg3, alpha: litc ? 0.3 + 0.5 * t : 1, stroke: litc ? C.green : C.border, r: 3 });
+      }
+      TT.text(ctx, n ? (n + " cores hold the activation in L1") : "activations are not in L1 between ops", mx + 90 + 8 * 22 + 12, my + 60, { color: n ? C.green : C.orange, font: "12px" });
+      TT.text(ctx, dec ? "Decode keeps activations in L1." : "Prefill keeps them in DRAM: S×2048", mx + 90 + 8 * 22 + 12, my + 84, { color: C.muted, font: "12px" });
+      TT.text(ctx, dec ? "Only weights and the KV cache come from DRAM." : "activations may not fit in L1.", mx + 90 + 8 * 22 + 12, my + 102, { color: C.muted, font: "12px" });
+      TT.text(ctx, "blue: attention   green: MLP   purple: head", mx + 90 + 8 * 22 + 12, my + 140, { color: C.muted, font: "11px" });
+    }
+    api = TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>Three things stand out once you step through both modes.</p>
+  <p><b>First, in decode the activations never touch DRAM.</b> The residual stream is width-sharded across 32 cores as one tile row of 32 users (<code>model_config.py:1352-1382</code>), and each op hands the next one a tensor already sharded the way it wants. The report's advice is blunt: avoid "unnecessary ShardedToInterleaved and InterleavedToSharded calls" (<code>llms.md:1860</code>). This is <a href="a09-memory.html">A09</a>'s sharding and <a href="a20-performance.html">A20</a>'s "activations already in L1" checkbox, applied to a whole model. The only DRAM reads are the weights (orange banks) and the KV cache.</p>
+  <p><b>Second, the weights are spread over the DRAM banks, not interleaved.</b> <code>create_dram_sharded_mem_config</code> width-shards each weight across the 12 Wormhole DRAM banks (8 on a p150, 7 on a p100), padding N so that it divides evenly:</p>
+  <div class="filename">tt-metal/models/tt_transformers/tt/model_config.py:3760-3768 @7aad8aac (trimmed)</div>
+<pre><code>def create_dram_sharded_mem_config(self, k, n, dram_grid=None):
+    dram_cores = self.dram_grid_size.x  # WH has 12 dram cores, P150 has 8, P100 has 7
+    padded_size = math.ceil(n / (ttnn.TILE_SIZE * dram_cores)) * (ttnn.TILE_SIZE * dram_cores)
+    ...
+    shard_spec = ttnn.ShardSpec(dram_grid, (k, padded_size // dram_cores), ttnn.ShardOrientation.ROW_MAJOR)
+    return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)</code></pre>
+  <p>Each bank then holds a contiguous strip of K × (N/12), and the matmul places one reader core next to each bank, so no two banks' traffic shares a NoC route. That is the difference between the ≈190 GB/s an interleaved matmul reads and the ≈240 GB/s a DRAM-sharded one reads (<code>llms.md:1844-1845</code>). It is <a href="a08-noc.html">A08</a>'s routing and <a href="a20-performance.html">A20</a>'s "the routes cross" wall, fixed at the level of data layout.</p>
+  <p><b>Third, the MLP is one fused eltwise op between three matmuls.</b> SiLU is a transcendental and runs on the SFPU (<a href="a07-vector-engine.html">A07</a>), but it is passed as an <i>input activation</i> of the multiply, so the gate tensor is read once and both operations happen in the same kernel:</p>
+  <div class="filename">tt-metal/models/tt_transformers/tt/mlp.py:318-324 @7aad8aac (comments added)</div>
+<pre><code>w2_in = ttnn.mul(
+    w1_out,
+    w3_out,
+    input_tensor_a_activations=[self.activation_type],   # SILU unless the model overrides it
+    dtype=activation_dtype or ttnn.bfloat8_b,             # the product is stored in bfp8
+    memory_config=w1_out.memory_config(),                 # stays width-sharded in L1
+)</code></pre>
+
+  <div class="callout gpu">On a GPU the same layer would keep activations in registers and shared memory inside each fused kernel, and rely on L2 between kernels. Here there is no L2: "stays in L1 between ops" is a <i>layout decision</i> you write into every op's <code>memory_config</code>. If two neighbouring ops disagree about the sharding, a reshard op appears between them, and it costs time just like an extra kernel launch on a GPU.</div>
+
+  <h2 id="config">Who chooses the formats: the model config</h2>
+  <p>Every dtype and fidelity in Figure 1 comes from one place: <code>ModelOptimizations</code> in <code>model_config.py</code>. It groups tensors (<code>TensorGroup</code>: FF1_FF3, FF2, WQKV, WO, KV_CACHE, ACTIVATION) and ops (<code>OpGroup</code>: LI_FF1_FF3, LI_QKV_DECODE, SDPA_PREFILL and so on) and assigns each a precision and a fidelity (<code>model_config.py:79-108</code>). The defaults are:</p>
+  <div class="filename">tt-metal/models/tt_transformers/tt/model_config.py:397-426 @7aad8aac (trimmed)</div>
+<pre><code>def _default_settings(self):
+    """Default is BFP8/HIFI2 everywhere, activation follows input type (usually BF16)
+    Only exceptions:
+    - SDPA runs in HIFI4 during prefill (still HIFI2 during decode)
+    """
+    "TensorPrecision": {
+        TensorGroup.FF1_FF3: PrecisionSetting.BFP8,  TensorGroup.FF2: PrecisionSetting.BFP8,
+        TensorGroup.WQKV: PrecisionSetting.BFP8,     TensorGroup.WO: PrecisionSetting.BFP8,
+        TensorGroup.KV_CACHE: PrecisionSetting.BFP8, TensorGroup.ACTIVATION: None,
+    },
+    "OpFidelity": {
+        OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI2_FP16,   # "BFP8 with FP16 accumulation to save L1"
+        OpGroup.LI_FF2: MathFidelitySetting.HIFI2_FP16,
+        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI2,  OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI2,    OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI2,
+        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI2,   # FP32 accumulate is important here
+    },</code></pre>
+  <p>The <code>performance()</code> preset changes exactly one thing for most models: FF1 and FF3 drop to <b>bfp4 with LoFi</b> (<code>model_config.py:335-338</code>). The <code>accuracy()</code> preset keeps bfp8 for Llama 3, Mistral-7B and Phi-3-mini, because these "test insensitive to attention precision". Other models get bf16 attention weights and KV cache at HiFi4 (<code>model_config.py:254-301</code>). Qwen2.5-7B is degraded by the performance settings, so it gets bf16 attention there too (<code>model_config.py:313-332</code>). Per-layer overrides also exist: Llama-3.1-8B keeps its last layer's FF1/FF3 in bfp8 (<code>model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json</code>, as <code>PERF.md:13-15</code> says).</p>
+  <p>This is the <b>precision ladder</b> from A05, A06 and A20 made concrete. The format and the fidelity move together, as the report's rule of thumb says: "Use HiFi4 for BF16 weights … HiFi2 for BFP8 weights … LoFi for BFP4 weights" (<code>llms.md:1885-1887</code>). The reason is <a href="a06-matrix-engine.html">A06</a>'s multiplier. A bfp4 mantissa fits in the first fidelity phase, so the extra phases would multiply bits that do not exist. The names map onto real compute kernel configs:</p>
+  <table>
+    <tr><th>Setting</th><th>math_fidelity</th><th>math_approx_mode</th><th>fp32_dest_acc_en</th><th>packer_l1_acc</th></tr>
+    <tr><td>LOFI</td><td>LoFi</td><td>False</td><td>False</td><td>True</td></tr>
+    <tr><td>HIFI2</td><td>HiFi2</td><td>True</td><td>True</td><td>True</td></tr>
+    <tr><td>HIFI2_FP16</td><td>HiFi2</td><td>False</td><td>False</td><td>True</td></tr>
+    <tr><td>HIFI4</td><td>HiFi4</td><td>False</td><td>True</td><td>True</td></tr>
+    <tr><td><code>compute_kernel_config_sdpa</code>*</td><td>HiFi4</td><td>False</td><td>True</td><td>False</td></tr>
+  </table>
+  <p style="color:#9aa4b2;font-size:0.9em">Source: <code>models/tt_transformers/tt/model_config.py:933-986</code>. *Defined at 981-986, but tt_transformers' attention does not use it: SDPA prefill gets its config through <code>OpGroup.SDPA_PREFILL</code>, i.e. the HIFI4 row (<code>attention.py:144-145</code>). <code>fp32_dest_acc_en</code> chooses whether the Dst register accumulates in FP32 (4 tiles) or FP16 (8 tiles), from A06 and A12. <code>packer_l1_acc</code> lets the packer add into L1 across K blocks.</p>
+
+  <div class="callout warn"><b>"Which accuracy is enough" is measured, not assumed.</b> The report's targets are PCC ≈ 0.999 for MLP and attention submodules, ≈ 0.998 for a decoder layer and ≈ 0.99 for the whole model, followed by top-1/top-5 token accuracy and perplexity on real data (<code>llms.md:1665-1667</code>). This chapter's simulator run shows why PCC alone is not enough. A layer at PCC 0.9967 still flipped one user's next token, because that user's top two logits were 2.522 and 2.508.</div>
+
+  <h2 id="roofline">Prefill vs decode on the roofline</h2>
+  <p>Now the opening puzzle can be answered with <a href="a20-performance.html">A20</a>'s tool. A matmul's <i>intensity</i> is FLOPs per DRAM byte. For a layer weight of K × N, one pass with M rows of activation does 2·M·K·N FLOPs and must read K·N weights. If the activations stay in L1, that gives</p>
+  <p style="text-align:center"><b>intensity ≈ 2·M ÷ (bytes per weight)</b></p>
+  <p>In decode, M is the number of users. In prefill, M is the number of prompt tokens. The formula is the same and only M changes. With bfp8 weights (1088 bytes per 1024-value tile, so about 1.06 bytes per weight) and 32 users, the intensity is 60 FLOP/B, which is exactly A20's decode limit for bfp8. The Wormhole ridge at HiFi2 is 131 TFLOP/s ÷ 288 GB/s ≈ 455 FLOP/B. Decode at batch 32 sits 7.6× to its left, deep in DRAM-bound territory. A 2048-token prefill sits around 3,900 FLOP/B, 8.5× to its right, and is compute-bound. Drag the sliders.</p>
+
+  <div class="viz" id="fig-roof"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 2. Llama-3.1-8B (7.5 billion weights, embedding excluded) on one Wormhole n150. Compute roofs come from A20's table for the 64 cores a matmul can get. Memory slopes are the 288 GB/s spec and the ≈240 GB/s a DRAM-sharded matmul measures (<code>llms.md:1845</code>). "perf mix" is bfp4 FF1/FF3 plus bfp8 everywhere else, about 0.81 bytes per weight. The step times assume perfect overlap and ignore KV-cache reads, op-to-op gaps and the host. They are lower bounds, not predictions.</div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-roof");
+    var g = TT.canvas(root, 880, 430), ctx = g.ctx, C = TT.C;
+    var P = 7.505e9;
+    var FMT = { "bf16": 2.0, "bfp8": 1088 / 1024, "perf mix": 0.812, "bfp4": 576 / 1024 };
+    var ROOF = { "LoFi": 262, "HiFi2": 131, "HiFi4": 65.5 };
+    var st = { B: 32, S: 128, fmt: "bfp8", fid: "HiFi2", bw: 240 };
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    ctrl.innerHTML =
+      '<label>decode batch B <input type="range" min="0" max="9" step="1" value="5" data-k="B"> <span data-o="B"></span></label>' +
+      '<label>prefill length S <input type="range" min="5" max="14" step="1" value="7" data-k="S"> <span data-o="S"></span></label>' +
+      '<label>weights <select data-k="fmt"><option>bf16</option><option selected>bfp8</option><option>perf mix</option><option>bfp4</option></select></label>' +
+      '<label>fidelity <select data-k="fid"><option>LoFi</option><option selected>HiFi2</option><option>HiFi4</option></select></label>' +
+      '<button data-k="play">Play: sweep B</button>';
+    root.appendChild(ctrl);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    ctrl.querySelectorAll("input,select").forEach(function (el) {
+      el.addEventListener("input", function () {
+        var k = el.getAttribute("data-k");
+        if (k === "B") st.B = Math.pow(2, +el.value);
+        else if (k === "S") st.S = Math.pow(2, +el.value);
+        else st[k] = el.value;
+        draw();
+      });
+    });
+    var playing = false;
+    ctrl.querySelector("button").onclick = function () {
+      if (playing) return; playing = true;
+      var inp = ctrl.querySelector('input[data-k="B"]'), v = 0;
+      (function tick() { inp.value = v; st.B = Math.pow(2, v); draw(); v++; if (v <= 9) setTimeout(tick, 600); else playing = false; })();
+    };
+    var X0 = 80, X1 = 560, Y0 = 380, Y1 = 30;
+    var lx0 = Math.log10(0.5), lx1 = Math.log10(20000), ly0 = Math.log10(0.05), ly1 = Math.log10(500);
+    function px(I) { return X0 + (Math.log10(I) - lx0) / (lx1 - lx0) * (X1 - X0); }
+    function py(T) { return Y0 - (Math.log10(T) - ly0) / (ly1 - ly0) * (Y0 - Y1); }
+    function fmtT(s) { return s < 1e-3 ? (s * 1e6).toFixed(0) + " µs" : (s * 1e3).toFixed(s < 0.01 ? 2 : 1) + " ms"; }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var bpw = FMT[st.fmt], roof = ROOF[st.fid];
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      [1, 10, 100, 1000, 10000].forEach(function (I) { ctx.beginPath(); ctx.moveTo(px(I), Y0); ctx.lineTo(px(I), Y1); ctx.stroke(); TT.text(ctx, String(I), px(I), Y0 + 14, { color: C.muted, align: "center", font: "11px" }); });
+      [0.1, 1, 10, 100].forEach(function (T) { ctx.beginPath(); ctx.moveTo(X0, py(T)); ctx.lineTo(X1, py(T)); ctx.stroke(); TT.text(ctx, String(T), X0 - 6, py(T), { color: C.muted, align: "right", font: "11px" }); });
+      TT.text(ctx, "intensity: FLOP per DRAM byte (log)", (X0 + X1) / 2, Y0 + 32, { color: C.muted, align: "center", font: "12px" });
+      ctx.save(); ctx.translate(22, (Y0 + Y1) / 2); ctx.rotate(-Math.PI / 2); TT.text(ctx, "TFLOP/s (log)", 0, 0, { color: C.muted, align: "center", font: "12px" }); ctx.restore();
+      // roofs
+      Object.keys(ROOF).forEach(function (f) {
+        var R = ROOF[f], on = f === st.fid;
+        ctx.strokeStyle = on ? C.green : C.border; ctx.lineWidth = on ? 2 : 1; ctx.setLineDash(on ? [] : [4, 4]);
+        var ridge = R * 1000 / st.bw;
+        ctx.beginPath(); ctx.moveTo(px(ridge), py(R)); ctx.lineTo(X1, py(R)); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, f + " " + R + " TF/s", px(ridge) - 8, py(R) - 6, { color: on ? C.green : C.muted, align: "right", font: "11px" });
+      });
+      [[288, C.muted, "288 GB/s spec"], [st.bw, C.blue, "240 GB/s DRAM-sharded"]].forEach(function (b, j) {
+        if (j === 0 && st.bw === 288) return;
+        ctx.strokeStyle = b[1]; ctx.lineWidth = j ? 2 : 1;
+        var Iend = roof * 1000 / b[0];
+        ctx.beginPath(); ctx.moveTo(px(0.5), py(0.5 * b[0] / 1000)); ctx.lineTo(px(Iend), py(roof)); ctx.stroke();
+      });
+      TT.text(ctx, "240 GB/s DRAM-sharded", px(2), py(2 * 0.24) + 16, { color: C.blue, font: "11px" });
+      var ridge = roof * 1000 / st.bw;
+      ctx.strokeStyle = C.yellow; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(px(ridge), py(roof)); ctx.lineTo(px(ridge), Y0); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "ridge " + ridge.toFixed(0), px(ridge) + 4, Y0 - 10, { color: C.yellow, font: "11px" });
+      // points
+      function pt(M, col, lab) {
+        var I = 2 * M / bpw, att = Math.min(roof, I * st.bw / 1000);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px(I), py(att), 7, 0, Math.PI * 2); ctx.fill();
+        if (col === C.pink) TT.text(ctx, lab, px(I) + (att < roof ? -10 : 0), py(att) + (att < roof ? 16 : -16), { color: col, font: "12px", align: att < roof ? "right" : "center" });
+        else TT.text(ctx, lab, px(I) + 10, py(att) + 16, { color: col, font: "12px" });
+        return { I: I, att: att };
+      }
+      var d = pt(st.B, C.pink, "decode B=" + st.B), p = pt(st.S, C.orange, "prefill S=" + st.S);
+      // side panel: times for Llama-3.1-8B
+      var bytes = P * bpw;
+      var tdm = bytes / (st.bw * 1e9), tdc = 2 * P * st.B / (roof * 1e12), td = Math.max(tdm, tdc);
+      var tpm = bytes / (st.bw * 1e9), tpc = 2 * P * st.S / (roof * 1e12), tp = Math.max(tpm, tpc);
+      var sx = 590, sy = 40;
+      TT.box(ctx, sx, sy - 12, 280, 352, { fill: C.bg2, stroke: C.border });
+      var L = [
+        ["Llama-3.1-8B, weights " + st.fmt, C.yellow],
+        ["weight bytes per pass: " + (bytes / 1e9).toFixed(2) + " GB", C.fg],
+        ["", C.fg],
+        ["Decode step, B = " + st.B, C.pink],
+        ["  read weights  " + fmtT(tdm), tdm >= tdc ? C.fg : C.muted],
+        ["  math (" + st.fid + ")  " + fmtT(tdc), tdc > tdm ? C.fg : C.muted],
+        ["  ⇒ ≥ " + fmtT(td) + "  (" + (tdm >= tdc ? "DRAM-bound" : "compute-bound") + ")", C.fg],
+        ["  per user: ≤ " + (1 / td).toFixed(1) + " tok/s", C.fg],
+        ["  all users: ≤ " + (st.B / td).toFixed(0) + " tok/s", C.fg],
+        ["", C.fg],
+        ["Prefill, S = " + st.S + " tokens", C.orange],
+        ["  read weights  " + fmtT(tpm), tpm >= tpc ? C.fg : C.muted],
+        ["  math (" + st.fid + ")  " + fmtT(tpc), tpc > tpm ? C.fg : C.muted],
+        ["  ⇒ ≥ " + fmtT(tp) + "  (" + (tpm >= tpc ? "DRAM-bound" : "compute-bound") + ")", C.fg],
+        ["", C.fg],
+        ["Measured, perf config, N150:", C.muted],
+        ["  28.3 tok/s/user, TTFT 104 ms", C.muted],
+        ["  (PERF.md:27, 128-token prompt)", C.muted]
+      ];
+      L.forEach(function (l, j) { TT.text(ctx, l[0], sx + 12, sy + 6 + j * 18.5, { color: l[1], font: "12px", mono: l[0].indexOf("  ") === 0 }); });
+      narr.innerHTML = (tdm >= tdc
+        ? "<b>Decode is DRAM-bound.</b> At B = " + st.B + " the intensity is " + d.I.toFixed(1) + " FLOP/B, " + (ridge / d.I).toFixed(1) + "× left of the ridge. Doubling the batch doubles the useful work and costs almost nothing, because the weights are read once per step whatever B is. The device pads users to a 32-row tile anyway (<code>model_config.py:807</code>), so B = 1 and B = 32 do the same matmul. "
+        : "<b>Decode has crossed the ridge.</b> At B = " + st.B + " the math takes longer than the weight read, so more users now cost time linearly, the regime the report describes for very large batches (<code>llms.md:1116</code>). tt_transformers caps B at 32 per device group (<code>model_config.py:754-757</code>). ") +
+        (tpm >= tpc ? " <b>Prefill at S = " + st.S + "</b> is still memory-bound: too few tokens share each weight read." : " <b>Prefill at S = " + st.S + "</b> is compute-bound: its time grows with S, and only lower fidelity or more cores help.");
+      ctrl.querySelector('[data-o="B"]').textContent = st.B;
+      ctrl.querySelector('[data-o="S"]').textContent = st.S;
+    }
+    draw();
+  })();
+  </script>
+
+  <p>The figure explains several design choices at once:</p>
+  <ul>
+    <li><b>Batching decode is nearly free</b> until B·2 / (bytes per weight) reaches the ridge. That point is about 290 users for bfp8 at HiFi2 on the 240 GB/s line (ridge ≈ 546 FLOP/B), well beyond the cap of 32. The report says the same in words: "LLM inference is bound by time to read model weights from DRAM. Batching allows model weight reuse across multiple sequences" (<code>llms.md:1110-1118</code>). The Short-Context, Batch-32 table shows the cost: Llama-3.1-8B on N150 drops from 28.3 to 22.3 tok/s per user while serving 32× as many users (<code>PERF.md:163</code>).</li>
+    <li><b>Lower fidelity does nothing for decode.</b> Switch HiFi2 to LoFi with B = 32. The roof doubles and the pink dot does not move. The win in the "perf" preset comes from <i>bfp4 bytes</i>, not from LoFi math. LoFi is used because extra phases on 4-bit mantissas are useless, and because a HiFi4 DRAM-sharded decode matmul "would be FLOP-bound on 12 cores" (comments at <code>attention.py:871-872</code> and <code>mlp.py:197-198</code>).</li>
+    <li><b>Prefill wants big matmuls and high fidelity where it matters.</b> It is compute-bound, so fidelity sets its speed. That is why SDPA keeps HiFi4 only in prefill, and why prefill uses 2D multicast matmuls (A16) on the full grid: "Use matmul 2D for all matmuls in prefill mode" (<code>llms.md:1536</code>).</li>
+    <li><b>Short prompts are not yet compute-bound.</b> A 128-token prompt with bfp8 weights sits at about 240 FLOP/B, still left of the ridge, so even this prefill is close to the memory line. The measured 104 ms TTFT covers 128 tokens, while one decode step (35 ms) covers one token per user. Per token, prefill is about 40× cheaper.</li>
+  </ul>
+  <div class="callout warn">The 25 ms lower bound is not reached, and the gap is real. The KV cache is also read each decode step (next section). Some ops (norms, heads, concat) are pure latency. Dispatch adds a gap between every pair of ops. And PERF.md itself is marked "DEPRECATED. PLEASE CHECK THE YAML FILE models/model_targets.yaml" (<code>PERF.md:1</code>), so treat its figures as illustrative at this commit, not as a specification.</div>
+
+  <h2 id="kv">The KV cache, in pages</h2>
+  <p>How big is the cache? Each layer stores k and v for 8 KV heads of 128 values each, so 2 × 8 × 128 = 2048 values per token per layer, or 65,536 per token over 32 layers. In bfp8 that is about 70 KB per token. One user with an 8K context holds 570 MB. Thirty-two users at a 1K context hold 2.3 GB, and decode reads all of it every step, as much as a third of the weight bytes. This is why the KV cache defaults to bfp8 (<code>TensorGroup.KV_CACHE</code> above), and why GQA's 8 KV heads instead of 32 matter four times over.</p>
+  <p>Where should that cache live? A plain tensor of shape [users, heads, max_seq_len, head_dim] reserves the worst case for every user. The <b>paged</b> layout from vLLM (Kwon et al., 2023) splits it into fixed-size <i>blocks</i> and keeps a per-user <i>page table</i> that maps "my block 3" to "physical block 41". tt_transformers adopts it directly. The cache tensor is <code>[max_num_blocks, n_kv_heads, block_size, head_dim]</code> in DRAM (<code>attention.py:550-565</code>), the demo uses <code>block_size</code> 32 (<code>simple_text_demo.py:351</code>), and the page table is an int32 tensor on the device. With 32-token blocks, each block of one head is exactly one tile tall (<a href="a05-tiles-and-formats.html">A05</a>). The animation below replays this chapter's simulator run, then continues it to show how the cache grows.</p>
+
+  <div class="viz" id="fig-kv"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 3. A paged KV cache of 8 physical blocks × 32 tokens, shared by two users. Steps 1–4 are this chapter's ttsim run: page table <code>[[7, 5, 3, 2], [4, 6, 1, 0]]</code>, prompts of 64 and 32 tokens, one decode step, with occupied blocks 3, 4, 5, 6 and 7, as printed by <code>a22_decoder_layer.py</code>. Steps 5–7 extrapolate the same code. The byte counts on the right scale the occupancy up to Llama-3.1-8B (70 KB per token, bfp8, all 32 layers).</div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-kv");
+    var g = TT.canvas(root, 880, 330), ctx = g.ctx, C = TT.C;
+    var PT = [[7, 5, 3, 2], [4, 6, 1, 0]], UC = [C.blue, C.orange];
+    // tokens held by each user after each step (end state); start state is previous step's end
+    var S = [[0, 0], [64, 0], [64, 32], [65, 33], [96, 64], [97, 65], [128, 96]];
+    var steps = [
+      { dur: 1.0, text: "<b>1. Reserve.</b> The demo builds the page table once: a random permutation of the 8 physical blocks, reshaped to 2 users × 4 blocks (<code>simple_text_demo.py:163-174</code>). Nothing is written yet. Each user can grow to 4 × 32 = 128 tokens. The blocks are deliberately shuffled, so the kernels must follow the table." },
+      { dur: 1.4, text: "<b>2. Prefill user 0 (64 tokens).</b> <code>paged_fill_cache(kcache, k, page_table, batch_idx=0)</code> writes virtual blocks 0 and 1 into physical blocks <b>7</b> and <b>5</b>. In the run the K tensor was typecast to bfp8 first: \"paged_fill_cache (K) (1, 6, 64, 32) BFLOAT8_B … written into blocks [7, 5]\"." },
+      { dur: 1.2, text: "<b>3. Prefill user 1 (32 tokens).</b> One block, physical <b>4</b>. Prefill runs one user at a time (<code>llms.md:1232</code>), so a new request can be dropped into any free slot while other users keep decoding. That is continuous batching (<code>llms.md:1432-1455</code>)." },
+      { dur: 1.4, text: "<b>4. One decode step for both users.</b> <code>paged_update_cache(…, update_idxs_tensor=pos, page_table)</code> writes one row per user. User 0's position 64 is virtual block 2, row 0, which is physical block <b>3</b>. User 1's position 32 is virtual block 1, physical block <b>6</b>. The run printed exactly these, and found blocks [3, 4, 5, 6, 7] holding data. Then paged SDPA decode reads 65 + 33 rows through the same table." },
+      { dur: 1.6, text: "<b>5. 31 more decode steps</b> (extrapolated, not run). Each step appends one row per user. No allocation, no copy: the rows land inside blocks that already exist. Every step's attention reads every row written so far, so its DRAM traffic grows linearly with context." },
+      { dur: 1.2, text: "<b>6. Crossing a block boundary</b> (extrapolated). User 0 reaches position 96 and moves into virtual block 3 (physical 2). User 1 reaches 64 and moves into physical 1. This is the only moment a new block is touched, and here it was reserved in step 1." },
+      { dur: 1.4, text: "<b>7. Full</b> (extrapolated). User 0 holds 128 tokens and has used its 4 blocks. In this static demo layout it cannot grow, even though block 0, reserved for user 1, is still empty. A serving engine (vLLM through the TT plugin) instead keeps a free list and hands out blocks on demand, which is the point of paging. The device op is the same; only the page table's contents change, and the generator copies new page tables to the device between traced steps (<code>generator.py:2648-2664</code>)." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var prev = i > 0 ? S[i - 1] : S[0], cur = S[i];
+        var held = [Math.round(TT.lerp(prev[0], cur[0], t)), Math.round(TT.lerp(prev[1], cur[1], t))];
+        if (i === 0) held = [0, 0];
+        var X = 110, Y = 40, cw = 12, ch = 26, gap = 8;
+        TT.text(ctx, "physical KV blocks in DRAM (32 token rows each)", X, 18, { color: C.muted, font: "12px" });
+        // owner of each physical block: [user, virtual idx]
+        var owner = {};
+        PT.forEach(function (row, u) { row.forEach(function (pb, v) { owner[pb] = [u, v]; }); });
+        for (var pb = 0; pb < 8; pb++) {
+          var y = Y + pb * (ch + gap), ow = owner[pb], u = ow[0], v = ow[1];
+          TT.text(ctx, "block " + pb, X - 12, y + ch / 2, { color: C.muted, align: "right", font: "12px" });
+          var filled = Math.max(0, Math.min(32, held[u] - v * 32));
+          for (var r = 0; r < 32; r++) {
+            var on = r < filled;
+            ctx.fillStyle = on ? UC[u] : C.bg3; ctx.globalAlpha = on ? 0.85 : 1;
+            ctx.fillRect(X + r * cw, y, cw - 2, ch); ctx.globalAlpha = 1;
+          }
+          TT.text(ctx, "user " + u + " · v" + v, X + 32 * cw + 8, y + ch / 2, { color: filled ? UC[u] : C.muted, font: "11px" });
+        }
+        // page table
+        var PX = 620, PY = 40;
+        TT.text(ctx, "page_table (int32, on device)", PX, 18, { color: C.muted, font: "12px" });
+        for (var u2 = 0; u2 < 2; u2++) {
+          TT.text(ctx, "user " + u2, PX, PY + 14 + u2 * 40, { color: UC[u2], font: "12px" });
+          for (var v2 = 0; v2 < 4; v2++) {
+            var used = held[u2] > v2 * 32;
+            TT.box(ctx, PX + 50 + v2 * 50, PY + u2 * 40, 44, 28, { fill: used ? UC[u2] : C.bg3, alpha: used ? 0.35 : 1, stroke: UC[u2], label: String(PT[u2][v2]), mono: true });
+          }
+        }
+        TT.text(ctx, "column = virtual block 0 1 2 3", PX + 50, PY + 92, { color: C.muted, font: "11px" });
+        var tok = held[0] + held[1];
+        var lines = [
+          ["tokens cached: " + held[0] + " + " + held[1] + " = " + tok, C.fg],
+          ["blocks touched: " + (Math.ceil(held[0] / 32) + Math.ceil(held[1] / 32)) + " of 8", C.fg],
+          ["as Llama-3.1-8B (bfp8, 32 layers):", C.muted],
+          ["  " + (tok * 69632 / 1e6).toFixed(1) + " MB in the cache", C.yellow],
+          ["  read by SDPA every decode step", C.yellow],
+          ["one 32-token block, all layers: 2.2 MB", C.muted]
+        ];
+        lines.forEach(function (l, j) { TT.text(ctx, l[0], PX, PY + 130 + j * 22, { color: l[1], font: "12px" }); });
+      }
+    });
+  })();
+  </script>
+
+  <p>Here is the decode-time code that Figure 3 animates. It also shows why the current position is a <i>tensor</i>, not a Python list:</p>
+  <div class="filename">tt-metal/models/tt_transformers/tt/attention.py:993-1018 @7aad8aac (trimmed, comment added)</div>
+<pre><code>ttnn.experimental.paged_update_cache(
+    keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+)
+ttnn.experimental.paged_update_cache(
+    values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+)
+...
+attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+    q_heads_1BQD, keys, values,
+    page_table_tensor=page_table,
+    cur_pos_tensor=current_pos,          # per-user position, lives on the device
+    scale=self.scale,
+    program_config=sdpa_decode_prog_cfg,
+    compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+)</code></pre>
+  <p>Flash decode splits each (user, KV head) pair's cached K/V into chunks across several cores, each computing a partial softmax, and then reduces the partials over the NoC. That is <a href="a16-multicast-sync.html">A16</a>'s semaphores at work. Past 16 cores per head, "the NOC bandwidth between cores will bottleneck" (<code>llms.md:582</code>). Positions can differ per user, which is what continuous batching needs (<code>llms.md:1454</code>).</p>
+  <div class="callout warn"><b>"Page" now has a third meaning.</b> In A09 a page is the unit a buffer is interleaved in, one tile for TILE layout. Here a <i>KV block</i> is 32 token rows per head, and the <i>page table</i> maps a user's virtual blocks to physical ones. The kernels reach a physical block by indexing an ordinary interleaved DRAM tensor, so a KV block is itself made of several A09 pages (one tile per head). And "sharding" means both "split across cores" and "split across chips" (<code>llms.md:1849-1850</code>).</div>
+
+  <h2 id="trace">Trace: taking the host out of decode</h2>
+  <p>A decode step of Llama-3.1-8B is dozens of ops per layer times 32 layers, and many of them run for only microseconds. The report shows an untraced profile where "more time (756us) is spent in between OPs (OP-to-OP gap) than running OPs on device (362us)" (<code>llms.md:1813</code>). The Python thread, the host API, and the command bytes over PCIe (stages 1–3 of the report's five) cannot keep up with the device.</p>
+  <p>This is exactly <a href="a17-dispatch-host.html">A17</a>'s trace. Record the whole decode step's commands into a DRAM trace buffer once, then replay them with a single command. The catch is equally from A17: "You cannot allocate or deallocate tensors during a trace. When executing a trace every buffer will be the same size every time" (<code>llms.md:1468</code>). Decode was designed to make that true. The batch is always padded to 32 rows. The KV cache is preallocated. The page table and positions are device tensors whose <i>contents</i> change while their addresses stay fixed. And the sampled token is written into the input buffer of the next step. The generator does exactly this:</p>
+  <div class="filename">tt-metal/models/tt_transformers/tt/generator.py:2488-2512, 2669-2670 @7aad8aac (trimmed, comment added)</div>
+<pre><code>trace_id = ttnn.begin_trace_capture(self.model_args[i].mesh_device, cq_id=0)
+...
+tt_out_trace.append(self.model[i].ttnn_decode_forward(*model_inputs, kv_cache=user_kv_cache,
+                                                      on_device_logits=on_device_sampling))
+ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=0)
+...
+# every later step: copy new host inputs into the same device tensors, then
+for i, trace_id in self.trace_ids_decode[on_device_sampling].items():
+    ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)</code></pre>
+  <p>With tracing, the op-to-op gap typically drops "below 6us" (<code>llms.md:1826</code>). The report's other host-side advice follows from A17 as well: embed on the device (token ids are tiny), return only the last token from prefill, sample on the device, and never tilize or untilize on the host (<code>llms.md:1747-1760</code>). On-device sampling is a top-k over the gathered logits followed by <code>ttnn.sampling</code> with per-user k, p and temperature tensors (<code>tt_sampling.py:1421-1429</code>), so the trace can include it and feed the token straight back.</p>
+  <div class="callout sim">This chapter's <code>a22_trace_decode_mlp.py</code> captures a decode MLP as a trace under ttsim and replays it three times with new inputs; the last replay is bit-identical to an eager run on the same input (output <a href="#sim">below</a>). Trace needs fast dispatch, as A17 found. <a href="a17-dispatch-host.html">A17</a> covers the dispatch modes, and lab <a href="../sim-labs/b09-breaking-things.html">B09</a> covers what ttsim can and cannot see.</div>
+
+  <h2 id="chips">Many chips: one layer split in two</h2>
+  <p>A 70B model's weights (about 70 GB in bfp8) do not fit in one Wormhole's 12 GB, and even 8B decodes faster when two chips each read half the bytes: 44.2 tok/s on N300 against 28.3 on N150 (<code>PERF.md:27-28</code>). <a href="a21-many-chips.html">A21</a> built the tools. Here is how tt_transformers uses them for one layer on a 1×2 mesh.</p>
+
+  <div class="viz" id="fig-tp"></div>
+  <div class="caption" style="color:#9aa4b2;font-size:0.9em;margin:-0.6em 0 1.2em">Figure 4. One Llama-3.1-8B decoder layer, tensor-parallel on an N300 (two chips), decode with 32 users. The scheme is the report's table: QKV and FF1/FF3 column-parallel, WO and FF2 row-parallel (<code>llms.md:1419-1430</code>). Collective sizes are for bf16 activations of 32 × 4096.</div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-tp");
+    var g = TT.canvas(root, 880, 330), ctx = g.ctx, C = TT.C;
+    var stages = ["x (replicated)", "QKV: 16 q + 4 kv", "attention: local heads", "WO: partial sum", "reduce-scatter", "norm: all-gather", "FF1/FF3: 7168 cols", "FF2: partial sum", "reduce-scatter"];
+    var steps = [
+      { dur: 1.2, text: "<b>1. Replicated input.</b> Both chips hold the full 32 × 4096 normalized activation. Weights were split at load time with mesh mappers (<code>ShardTensorToMesh</code>, A21)." },
+      { dur: 1.3, text: "<b>2. Column-parallel QKV.</b> Each chip holds the columns for half the heads: 16 query heads and 4 KV heads. No communication: each chip's heads are complete." },
+      { dur: 1.3, text: "<b>3. Attention is local.</b> Each chip keeps the KV cache for its own 4 KV heads, so the cache is split too (<code>n_local_kv_heads</code>, <code>attention.py:550-565</code>)." },
+      { dur: 1.3, text: "<b>4. Row-parallel WO.</b> Each chip multiplies its 2048 attention outputs by its 2048 rows of WO and gets a <i>partial</i> 32 × 4096 sum. Both partials must be added." },
+      { dur: 1.4, text: "<b>5. Reduce-scatter.</b> <code>tt_all_reduce</code> on a 1-D mesh is a <code>reduce_scatter_minimal_async</code> (<code>ccl.py:176-199</code>). Each chip ends with the summed half of the residual: \"x is fractured across devices\" (<code>decoder.py:311</code>). Bytes per link: (N−1)/N × 256 KB = 128 KB (A21's formula)." },
+      { dur: 1.3, text: "<b>6. The norm gathers.</b> \"Norms take fractured inputs and output replicated across devices\" (<code>decoder.py:323</code>): an all-gather of 128 KB inside the norm (<code>distributed_norm.py:141-164</code>). Reduce-scatter followed by all-gather is an all-reduce, split in two around the residual add." },
+      { dur: 1.3, text: "<b>7. Column-parallel FF1/FF3.</b> Each chip computes 7168 of the 14,336 MLP columns and applies SiLU × locally. Again no communication." },
+      { dur: 1.3, text: "<b>8. Row-parallel FF2</b> gives partial sums again: \"MLP takes replicated inputs and produces fractured outputs\" (<code>decoder.py:385</code>)." },
+      { dur: 1.4, text: "<b>9. Reduce-scatter</b> once more (<code>mlp.py:398-412</code>). Per layer: two reduce-scatters and two all-gathers of 32 × 4096, about 0.5 MB on the link, while each chip reads half of the layer's weight bytes. Pairing column- with row-parallel matmuls is what keeps it to one all-reduce per block (<code>llms.md:1376-1386</code>)." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var W = 88, H = 44, x0 = 20, gap = 8;
+        ["chip 0", "chip 1"].forEach(function (nm, c) {
+          var y = 60 + c * 150;
+          TT.text(ctx, nm, x0, y - 16, { color: C.muted, font: "12px" });
+          for (var k = 0; k < stages.length; k++) {
+            var x = x0 + k * (W + gap), on = k === i, done = k < i;
+            var ccl = k === 4 || k === 5 || k === 8;
+            var col = ccl ? C.red : (k <= 4 ? C.blue : C.green);
+            TT.box(ctx, x, y, W, H, { fill: on ? col : C.bg3, alpha: on ? 0.3 + 0.4 * t : 1, stroke: on || done ? col : C.border, lw: on ? 2.5 : 1 });
+            var words = stages[k].split(": ");
+            TT.text(ctx, words[0], x + W / 2, y + (words[1] ? 15 : 22), { color: on ? C.fg : C.muted, align: "center", font: "11px" });
+            if (words[1]) TT.text(ctx, words[1], x + W / 2, y + 31, { color: on ? C.fg : C.muted, align: "center", font: "10px" });
+          }
+        });
+        // link
+        var cx = x0 + i * (W + gap) + W / 2;
+        var isCcl = i === 4 || i === 5 || i === 8;
+        ctx.strokeStyle = isCcl ? C.red : C.border; ctx.lineWidth = isCcl ? 3 : 1; ctx.setLineDash(isCcl ? [] : [4, 4]);
+        ctx.beginPath(); ctx.moveTo(cx, 108); ctx.lineTo(cx, 208); ctx.stroke(); ctx.setLineDash([]);
+        if (isCcl) {
+          var yy = TT.lerp(112, 204, t), yy2 = TT.lerp(204, 112, t);
+          ctx.fillStyle = C.yellow; ctx.beginPath(); ctx.arc(cx - 6, yy, 5, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(cx + 6, yy2, 5, 0, 7); ctx.fill();
+          var lft = i > 6;  // near the right edge, put the label left of the link
+          TT.text(ctx, "Ethernet: 128 KB each way", lft ? cx - 14 : cx + 14, 158, { color: C.red, font: "12px", align: lft ? "right" : undefined });
+        } else {
+          TT.text(ctx, "no traffic", cx + 8, 158, { color: C.muted, font: "11px" });
+        }
+        TT.text(ctx, "red = collective over Ethernet   blue = attention   green = MLP", x0, 312, { color: C.muted, font: "11px" });
+      }
+    });
+  })();
+  </script>
+  <p>On a T3K (8 chips in a ring) the same layer is used. When the ring and shapes allow it, the attention output's all-gather is fused into the WO matmul with <code>all_gather_matmul_async</code>, so communication overlaps compute (<code>attention.py:1054-1072</code>, enabled by <code>model_config.py:873-879</code>). On a Galaxy (8×4) the weights are split in 2-D, with partial sums reduced along one axis and gathered along the other (<code>llms.md:769-790</code>). Collectives are costed exactly as in A21. The report's advice to "try using bfp8 inputs instead of bf16" for them is the same byte-counting lever as bfp4 weights, now on the Ethernet wall (<code>llms.md:1862</code>).</p>
+  <div class="callout sim">The two-device mesh that does run under ttsim (<code>wh_x2</code> with the N300 cluster descriptor) is covered in <a href="a21-many-chips.html">A21</a> and lab <a href="../sim-labs/b10-two-chips.html">B10</a>. A21 found that with stock tt-metal the fabric-enabled collectives do not complete in the simulator (B10 gets a two-chip <code>all_gather</code> through only with a kernel overlay), so this chapter's runs are single-chip.</div>
+
+  <h2 id="sim">Run it: a decoder layer under ttsim</h2>
+  <p>A full LLM is far beyond a functional simulator: building the real 1B layer and running one decode step through it took 83 s of simulator host wall time, as you will see below. The building blocks are not, so this chapter ships three scripts. As always, ttsim is a <b>functional, bit-exact model, not a timing model</b>. Every time below is simulator host wall-clock time, not silicon performance.</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench     # env.sh cds away, so use absolute paths
+export LAB_HOME=$HOME/ttlab/a22
+source $W/env.sh wh
+source $TT_METAL_HOME/python_env/bin/activate
+export PYTHONPATH=$TT_METAL_HOME                          # to import models.tt_transformers
+
+python $W/py/a22_decoder_layer.py                        # tiny Llama layer, "performance" formats
+python $W/py/a22_decoder_layer.py --precision bf16       # top of the precision ladder
+A22_FP16_DST=1 python $W/py/a22_tt_transformers_block.py  # the real TransformerBlock, 1 layer of Llama-3.2-1B
+unset TT_METAL_SLOW_DISPATCH_MODE; python $W/py/a22_trace_decode_mlp.py   # trace needs fast dispatch</code></pre>
+
+  <h3>1. A tiny Llama layer from TT-NN ops</h3>
+  <p><code>a22_decoder_layer.py</code> builds a Llama-shaped layer with random weights: <i>d</i> = 384, 12 query heads, 6 KV heads of 32, MLP width 768, vocabulary 768. Every width divides evenly over the 12 DRAM banks. The script uses the same ops, memory configs and format choices as Figure 1, plus the real <code>RotarySetup</code> from tt_transformers. It prefills two users (64 and 32 tokens) one at a time into a paged bfp8 KV cache, runs the final norm, the LM head on the last tile and <code>ttnn.argmax</code> on device, then runs one batched decode step with width-sharded activations and DRAM-sharded matmuls. It compares everything with a float32 PyTorch reference. Real output, trimmed of log lines and of some op rows:</p>
+<pre><code>== a22 tiny decoder layer, precision=perf, arch=wormhole_b0 ==
+config: vocab=768 dim=384 heads=12 kv_heads=6 head_dim=32 ffn=768; paged KV 8x32 tokens
+page_table (virtual block -&gt; physical block, one row per user): [[7, 5, 3, 2], [4, 6, 1, 0]]
+
+-- prefill (user 0, S=64): op, output shape, dtype, where it lives --
+  embedding                          (1, 1, 64, 384)    BFLOAT16    DRAM INTERLEAVED         ttnn.embedding: token ids -&gt; rows of the table
+  wqkv                               (1, 1, 64, 768)    BFLOAT16    DRAM INTERLEAVED         ttnn.linear, weight BFLOAT8_B
+  rotary_embedding_llama (Q)         (1, 12, 64, 32)    BFLOAT16    DRAM INTERLEAVED         RoPE as a matmul with a 32x32 transformation tile
+  paged_fill_cache (K)               (1, 6, 64, 32)     BFLOAT8_B   DRAM INTERLEAVED         written into blocks [7, 5]
+  scaled_dot_product_attention       (1, 12, 64, 32)    BFLOAT8_B   DRAM INTERLEAVED         flash attention, causal, GQA 12 q / 6 kv heads
+  w1 / w3                            (1, 1, 64, 768)    BFLOAT16    DRAM INTERLEAVED         weight BFLOAT4_B
+  silu(w1) * w3                      (1, 1, 64, 768)    BFLOAT8_B   DRAM INTERLEAVED         one fused eltwise op
+  final norm + LM head (last tile)   (1, 1, 32, 768)    BFLOAT16    DRAM INTERLEAVED         then ttnn.argmax on device
+prefill user 0: S= 64  layer-output PCC=0.99669  next token device=690 torch=690 (torch top-2 [690, 237] logits [3.431, 2.87])
+prefill user 1: S= 32  layer-output PCC=0.99668  next token device=690 torch=270 (torch top-2 [270, 690] logits [2.522, 2.508])
+
+-- decode step (2 users padded to 32 rows): op, output shape, dtype, where it lives --
+  embedding -&gt; L1 width-sharded      (1, 1, 32, 384)    BFLOAT16    L1 WIDTH_SHARDED         32 user rows, 1 tile per core
+  wqkv (DRAM-sharded matmul)         (1, 1, 32, 768)    BFLOAT16    L1 WIDTH_SHARDED         weight streamed from 12 DRAM banks
+  create_qkv_heads_decode (Q)        (1, 2, 12, 32)     BFLOAT16    L1 HEIGHT_SHARDED        one user per core
+  paged_update_cache (K)             (1, 2, 6, 32)      BFLOAT16    L1 HEIGHT_SHARDED        one new row per user, block from page_table
+  paged_sdpa_decode                  (1, 2, 12, 32)     BFLOAT16    DRAM INTERLEAVED         flash decode over cached K/V
+  silu(w1) * w3                      (1, 1, 32, 768)    BFLOAT8_B   L1 WIDTH_SHARDED
+  w2 + residual add                  (1, 1, 32, 384)    BFLOAT16    L1 WIDTH_SHARDED         layer output
+decode (teacher-forced on device tokens [690, 690]): positions=[64, 32]  layer-output PCC=0.99651  next tokens device=[14, 14] torch=[14, 14]
+user 0: token at position 64 -&gt; virtual block 2, row 0 -&gt; physical block 3; row non-zero: True
+user 1: token at position 32 -&gt; virtual block 1, row 0 -&gt; physical block 6; row non-zero: True
+physical blocks holding data: [3, 4, 5, 6, 7] of 8
+wall time: prefill 3.5 s, decode 1.7 s (simulator time, not hardware performance)</code></pre>
+  <p>Read it top to bottom and you can see the chapter. Prefill lives in DRAM and decode in L1. The weights are bfp8 or bfp4 while activations stay bf16, and the SiLU product drops to bfp8 as <code>mlp.py:322</code> says. The paged cache wrote into exactly the blocks the page table names. The <code>(1, 2, 6, 32)</code> rows of K went to the L1 of one core per user. Decode reproduces the reference's next token for both users. The paged decode attention read K/V rows from shuffled blocks and still gave PCC 0.9965.</p>
+  <p>Now look at user 1's prefill. The layer output has PCC 0.9967, but the device picked token 690 where PyTorch picked 270. The reference's top two logits were 2.522 and 2.508, within 0.6% of each other, and bfp4 MLP weights moved them by more than that. The <code>--precision bf16</code> run (bf16 weights and cache, HiFi4 everywhere) is the top of the ladder:</p>
+<pre><code>prefill user 0: S= 64  layer-output PCC=0.99992  next token device=690 torch=690 (torch top-2 [690, 237] logits [3.431, 2.87])
+prefill user 1: S= 32  layer-output PCC=0.99991  next token device=270 torch=270 (torch top-2 [270, 690] logits [2.522, 2.508])
+decode (teacher-forced on device tokens [690, 270]): positions=[64, 32]  layer-output PCC=0.99994  next tokens device=[14, 267] torch=[14, 267]</code></pre>
+  <p>This is why tt_transformers measures top-1 and top-5 token accuracy, not just PCC. A random-weight toy has much flatter logits than a trained model. That is also why PERF.md's Llama-3.1-8B top-1 drops only from 96% to 90% between the accuracy and performance configs (<code>PERF.md:27,82</code>), rather than collapsing.</p>
+  <p>Two things in this script are not the stock configs. Both work around ways in which Wormhole ttsim stops on the FP32 unpack path, found while building it:</p>
+  <ul>
+    <li><b>FP32 Dst accumulation does not run on Wormhole ttsim.</b> Any kernel built with <code>fp32_dest_acc_en=True</code> stopped the simulator. Default, 1D and 2D matmuls stopped with <code>UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code>. The DRAM-sharded matmul stopped with <code>UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code>. The same matmuls with FP16 Dst pass. The first error is the one lab <a href="../sim-labs/b08-formats-and-sfpu.html#dst">B08</a> traces to its source, and it is not a ttsim bug. After the last unpack straight into Dst, the Wormhole LLK deliberately issues one dummy unpack into SrcA to work around a hardware bug (TEN-3868, <code>tt_llk_wormhole_b0/common/inc/cunpack_common.h:981-983</code>). That dummy unpack keeps the FP32 → FP32 formats of the unpack-to-Dst setup, a combination the ISA does not define for SrcA, and ttsim strictly rejects it as undefined behaviour (<code>tensix.cpp:3456-3458</code>). The same instruction carries the current unpack config context in its <code>CfgContextId</code> field, and ttsim does not model a non-zero config context at all (<code>tensix.cpp:3165</code>), which is the second error. A ttsim that skips only that dummy unpack (lab <a href="../sim-labs/b11-ttnn-on-sim.html">B11</a>'s <code>b11-ten3868.patch</code>) runs both the DRAM-sharded and the 1D matmul with FP32 Dst, so both errors come from it. Silicon runs these kernels. tt_transformers' HIFI2 and HIFI4 configs turn FP32 Dst on, so the script turns it off everywhere and says so in a comment.</li>
+    <li><b>Converting float32 to bf16 on the device does not run either.</b> <code>ttnn.from_torch(float32_tensor, dtype=bfloat16, mesh_mapper=…)</code>, which is what <code>RotarySetup</code> does, stops with the same <code>in_data_format=0</code> (Float32) error. It is the same unpack-to-Dst path that B08 hits with <code>ttnn.typecast</code> from FP32. Without a mesh mapper, or with a bf16 host tensor, it works. The script casts on the host first. The values are identical.</li>
+  </ul>
+  <p>One host-side error is worth knowing too. Prefill matmuls with DRAM-sharded weights and no program config fail validation with <code>TT_FATAL … DFB 'in1' borrows memory from TensorParameter 'in1', but its TensorSpec is not L1-resident</code>. The default program choice assumed an L1 weight. tt_transformers always passes an explicit program config, and so does the script (a matmul-2D config, <code>llms.md:1532-1556</code>).</p>
+
+  <h3>2. The real tt_transformers block</h3>
+  <p><code>a22_tt_transformers_block.py</code> builds the real <code>ModelArgs(dummy_weights=True)</code> for Llama-3.2-1B-Instruct from the config shipped in <code>models/tt_transformers/model_params</code>, with no download. It keeps one layer, seeds the random init so that the HuggingFace reference layer gets the same weights, builds the real <code>TransformerBlock</code> with a paged cache, and runs one decode step through <code>test_decoder.py</code>'s path. With the stock compute configs:</p>
+<pre><code>ok  ModelArgs(dummy_weights=True): Llama-3.2-1B-Instruct dim=2048 heads=32 kv_heads=8 hidden=8192 device_name=N150
+ok  load_state_dict (random weights from the HF config): 12 tensors
+ok  RotarySetup
+ok  TransformerBlock (weights -&gt; DRAM, bfloat8_b)  (35 s so far)
+ok  reference_decoder: v_proj weights identical to the device copy (layers.0.attention.wv.weight): True
+[22743] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
+  <p>Everything up to the forward pass works, including weight loading, DRAM sharding and RoPE setup. The decode step then hits the FP32-Dst stop described above, with the same error B08 explains. With <code>A22_FP16_DST=1</code> the script wraps <code>ttnn.WormholeComputeKernelConfig</code> to force <code>fp32_dest_acc_en=False</code> and changes nothing else:</p>
+<pre><code>ok  TransformerBlock (weights -&gt; DRAM, bfloat8_b)  (37 s so far)
+ok  reference_decoder: v_proj weights identical to the device copy (layers.0.attention.wv.weight): True
+ok  one decode step  (83 s so far)
+ok  reference layer (HF, CPU): decode-step PCC vs HF reference = 0.99945</code></pre>
+  <p>The real Llama-3.2-1B decoder layer, with its real DRAM-sharded matmuls, sharded norms, fused RoPE, paged cache update and flash decode, matches HuggingFace at PCC 0.9995 on simulated Wormhole. That clears the report's 0.998 target for a decoder layer. It is one layer at batch 1 and position 0 with random weights, and with FP16 rather than FP32 Dst accumulation. Prefill, the full model, the generator and trace were not run through the real modules.</p>
+
+  <h3>3. Trace a decode MLP</h3>
+<pre><code>compile run: 0.6 s, program cache entries = 4
+trace captured: 5 ops (w1, w3, fused silu*mul, reshard, w2)
+replay 0: PCC vs torch = 0.9869  (0.36 s simulator wall time)
+replay 1: PCC vs torch = 0.9864  (0.34 s simulator wall time)
+replay 2: PCC vs torch = 0.9871  (0.37 s simulator wall time)
+last replay bit-identical to an eager run on the same input: True</code></pre>
+  <p>The pattern is the generator's: allocate the input once, run once to compile, capture, then for each "token" copy new data into the <i>same</i> device buffer and <code>execute_trace</code>. The replayed result is bit-identical to an eager call. That is expected, since a trace replays the same commands against the same buffers. PCC is 0.987 because all three MLP matmuls use LoFi and w1/w3 are bfp4, the bottom of the ladder, with nothing at higher precision around them.</p>
+
+  <h2 id="contradictions">Where the sources disagree</h2>
+  <p>The LLM tech report is the best single document on this topic, but at 7aad8aac the code has moved past it in places. When they disagree, trust the code.</p>
+  <table>
+    <tr><th>Topic</th><th><code>tech_reports/LLMs/llms.md</code> says</th><th>The code at 7aad8aac does</th></tr>
+    <tr><td>Tracing prefill</td><td>"Tracing doesn’t work with prefill" (1470)</td><td>The generator traces prefill per sequence-length key (<code>generator.py:1003-1024</code>, <code>_capture_trace_prefill</code> at 897) when <code>can_enable_trace</code> allows it (<code>model_config.py:3339</code>)</td></tr>
+    <tr><td>FF1/FF3 fidelity</td><td>HiFi2 "to retain accuracy while still being performant" (738)</td><td>Default HIFI2_FP16; the performance preset uses LoFi with bfp4 weights (<code>model_config.py:335-338,416</code>)</td></tr>
+    <tr><td>The "hifi2" compute config</td><td><code>math_approx_mode=False, fp32_dest_acc_en=False</code> (741-746, 1892-1897)</td><td><code>compute_kernel_config_hifi2</code> has <code>math_approx_mode=True, fp32_dest_acc_en=True</code>; the report's version is <code>hifi2_fp16</code> (<code>model_config.py:939-950</code>)</td></tr>
+    <tr><td>Fused SiLU multiply</td><td><code>ttnn.multiply(…, input_tensor_a_activation=SILU)</code> (797-810)</td><td><code>ttnn.mul(…, input_tensor_a_activations=[SILU])</code>, a list (<code>mlp.py:318-324</code>)</td></tr>
+    <tr><td>FF2 reduction on n300/T3K</td><td><code>ttnn.reduce_scatter(…)</code> (846-854)</td><td><code>ttnn.experimental.reduce_scatter_minimal_async</code> inside <code>tt_all_reduce</code> (<code>ccl.py:183-199</code>)</td></tr>
+    <tr><td>File names</td><td>Links to <code>llama_attention.py</code>, <code>llama_mlp.py</code> (1425-1429)</td><td><code>tt/attention.py</code>, <code>tt/mlp.py</code></td></tr>
+    <tr><td>DRAM banks</td><td>"pads weights to fit evenly into the 12 DRAM banks" (1597)</td><td>12 on Wormhole, 8 on P150, 7 on P100 (<code>model_config.py:3762</code>)</td></tr>
+    <tr><td>Performance tables</td><td>—</td><td><code>PERF.md:1</code> says it is deprecated in favour of <code>models/model_targets.yaml</code>; this chapter quotes it as illustrative only</td></tr>
+  </table>
+  <p>A last disagreement is about the hardware itself. Wormhole DRAM bandwidth is quoted as 288 GB/s in some places and 336 GB/s in others. The 192-bit GDDR6 bus gives 288 GB/s at 12 GT/s and 336 GB/s at 14 GT/s, and older spec pages listed 14 GT/s (see <a href="a03-chip-tour.html">A03</a>). The current n150 spec (<a href="https://docs.tenstorrent.com/aibs/wormhole/index.html">docs.tenstorrent.com</a>: 12 GT/s, 288 GB/s), the ISA documentation (<code>WormholeB0/DRAMTile/README.md</code>, "Performance": 12 channels × 24 GB/s) and the FlashAttention tech report all say 288 GB/s. This chapter uses 288 GB/s as the spec and the report's measured 240 GB/s for DRAM-sharded reads.</p>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A decoder layer is two RMSNorms, four matmul groups (QKV, WO, W1/W3, W2), RoPE, attention over a KV cache, one fused SiLU multiply and two residual adds. tt_transformers maps each to one or two TT-NN ops.</li>
+    <li><b>Prefill</b> is one user and S tokens: activations in DRAM, 2D multicast matmuls, causal flash attention at HiFi4, compute-bound once S is a few hundred.</li>
+    <li><b>Decode</b> is up to 32 users and one token each: activations width-sharded in L1, DRAM-sharded weight reads from all 12 banks, flash decode over a paged cache. It is DRAM-bound with intensity ≈ 2B ÷ bytes-per-weight, so one step costs about one read of all the weights.</li>
+    <li>The levers for decode are bytes: bfp8 everywhere, bfp4 in the MLP, a bfp8 KV cache, GQA, more chips. Fidelity follows the format (HiFi4 bf16, HiFi2 bfp8, LoFi bfp4) and matters for compute-bound prefill.</li>
+    <li>The paged KV cache is <code>[blocks, kv_heads, 32, head_dim]</code> plus a device page table. Positions and page tables are tensors, so decode is shape-static and can be <b>traced</b>, which removes the host from the loop.</li>
+    <li>Across chips: column-parallel then row-parallel, one reduce-scatter and one all-gather per block, costed in link bytes.</li>
+    <li>Under ttsim the real Llama-3.2-1B block runs a decode step at PCC 0.9995 with FP16 Dst. On Wormhole ttsim, FP32 Dst accumulation is the blocker for stock configs: an LLK hardware workaround that ttsim strictly rejects (B08), not a fault in the kernels.</li>
+  </ul>
+
+  <h2 id="map">What you now understand</h2>
+  <p>Every chapter of the series shows up in a single decode step. Here is where.</p>
+  <table>
+    <tr><th>Chapter</th><th>Where it appears in one LLM token</th></tr>
+    <tr><td><a href="a01-why-new-hardware.html">A01</a> Why AI needs new hardware</td><td>Decode is the extreme case of the opening puzzle: a chip of hundreds of TFLOP/s, held back by bytes.</td></tr>
+    <tr><td><a href="a02-gpu-vs-tenstorrent.html">A02</a> GPU vs Tenstorrent</td><td>No cache: "stay in L1 between ops" is a <code>memory_config</code> you write, not a hope.</td></tr>
+    <tr><td><a href="a03-chip-tour.html">A03</a> Chip tour</td><td>12 DRAM banks and an 8×8 usable grid set the shard counts; harvesting and dispatch decide the grid.</td></tr>
+    <tr><td><a href="a04-inside-tensix.html">A04</a> Inside Tensix</td><td>Every op is five RISC-Vs feeding unpack, math and pack.</td></tr>
+    <tr><td><a href="a05-tiles-and-formats.html">A05</a> Tiles and formats</td><td>32-user padding, 32-token KV blocks, bfp8/bfp4 weights, PCC targets.</td></tr>
+    <tr><td><a href="a06-matrix-engine.html">A06</a> Matrix engine</td><td>Fidelity per op group; FP16 vs FP32 Dst; RoPE as a matmul.</td></tr>
+    <tr><td><a href="a07-vector-engine.html">A07</a> Vector engine</td><td>rsqrt in RMSNorm, exp in softmax, SiLU fused into the multiply.</td></tr>
+    <tr><td><a href="a08-noc.html">A08</a> NoC</td><td>DRAM-sharded readers placed next to their bank; flash-decode reductions; the 16-cores-per-head limit.</td></tr>
+    <tr><td><a href="a09-memory.html">A09</a> Memory</td><td>Width-sharded residual, height-sharded heads, DRAM-sharded weights, interleaved prefill.</td></tr>
+    <tr><td><a href="a10-first-program.html">A10</a> First program</td><td>Under each TT-NN op: a Program, kernels and runtime arguments.</td></tr>
+    <tr><td><a href="a11-dataflow-and-cbs.html">A11</a> Dataflow and CBs</td><td>The weight-streaming readers and their double-buffered CBs.</td></tr>
+    <tr><td><a href="a12-compute-kernels.html">A12</a> Compute kernels</td><td>Norm, add and mul kernels; the Dst handshake whose size the configs trade.</td></tr>
+    <tr><td><a href="a13-llk-mops-jit.html">A13</a> LLK, MOPs and JIT</td><td>Every distinct op config is one JIT build, which is why traces compile first.</td></tr>
+    <tr><td><a href="a14-one-tiles-journey.html">A14</a> One tile's journey</td><td>A weight tile's trip from a DRAM bank to the FPU, 7.5 billion weights per token.</td></tr>
+    <tr><td><a href="a15-matmul-one-to-many.html">A15</a> Matmul, one to many</td><td>per_core_M/N, in0_block_w, subblocks in every program config.</td></tr>
+    <tr><td><a href="a16-multicast-sync.html">A16</a> Multicast and sync</td><td>2D prefill matmuls; flash-decode partial-softmax reductions.</td></tr>
+    <tr><td><a href="a17-dispatch-host.html">A17</a> Dispatch and the host</td><td>Trace for decode; on-device sampling; the op-to-op gap.</td></tr>
+    <tr><td><a href="a18-ttnn-user.html">A18</a> TT-NN as a user</td><td><code>from_torch</code>, layouts and memory configs for every weight.</td></tr>
+    <tr><td><a href="a19-op-anatomy-compilers.html">A19</a> Op anatomy</td><td>Program cache hits on every decode step after the first; minimal_matmul and friends are device ops.</td></tr>
+    <tr><td><a href="a20-performance.html">A20</a> Performance</td><td>The roofline that says decode is DRAM-bound and prefill compute-bound.</td></tr>
+    <tr><td><a href="a21-many-chips.html">A21</a> Many chips</td><td>Column/row tensor parallelism, reduce-scatter and all-gather per layer, Galaxy 2D.</td></tr>
+    <tr><td><a href="../sim-labs/b00-workbench.html">B00</a>–<a href="../sim-labs/b11-ttnn-on-sim.html">B11</a> ttsim labs</td><td>The workbench these runs used; B07/B08 for the formats and fidelity (and, in B08, why FP32 Dst stops Wormhole ttsim); B09 for simulator errors and limits; B10 for the two-chip mesh; B11 for TT-NN on the simulator.</td></tr>
+  </table>
+
+  <h2 id="next">Where to go next</h2>
+  <ul>
+    <li><b>Read the real thing.</b> Start with <code>models/tt_transformers/tt/decoder.py</code> (≈400 lines), then <code>attention.py</code>'s <code>forward_decode</code>, then the getters in <code>model_config.py</code> that it calls. The module tests in <code>models/tt_transformers/tests/</code> (<code>test_mlp.py</code>, <code>test_attention.py</code>, <code>test_decoder.py</code>) are the smallest runnable units; <code>a22_tt_transformers_block.py</code> is a trimmed copy of <code>test_decoder.py</code>.</li>
+    <li><b>Keep using the simulator</b> for what it is good at: functional correctness of kernels and ops, bit-exact numerics, and stepping through control flow. Series B (<a href="../index.html#series-b">index</a>) is the hands-on half of this series.</li>
+    <li><b>Real hardware.</b> Timing, bandwidth, Tracy profiles and the PERF numbers above only exist on silicon. A single n150 or p150 card runs Llama-3.1-8B. <a href="https://docs.tenstorrent.com/">docs.tenstorrent.com</a> covers setup, and tt-inference-server and the vLLM plugin cover serving.</li>
+    <li><b>Contribute.</b> tt-metal's CONTRIBUTING guide, its good-first-issue and bounty labels, and model bring-ups following the report's bottom-up PCC method are all open. Note the CONTRIBUTING rule that automated agents must not claim bounty issues (<code>CONTRIBUTING.md:584-590</code>).</li>
+    <li><b>Ask.</b> The Tenstorrent Discord is where kernel writers, model engineers and the ttsim authors answer questions.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Llama-3.1-8B on an n150 in the performance config decodes at 28.3 tok/s/user at batch 1. Roughly what would you expect at batch 2, and why?</summary><p>Almost the same, about 28 tok/s per user and therefore nearly double the total. A decode step is bounded by reading ≈6.1 GB of weights (≈25 ms at 240 GB/s), and that read is shared by all users in the batch. The math for 2 users is about 0.2 ms at HiFi2, far below the read. In fact the device already pads the batch to a 32-row tile (<code>tile_padded_batch_rows</code>), so batch 1 and batch 2 run the identical matmul. The Batch-32 table shows the per-user rate dropping only to 22.3, from KV-cache reads and other per-user work.</p></details>
+  <details class="quiz"><summary>Switching w1/w3 from HiFi2 to LoFi while keeping bfp8 weights: does decode get faster? Does prefill?</summary><p>Decode barely changes. It is DRAM-bound, so a higher compute roof does not move the point (Figure 2). Prefill is compute-bound for prompts of a few hundred tokens or more, so its MLP matmuls would get up to 2× faster, at the cost of dropping mantissa bits that bfp8 actually has. That is why the performance preset pairs LoFi with <i>bfp4</i>, where the dropped bits do not exist, and why the decode win comes from bfp4's bytes rather than LoFi.</p></details>
+  <details class="quiz"><summary>Why does tt_transformers pass the current position as a device tensor (<code>cur_pos_tensor</code>) rather than a Python list?</summary><p>Because decode is traced. A trace replays recorded commands against fixed buffers, and runtime values baked in from a Python list would be frozen into the trace. A device tensor's contents can change every step (the host copies new values in, or a device op increments it) while its address stays the same, so the traced paged_update_cache and SDPA ops read the new positions (<code>llms.md:586-588</code>). The page table and the input token buffer follow the same rule.</p></details>
+  <details class="quiz"><summary>With block_size 32 and the run's page table [[7, 5, 3, 2], [4, 6, 1, 0]], where does user 1's token at position 70 go?</summary><p>70 ÷ 32 = 2 remainder 6, so virtual block 2, row 6. User 1's virtual block 2 is physical block 1. The K rows go into physical block 1, row 6, for each of that layer's KV heads.</p></details>
+  <details class="quiz"><summary>A layer test passes at PCC 0.9967, but the model's top-1 accuracy drops. How can both be true, and what does the report recommend measuring?</summary><p>PCC measures how well the whole output vector correlates. A token choice depends only on the order of the top logits, and when two are close (2.522 vs 2.508 in this chapter's run), a tiny error flips it. The report tests bottom-up: submodule PCC ≈ 0.999, decoder ≈ 0.998, model ≈ 0.99, then top-1/top-5 token accuracy and perplexity on a dataset (<code>llms.md:1655-1667</code>). If those fail, move the sensitive groups (often attention, or one layer's MLP) up the precision ladder.</p></details>
+  <details class="quiz"><summary>On an N300, why does tt_transformers make QKV column-parallel and WO row-parallel instead of the reverse?</summary><p>Column-parallel QKV splits by heads, and attention is independent per head, so each chip can run its heads and keep its share of the KV cache with no communication. Row-parallel WO then consumes exactly that head-split output and produces partial sums, so the whole attention block needs one reduction (a reduce-scatter, then the all-gather inside the next norm). The reverse would need the activations gathered before attention and again after.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">LLMs in TT-NN</a>, the tech report this chapter follows: modules, prefill vs decode, multi-device, configs and accuracy.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers">models/tt_transformers</a>, the reference Llama/Qwen/Mistral implementation, its demos and module tests.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md">Saturating DRAM bandwidth</a>, the tech report behind DRAM-sharded matmuls.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/FlashAttention/FlashAttention.md">FlashAttention on Tenstorrent</a>, the tech report on the SDPA and flash-decode ops.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md">Advanced performance optimizations for models</a>: metal trace and multiple command queues.</li>
+    <li><a href="https://arxiv.org/abs/2309.06180">Kwon et al., Efficient Memory Management for LLM Serving with PagedAttention</a> (vLLM), the origin of the paged KV cache.</li>
+    <li><a href="https://arxiv.org/abs/2307.08691">Dao, FlashAttention-2</a>, the tiling that the prefill SDPA op implements.</li>
+    <li><a href="https://arxiv.org/abs/2305.13245">Ainslie et al., GQA</a>: why 32 query heads share 8 KV heads.</li>
+    <li><a href="https://arxiv.org/abs/2104.09864">Su et al., RoFormer</a>, the rotary position embedding.</li>
+    <li><a href="https://github.com/tenstorrent/vllm-tt-plugin">vllm-tt-plugin</a> and <a href="https://github.com/tenstorrent/tt-inference-server">tt-inference-server</a>, serving tt_transformers models with continuous batching.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/CONTRIBUTING.md">tt-metal CONTRIBUTING</a> and <a href="https://github.com/tenstorrent/tt-metal/issues?q=is%3Aopen+label%3A%22good+first+issue%22">good first issues</a>: where to start contributing.</li>
+    <li><a href="https://discord.gg/tenstorrent">Tenstorrent Discord</a> and <a href="https://docs.tenstorrent.com/">docs.tenstorrent.com</a>: community and official documentation.</li>
+  </ul>
+
+  <div class="pager"><a href="a21-many-chips.html">&larr; 21 Many chips: Ethernet, meshes and TT-Fabric</a><a class="next" href="../index.html#series-b">Series B: ttsim Labs &rarr;</a></div>
+</main>
+</body>
+</html>
