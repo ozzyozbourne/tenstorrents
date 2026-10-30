@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A13 · Under the hood: LLK, MOPs and the JIT · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a12-compute-kernels.html">&larr; Prev</a>
+  <a href="a14-one-tiles-journey.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 13</span><span class="tag">Prerequisites: A04, A06, A12</span>
+  <h1><span class="num">13.</span> Under the hood: LLK, MOPs and the JIT</h1>
+  <p class="subtitle">Follow one line of a compute kernel down through three software layers to the 32-bit words the Tensix coprocessor executes, then back up through the compiler and cache that put those words in L1.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#layers">Three layers between you and the hardware</a></li>
+      <li><a href="#encoding">What a Tensix instruction looks like</a></li>
+      <li><a href="#template">Init functions write a loop into hardware</a></li>
+      <li><a href="#expander">The MOP expander, step by step</a></li>
+      <li><a href="#pertile">Per tile: one MOP and a SETRWC</a></li>
+      <li><a href="#replay">The replay buffer</a></li>
+      <li><a href="#sim">Seeing it in ttsim</a></li>
+      <li><a href="#jit">The JIT: from .cpp to L1</a></li>
+      <li><a href="#cache">The kernel cache</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="a12-compute-kernels.html">A12</a> we wrote compute kernels as if <code>add_tiles</code> were an instruction. It sits inside the loop of the <code>eltwise_binary</code> example like this:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp:41-43 @7aad8aac</div>
+<pre><code>        tile_regs_acquire();
+        // Add the tiles from the input circular buffers and write the result to the destination register
+        add_tiles(cb_in0, cb_in1, 0, 0, dst_reg);</code></pre>
+  <blockquote><b><code>add_tiles</code> is one line. How many hardware instructions is it?</b></blockquote>
+  <p>Make a guess before reading on. One, because the FPU has an <code>ELWADD</code> instruction? 1024, one per element? Something in between?</p>
+  <p>Here's a hint from A04 and A06. One <code>ELWADD</code> adds an 8-row by 16-column block, which is 128 numbers. A 32×32 tile is 1024 numbers, so the arithmetic alone takes 1024 / 128 = <b>8</b> <code>ELWADD</code>s. The data also has to get into SrcA and SrcB first, and the unpackers move one 16×16 face per instruction, so that's 4 faces × 2 operands = <b>8</b> <code>UNPACR</code>s. Sixteen instructions do real work. Then there's bookkeeping: address counters, semaphores, register hand-offs.</p>
+  <p>The surprising part isn't the total. It's that the RISC-V cores push only a handful of those instructions. Most of them are generated <em>inside</em> the coprocessor by a small loop machine called the <b>MOP expander</b>, which an earlier <code>add_init</code> call programmed. The animation below zooms in on one call. Every name and count in it comes from the real code and from a trace I took in ttsim (shown <a href="#sim">later</a>).</p>
+
+  <div class="viz" id="zoom"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("zoom");
+    var g = TT.canvas(root, 880, 470), ctx = g.ctx, C = TT.C;
+    var COL = { MOP: C.yellow, UNP: C.orange, ELW: C.blue, CFG: C.purple, SYNC: C.pink };
+    // Pushed instructions, per thread, in the order ttsim saw them for one add_tiles call.
+    var push0 = [["SETADCZW", "CFG"], ["STALLWAIT", "SYNC"], ["MOP", "MOP"], ["SEMGET", "SYNC"], ["SETC16", "CFG"]];
+    var push1 = [["SETC16", "CFG"], ["MOP", "MOP"], ["SETRWC", "CFG"]];
+    // After the MOP expander.
+    var exp0 = [["ADCZW", "CFG"], ["STALL", "SYNC"]];
+    for (var k = 0; k < 4; k++) { exp0.push(["UNP A", "UNP"]); exp0.push(["UNP B", "UNP"]); }
+    exp0.push(["SEMGET", "SYNC"]); exp0.push(["SETC16", "CFG"]);
+    var exp1 = [["SETC16", "CFG"]];
+    for (k = 0; k < 4; k++) { exp1.push(["ELW", "ELW"]); exp1.push(["ELW", "ELW"]); exp1.push(["RWC", "CFG"]); }
+    exp1.push(["RWC", "CFG"]);
+    var counts = [1, 2, 8, 8, 26, 26];
+    var labels = ["line of C++", "LLK calls", "instructions pushed by RISC-V", "instructions pushed by RISC-V", "instructions reach the wait gates", "instructions reach the wait gates"];
+    var steps = [
+      { dur: 1.0, text: "<b>Level 0: the kernel.</b> One call in <code>tiles_add.cpp</code>. The same source is compiled three times, once per TRISC (A12), so this line exists in all three binaries." },
+      { dur: 1.4, text: "<b>Level 1: the compute API.</b> <code>add_tiles</code> is two macros. <code>UNPACK(...)</code> keeps <code>llk_unpack_AB</code> only in the TRISC0 build, <code>MATH(...)</code> keeps <code>llk_math_eltwise_binary</code> only in the TRISC1 build. The PACK build gets nothing: packing is <code>pack_tile</code>'s job." },
+      { dur: 1.6, text: "<b>Level 2: LLK.</b> Inside those calls the TRISCs push Tensix instructions. TRISC0 pushes 5 and TRISC1 pushes 3, so 8 in total. The yellow ones are <code>MOP</code>: a single instruction that means \"run the loop you were configured with\"." },
+      { dur: 1.6, text: "<b>Level 3: the MOP templates.</b> <code>add_init</code> ran earlier and wrote a loop description into each thread's MOP configuration registers. UNPACK's loop is 2 × (UNPACR A, UNPACR B, UNPACR A, UNPACR B). MATH's is 4 × (ELWADD, ELWADD, then SETRWC): one pass per 16×16 face." },
+      { dur: 3.0, text: "<b>Level 4: expansion.</b> Each MOP expander replaces its <code>MOP</code> with the loop body, one instruction per cycle. UNPACK's MOP becomes 8 <code>UNPACR</code>s; MATH's becomes 8 <code>ELWADD</code>s and 4 <code>SETRWC</code>s. The counter climbs from 8 to 26." },
+      { dur: 1.0, text: "<b>The answer.</b> One line → 2 TRISCs → 8 pushed instructions → <b>26</b> instructions at the wait gates (12 on UNPACK, 14 on MATH). 16 of them move or add data: 8 UNPACR (4 faces × 2 operands) and 8 ELWADD (8 × 8 rows × 16 columns = 1024 sums). The RISC-V never wrote a loop over faces." }
+    ];
+    var X0 = 170, LANE = [175, 265, 355];
+    function chip(x, y, w, lab, kind, alpha) {
+      TT.box(ctx, x, y, w, 30, { fill: COL[kind], alpha: 0.28 * alpha, stroke: COL[kind], lw: 1.2, r: 4 });
+      ctx.globalAlpha = alpha;
+      TT.text(ctx, lab, x + w / 2, y + 15, { align: "center", font: w < 56 ? "11px" : "12px", mono: true });
+      ctx.globalAlpha = 1;
+    }
+    function lanes(a) {
+      var nm = [["TRISC0", "UNPACK"], ["TRISC1", "MATH"], ["TRISC2", "PACK"]];
+      for (var t = 0; t < 3; t++) {
+        ctx.globalAlpha = a;
+        TT.box(ctx, 14, LANE[t] - 4, 138, 62, { fill: C.bg2, stroke: C.border, r: 6 });
+        TT.text(ctx, nm[t][0], 26, LANE[t] + 14, { font: "bold 14px" });
+        TT.text(ctx, nm[t][1] + " build", 26, LANE[t] + 36, { color: C.muted, font: "12px" });
+        ctx.globalAlpha = 1;
+      }
+    }
+    function row(list, y, w, gap, n, alpha) {
+      for (var i = 0; i < Math.min(n, list.length); i++) chip(X0 + i * (w + gap), y, w, list[i][0], list[i][1], alpha);
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        // counter
+        var prev = i > 0 ? counts[i - 1] : counts[0];
+        var cnt = Math.round(TT.lerp(prev, counts[i], i === 4 ? t : Math.min(1, t * 2)));
+        TT.text(ctx, String(cnt), 862, 42, { align: "right", font: "bold 40px", color: C.yellow, mono: true });
+        TT.text(ctx, labels[i], 862, 76, { align: "right", color: C.muted, font: "13px" });
+        // the line of code
+        var cy = i === 0 ? 120 : TT.lerp(120, 50, i === 1 ? t : 1);
+        var fs = i === 0 ? 22 : Math.round(TT.lerp(22, 16, i === 1 ? t : 1));
+        TT.text(ctx, "add_tiles(cb_in0, cb_in1, 0, 0, dst_reg);", 30, cy, { font: fs + "px", mono: true, color: C.fg });
+        if (i === 0) {
+          TT.text(ctx, "tiles_add.cpp, inside the per-tile loop", 30, 160, { color: C.muted, font: "13px" });
+          return;
+        }
+        var la = i === 1 ? t : 1;
+        lanes(la);
+        TT.text(ctx, i <= 1 ? "after the UNPACK / MATH / PACK macros" : i <= 3 ? "Tensix instructions each TRISC pushes" : "instruction stream leaving the MOP expander (into the wait gate)", 30, 125, { color: C.muted, font: "13px" });
+        if (i === 1) {
+          ctx.globalAlpha = t;
+          TT.text(ctx, "llk_unpack_AB(icb0, icb1, itile0, itile1)", X0 + 10, LANE[0] + 27, { mono: true, font: "14px", color: C.orange });
+          TT.text(ctx, "llk_math_eltwise_binary<ELWADD, NONE, DST_ACCUM_MODE, LoFi, NONE>(…)", X0 + 10, LANE[1] + 27, { mono: true, font: "14px", color: C.blue });
+          TT.text(ctx, "(nothing: add_tiles has no PACK(...) line)", X0 + 10, LANE[2] + 27, { mono: true, font: "14px", color: C.muted });
+          ctx.globalAlpha = 1;
+          return;
+        }
+        TT.text(ctx, "(nothing)", X0 + 10, LANE[2] + 27, { mono: true, font: "13px", color: C.muted });
+        if (i === 2 || i === 3) {
+          var a = i === 2 ? t : 1;
+          row(push0, LANE[0] + 12, 82, 6, push0.length, a);
+          row(push1, LANE[1] + 12, 82, 6, push1.length, a);
+          if (i === 3) {
+            // template boxes
+            var bx = 630, a3 = t;
+            ctx.globalAlpha = a3;
+            TT.arrow(ctx, X0 + 2 * 88 + 41, LANE[0] + 44, bx - 4, LANE[0] + 48, { color: C.yellow, lw: 1.5 });
+            TT.arrow(ctx, X0 + 1 * 88 + 41, LANE[1] + 44, bx - 4, LANE[1] + 48, { color: C.yellow, lw: 1.5 });
+            TT.box(ctx, bx, LANE[0] + 20, 236, 56, { fill: C.yellow, alpha: 0.1, stroke: C.yellow, r: 6 });
+            TT.text(ctx, "MopCfg T0: outer=2 inner=2", bx + 10, LANE[0] + 38, { mono: true, font: "12px" });
+            TT.text(ctx, "loop: UNPACR A ⇄ UNPACR B", bx + 10, LANE[0] + 58, { mono: true, font: "12px", color: C.orange });
+            TT.box(ctx, bx, LANE[1] + 20, 236, 56, { fill: C.yellow, alpha: 0.1, stroke: C.yellow, r: 6 });
+            TT.text(ctx, "MopCfg T1: outer=4 inner=2", bx + 10, LANE[1] + 38, { mono: true, font: "12px" });
+            TT.text(ctx, "loop: ELWADD; end: SETRWC", bx + 10, LANE[1] + 58, { mono: true, font: "12px", color: C.blue });
+            ctx.globalAlpha = 1;
+          }
+          return;
+        }
+        // i >= 4: expanded rows
+        var n0 = i === 4 ? Math.floor(TT.lerp(push0.length, exp0.length, t)) : exp0.length;
+        var n1 = i === 4 ? Math.floor(TT.lerp(push1.length, exp1.length, t)) : exp1.length;
+        row(exp0, LANE[0] + 12, 52, 3, n0, 1);
+        row(exp1, LANE[1] + 12, 44, 3, n1, 1);
+        TT.text(ctx, n0 + " on T0", 862, LANE[0] + 54, { align: "right", color: C.muted, font: "12px" });
+        TT.text(ctx, n1 + " on T1", 862, LANE[1] + 54, { align: "right", color: C.muted, font: "12px" });
+        if (i === 5) {
+          TT.text(ctx, "8 UNPACR + 8 ELWADD do the work; the other 10 are counters, semaphores and config.", 30, 440, { color: C.green, font: "14px" });
+        }
+      }
+    });
+  })();
+  </script>
+
+  <p>Two things in that picture are worth keeping. The <em>shape</em> of the work (4 faces, 2 row-blocks each, 2 operands) was decided by an init call and stored in hardware, not in the per-tile code. And the RISC-V side of <code>add_tiles</code> on the MATH core is three pushes, whatever the tile size. That's why TRISC1 gets away with a ½ KiB instruction cache (<a href="a04-inside-tensix.html#riscv">A04</a>).</p>
+
+  <div class="callout key">A compute-API call compiles to a few RISC-V instructions that push a few Tensix instructions. One of them is usually <code>MOP</code>, and the MOP expander inside the coprocessor turns it into the long, regular instruction stream the engines need. The init call is what programs that expansion.</div>
+
+  <h2 id="layers">Three layers between you and the hardware</h2>
+  <p>Between <code>add_tiles</code> and the <code>.ttinsn</code> words in the binary are three layers of header-only C++. Each one is a different team's contract.</p>
+  <table>
+    <tr><th>Layer</th><th>Where</th><th>What it knows</th><th>Example</th></tr>
+    <tr><td>1. Compute API</td><td><code>tt_metal/hw/inc/api/compute/</code></td><td>Circular buffers, tile indices, which TRISC does what</td><td><code>add_tiles</code>, <code>add_init</code></td></tr>
+    <tr><td>2. Metal LLK wrappers</td><td><code>tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/</code></td><td>How a CB id maps to an L1 address, tile shape and data format; checks and sanitizer hooks</td><td><code>llk_math_eltwise_binary</code></td></tr>
+    <tr><td>3. tt-llk</td><td><code>tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/</code></td><td>Tensix instructions, address modes, MOP templates, per architecture</td><td><code>_llk_math_eltwise_binary_</code></td></tr>
+  </table>
+  <p>"LLK" stands for <em>low-level kernel</em>. tt-llk is also published as its own repository (<a href="https://github.com/tenstorrent/tt-llk">tenstorrent/tt-llk</a>) and vendored into tt-metal, and its functions follow a naming convention you can grep for: a leading and trailing underscore, <code>_llk_…_</code>.</p>
+
+  <h3>Layer 1: the compute API</h3>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/eltwise_binary.h:265-275 @7aad8aac</div>
+<pre><code>template &lt;bool is_fp32_dest_acc_en = DST_ACCUM_MODE&gt;
+ALWI void add_tiles(
+    std::uint32_t icb0, std::uint32_t icb1, std::uint32_t itile0, std::uint32_t itile1, std::uint32_t idst) {
+    UNPACK((llk_unpack_AB(icb0, icb1, itile0, itile1)));
+    MATH((llk_math_eltwise_binary&lt;
+          EltwiseBinaryType::ELWADD,
+          BroadcastType::NONE,
+          is_fp32_dest_acc_en,
+          MathFidelity::LoFi,
+          EltwiseBinaryReuseDestType::NONE&gt;(icb0, icb1, idst, true /* clear_fp32_dst_acc */)));
+}</code></pre>
+  <p><code>ALWI</code> means "always inline". There's no function call at runtime, so the whole chain collapses into straight-line code in each TRISC binary. Notice that <code>MathFidelity::LoFi</code> is hard-coded: addition doesn't need multiplier phases (A06), whatever <code>ComputeConfig</code> says.</p>
+
+  <h3>Layer 2: the Metal wrapper</h3>
+  <p>The wrapper turns "circular buffer 0" into facts tt-llk understands. On the unpack side it computes L1 addresses from the CB read pointer (<code>llk_unpack_AB_api.h:58-65</code>). On the math side it looks up the tile shape:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_math_binary_api.h:96-133 @7aad8aac (assert and sanitizer hook elided)</div>
+<pre><code>inline void llk_math_eltwise_binary(
+    const std::uint32_t operand_A,
+    const std::uint32_t operand_B,
+    uint dst_index,
+    const bool clear_fp32_dst_acc = true) {
+    ...
+    const std::uint32_t operand_id = get_operand_id(operand_A);
+    const ckernel::TensorShape tensor_shape = get_operand_tensor_shape(operand_id);
+    ...
+    _llk_math_eltwise_binary_&lt;
+        eltwise_binary_type,
+        src_b_bcast_type,
+        DST_SYNC_MODE,
+        is_fp32_dest_acc_en,
+        effective_math_fidelity,
+        binary_reuse_dest&gt;(tensor_shape, dst_index, clear_fp32_dst_acc);
+}</code></pre>
+  <p>Where does <code>get_operand_tensor_shape</code> get its answer? From tables the JIT compiler generated for this kernel, such as <code>unpack_tile_face_r_dim[32]</code> (all 16) and <code>unpack_tile_num_faces[32]</code> (all 4). They live in a file called <code>chlkc_descriptors.h</code>, which we'll find in the <a href="#jit">kernel cache</a>. The CB formats are baked in at compile time, which is one reason kernels are compiled at run time at all.</p>
+
+  <h3>Layer 3: tt-llk</h3>
+  <p>Here's the bottom of the call, the "standard" (no broadcast, no Dst reuse) path, trimmed to the <code>ELWADD</code> case:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_binary.h:242-262,320 @7aad8aac (COL/SCALAR broadcast branches elided)</div>
+<pre><code>    // Dest counter always jumps by 32x32 tile spacing regardless of actual tile size
+    math::set_dst_write_addr&lt;DstTileShape::Tile32x32, UnpackDestination::SrcRegs&gt;(dst_index);
+
+    if constexpr ((eltwise_binary_type == EltwiseBinaryType::ELWADD) || ...)
+    {
+            ...
+            // NONE/ROW/SCALAR: MOP handles all faces in one call
+            ckernel_template::run();
+            ...
+    }
+    math::clear_dst_reg_addr();</code></pre>
+  <p>That's the whole per-tile math path: point the Dst write address at tile <code>dst_index</code>, run the MOP, reset the Dst counter. <code>set_dst_write_addr</code> ends in <code>TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, dst_index)</code> and <code>clear_dst_reg_addr</code> is <code>TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D)</code> (<code>cmath_common.h:260-288</code>). Three pushes, as in the animation.</p>
+
+  <div class="callout gpu">On a GPU the closest thing is a library like CUTLASS: templates that pick tile shapes and emit <code>mma</code> instructions. The difference is where the loop lives. A CUTLASS mainloop is unrolled into the instruction stream the SM fetches. An LLK loop over faces is written once into the MOP expander's registers, and from then on the coprocessor generates it from a single <code>MOP</code> instruction.</div>
+
+  <h2 id="encoding">What a Tensix instruction looks like</h2>
+  <p>Every Tensix instruction is a 32-bit word with the opcode in the top byte and operands packed into the low 24 bits. tt-llk spells this out with one macro per instruction, generated from the ISA description:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel_ops.h:12-13,24,161-162,167,260,263 @7aad8aac</div>
+<pre><code>#define TT_INSN(ENCODING)  __builtin_rvtt_ttinsn(::ckernel::instrn_buffer, (ENCODING), 0, 0, 0)
+#define TTI_INSN(ENCODING) __builtin_rvtt_ttinsn(nullptr, (ENCODING), 0, 0, 0)
+
+#define TT_OP(opcode, params) ((opcode &lt;&lt; 24) + params)
+
+#define TT_OP_ELWADD(clear_dvalid, dest_accum_en, instr_mod19, addr_mode, dst) \
+    TT_OP(0x28, (((clear_dvalid) &lt;&lt; 22) + ((dest_accum_en) &lt;&lt; 21) + ((instr_mod19) &lt;&lt; 19) + ((addr_mode) &lt;&lt; 15) + ((dst) &lt;&lt; 0)))
+#define TTI_ELWADD(clear_dvalid, dest_accum_en, instr_mod19, addr_mode, dst) TTI_INSN(TT_OP_ELWADD(...))
+
+#define TT_OP_MOP(mop_type, loop_count, zmask_lo16)    TT_OP(0x01, (((mop_type) &lt;&lt; 23) + ((loop_count) &lt;&lt; 16) + ((zmask_lo16) &lt;&lt; 0)))
+#define TTI_MOP(mop_type, loop_count, zmask_lo16)      TTI_INSN(TT_OP_MOP(mop_type, loop_count, zmask_lo16))</code></pre>
+  <p>There are three name patterns for each instruction:</p>
+  <ul>
+    <li><b><code>TT_OP_X(...)</code></b> is just the number. The LLK uses it when it needs an instruction as <em>data</em>, for example to store into a MOP template.</li>
+    <li><b><code>TTI_X(...)</code></b> ("immediate") pushes an instruction whose operands are all compile-time constants. The SFPI compiler turns <code>__builtin_rvtt_ttinsn(nullptr, …)</code> into one 32-bit <code>.ttinsn</code> RISC-V instruction: the Tensix word rotated left by two bits, which the core recognises because its low bits aren't <code>11</code>. A04 <a href="a04-inside-tensix.html#push">walks through that rotation</a>.</li>
+    <li><b><code>TT_X(...)</code></b> pushes an instruction with runtime operands. The compiler builds the word in a register and stores it with an ordinary <code>sw</code> to <code>instrn_buffer</code> (0xFFE40000).</li>
+  </ul>
+  <p>The builtin only exists when compiling for a TRISC. <code>ckernel_ops.h:7</code> checks <code>__riscv_xtttensixwh</code>, and anything else gets an <code>.error "TTI_INSN in non-tensix code"</code>. I checked which flag defines it: <code>riscv-tt-elf-g++ -mcpu=tt-wh-tensix -dM -E</code> prints <code>#define __riscv_xtttensixwh 1000000</code>, and <code>-mcpu=tt-wh</code> (the BRISC/NCRISC flag) doesn't.</p>
+
+  <p>The widget below uses real words from the JIT-compiled <code>trisc1.elf</code> of <code>eltwise_binary</code>. Pick one to see the stored word, the rotation back, and the fields as ttsim decodes them from its <code>data/wh/tensix_isa.json</code>.</p>
+
+  <div class="viz" id="dec">
+    <div class="controls"><label>Word from trisc1.elf:
+      <select id="decsel"></select></label></div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("dec");
+    var g = TT.canvas(root, 880, 330), ctx = g.ctx, C = TT.C;
+    // Field layouts copied from ttsim data/wh/tensix_isa.json (hi, lo). MOP and REPLAY are decoded by hand in
+    // ttsim's tensix.cpp (mop_ingest, replay_expander); their JSON entries give only a placeholder bit.
+    var ISA = {
+      0x01: ["MOP", [["mop_type", 23, 23], ["loop_count", 22, 16], ["zmask_lo16", 15, 0]]],
+      0x04: ["REPLAY", [["start_idx", 23, 14], ["len", 13, 4], ["exec", 1, 1], ["load", 0, 0]]],
+      0x28: ["ELWADD", [["clear_dvalid", 23, 22], ["dest_accum_en", 21, 21], ["instr_mod19", 20, 19], ["addr_mode", 16, 15], ["dst", 9, 0]]],
+      0x37: ["SETRWC", [["clear_ab_vld", 23, 22], ["rwc_cr", 21, 18], ["rwc_d", 17, 14], ["rwc_b", 13, 10], ["rwc_a", 9, 6], ["bit_mask", 3, 0]]],
+      0xa4: ["SEMPOST", [["sem_sel", 9, 2]]],
+      0xa6: ["SEMWAIT", [["stall_res", 23, 15], ["sem_sel", 9, 2], ["wait_sem_cond", 1, 0]]],
+      0xa2: ["STALLWAIT", [["stall_res", 23, 15], ["wait_res", 14, 0]]],
+      0xb2: ["SETC16", [["setc16_reg", 23, 16], ["setc16_value", 15, 0]]]
+    };
+    var W = [
+      { raw: 0x06000000, rot: true, where: "0x6bd0  ttmop 1,0,0", note: "ckernel_template::run() = TTI_MOP(1, 0, 0): template 1, the double loop." },
+      { raw: 0xdc000010, rot: true, where: "0x6bd4  ttsetrwc 0,0,0,0,0,4", note: "clear_dst_reg_addr(): SETRWC with bit_mask = SET_D (4) resets the Dst row counter." },
+      { raw: 0x9a84002a, rot: true, where: "0x6bbc  ttsemwait 322,2,2", note: "tile_regs_acquire(): wait on semaphore mask 0b10 (MATH_PACK) until it is below its max." },
+      { raw: 0x90000022, rot: true, where: "0x6bdc  ttsempost 2", note: "tile_regs_commit(): post MATH_PACK, telling PACK that Dst is ready." },
+      { raw: 0xdc00003c, rot: true, where: "0x6b74  ttsetrwc 0,0,0,0,0,15", note: "math::reset_counters(SET_ABD_F) at the end of add_init." },
+      { raw: 0x28000000, rot: false, where: "0x6b5c  lui a4,0x28000 → sw to 0xFFB80014", note: "Not pushed. add_init stores this ELWADD into MopCfg[5] (LoopOp) as plain data, so it is not rotated." },
+      { raw: 0x37cc0003, rot: false, where: "0x6b48  lui a4,0x37cc0 … sw to 0xFFB8000C", note: "MopCfg[3] (EndOp0): SETRWC(CLR_AB, CR_AB, 0, 0, 0, SET_AB), stored as data." }
+    ];
+    var sel = document.getElementById("decsel");
+    W.forEach(function (w, i) { var o = document.createElement("option"); o.value = i; o.textContent = w.where; sel.appendChild(o); });
+    function rotr2(x) { return ((x >>> 2) | (x << 30)) >>> 0; }
+    function hex(x) { return "0x" + (x >>> 0).toString(16).padStart(8, "0"); }
+    var FC = [C.blue, C.green, C.orange, C.pink, C.teal, C.purple];
+    function bits(y, val, colorOf, label) {
+      TT.text(ctx, label, 14, y + 13, { color: C.muted, font: "11px" });
+      for (var b = 31; b >= 0; b--) {
+        var x = 200 + (31 - b) * 21, v = (val >>> b) & 1, col = colorOf(b);
+        TT.box(ctx, x, y, 19, 26, { fill: col, alpha: v ? 0.65 : 0.12, stroke: col, lw: 1, r: 2 });
+        TT.text(ctx, String(v), x + 9.5, y + 13, { align: "center", mono: true, font: "12px" });
+      }
+    }
+    function draw() {
+      var w = W[+sel.value], word = w.rot ? rotr2(w.raw) : w.raw, op = word >>> 24, d = ISA[op];
+      TT.clear(ctx, g.W, g.H);
+      for (var b = 31; b >= 0; b -= 4) TT.text(ctx, String(b), 200 + (31 - b) * 21 + 9.5, 14, { align: "center", color: C.muted, font: "10px", mono: true });
+      bits(26, w.raw, function (b) { return w.rot && b <= 1 ? C.yellow : C.border; }, w.rot ? "stored (.ttinsn) " + hex(w.raw) : "stored as data " + hex(w.raw));
+      if (w.rot) TT.text(ctx, "low bits " + ((w.raw & 3).toString(2).padStart(2, "0")) + " ≠ 11 → Tensix push; rotate right by 2", 200, 70, { color: C.yellow, font: "12px" });
+      else TT.text(ctx, "never executed as a RISC-V instruction, so no rotation", 200, 70, { color: C.muted, font: "12px" });
+      function fieldOf(b) {
+        if (b >= 24) return C.red;
+        var f = d[1];
+        for (var k = 0; k < f.length; k++) if (b <= f[k][1] && b >= f[k][2]) return FC[k % FC.length];
+        return C.border;
+      }
+      bits(88, word, fieldOf, "Tensix word " + hex(word));
+      TT.text(ctx, "opcode 0x" + op.toString(16).padStart(2, "0") + " = " + d[0], 20, 150, { font: "bold 15px", color: C.red });
+      var y = 178;
+      d[1].forEach(function (f, k) {
+        var v = (word >>> f[2]) & ((1 << (f[1] - f[2] + 1)) - 1);
+        TT.box(ctx, 20, y - 9, 12, 12, { fill: FC[k % FC.length], alpha: 0.7, r: 2 });
+        TT.text(ctx, f[0] + " [" + f[1] + ":" + f[2] + "] = " + v, 40, y - 3, { mono: true, font: "13px" });
+        y += 22;
+      });
+      TT.text(ctx, w.note, 20, 316, { color: C.fg, font: "13px" });
+    }
+    sel.onchange = draw;
+    draw();
+  })();
+  </script>
+
+  <p>The ELWADD that MATH actually executes is the plain constant <code>0x28000000</code>: clear_dvalid 0, no accumulation, address mode 0, dst 0. The destination row isn't in the instruction. It comes from the Dst read/write counter (RWC), which address mode 0 advances by 8 rows after each <code>ELWADD</code> (<code>eltwise_binary_configure_addrmod</code>, <code>llk_math_eltwise_binary.h:44-49</code>). Eight identical instruction words can therefore write eight different 8-row blocks. A loop machine that can only repeat <em>fixed</em> words needs exactly this property.</p>
+
+  <div class="callout warn">Names differ between sources. tt-llk's <code>TT_SETDMAREG</code> (opcode 0x45) is <code>SETGPR</code> in ttsim's <code>tensix_isa.json</code>. The ISA docs also use <code>SETDMAREG</code>. Match on opcode numbers, not names, when you move between tt-metal, ttsim and the ISA docs.</div>
+
+  <h2 id="template">Init functions write a loop into hardware</h2>
+  <p>The MOP expander is a generator with nine 32-bit configuration registers per thread. TT-LLK wraps them in a small class whose comment is the best one-glance description of the hardware:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel_template.h:16-26 @7aad8aac</div>
+<pre><code>    // Here is the basic outline of a MOP loop and the definition of the
+    // variables used.
+    // LOOP_OUTER: &lt;OUTER_LOOP_COUNT&gt;
+    //   START_OP
+    //   LOOP_INNER: &lt;INNER_LOOP_COUNT&gt;
+    //     LOOP_OP0
+    //     LOOP_OP1
+    //   END_LOOP_INNER
+    //   END_OP0
+    //   END_OP1
+    // END_LOOP_OUTER</code></pre>
+  <p>An analogy: a knitting pattern. "*Knit 2, purl 1; repeat from * 4 times; on the last repeat, end with knit 3." The pattern is short, the row is long, and the knitter never improvises. The analogy breaks in one useful place. A knitter can look at the wool. The MOP expander never looks at data, flags or registers, so it can't branch. All it can do is emit fixed words in a fixed order, with two special cases for the last iteration.</p>
+
+  <p>For <code>add_tiles</code> the math init builds this template:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_binary.h:123-131,141-151 @7aad8aac (comments trimmed)</div>
+<pre><code>    const std::uint8_t innerloop = tensor_shape.face_r_dim &gt; MAX_FPU_ROWS ? (tensor_shape.face_r_dim &gt;&gt; MAX_FPU_ROWS_LOG2) : 1;
+    const std::uint32_t outerloop = (bcast_type == BroadcastType::COL) ? num_faces_c_dim : num_faces;
+    ...
+    if constexpr ((eltwise_binary_type == EltwiseBinaryType::ELWADD) || (eltwise_binary_type == EltwiseBinaryType::ELWSUB))
+    {
+        ckernel_template tmp(outerloop, innerloop, eltwise_binary_func&lt;eltwise_binary_type&gt;(0 /*clr_src*/, acc_to_dest, broadcast_type, addr_mod));
+        if (tensor_shape.face_r_dim &lt;= MAX_FPU_ROWS)
+        {
+            tmp.set_loop_op1(TT_OP_INCRWC(0, MAX_FPU_ROWS, MAX_FPU_ROWS, MAX_FPU_ROWS));
+        }
+        tmp.set_end_op(TT_OP_SETRWC(CLR_SRC, p_setrwc::CR_AB, 0, 0, 0, p_setrwc::SET_AB));
+        tmp.program();
+    }</code></pre>
+  <p>With the default tile (face_r_dim 16, 4 faces, <code>MAX_FPU_ROWS</code> = 8), that's <b>outer = 4</b> (one per face) and <b>inner = 16 / 8 = 2</b> (two 8-row ELWADDs per face). The end op <code>SETRWC(CLR_AB, CR_AB, …, SET_AB)</code> runs once per face. Per the ISA's <code>SETRWC</code> functional model, it rewinds the SrcA/SrcB row counters and flips both Src banks back to the unpackers, so the next face can be unpacked. It leaves the Dst counter alone, so Dst keeps advancing: 8 ELWADDs × 8 rows = 64 rows, one 32×32 tile.</p>
+  <p><code>program()</code> is where the template reaches hardware:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel_template.h:320-340 @7aad8aac</div>
+<pre><code>inline void ckernel_template::run()
+{
+    TTI_MOP(1, 0, 0); // run the double-loop template
+}
+
+inline void ckernel_template::program()
+{
+    volatile std::uint32_t *mop_cfg = reinterpret_cast&lt;volatile std::uint32_t *&gt;(TENSIX_MOP_CFG_BASE);
+
+    mop_sync(); // wait until previous mops have completed
+
+    mop_cfg[0] = m_outer_loop_len;
+    mop_cfg[1] = m_inner_loop_len;
+    mop_cfg[2] = m_start_op0;
+    mop_cfg[3] = m_end_op0;
+    mop_cfg[4] = m_end_op1;
+    mop_cfg[5] = m_loop_op0;
+    mop_cfg[6] = m_loop_op1;
+    mop_cfg[7] = m_loop0_last_instr;
+    mop_cfg[8] = m_loop1_last_instr;
+}</code></pre>
+  <p><code>TENSIX_MOP_CFG_BASE</code> is <code>0xFFB80000</code> (<code>hw/inc/internal/tt-1xx/wormhole/tensix.h:72</code>). Per the ISA docs, each TRISC sees <em>its own thread's</em> nine registers at that address, and the range is write-only: reading it is <code>UndefinedBehavior</code>. <code>mop_sync()</code> is a store to <code>pc_buf_base[2]</code> (<code>ckernel.h:237-240</code>), the RISCV TTSync mechanism that waits for in-flight expansions to finish. The ISA page says why: hardware samples the configuration <em>during</em> expansion, so overwriting it mid-MOP changes a loop that's already running.</p>
+  <p>Here is that function after the compiler finished with it, from the real <code>trisc1.elf</code> (labels removed):</p>
+  <div class="filename">objdump -d of $TT_METAL_CACHE/…/kernels/tiles_add/6990101545042396689/trisc1/trisc1.elf (run in this orb; labels and mop_sync's two filler instructions at 6b1c and 6b2c removed)</div>
+<pre><code>    6b18:  ffe80737   lui   a4,0xffe80
+    6b20:  00870713   addi  a4,a4,8          # ffe80008: pc_buf_base[2] = mop_sync()
+    6b24:  00f72023   sw    a5,0(a4)
+    6b28:  00072783   lw    a5,0(a4)
+    6b30:  ffb807b7   lui   a5,0xffb80       # TENSIX_MOP_CFG_BASE
+    6b34:  00400713   li    a4,4
+    6b38:  00e7a023   sw    a4,0(a5)         # [0] outer = 4
+    6b3c:  00200713   li    a4,2
+    6b40:  00e7a223   sw    a4,4(a5)         # [1] inner = 2
+    6b44:  020006b7   lui   a3,0x2000        # 0x02000000 = NOP
+    6b48:  37cc0737   lui   a4,0x37cc0
+    6b4c:  00d7a423   sw    a3,8(a5)         # [2] start  = NOP
+    6b50:  00370713   addi  a4,a4,3
+    6b54:  00e7a623   sw    a4,12(a5)        # [3] end0   = 0x37cc0003 SETRWC
+    6b58:  00d7a823   sw    a3,16(a5)        # [4] end1   = NOP
+    6b5c:  28000737   lui   a4,0x28000
+    6b60:  00e7aa23   sw    a4,20(a5)        # [5] loop0  = 0x28000000 ELWADD
+    6b64:  00d7ac23   sw    a3,24(a5)        # [6] loop1  = NOP
+    6b68:  00e7ae23   sw    a4,28(a5)        # [7] last0  = ELWADD
+    6b6c:  02e7a023   sw    a4,32(a5)        # [8] last1  = ELWADD</code></pre>
+  <p>Nine stores, all with constants. The C++ template machinery is gone, leaving exactly the data the hardware needs. Both "last" slots hold the same ELWADD because the one-op constructor copies <code>loop_op</code> into them (<code>ckernel_template.h:252-263</code>). The ELWMUL path at higher fidelity puts <em>different</em> instructions there, as the next figure shows.</p>
+
+  <p>The unpack side does the same thing on TRISC0 with two loop ops: <code>ckernel_template tmp(num_faces_r_dim, num_faces_c_dim, unpack_srca, unpack_srcb)</code>, which is outer 2 × inner 2 for a 2×2-face tile (<code>llk_unpack_AB.h:129-131</code>). When <code>LoopOp1</code> isn't a NOP, the expander alternates between the two ops and doubles the inner count. That's where the "A, B, A, B" pattern comes from.</p>
+
+  <h2 id="expander">The MOP expander, step by step</h2>
+  <p>The ISA documentation gives the expander's behaviour as a Python generator. For template 1, the double loop that <code>ckernel_template</code> uses:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/MOPExpander.md:69-105 @be83310 (Blackhole branch and hardware-bug corner case elided)</div>
+<pre><code>    OuterCount = MopCfg[0] &amp; 127
+    InnerCount = MopCfg[1] &amp; 127
+  StartOp    = MopCfg[2]
+  EndOp0     = MopCfg[3]
+  EndOp1     = MopCfg[4]
+  LoopOp     = MopCfg[5]
+  LoopOp1    = MopCfg[6]
+  Loop0Last  = MopCfg[7] # Overrides LoopOp or LoopOp1 on last iteration of inner loop, if also last iteration of outer loop
+  Loop1Last  = MopCfg[8] # Overrides LoopOp or LoopOp1 on last iteration of inner loop, if not last iteration of outer loop
+  if IsNop(LoopOp1):
+    LoopOpFlip = 0
+  else:
+    LoopOpFlip = LoopOp ^ LoopOp1 # Inner loop will alternate between the two instructions and will
+    InnerCount *= 2               # execute for twice as many iterations.
+  ...
+  for j in range(OuterCount):
+    if not IsNop(StartOp):
+      yield StartOp
+    for i in range(InnerCount):
+      if i != InnerCount-1:
+        yield LoopOp
+      elif j != OuterCount-1:
+        yield Loop1Last
+      else:
+        yield Loop0Last
+      LoopOp ^= LoopOpFlip
+    if not IsNop(EndOp0):
+      yield EndOp0
+      if not IsNop(EndOp1):
+        yield EndOp1</code></pre>
+  <p>Two small tricks are worth noticing. Alternation is an XOR: <code>LoopOpFlip</code> holds the bits where the two ops differ, so XORing toggles between them with no extra state. And NOP (opcode 0x02) means "absent" for the start and end slots, so one fixed-size register file can describe loops with or without prologue and epilogue.</p>
+  <p>Step through it. The presets are the real configurations from tt-llk. The first two match what ttsim logged for <code>add_tiles</code>.</p>
+
+  <div class="viz" id="mop"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("mop");
+    var g = TT.canvas(root, 880, 440), ctx = g.ctx, C = TT.C;
+    var NOP = "NOP";
+    var PRESETS = [
+      { name: "add_tiles, MATH thread (ELWADD)", cfg: [4, 2, NOP, "SETRWC", NOP, "ELWADD", NOP, "ELWADD", "ELWADD"],
+        intro: "add_init stored outer=4 (faces), inner=2 (8-row blocks per face), ELWADD as the loop op and SETRWC as EndOp0. LoopOp1 is NOP, so there's no alternation." },
+      { name: "add_tiles, UNPACK thread (UNPACR A/B)", cfg: [2, 2, NOP, NOP, NOP, "UNPACR·A", "UNPACR·B", "UNPACR·B", "UNPACR·B"],
+        intro: "ckernel_template(2, 2, unpack_srca, unpack_srcb). LoopOp1 is not NOP, so the inner loop alternates A, B and runs 2 × 2 = 4 times. The two-op constructor sets both Last slots to LoopOp1." },
+      { name: "mul_tiles at HiFi4, MATH (ELWMUL)", cfg: [4, 2, NOP, NOP, NOP, "ELWMUL", NOP, "ELWMUL·clr·AM3", "ELWMUL·AM2"],
+        intro: "The high-fidelity ELWMUL template: outer = 4 fidelity phases, inner = 2. The last inner op uses ADDR_MOD_2 (rewind Src, bump the fidelity phase). The very last one uses ADDR_MOD_3 and clears Src. The LLK runs this MOP once per face." },
+      { name: "matmul at HiFi4, MATH (REPLAY)", cfg: [1, 4, NOP, "SETRWC", NOP, "REPLAY 16,16", NOP, "REPLAY 16,16", "REPLAY 16,16"],
+        intro: "matmul records 16 MVMULs in the replay buffer (slots 16–31), then loops a single REPLAY once per fidelity phase. The replay expander, which sits after the MOP expander, turns each REPLAY into 16 MVMULs." }
+    ];
+    var SLOT = ["OuterCount", "InnerCount", "StartOp", "EndOp0", "EndOp1", "LoopOp", "LoopOp1", "Loop0Last", "Loop1Last"];
+    var CODE = [
+      "for j in range(OuterCount):",
+      "  if StartOp != NOP: yield StartOp",
+      "  for i in range(InnerCount):",
+      "    if i < InnerCount-1: yield LoopOp",
+      "    elif j < OuterCount-1: yield Loop1Last",
+      "    else: yield Loop0Last",
+      "    LoopOp ^= LoopOpFlip",
+      "  if EndOp0 != NOP: yield EndOp0",
+      "    if EndOp1 != NOP: yield EndOp1"
+    ];
+    function events(cfg) {
+      var ev = [], outer = cfg[0], inner = cfg[1], flip = cfg[6] !== NOP;
+      if (flip) inner *= 2;
+      for (var j = 0; j < outer; j++) {
+        if (cfg[2] !== NOP) ev.push({ j: j, i: -1, slot: 2, line: 1, op: cfg[2] });
+        for (var i = 0; i < inner; i++) {
+          var slot, line;
+          if (i !== inner - 1) { slot = flip && (i & 1) ? 6 : 5; line = 3; }
+          else if (j !== outer - 1) { slot = 8; line = 4; }
+          else { slot = 7; line = 5; }
+          ev.push({ j: j, i: i, slot: slot, line: line, op: cfg[slot], inner: inner });
+        }
+        if (cfg[3] !== NOP) { ev.push({ j: j, i: inner, slot: 3, line: 7, op: cfg[3] }); if (cfg[4] !== NOP) ev.push({ j: j, i: inner, slot: 4, line: 8, op: cfg[4] }); }
+      }
+      return ev;
+    }
+    function colorOf(op) {
+      if (/^ELW/.test(op)) return C.blue;
+      if (/^UNPACR/.test(op)) return C.orange;
+      if (/^REPLAY/.test(op)) return C.green;
+      if (op === NOP) return C.border;
+      return C.purple;
+    }
+    // controls
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    var narr = document.createElement("div"); narr.className = "narration";
+    function mkb(l) { var b = document.createElement("button"); b.textContent = l; ctrl.appendChild(b); return b; }
+    var bBack = mkb("Back"), bPlay = mkb("Play"), bStep = mkb("Step"), bReset = mkb("Restart");
+    var lab = document.createElement("label"); lab.textContent = "MOP config:";
+    var sel = document.createElement("select");
+    PRESETS.forEach(function (p, k) { var o = document.createElement("option"); o.value = k; o.textContent = p.name; sel.appendChild(o); });
+    lab.appendChild(sel); ctrl.appendChild(lab);
+    var info = document.createElement("span"); info.style.marginLeft = "auto"; info.style.color = C.muted; ctrl.appendChild(info);
+    root.appendChild(ctrl); root.appendChild(narr);
+    var P, EV, k = -1, playing = false, timer = null;
+    function load() { P = PRESETS[+sel.value]; EV = events(P.cfg); k = -1; stop(); draw(); }
+    function stop() { playing = false; if (timer) clearInterval(timer); timer = null; bPlay.textContent = "Play"; }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var e = k >= 0 && k < EV.length ? EV[k] : null;
+      // config registers
+      TT.text(ctx, "MopCfg (written by init)", 20, 22, { color: C.muted, font: "13px" });
+      for (var s = 0; s < 9; s++) {
+        var y = 40 + s * 40, hl = e && e.slot === s;
+        TT.box(ctx, 20, y, 270, 32, { fill: hl ? C.yellow : C.bg2, alpha: hl ? 0.3 : 1, stroke: hl ? C.yellow : C.border, r: 5 });
+        TT.text(ctx, "[" + s + "] " + SLOT[s], 30, y + 16, { font: "12px", color: C.muted, mono: true });
+        var v = String(P.cfg[s]);
+        TT.text(ctx, v, 280, y + 16, { align: "right", font: "12px", mono: true, color: s < 2 ? C.fg : colorOf(v) });
+      }
+      // code
+      TT.text(ctx, "MOP expander (template 1)", 310, 22, { color: C.muted, font: "13px" });
+      CODE.forEach(function (ln, q) {
+        var y = 48 + q * 24, hl = e && e.line === q;
+        if (hl) TT.box(ctx, 306, y - 11, 294, 22, { fill: C.yellow, alpha: 0.22, r: 3 });
+        TT.text(ctx, ln, 312, y, { mono: true, font: "11.5px", color: hl ? C.yellow : C.fg });
+      });
+      var outer = P.cfg[0], inner = P.cfg[1] * (P.cfg[6] !== NOP ? 2 : 1);
+      TT.text(ctx, "OuterCount = " + outer + "   InnerCount = " + inner + (P.cfg[6] !== NOP ? "  (doubled: LoopOp1 ≠ NOP)" : ""), 312, 280, { font: "12px", mono: true, color: C.muted });
+      // j, i bars
+      var jj = e ? e.j : (k >= EV.length ? outer : -1), ii = e ? e.i : -1;
+      TT.text(ctx, "j", 312, 312, { mono: true });
+      for (var q = 0; q < outer; q++) TT.box(ctx, 330 + q * 26, 302, 22, 20, { fill: C.teal, alpha: q < jj ? 0.5 : q === jj ? 0.9 : 0.1, stroke: C.teal, lw: 1, r: 3 });
+      TT.text(ctx, "i", 312, 344, { mono: true });
+      for (q = 0; q < inner; q++) TT.box(ctx, 330 + q * 26, 334, 22, 20, { fill: C.pink, alpha: (e && e.j === jj && q < ii) ? 0.5 : (q === ii ? 0.9 : 0.1), stroke: C.pink, lw: 1, r: 3 });
+      // output stream
+      TT.text(ctx, "emitted into the thread's FIFO", 620, 22, { color: C.muted, font: "13px" });
+      var n = Math.max(0, Math.min(k + 1, EV.length)), first = Math.max(0, n - 11);
+      for (q = first; q < n; q++) {
+        var y2 = 40 + (q - first) * 30, op = EV[q].op;
+        TT.box(ctx, 620, y2, 240, 25, { fill: colorOf(op), alpha: q === k ? 0.5 : 0.18, stroke: colorOf(op), lw: 1, r: 4 });
+        TT.text(ctx, (q + 1) + ". " + op, 630, y2 + 13, { mono: true, font: "12px" });
+      }
+      TT.text(ctx, "emitted: " + n + " / " + EV.length, 620, 392, { font: "bold 15px", color: C.yellow });
+      if (/REPLAY/.test(P.cfg[5])) {
+        var reps = 0; for (q = 0; q < n; q++) if (/REPLAY/.test(EV[q].op)) reps++;
+        TT.text(ctx, "after the replay expander: " + (reps * 16) + " MVMUL", 620, 418, { font: "13px", color: C.green });
+      }
+      // narration
+      var txt;
+      if (k < 0) txt = "<b>Before the MOP.</b> " + P.intro + " Press Step: the TRISC pushes one <code>MOP</code> (0x01800000) and the expander starts.";
+      else if (k >= EV.length) txt = "<b>Done.</b> One pushed <code>MOP</code> became " + EV.length + " instructions" + (/REPLAY/.test(P.cfg[5]) ? ", and the replay expander turns its REPLAYs into " + (P.cfg[1] * 16) + " MVMULs" : "") + ". The expander is idle and the thread's next pushed instruction can enter.";
+      else {
+        var why = { 1: "the start op, once per outer iteration", 3: "an ordinary inner iteration emits LoopOp" + (P.cfg[6] !== NOP ? " (currently " + e.op + ", toggled by the XOR)" : ""), 4: "last inner iteration but not the last outer one, so Loop1Last replaces LoopOp", 5: "last inner iteration of the last outer iteration, so Loop0Last replaces LoopOp", 7: "after the inner loop: EndOp0", 8: "EndOp1 follows EndOp0" }[e.line];
+        txt = "<b>j = " + e.j + (e.i >= 0 && e.line <= 5 ? ", i = " + e.i : "") + ".</b> Emits <code>" + e.op + "</code> from MopCfg[" + e.slot + "]: " + why + ".";
+      }
+      narr.innerHTML = txt;
+      info.textContent = "step " + (k + 2) + " / " + (EV.length + 2);
+    }
+    function fwd() { if (k < EV.length) { k++; draw(); } else stop(); }
+    bStep.onclick = function () { stop(); fwd(); };
+    bBack.onclick = function () { stop(); if (k > -1) k--; draw(); };
+    bReset.onclick = function () { stop(); k = -1; draw(); };
+    bPlay.onclick = function () {
+      if (playing) { stop(); return; }
+      if (k >= EV.length) k = -1;
+      playing = true; bPlay.textContent = "Pause";
+      timer = setInterval(fwd, 650);
+    };
+    sel.onchange = load;
+    load();
+  })();
+  </script>
+
+  <p>Some numbers fall straight out of the model. On Wormhole both counts are 7-bit, so the longest possible expansion is 127 outer iterations × (StartOp + 2 × 127 alternating inner ops + EndOp0 + EndOp1) = 127 × 257 = <b>32,639</b> instructions, the figure the ISA page quotes. The expander emits one instruction per cycle, and its control flow is "effectively free". There is a one-cycle penalty when the instruction after a MOP isn't another MOP, and the docs suggest hiding it by having the expansion contain a <code>REPLAY</code> (MOPExpander.md:131-137). That's one reason the matmul preset looks the way it does.</p>
+  <p>There's also a <b>template 0</b>, selected by <code>MOP</code> bit 23 = 0. It's a single loop of up to 128 iterations that picks, per iteration, between an "unpack" sequence (<code>InsnA0</code>, optionally <code>A1–A3</code> and <code>InsnB</code>) and a "skip" sequence, driven by a 32-bit zero-mask. It's built for sparse unpacking: skip tiles known to be zero. tt-llk wraps it as <code>ckernel_unpack_template</code> (<code>ckernel_template.h:65-118,348-358</code>), and <code>MOP_CFG</code> supplies the mask's upper 16 bits.</p>
+
+  <div class="callout warn"><b>ttsim is stricter than the ISA here.</b> For template 1 on Wormhole, ttsim's <code>mop_ingest</code> rejects <code>OuterCount</code> outside 1–32 with <code>UnimplementedFunctionality</code> and <code>InnerCount</code> outside 1–127 with <code>UnsupportedFunctionality</code> (<code>tensix.cpp:144-145</code>), and template 0 with a <code>loop_count</code> above 31, that is more than 32 iterations (<code>UnsupportedFunctionality</code>, <code>tensix.cpp:131</code>; the ISA allows 128). The ISA allows outer counts up to 127. Every real tt-llk template I traced stays well inside ttsim's limits, but a hand-written MOP with a large outer count would stop the simulator, not the silicon.</div>
+
+  <h2 id="pertile">Per tile: one MOP and a SETRWC</h2>
+  <p>Once <code>add_init</code> has run, the per-tile math path never touches the MOP configuration again. Here's the loop body of <code>tiles_add.cpp</code> as TRISC1 executes it. It covers <code>tile_regs_acquire</code>, <code>add_tiles</code> and <code>tile_regs_commit</code>; the other calls in the loop have no MATH code.</p>
+  <div class="filename">objdump -d of the same trisc1.elf, loop .L17 (labels removed, comments mine)</div>
+<pre><code>    6bbc:  9a84002a   ttsemwait   322,2,2     # tile_regs_acquire: wait until MATH_PACK &lt; max
+    6bc0:  00e037b3   snez  a5,a4             #   add_tiles → set_dst_write_addr: which Dst half?
+    6bc4:  00979793   slli  a5,a5,0x9         #   ... 0 or 512 rows
+    6bc8:  00b787b3   add   a5,a5,a1          #   a1 = 0xb2010000 = SETC16 reg 1
+    6bcc:  00f62023   sw    a5,0(a2)          #   push via sw to 0xffe40000 (a TT_ macro)
+    6bd0:  06000000   ttmop       1,0,0       #   ckernel_template::run()
+    6bd4:  dc000010   ttsetrwc    0,0,0,0,0,4 #   clear_dst_reg_addr()
+    6bd8:  88050202   ttstallwait 2,16512     # tile_regs_commit: wait for the FPU to finish
+    6bdc:  90000022   ttsempost   2           #   post MATH_PACK
+    6be0:  fff70793   addi  a5,a4,-1
+    6be4:  40e50733   sub   a4,a0,a4
+    6be8:  89010202   ttstallwait 128,16512   #   then flip to the other Dst half
+    6bec:  00f037b3   snez  a5,a5
+    6bf0:  00979793   slli  a5,a5,0x9
+    6bf4:  00b787b3   add   a5,a5,a1
+    6bf8:  00f62023   sw    a5,0(a2)
+    6bfc:  00168693   addi  a3,a3,1
+    6c00:  fad41ee3   bne   s0,a3,6bbc        # next tile</code></pre>
+  <p>Eighteen RISC-V instructions per tile on TRISC1. Eight of them push to the coprocessor: six <code>.ttinsn</code> words and two <code>sw</code> stores. The only FPU-related pushes in <code>add_tiles</code> are <code>ttmop</code> and <code>ttsetrwc</code>; the eight ELWADDs that do the arithmetic never appear in the RISC-V binary. The <code>SETC16</code> value alternates between 0 and 512 rows (<code>0xb2010000</code> / <code>0xb2010200</code> in the trace below) because of the double-buffered Dst from A12: MATH writes one half while PACK drains the other.</p>
+  <p>This is also why the init call is not optional. The MOP configuration is one global register file per thread, and every init writes all nine words. Call <code>mul_init</code> and then <code>add_tiles</code>, and the MATH thread happily expands the multiply template: <code>ELWMUL</code>s, with the multiply's address modes. There's no error. The LLK can't detect it, and the hardware can't either, because the expander doesn't know what the template "should" be.</p>
+  <div class="callout warn">Init calls aren't one-time setup. Each one <em>replaces</em> the per-thread MOP template, address modes and some configuration. If a kernel alternates operations (add, then exp, then add), call the matching init before each switch. Debug builds have some checks: the eltwise path asserts on a leaked zero-flag state (<code>llk_math_eltwise_binary.h:684-687</code>, only under LLK asserts). Nothing checks that the MOP matches the operation you meant.</div>
+
+  <h2 id="replay">The replay buffer</h2>
+  <p>The MOP template can only repeat two loop ops plus a few fixed extras. A matmul tile needs 16 <code>MVMUL</code>s that differ in their address-mode bits (A06 tabulated them). That's a straight-line sequence, not a loop body. The <b>replay expander</b>, the next frontend stage after the MOP expander, handles it. Each thread has a 32-entry buffer of instruction words, and one instruction, <code>REPLAY</code>, either records the next <i>N</i> incoming instructions into it or plays <i>N</i> of them back:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/REPLAY.md:42-53 @be83310</div>
+<pre><code>    if Instruction.Load:
+      Exec = Instruction.Exec
+      for i in range(Count):
+        Instruction = await GetNextIncomingInstruction()
+        if Instruction.Opcode == REPLAY:
+          UndefinedBehavior() # A REPLAY cannot be one of the instructions loaded
+        ReplayBuffer[(Index + i) % 32] = Instruction
+        if Exec:
+          yield Instruction
+    else:
+      for i in range(Count):
+        yield ReplayBuffer[(Index + i) % 32]</code></pre>
+  <p>tt-llk exposes it through <code>lltt</code>, a tiny header that ships with the SFPI compiler (<code>runtime/sfpi/include/lltt.h</code>). <code>lltt::record(start, len)</code> emits a <code>REPLAY</code> with Load set, and <code>lltt::replay_insn(start, len)</code> builds a playback <code>REPLAY</code> word as data, for use inside a MOP template. Matmul combines them:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_matmul.h:361-364,469-470 @7aad8aac</div>
+<pre><code>    const std::uint32_t replay_buf_len =
+        (is_in0_16x32 &amp;&amp; is_in1_32x16) ? 4 : ((is_in0_16x32 || is_in1_32x16 || is_in0_32x16 || is_in1_16x32) ? (partial_face ? 4 : 8) : 16);
+
+    lltt::record(ckernel::math::replay_buf_offset, replay_buf_len);
+    ...
+    constexpr std::uint32_t inner_loops = high_fidelity ? to_underlying(math_fidelity) : 1;
+    ckernel_template tmp(1 /* outer loop */, inner_loops, lltt::replay_insn(ckernel::math::replay_buf_offset, replay_buf_len));</code></pre>
+  <p><code>replay_buf_offset</code> is 16, with the comment "split replay buffer usage between fpu/sfpu" (<code>cmath_common.h:30</code>). By convention, the FPU's recorded sequences go in slots 16–31 and SFPU code can use 0–15. The order of the two expanders matters. Because the replay expander comes <em>after</em> the MOP expander, a MOP can emit <code>REPLAY</code>s ("loop this recorded sequence 4 times, once per fidelity phase"), but a recorded sequence can't contain a <code>MOP</code> or another <code>REPLAY</code>. ttsim enforces the second rule: "nested REPLAY instruction loaded inside a REPLAY buffer" is <code>UndefinedBehavior</code> (<code>tensix.cpp:65-66</code>).</p>
+  <div class="callout gpu">CUDA Graphs record a sequence of <em>kernel launches</em> once and replay it cheaply. The replay buffer does the same at the level of individual instructions inside one core: record once at init, then play back for every tile with a one-word command. The scale is very different (32 words, not a DAG of kernels), but the reason is the same: the thing issuing commands is slower than the thing executing them.</div>
+
+  <h2 id="sim">Seeing it in ttsim</h2>
+  <p>ttsim has no tracing switches (it reads no environment variables), so I made an instrumented copy. These are the steps I ran in this orb, on ttsim b3620244 (Wormhole build) and tt-metal 7aad8aac:</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/a13
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs   # env.sh changes directory, so use absolute paths
+source $W/workbench/env.sh wh
+$W/workbench/build_ttsim.sh mop wh     # copy to $LAB_HOME/ttsim-mop, build in ~4 s
+patch -p1 -d $LAB_HOME/ttsim-mop &lt; $W/patches/a13-mop-trace.patch
+$W/workbench/build_ttsim.sh mop wh     # rebuild with the hooks
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-mop-wh-release/libttsim.so
+$EX/metal_example_eltwise_binary</code></pre>
+  <p>The instrumentation is <em>not</em> part of ttsim. The whole change is <a href="../sim-labs/patches/a13-mop-trace.patch"><code>sim-labs/patches/a13-mop-trace.patch</code></a>, a <code>diff -u</code> against pristine ttsim b3620244. It adds a 256-entry opcode→name table generated from ttsim's own <code>data/wh/tensix_isa.json</code> (<code>src/a13_opnames.h</code>) and about 35 lines to <code>tensix.cpp</code>, mostly <code>ttsim_printf</code> calls in four places: <code>tensix_push_inst</code> (what the TRISC pushed), <code>mop_ingest</code> (the nine sampled config words), <code>mop_next</code> (each instruction the expander emits) and <code>tensix_frontend_step</code> (each replayed instruction). It logs only the tile whose TRISC1 pushes first, which is the one tile running the compute kernel, and only threads 0 and 1 until their third MOP. The core of the hook in <code>mop_next</code>:</p>
+  <div class="filename">$LAB_HOME/ttsim-mop/src/tensix.cpp (my instrumentation inside ttsim's mop_next, tensix.cpp:231-237 upstream)</div>
+<pre><code>        p_mop-&gt;step++;
+        if (step == MOP_STEP_EMIT) {
+            if (a13_on(p_tensix, pipe)) {
+                ttsim_printf("A13 T%u   mop #%u -&gt; %-8s 0x%08x  (outer iter %u, step %u)\n", pipe,
+                    a13_emitted[pipe] + 1, A13_NAME(*p_inst), *p_inst, p_mop-&gt;iter, p_mop-&gt;step - 1);
+            }
+            a13_emitted[pipe]++;
+            return true;
+        }</code></pre>
+  <p>The output still says <code>Test Passed</code>, and the clock count is unchanged from the stock simulator (<code>[7959]</code>), so the hooks only observe. Here is one complete <code>add_tiles</code> on the MATH thread (T1), from the <code>SEMWAIT</code> of <code>tile_regs_acquire</code> to the <code>SEMPOST</code> of <code>tile_regs_commit</code>. The bracketed number is ttsim's clock.</p>
+<pre><code>[4328] A13 T1 push SEMWAIT  0xa6a1000a
+[4331] A13 T1 push SETC16   0xb2010000
+[4331] A13 T1 push MOP      0x01800000
+[4331] A13 T1 mop_ingest #1 inst=0x01800000 template=1 cfg: outer=4 inner=2 start=NOP end0=SETRWC(0x37cc0003) end1=NOP loop0=ELWADD(0x28000000) loop1=NOP last0=ELWADD last1=ELWADD
+[4331] A13 T1   mop #1 -&gt; ELWADD   0x28000000  (outer iter 0, step 1)
+[4331] A13 T1   mop #2 -&gt; ELWADD   0x28000000  (outer iter 0, step 2)
+[4331] A13 T1   mop #3 -&gt; SETRWC   0x37cc0003  (outer iter 0, step 3)
+[4331] A13 T1   mop #4 -&gt; ELWADD   0x28000000  (outer iter 1, step 1)
+[4331] A13 T1   mop #5 -&gt; ELWADD   0x28000000  (outer iter 1, step 2)
+[4331] A13 T1   mop #6 -&gt; SETRWC   0x37cc0003  (outer iter 1, step 3)
+[4331] A13 T1   mop #7 -&gt; ELWADD   0x28000000  (outer iter 2, step 1)
+[4331] A13 T1   mop #8 -&gt; ELWADD   0x28000000  (outer iter 2, step 2)
+[4331] A13 T1   mop #9 -&gt; SETRWC   0x37cc0003  (outer iter 2, step 3)
+[4331] A13 T1   mop #10 -&gt; ELWADD   0x28000000  (outer iter 3, step 1)
+[4331] A13 T1   mop #11 -&gt; ELWADD   0x28000000  (outer iter 3, step 2)
+[4331] A13 T1   mop #12 -&gt; SETRWC   0x37cc0003  (outer iter 3, step 3)
+[4331] A13 T1   mop expansion done: 12 instructions emitted
+[4332] A13 T1 push SETRWC   0x37000004
+[4333] A13 T1 push STALLWAIT 0xa2014080
+[4334] A13 T1 push SEMPOST  0xa4000008</code></pre>
+  <p>Everything in the static analysis shows up here. The nine sampled config words match the nine stores in the disassembly. The 12 emitted instructions follow the functional model exactly: (ELWADD, ELWADD, SETRWC) four times. The whole expansion happens within clock 4331. ttsim drains the expander into the FIFO as fast as there's room, and as A02 and A04 warned, its clock isn't a timing model. The UNPACK thread (T0) for the same tile:</p>
+<pre><code>[4515] A13 T0 push SETADCZW 0x5460000f
+[4523] A13 T0 push STALLWAIT 0xa2042000
+[4523] A13 T0 push MOP      0x01800000
+[4523] A13 T0 mop_ingest #1 inst=0x01800000 template=1 cfg: outer=2 inner=2 start=NOP end0=NOP(0x02000000) end1=NOP loop0=UNPACR(0x420080c1) loop1=UNPACR last0=UNPACR last1=UNPACR
+[4523] A13 T0   mop #1 -&gt; UNPACR   0x420080c1  (outer iter 0, step 1)
+[4523] A13 T0   mop #2 -&gt; UNPACR   0x428080c1  (outer iter 0, step 2)
+[4523] A13 T0   mop #3 -&gt; UNPACR   0x420080c1  (outer iter 0, step 3)
+[4523] A13 T0   mop #4 -&gt; UNPACR   0x428080c1  (outer iter 0, step 4)
+[4523] A13 T0   mop #5 -&gt; UNPACR   0x420080c1  (outer iter 1, step 1)
+[4523] A13 T0   mop #6 -&gt; UNPACR   0x428080c1  (outer iter 1, step 2)
+[4523] A13 T0   mop #7 -&gt; UNPACR   0x420080c1  (outer iter 1, step 3)
+[4523] A13 T0   mop #8 -&gt; UNPACR   0x428080c1  (outer iter 1, step 4)
+[4523] A13 T0   mop expansion done: 8 instructions emitted
+[4523] A13 T0 push SEMGET   0xa5000080
+[4523] A13 T0 push SETC16   0xb2270101
+[4523] A13 T0 push SETGPR   0x45000108     ← cb_pop_front(cb_in0): tiles_acked update
+[4523] A13 T0 push STALLWAIT 0xa2100006
+[4523] A13 T0 push STOREREG 0x67110003
+...                                         (same three again for cb_in1)</code></pre>
+  <p>The two UNPACR words differ in one bit, bit 23, which <code>tensix_isa.json</code> calls <code>unpack_block_selection</code>: 0 selects unpacker 0 (SrcA), 1 selects unpacker 1 (SrcB). That's the <code>LoopOpFlip</code> XOR at work, and you can see it in the raw hex. The five pushes before <code>SETGPR</code> are exactly <code>_llk_unpack_AB_</code>: reset the address counters (<code>SETADCZW</code>), stall until the TRISC's configuration writes land, <code>MOP</code>, release the unpack context (<code>SEMGET</code>), switch config context (<code>SETC16</code>) (<code>llk_unpack_AB.h:231-283</code>). The trailing group comes from <code>cb_pop_front</code>, which on the UNPACK core updates the CB's <code>tiles_acked</code> counter through the coprocessor (<code>TT_SETDMAREG</code> + <code>TT_STOREREG</code>, <code>llk_io_unpack.h:99-102</code>). That way the counter only changes after the unpacker is done with the tile.</p>
+  <p>Totals for one <code>add_tiles</code>: T0 pushes 5 and emits 12; T1 pushes 3 and emits 14. <b>8 pushed, 26 at the wait gates</b>, the numbers from the opening animation. The same hooks on <code>metal_example_matmul_single_core</code> (default HiFi4) show the replay buffer:</p>
+<pre><code>[4288] A13 T1 push REPLAY   0x04040101       ← record: start 16, len 16, load=1, exec=0
+[4289] A13 T1 push MVMUL    0x26000000
+[4290] A13 T1 push MVMUL    0x26008000
+...                                           (16 MVMULs are recorded, not executed)
+[4349] A13 T1 push MOP      0x01800000
+[4349] A13 T1 mop_ingest #1 inst=0x01800000 template=1 cfg: outer=1 inner=4 start=NOP end0=SETRWC(0x3740000f) end1=NOP loop0=REPLAY(0x04040100) loop1=NOP last0=REPLAY last1=REPLAY
+[4349] A13 T1   mop #1 -&gt; REPLAY   0x04040100  (outer iter 0, step 1)
+[4349] A13 T1     replay[16] -&gt; MVMUL    0x26000000
+[4349] A13 T1     replay[17] -&gt; MVMUL    0x26008000
+...
+[4349] A13 T1     replay[31] -&gt; MVMUL    0x26008000
+[4349] A13 T1   mop #2 -&gt; REPLAY   0x04040100  (outer iter 0, step 2)
+...
+[4349] A13 T1   mop #5 -&gt; SETRWC   0x3740000f  (outer iter 0, step 5)
+[4349] A13 T1   mop expansion done: 5 instructions emitted</code></pre>
+  <p>One <code>MOP</code> → 4 <code>REPLAY</code>s + 1 <code>SETRWC</code> → 64 <code>MVMUL</code>s: 16 per fidelity phase × 4 phases, as A06 predicted. The 16 recorded words differ only in bits 15–16, the address-mode field (0x26<b>00</b>0000, 0x26<b>00</b>8000, 0x26<b>01</b>0000, 0x26<b>01</b>8000 = <code>ADDR_MOD_0..3</code>). The matrix arithmetic is the same every time; only where it reads and writes changes.</p>
+
+  <h3>Decoding the binary with tensix_isa.json</h3>
+  <p>The SFPI <code>objdump</code> already knows the <code>tt*</code> mnemonics. To cross-check it against ttsim's ISA table, I wrote a short Python script (scratch, not kept) that takes every <code>tt*</code> line from <code>riscv-tt-elf-objdump -d trisc1.elf</code>, rotates the word right by 2, and decodes the fields from <code>refs/ttsim/data/wh/tensix_isa.json</code>. Selected lines of its output:</p>
+<pre><code>6aa4: 8c800022  ttseminit 2,0,2 -&gt; 0xa3200008  SEMINIT   max_value=2 init_value=0 sem_sel=2
+6b74: dc00003c  ttsetrwc 0,0,0,0,0,15 -&gt; 0x3700000f  SETRWC    clear_ab_vld=0 rwc_cr=0 rwc_d=0 rwc_b=0 rwc_a=0 bit_mask=15
+6bbc: 9a84002a  ttsemwait 322,2,2 -&gt; 0xa6a1000a  SEMWAIT   stall_res=322 sem_sel=2 wait_sem_cond=2
+6bd0: 06000000  ttmop 1,0,0  -&gt; 0x01800000  MOP       mop_type=1 loop_count=0 zmask_lo16=0
+6bd4: dc000010  ttsetrwc 0,0,0,0,0,4 -&gt; 0x37000004  SETRWC    clear_ab_vld=0 rwc_cr=0 rwc_d=0 rwc_b=0 rwc_a=0 bit_mask=4
+6bdc: 90000022  ttsempost 2  -&gt; 0xa4000008  SEMPOST   sem_sel=2
+data 0x28000000  ELWADD    clear_dvalid=0 dest_accum_en=0 instr_mod19=0 addr_mode=0 dst=0
+data 0x37cc0003  SETRWC    clear_ab_vld=3 rwc_cr=3 rwc_d=0 rwc_b=0 rwc_a=0 bit_mask=3</code></pre>
+  <p>All 34 <code>tt*</code> instructions in the binary decode cleanly, and the field values agree with objdump's operands. Over the whole file, <code>trisc1.elf</code>'s <code>.text</code> is only 716 bytes (<code>0x2cc</code>), and it contains exactly <b>one</b> <code>ttmop</code>. One caveat: <code>tensix_isa.json</code> lists <code>MOP</code>, <code>MOP_CFG</code>, <code>NOP</code> and <code>REPLAY</code> with placeholder bit ranges (for example <code>"loop_count": "16:16"</code>). ttsim's generator skips those four (<code>tensix_gen_decode.py:20-21</code>) and decodes them by hand in <code>tensix.cpp</code>, so my script takes their field ranges from <code>mop_ingest</code> and <code>replay_expander</code>.</p>
+
+  <div class="callout sim">Lab <a href="../sim-labs/b04-tensix-instructions.html">B04</a> builds this kind of instrumented ttsim step by step: per-pipe opcode traces for <code>add_2_integers_in_compute</code>, MOP expansion, stalls on Src valid, and mapping opcodes with <code>tensix_isa.json</code>.</div>
+
+  <h2 id="jit">The JIT: from .cpp to L1</h2>
+  <p>So far the binary has just been there. Where did <code>trisc1.elf</code> come from? Not from tt-metal's build: the example binary <code>metal_example_eltwise_binary</code> contains no device code. <code>CreateKernel(program, "…/tiles_add.cpp", core, ComputeConfig{…})</code> only records a path and some options. The first time the program is enqueued, tt-metal compiles the kernel <em>at run time</em>, on the host, with a RISC-V cross-compiler, and caches the result. Three things make this worth the complexity:</p>
+  <ul>
+    <li><b>One source, three binaries.</b> A compute kernel becomes three programs, one each for TRISC0/1/2, distinguished by <code>#define</code>s (A12).</li>
+    <li><b>Specialisation.</b> Compile-time args, defines, CB data formats, math fidelity and Dst mode all become constants. That's how <code>add_init</code> compiled into nine constant stores instead of a table lookup.</li>
+    <li><b>Freedom to change kernels without rebuilding tt-metal.</b> The kernel overlay in the <a href="../sim-labs/b00-workbench.html">workbench</a> depends on it.</li>
+  </ul>
+
+  <h3>Step 1: find the file</h3>
+  <p>A relative kernel path is resolved in a fixed order:</p>
+  <div class="filename">tt-metal/tt_metal/impl/kernels/kernel.cpp:48-95 @7aad8aac (bodies condensed)</div>
+<pre><code>// If the path is not an absolute path, then it must be resolved relative to:
+// 1. CWD
+// 2. TT_METAL_KERNEL_PATH
+// 3. System Kernel Directory
+// 4. TT_METAL_HOME / SetRootDir (API)
+fs::path resolve_path(const fs::path&amp; given_file_name, ContextId context_id) {
+    if (given_file_name.is_absolute()) { return given_file_name; }                 // Priority 0
+    ... fs::current_path() / given_file_name ...                                    // Priority 1
+    if (rtoptions.is_kernel_dir_specified()) { ... get_kernel_dir() / given_file_name ... }  // Priority 2
+    ... get_system_kernel_dir() / given_file_name ...                               // Priority 3
+    ... get_root_dir() / given_file_name ...                                        // Priority 4
+    TT_THROW("Kernel file {} doesn't exist in any of the searched paths!", given_file_name);
+}</code></pre>
+  <div class="callout warn">The current directory wins over everything except an absolute path. Run an example from <code>$TT_METAL_HOME</code> and the stock kernel under <code>tt_metal/programming_examples/…</code> is found at priority 1, so your overlay in <code>TT_METAL_KERNEL_PATH</code> is silently ignored. That's why the workbench's <code>env.sh</code> changes into <code>$LAB_HOME/run</code>.</div>
+
+  <h3>Step 2: generate the sources</h3>
+  <p>For a compute kernel, <code>jit_build_genfiles_triscs_src</code> writes one tiny <code>.cpp</code> per TRISC into the kernel's cache directory. Each one is a <code>#define</code> followed by an <code>#include</code> of your file (<code>genfiles.cpp:78-83,815-842</code>). From the cache in this orb:</p>
+<pre><code>$ cat …/kernels/tiles_add/6990101545042396689/chlkc_math.cpp
+#define TRISC_MATH
+#include "defines_generated.h"
+void kernel_main();
+#include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp"</code></pre>
+  <p>Next to it are <code>chlkc_unpack.cpp</code>, <code>chlkc_pack.cpp</code> and <code>chlkc_isolate_sfpu.cpp</code> (the comment says the fourth is "only used on Quasar"), plus <code>defines_generated.h</code> (here just <code>#define NOC_MODE 0</code>) and <code>chlkc_descriptors.h</code>. That last file holds the per-CB tables from <a href="#layers">layer 2</a> and the math settings:</p>
+<pre><code>#if defined(UCK_CHLKC_MATH)
+#include "llk_defs.h"
+constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast&lt;ckernel::MathFidelity&gt;(4);
+constexpr bool APPROX = false;
+#endif
+...
+constexpr uint8_t unpack_src_format[32] = {
+    5,5,255,255,255,255,255,255,255,255,255,255,255,255,255,255,5,255,...</code></pre>
+  <p>CBs 0, 1 and 16 have format 5 (Float16_b), and 255 marks unused CBs. Fidelity 4 is HiFi4, the <code>ComputeConfig</code> default, which <code>add_tiles</code> overrides with LoFi anyway. The file actually compiled isn't <code>chlkc_math.cpp</code>, though. It's the firmware-side <code>trisck.cc</code>, which includes <code>chlkc_list.h</code>, which includes <code>chlkc_math.cpp</code> under <code>#ifdef UCK_CHLKC_MATH</code> and defines <code>run_kernel()</code> to call your <code>kernel_main()</code> (<code>hw/ckernels/wormhole_b0/metal/common/chlkc_list.h:14-41</code>).</p>
+
+  <h3>Step 3: compile with the SFPI toolchain</h3>
+  <p>The compiler is Tenstorrent's GCC fork, <code>riscv-tt-elf-g++</code> from the SFPI package. tt-metal looks for it under <code>runtime/sfpi</code> first, then <code>/opt/tenstorrent/sfpi</code> (<code>build.cpp:274-292</code>). In this orb: <code>riscv-tt-elf-g++ (tenstorrent/sfpi:7.92.0[1080]) 15.1.0</code>. Setting <code>TT_METAL_LOG_KERNELS_COMPILE_COMMANDS=1</code> makes tt-metal log every command. Here is the TRISC1 compile, one argument per line in the original, condensed:</p>
+<pre><code>$TT_METAL_HOME/runtime/sfpi/compiler/bin/riscv-tt-elf-g++ -O3
+  -std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval -ftt-no-dyninit -flto=1 -flto-partition=one
+  -ffast-math -fno-finite-math-only -fsigned-zeros -fno-associative-math -fno-exceptions -fno-rtti ...
+  -mcpu=tt-wh-tensix
+  -I. -I.. -I$TT_METAL_HOME/tt_metal/hw/inc ... -I$TT_METAL_HOME/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib
+  -I$TT_METAL_HOME/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api ...
+  -I$LAB_HOME/kernels/tt_metal/programming_examples/eltwise_binary/kernels/compute
+  -include $LAB_HOME/cache/tt-metal-cache/pch/7246a680489f1e9b/pch.h
+  -DTENSIX_FIRMWARE -DDISABLE_SFPLOADMACRO -DPROCESSOR_INDEX=3 -DUCK_CHLKC_MATH -DCOMPILE_FOR_TRISC=1
+  -DARCH_WORMHOLE -DKERNEL_BUILD -DFULL_KERNEL_NAME="tiles_add/5674410263751058075/"
+  -c -o …/kernels/tiles_add/5674410263751058075/trisc1/trisck.&lt;tmp&gt;.o
+  $TT_METAL_HOME/tt_metal/hw/firmware/src/tt-1xx/trisck.cc</code></pre>
+  <p>Several details are worth a closer look:</p>
+  <ul>
+    <li><b><code>-mcpu</code></b> comes from the HAL. On Wormhole, compute processors get <code>-mcpu=tt-wh-tensix</code> and everything else gets <code>-mcpu=tt-wh</code> (<code>llrt/hal/tt-1xx/wormhole/wh_hal.cpp:185-189</code>). Blackhole uses <code>tt-bh-tensix</code>/<code>tt-bh</code>. Only the <code>-tensix</code> variant defines <code>__riscv_xtttensixwh</code>, which turns on <code>.ttinsn</code>.</li>
+    <li><b>Optimisation level</b> defaults to <code>O3</code> for <code>ComputeConfig</code> and <code>O2</code> for data-movement configs (<code>api/tt-metalium/kernel_types.hpp:83,133</code>). Firmware is built separately at <code>-Os</code> for BRISC/NCRISC and <code>-O3</code> for TRISCs (from the same log).</li>
+    <li><b><code>-flto</code></b> plus the <code>pch.h</code> force-include: link-time optimisation strips unreachable code, which is how a header-heavy LLK ends up as 716 bytes of text, and a precompiled header keeps compiles fast.</li>
+    <li><b><code>-DKERNEL_COMPILE_TIME_ARGS</code></b> carries <code>compile_args</code>. The compute kernel here has none, but the reader does. From the same log, its BRISC compile has <code>-O2 -mcpu=tt-wh -DKERNEL_COMPILE_TIME_ARGS=2,2048,2,2048</code>: two <code>TensorAccessorArgs</code>, each contributing two words. The define is generated at <code>jit_build/build.cpp:1225-1230</code>, and <code>get_compile_time_arg_val(i)</code> indexes into it.</li>
+  </ul>
+
+  <h3>Step 4: link and load</h3>
+  <p>Each processor's object is linked with <code>kernel_trisc1.ld</code> (or <code>_trisc0</code>, <code>_brisc</code>, …; <code>wh_hal.cpp:207-218</code>) and <code>-Wl,--just-symbols=…/firmware/trisc1/trisc1_weakened.elf</code>. The kernel doesn't carry its own copy of the firmware. It resolves symbols against the already-loaded firmware image, which is built once per build key into the same cache. At load time tt-metal applies an "execute in place" transform so the text can run wherever it's placed (<code>llrt/tt_memory.cpp:33-46</code>, which also writes the <code>.xip.elf</code> you'll see in the cache). In slow dispatch it then writes the binary into L1 at the kernel-config base plus a per-processor <code>kernel_text_offset</code> (<code>impl/program/slow_dispatch.cpp:47-62</code>, <code>hw/inc/hostdev/dev_msgs.h:181-182</code>). The launch message tells each TRISC's firmware where its kernel text starts.</p>
+
+  <div class="viz" id="jitfig"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("jitfig");
+    var g = TT.canvas(root, 880, 430), ctx = g.ctx, C = TT.C;
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    var lab = document.createElement("label"); lab.textContent = "Scenario:";
+    var sel = document.createElement("select");
+    var SC = [
+      { name: "1. first run, empty cache", found: 4, dir: "tiles_add/6990101545042396689", hit: false, why: "the directory doesn't exist", comp: "13 compiles: 8 firmware objects (built once per build key) + reader, writer and 3 TRISC objects", wall: "4.6 s" },
+      { name: "2. same program again", found: 4, dir: "tiles_add/6990101545042396689", hit: true, why: "the ELF exists and every .dephash still matches", comp: "0 compiles", wall: "0.47 s" },
+      { name: "3. copy kernel to TT_METAL_KERNEL_PATH", found: 2, dir: "tiles_add/5674410263751058075", hit: false, why: "the resolved kernel directory is part of the hash, so this is a NEW directory", comp: "3 compiles (trisc0/1/2 only)", wall: "1.2 s" },
+      { name: "4. edit the overlay copy", found: 2, dir: "tiles_add/5674410263751058075", hit: false, why: "same directory, but tiles_add.cpp's content hash in trisck.o.dephash changed", comp: "3 compiles into the SAME directory", wall: "1.3 s" }
+    ];
+    SC.forEach(function (s, k) { var o = document.createElement("option"); o.value = k; o.textContent = s.name; sel.appendChild(o); });
+    lab.appendChild(sel); ctrl.appendChild(lab); root.appendChild(ctrl);
+    var BOX = [
+      { x: 20, y: 30, w: 190, h: 64, t: "CreateKernel", s: "\"…/tiles_add.cpp\"" },
+      { x: 240, y: 30, w: 190, h: 64, t: "resolve_path", s: "cwd → KERNEL_PATH → root" },
+      { x: 460, y: 30, w: 190, h: 64, t: "KernelCompileHash", s: "path, args, cfg, -I dirs" },
+      { x: 680, y: 30, w: 180, h: 64, t: "cache lookup", s: "dir? .dephash current?" },
+      { x: 680, y: 170, w: 180, h: 64, t: "genfiles", s: "chlkc_*.cpp + headers" },
+      { x: 460, y: 170, w: 190, h: 64, t: "riscv-tt-elf-g++ ×3", s: "-mcpu=tt-wh-tensix -O3" },
+      { x: 240, y: 170, w: 190, h: 64, t: "link ×3", s: "kernel_trisc{0,1,2}.ld" },
+      { x: 20, y: 170, w: 190, h: 64, t: "trisc{0,1,2}.elf", s: "in the cache" },
+      { x: 20, y: 310, w: 410, h: 64, t: "XIP transform → write to L1", s: "kernel_config_base + kernel_text_offset[proc]" },
+      { x: 460, y: 310, w: 400, h: 64, t: "launch: TRISC firmware jumps to run_kernel()", s: "UNPACK / MATH / PACK start pushing" }
+    ];
+    var ARR = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9]];
+    var MAP = [[0], [1], [2], [3], [4], [5], [6, 7], [8, 9]]; // step -> boxes lit
+    function texts(s) {
+      return [
+        "<b>CreateKernel.</b> The host program passes the relative path <code>tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp</code> and a <code>ComputeConfig</code>. Nothing is compiled yet; that happens when the program is first compiled for a device.",
+        "<b>Find the file.</b> " + (s.found === 4 ? "Not in the cwd (<code>$LAB_HOME/run</code>), not under <code>TT_METAL_KERNEL_PATH</code> (overlay empty), not in the system directory. Found under the runtime root, <code>$TT_METAL_HOME</code>." : "Not in the cwd, but found under <code>TT_METAL_KERNEL_PATH</code> = <code>$LAB_HOME/kernels</code>, which wins over the stock copy under <code>$TT_METAL_HOME</code>."),
+        "<b>Hash.</b> <code>Kernel::compute_hash()</code> covers defines, named and positional compile-time args, the caller's path <em>string</em>, the <code>ComputeConfig</code> hash (fidelity, fp32 Dst, approx, full-sync, unpack modes) and the include paths, including the resolved kernel directory. Combined with the build key, it gives <code>" + s.dir + "</code>.",
+        "<b>Cache lookup: " + (s.hit ? "HIT" : "MISS") + ".</b> " + s.why + ".",
+        s.hit ? "<b>genfiles skipped.</b> Nothing to regenerate." : "<b>Generate sources.</b> chlkc_unpack/math/pack/isolate_sfpu.cpp, defines_generated.h, chlkc_descriptors.h.",
+        s.hit ? "<b>No compile.</b> The objects and ELFs on disk are reused (0 compile commands logged)." : "<b>Compile.</b> " + s.comp + ". Each TRISC compiles <code>trisck.cc</code> with its own <code>-DUCK_CHLKC_*</code>.",
+        s.hit ? "<b>No link.</b> The ELFs on disk are reused." : "<b>Link</b> each object against its linker script and <code>--just-symbols</code> of the matching weakened firmware ELF. Write <code>.dephash</code> and <code>.build_state</code> next to the ELF.",
+        "<b>Load and run.</b> Read the ELF, make it execute-in-place, write it into L1 and send the launch message. Wall time for the whole example in this orb: <b>" + s.wall + "</b>. The simulated clock is <code>[7959]</code> every time; compiling is host work."
+      ];
+    }
+    var steps = []; for (var q = 0; q < 8; q++) steps.push({ dur: 1.0, text: "" });
+    var st = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        var s = SC[+sel.value], tx = texts(s);
+        steps.forEach(function (x, k) { x.text = tx[k]; });
+        TT.clear(ctx, g.W, g.H);
+        var lit = {};
+        for (var k = 0; k <= i; k++) MAP[k].forEach(function (b) { lit[b] = k === i ? t : 1; });
+        var skipped = s.hit ? { 4: 1, 5: 1, 6: 1 } : {};
+        ARR.forEach(function (a) {
+          var A = BOX[a[0]], B = BOX[a[1]], on = lit[a[1]] !== undefined;
+          var x1, y1, x2, y2;
+          if (A.y === B.y) { var r = B.x > A.x; x1 = r ? A.x + A.w : A.x; x2 = r ? B.x : B.x + B.w; y1 = y2 = A.y + A.h / 2; }
+          else { x1 = A.x + A.w / 2; y1 = A.y + A.h; x2 = B.x + Math.min(B.w, A.w) / 2; y2 = B.y; if (a[0] === 7) { x1 = A.x + 95; x2 = B.x + 95; } }
+          TT.arrow(ctx, x1, y1, x2, y2, { color: on ? (skipped[a[0]] || skipped[a[1]] ? C.muted : C.yellow) : C.border, lw: 1.6 });
+        });
+        if (s.hit) {
+          // bypass arrow from lookup straight to the ELF
+          var hc = lit[3] !== undefined ? C.green : C.border;
+          ctx.setLineDash([5, 4]); ctx.strokeStyle = hc; ctx.lineWidth = 1.6;
+          ctx.beginPath(); ctx.moveTo(700, 94); ctx.lineTo(700, 132); ctx.lineTo(115, 132); ctx.stroke();
+          ctx.setLineDash([]);
+          TT.arrow(ctx, 115, 132, 115, 168, { color: hc, lw: 1.6 });
+          TT.text(ctx, "hit: skip genfiles, compile and link; reuse the ELF", 300, 146, { color: hc, font: "12px" });
+        }
+        BOX.forEach(function (b, k) {
+          var a = lit[k], sk = skipped[k] && a !== undefined;
+          var col = sk ? C.muted : (k === 3 ? (s.hit ? C.green : C.red) : C.blue);
+          TT.box(ctx, b.x, b.y, b.w, b.h, { fill: col, alpha: a === undefined ? 0.06 : (sk ? 0.08 : 0.12 + 0.25 * a), stroke: a === undefined ? C.border : col, r: 7 });
+          TT.text(ctx, b.t, b.x + 10, b.y + 22, { font: "bold 13px", color: a === undefined ? C.muted : C.fg });
+          TT.text(ctx, sk ? "(skipped on a hit)" : b.s, b.x + 10, b.y + 45, { font: "11.5px", mono: true, color: C.muted });
+        });
+        TT.text(ctx, "cache dir: $TT_METAL_CACHE/tt-metal-cache13101861097061555864/kernels/" + s.dir + "/", 20, 405, { mono: true, font: "12px", color: i >= 2 ? C.yellow : C.border });
+      }
+    });
+    sel.onchange = function () { st.render(); };
+  })();
+  </script>
+
+  <h2 id="cache">The kernel cache</h2>
+  <p>The cache root is <code>~/.cache/tt-metal-cache/</code>, or <code>/tmp/tt-metal-cache/</code> if <code>$HOME</code> isn't usable (<code>build.cpp:192-199</code>). Under it, the layout has two levels of hashing:</p>
+<pre><code>&lt;root&gt;/&lt;build_key&gt;/firmware/{brisc,ncrisc,trisc0,trisc1,trisc2,erisc,idle_erisc}/
+&lt;root&gt;/&lt;build_key&gt;/kernels/&lt;kernel name&gt;/&lt;kernel hash&gt;/{brisc|ncrisc|trisc0..2}/…elf</code></pre>
+  <ul>
+    <li><b>The build key</b> hashes the whole environment: a per-device build key passed in by the caller, the architecture, all common compile and link flags and defines, and the compiler's version string (<code>build.cpp:539-558</code>). Upgrade SFPI, or turn on Watcher (which adds defines), and you get a fresh tree.</li>
+    <li><b>The kernel hash</b> is <code>KernelCompileHash(build_key, hlk_desc, kernel-&gt;compute_hash())</code> (<code>impl/program/kernel_compile_utils.cpp:23-31</code>). The directory name is <code>kernel-&gt;name() + "/" + hash</code> (<code>program.cpp:3275-3278</code>).</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/impl/kernels/kernel.cpp:832-848 @7aad8aac (end of Kernel::compute_hash)</div>
+<pre><code>    hasher.update(this-&gt;kernel_src_.source_);
+    hasher.update(this-&gt;compile_time_args_.begin(), this-&gt;compile_time_args_.end());
+    ...
+    hasher.update(this-&gt;config_hash());
+
+    // Include paths affect compilation: the gcc -I order is significant (left-to-right
+    // header resolution), so different lists or orderings must produce different binaries.
+    // Header contents are tracked separately via the per-object .dephash mechanism.
+    size_t num_include_paths = 0;
+    this-&gt;process_include_paths([&amp;](const std::string&amp; path) {
+        hasher.update(path);
+        ++num_include_paths;
+    });</code></pre>
+  <p>Read that carefully, because it isn't what the workbench README suggests. <code>source_</code> is the <em>caller-supplied path string</em>, not the file's contents (<code>kernel.cpp:134</code>: "Keep source_ as the caller-supplied path (metadata/watcher/hash)"). Contents are checked by a second mechanism. Every object and ELF has a <code>.dephash</code> sidecar that lists each file the compiler read with a hash of its contents: 155 files for <code>trisck.o</code>, including <code>tiles_add.cpp</code>, <code>eltwise_binary.h</code>, <code>llk_math_eltwise_binary.h</code> and <code>ckernel_template.h</code>. <code>need_compile</code> rebuilds when the object is missing or any listed hash differs (<code>build.cpp:897-900</code>). <code>process_include_paths</code> adds the resolved kernel's <em>directory</em> to the hash (<code>kernel.cpp:415-421</code>). So moving a kernel changes the hash directory, and editing it doesn't.</p>
+  <p>I tested both claims with a private cache (<code>TT_METAL_CACHE=$LAB_HOME/cache</code>) and <code>TT_METAL_LOG_KERNELS_COMPILE_COMMANDS=1</code>, counting compile commands with <code>grep -c "g++ compile cmd"</code>:</p>
+  <table>
+    <tr><th>Run</th><th>Compile commands</th><th>Kernel directories under <code>kernels/tiles_add/</code></th><th>Wall time</th></tr>
+    <tr><td>1. Empty cache</td><td>13 (8 firmware + 5 kernel; logged on a verification re-run)</td><td><code>6990101545042396689</code></td><td>4.62 s</td></tr>
+    <tr><td>2. Same again</td><td>0</td><td><code>6990101545042396689</code></td><td>0.47 s</td></tr>
+    <tr><td>3. Copy <code>tiles_add.cpp</code> into the overlay, append a comment</td><td>3</td><td><code>5674410263751058075</code>, <code>6990101545042396689</code></td><td>1.24 s</td></tr>
+    <tr><td>4. Append another comment to the overlay copy</td><td>3</td><td>the same two</td><td>1.32 s</td></tr>
+    <tr><td>5. Same again</td><td>0</td><td>the same two</td><td>0.45 s</td></tr>
+    <tr><td>6. <code>TT_METAL_FORCE_JIT_COMPILE=1</code></td><td>13 (8 firmware + 5 kernel)</td><td>the same two</td><td>n/a</td></tr>
+  </table>
+  <p>Run 4 is the interesting one: content changed, directory didn't, and exactly the three TRISC objects were rebuilt in place. Every run printed <code>Test Passed</code>. The wall times are host time in this orb, dominated by the compiler on cold runs; the simulated clock was <code>[7959]</code> in all of them. Here is what one kernel directory contains (sizes from <code>ls -la</code>):</p>
+<pre><code>tiles_add/6990101545042396689/
+  chlkc_descriptors.h    4063 B   per-CB formats, tile dims, fidelity
+  chlkc_isolate_sfpu.cpp  199 B
+  chlkc_math.cpp          191 B   #define TRISC_MATH + #include of your file
+  chlkc_pack.cpp          191 B
+  chlkc_unpack.cpp        193 B
+  defines_generated.h      32 B
+  trisc0/  trisc1/  trisc2/
+tiles_add/6990101545042396689/trisc1/
+  .build_state             20 B   hash of the full build recipe
+  trisc1.elf           227480 B   (716 B of it is .text; most of the rest is debug info)
+  trisc1.elf.dephash      224 B   linker script + weakened firmware ELF
+  trisc1.elf.log            0 B
+  trisc1.elf.xip.elf   227480 B   after the execute-in-place transform
+  trisck.o             220304 B
+  trisck.o.dephash      18120 B   155 headers and sources with content hashes
+  trisck.o.log              0 B</code></pre>
+  <p>The data-movement kernels sit beside it, as <code>read_tiles/&lt;hash&gt;/brisc/</code> and <code>write_tile/&lt;hash&gt;/ncrisc/</code>.</p>
+
+  <div class="callout warn"><b>A path quirk at this commit.</b> With <code>TT_METAL_CACHE=/x</code>, the cache root becomes <code>/x/tt-metal-cache</code> with <em>no trailing slash</em> (<code>rtoptions.cpp:505</code>, <code>normalize_path(value, "tt-metal-cache")</code>), and the build key is appended directly (<code>build.cpp:557-558</code>). The result is a sibling directory called <code>/x/tt-metal-cache13101861097061555864/</code>, with the precompiled headers in <code>/x/tt-metal-cache/pch/</code>. It works, but don't go looking for <code>/x/tt-metal-cache/&lt;build_key&gt;/</code>. The default <code>~/.cache</code> path ends in a slash and doesn't have this problem.</div>
+
+  <div class="callout gpu">CUDA has the same two-level idea. <code>nvcc</code> can embed PTX that the driver JIT-compiles for the actual GPU, and the driver keeps a compute cache keyed on the PTX and driver version, so the second launch is fast. Tenstorrent goes further: <em>all</em> device code is compiled at run time, from C++ source rather than an IR, with every compile-time argument and CB format folded in as a constant. The cost is a multi-second first run; the benefit is code like nine constant stores for <code>add_init</code>.</div>
+
+  <div class="callout sim">The workbench page <a href="../sim-labs/b00-workbench.html">B00</a> sets up <code>TT_METAL_KERNEL_PATH</code> overlays. Lab <a href="../sim-labs/b04-tensix-instructions.html">B04</a> uses an overlay kernel plus an instrumented ttsim to follow the instruction stream per pipe.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>Three layers.</b> The compute API (<code>add_tiles</code>) splits work across TRISCs with <code>UNPACK</code>/<code>MATH</code>/<code>PACK</code>. The Metal wrappers (<code>llk_*</code>) turn CB ids into addresses and tile shapes from generated tables. tt-llk (<code>_llk_*_</code>) emits Tensix instructions. All three are inlined away.</li>
+    <li><b>Encoding.</b> <code>TT_OP(opcode, params) = (opcode &lt;&lt; 24) + params</code>. <code>TTI_*</code> compiles to one <code>.ttinsn</code> word (rotated left by 2); <code>TT_*</code> with runtime operands is an <code>sw</code> to 0xFFE40000; <code>TT_OP_*</code> is the word as data. Only <code>-mcpu=tt-wh-tensix</code> enables the builtin.</li>
+    <li><b>MOPs.</b> Init functions build a <code>ckernel_template</code> (outer × inner loop, two alternating loop ops, start/end ops, last-iteration substitutes) and write it to nine write-only registers at 0xFFB80000 after <code>mop_sync()</code>. Per tile, the LLK pushes <code>TTI_MOP(1,0,0)</code> plus a <code>SETRWC</code> or two. The maximum expansion on Wormhole is 127 × 257 = 32,639 instructions.</li>
+    <li><b>In the simulator,</b> one <code>add_tiles</code> was 8 pushed instructions and 26 at the wait gates: 8 <code>UNPACR</code> and 8 <code>ELWADD</code> doing the work. Re-running an init replaces the template; nothing checks it matches your operation.</li>
+    <li><b>Replay.</b> A 32-entry per-thread buffer records straight-line sequences (<code>lltt::record</code>) and plays them back. Matmul records 16 <code>MVMUL</code>s in slots 16–31 and has the MOP loop one <code>REPLAY</code> per fidelity phase: 1 MOP → 64 MVMULs at HiFi4.</li>
+    <li><b>JIT.</b> Kernels are compiled at first use by SFPI's <code>riscv-tt-elf-g++</code> (<code>-O3</code> compute, <code>-O2</code> data movement), from generated <code>chlkc_*.cpp</code> files, with compile-time args passed as <code>-DKERNEL_COMPILE_TIME_ARGS</code>. They're linked against the weakened firmware ELF, made execute-in-place, and written to L1.</li>
+    <li><b>Cache.</b> <code>&lt;root&gt;/&lt;build_key&gt;/kernels/&lt;name&gt;/&lt;hash&gt;/</code>. The hash covers the path string, the resolved directory, args, defines and config; file <em>contents</em> are checked by <code>.dephash</code> sidecars. Kernel path search: absolute, cwd, <code>TT_METAL_KERNEL_PATH</code>, system directory, runtime root.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A kernel calls <code>mul_init(cb0, cb1)</code> once at the top, then later uses <code>add_tiles</code> in a loop without calling <code>add_init</code>. It compiles and runs without errors. What does the MATH thread actually execute, and why is there no error?</summary>
+    <p>It executes the <em>multiply</em> template. <code>add_tiles</code>'s math path is just <code>SETC16</code>, <code>TTI_MOP(1,0,0)</code> and <code>SETRWC</code>, and <code>MOP</code> means "expand whatever is in MopCfg". The last init to write MopCfg was the multiply's, so the expander emits <code>ELWMUL</code>s with the multiply's address modes. Nothing can catch it: MopCfg is write-only from the RISC-V (reading it is UndefinedBehavior), the expander has no idea what operation was intended, and the API call itself carries no opcode. Results are silently wrong. (The unpack side happens to need the same AB template, but address modes and some configuration also differ between ops.)</p></details>
+  <details class="quiz"><summary>2. A template has OuterCount = 3, InnerCount = 2, a non-NOP LoopOp1, a StartOp, EndOp0 set and EndOp1 = NOP. How many instructions does one <code>MOP</code> produce?</summary>
+    <p>18. LoopOp1 isn't NOP, so the inner loop alternates and runs 2 × 2 = 4 times. Each outer iteration emits StartOp + 4 loop ops + EndOp0 = 6, and 3 × 6 = 18. The last inner op of the first two outer iterations is Loop1Last, and the very last one is Loop0Last, but that changes <em>which</em> word is emitted, not how many.</p></details>
+  <details class="quiz"><summary>3. Where does the ISA's "up to 32,639 instructions" come from?</summary>
+    <p>On Wormhole, OuterCount and InnerCount are 7-bit fields, so each is at most 127. With a non-NOP LoopOp1 the inner count doubles to 254. Adding StartOp, EndOp0 and EndOp1 gives 257 instructions per outer iteration, and 127 × 257 = 32,639. Note that ttsim only implements outer counts up to 32 on Wormhole, so a template that long would stop the simulator with <code>UnimplementedFunctionality</code>.</p></details>
+  <details class="quiz"><summary>4. You edit <code>tiles_add.cpp</code> in place and rerun. Does the kernel's cache directory name change? What if you copy the file into <code>TT_METAL_KERNEL_PATH</code> without editing it?</summary>
+    <p>Editing in place: no. The hash covers the caller's path string, args, defines, config and include paths, not file contents. tt-metal still recompiles, because <code>trisck.o.dephash</code> records a content hash for <code>tiles_add.cpp</code> and <code>need_compile</code> sees the mismatch. The new objects land in the same directory (run 4 in the table). Copying to the overlay: yes. The resolved kernel directory is added to the include paths, and include paths are hashed, so you get a new directory and a compile even though the bytes are identical (run 3).</p></details>
+  <details class="quiz"><summary>5. Why does matmul put a <code>REPLAY</code> inside the MOP instead of putting <code>MVMUL</code>s in the MOP template directly?</summary>
+    <p>A tile product is 16 <code>MVMUL</code>s that differ in their address-mode bits (0x26000000, 0x26008000, 0x26010000, 0x26018000 in a fixed but irregular order). A template-1 MOP can only alternate between two loop ops plus fixed start/end/last words, so it can't express that sequence. The replay buffer can hold any straight-line sequence of up to 32 words. The MOP then supplies the loop: once per fidelity phase (4 at HiFi4), each iteration one <code>REPLAY</code>. As a bonus, emitting a <code>REPLAY</code> from the MOP is the ISA's recommended way to hide the MOP expander's one-cycle transition penalty.</p></details>
+  <details class="quiz"><summary>6. Why is <code>-mcpu=tt-wh-tensix</code> used only for TRISC builds, and what would happen if a data-movement kernel included <code>ckernel_ops.h</code> and used <code>TTI_SETRWC</code>?</summary>
+    <p>Only <code>-mcpu=tt-wh-tensix</code> defines <code>__riscv_xtttensixwh</code> and enables the <code>__builtin_rvtt_ttinsn</code> builtin that emits <code>.ttinsn</code> words. BRISC and NCRISC are built with <code>-mcpu=tt-wh</code>. Under that flag <code>ckernel_ops.h</code> falls through to its <code>#else</code> branch, where <code>TTI_INSN</code> expands to an assembler <code>.error "TTI_INSN in non-tensix code"</code>, so the build fails. That matches the hardware: NCRISC can't push Tensix instructions at all, and BRISC's pushes enter after the MOP expander, so it can't use <code>MOP</code> anyway.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MOPExpander.md">MOP Expander (tt-isa-documentation)</a>: the functional model of both templates, the MopCfg register table and the performance notes used here.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MOP.md"><code>MOP</code> instruction</a>: encoding and the note that RISCV B can't use it.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/REPLAY.md"><code>REPLAY</code> instruction</a>: record and playback semantics, with the Wormhole/Blackhole count quirks.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/PushTensixInstruction.md">Push Tensix Instruction</a>: <code>sw</code> to 0xFFE40000 and the <code>.ttinsn</code> encoding.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/TTSync.md">RISCV TTSync</a>: the mechanism behind <code>mop_sync()</code> and <code>tensix_sync()</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-llk">tenstorrent/tt-llk</a>: the low-level kernel library as a standalone repository, with its own tests.</li>
+    <li><a href="https://github.com/tenstorrent/sfpi">tenstorrent/sfpi</a>: the RISC-V GCC fork (<code>riscv-tt-elf-g++</code>) with the Tensix builtins and the SFPI vector extensions.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix (TT-Metalium docs)</a>: the official overview of unpack, math and pack, and why init calls are needed.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/sfpu/llk.html">Low Level Kernels programming guide (TT-Metalium docs)</a>: how SFPU LLKs are written, the SFPI side of the same three layers.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: the tt-metal repository's own architectural guide to kernels, compilation and dispatch.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">tenstorrent/ttsim</a>: the simulator whose <code>mop_ingest</code>, <code>mop_step_inst</code> and <code>replay_expander</code> we instrumented.</li>
+  </ul>
+
+  <div class="pager"><a href="a12-compute-kernels.html">&larr; 12 Compute kernels: one source, three cores</a><a class="next" href="a14-one-tiles-journey.html">14 One tile's journey &rarr;</a></div>
+</main>
+</body>
+</html>

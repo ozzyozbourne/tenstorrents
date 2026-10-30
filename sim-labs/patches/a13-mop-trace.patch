@@ -1,0 +1,340 @@
+--- a/src/a13_opnames.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/a13_opnames.h	2026-10-30 08:16:13.543526883 +0000
+@@ -0,0 +1,259 @@
++// A13 instrumentation: opcode -> mnemonic, generated from data/wh/tensix_isa.json
++static const char *const a13_opname[256] = {
++    "?",
++    "MOP",
++    "NOP",
++    "MOP_CFG",
++    "REPLAY",
++    "?",
++    "?",
++    "?",
++    "MOVD2A",
++    "MOVDBGA2D",
++    "MOVD2B",
++    "MOVB2A",
++    "?",
++    "?",
++    "?",
++    "?",
++    "ZEROACC",
++    "ZEROSRC",
++    "MOVA2D",
++    "MOVB2D",
++    "TRNSPSRCA",
++    "RAREB",
++    "TRNSPSRCB",
++    "SHIFTXA",
++    "SHIFTXB",
++    "?",
++    "SETASHRMH0",
++    "SETASHRMH1",
++    "SETASHRMV",
++    "SETPKEDGOF",
++    "SETASHRMH",
++    "?",
++    "?",
++    "CLREXPHIST",
++    "CONV3S1",
++    "CONV3S2",
++    "MPOOL3S1",
++    "APOOL3S1",
++    "MVMUL",
++    "ELWMUL",
++    "ELWADD",
++    "DOTPV",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "ELWSUB",
++    "MPOOL3S2",
++    "APOOL3S2",
++    "GMPOOL",
++    "GAPOOL",
++    "GATESRCRST",
++    "CLEARDVALID",
++    "SETRWC",
++    "INCRWC",
++    "SETIBRWC",
++    "MFCONV3S1",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "XMOV",
++    "PACR",
++    "UNPACR",
++    "UNPACR_NOP",
++    "RSTDMA",
++    "SETGPR",
++    "FLUSHDMA",
++    "?",
++    "REG2FLOP",
++    "LOADIND",
++    "PACR_SETREG",
++    "TBUFCMD",
++    "?",
++    "?",
++    "?",
++    "?",
++    "SETADC",
++    "SETADCXY",
++    "INCADCXY",
++    "ADDRCRXY",
++    "SETADCZW",
++    "INCADCZW",
++    "ADDRCRZW",
++    "SETDVALID",
++    "ADDGPR",
++    "SUBGPR",
++    "MULGPR",
++    "BITWOPGPR",
++    "SHIFTGPR",
++    "CMPGPR",
++    "SETADCXX",
++    "?",
++    "DMANOP",
++    "ATINCGET",
++    "ATINCGETPTR",
++    "ATSWAP",
++    "ATCAS",
++    "?",
++    "STOREIND",
++    "STOREREG",
++    "LOADREG",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "SFPLOAD",
++    "SFPLOADI",
++    "SFPSTORE",
++    "SFPLUT",
++    "SFPMULI",
++    "SFPADDI",
++    "SFPDIVP2",
++    "SFPEXEXP",
++    "SFPEXMAN",
++    "SFPIADD",
++    "SFPSHFT",
++    "SFPSETCC",
++    "SFPMOV",
++    "SFPABS",
++    "SFPAND",
++    "SFPOR",
++    "SFPNOT",
++    "SFPLZ",
++    "SFPSETEXP",
++    "SFPSETMAN",
++    "SFPMAD",
++    "SFPADD",
++    "SFPMUL",
++    "SFPPUSHC",
++    "SFPPOPC",
++    "SFPSETSGN",
++    "SFPENCC",
++    "SFPCOMPC",
++    "SFPTRANSP",
++    "SFPXOR",
++    "SFP_STOCH_RND",
++    "SFPNOP",
++    "SFPCAST",
++    "SFPCONFIG",
++    "SFPSWAP",
++    "SFPLOADMACRO",
++    "SFPSHFT2",
++    "SFPLUTFP32",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "ATGETM",
++    "ATRELM",
++    "STALLWAIT",
++    "SEMINIT",
++    "SEMPOST",
++    "SEMGET",
++    "SEMWAIT",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "WRCFG",
++    "RDCFG",
++    "SETC16",
++    "RMWCIB0",
++    "RMWCIB1",
++    "RMWCIB2",
++    "RMWCIB3",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?",
++    "?"
++};
+--- a/src/tensix.cpp	2026-10-30 08:16:13.539526883 +0000
++++ b/src/tensix.cpp	2026-10-30 08:16:13.543526883 +0000
+@@ -46,6 +46,16 @@
+     return 0;
+ }
+ 
++#include "a13_opnames.h"
++// A13 instrumentation: trace the frontend of the one tile that runs the compute kernel, for the
++// UNPACK (pipe 0) and MATH (pipe 1) threads, until each thread has ingested its third MOP.
++static int a13_tile = -1;
++static uint32_t a13_mops[3], a13_emitted[3];
++static bool a13_on(const TensixState *p, uint32_t pipe) {
++    return (int)p->tile_id == a13_tile && pipe <= 1 && a13_mops[pipe] < 3;
++}
++#define A13_NAME(i) a13_opname[bits<31,24>(i)]
++
+ static void tensix_push_inst_fifo(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+     if (IS_TENSIX_NOP(inst)) {
+         return; // eat NOPs here so we don't overflow as quickly on MOP
+@@ -152,6 +162,12 @@
+     std::copy(cfg, cfg + 9, p_mop->cfg);
+     p_mop->iter = 0;
+     p_mop->step = 0;
++    a13_emitted[pipe] = 0;
++    if (a13_on(p_tensix, pipe)) {
++        ttsim_printf("A13 T%u mop_ingest #%u inst=0x%08x template=%u cfg: outer=%u inner=%u start=%s end0=%s(0x%08x) end1=%s loop0=%s(0x%08x) loop1=%s last0=%s last1=%s\n",
++            pipe, a13_mops[pipe], inst, mop_type, cfg[0], cfg[1], A13_NAME(cfg[2]), A13_NAME(cfg[3]), cfg[3],
++            A13_NAME(cfg[4]), A13_NAME(cfg[5]), cfg[5], A13_NAME(cfg[6]), A13_NAME(cfg[7]), A13_NAME(cfg[8]));
++    }
+ }
+ 
+ enum MopStep { MOP_STEP_END, MOP_STEP_EMIT, MOP_STEP_SKIP };
+@@ -230,9 +246,17 @@
+         }
+         p_mop->step++;
+         if (step == MOP_STEP_EMIT) {
++            if (a13_on(p_tensix, pipe)) {
++                ttsim_printf("A13 T%u   mop #%u -> %-8s 0x%08x  (outer iter %u, step %u)\n", pipe,
++                    a13_emitted[pipe] + 1, A13_NAME(*p_inst), *p_inst, p_mop->iter, p_mop->step - 1);
++            }
++            a13_emitted[pipe]++;
+             return true;
+         }
+     }
++    if (a13_on(p_tensix, pipe)) {
++        ttsim_printf("A13 T%u   mop expansion done: %u instructions emitted\n", pipe, a13_emitted[pipe]);
++    }
+     p_mop->busy = false;
+     return false;
+ }
+@@ -249,6 +273,11 @@
+ void tensix_frontend_step(TensixState *p_tensix, uint32_t pipe) {
+     while (inst_fifo_used(p_tensix, pipe) < TENSIX_INST_FIFO_SIZE - 1) { // the FIFO keeps one entry empty
+         if (p_tensix->replay_play_left[pipe]) {
++            if (a13_on(p_tensix, pipe)) {
++                uint32_t r = p_tensix->replay_buf[pipe][p_tensix->replay_play_index[pipe]];
++                ttsim_printf("A13 T%u     replay[%u] -> %-8s 0x%08x\n", pipe,
++                    p_tensix->replay_play_index[pipe], A13_NAME(r), r);
++            }
+             tensix_push_inst_fifo(p_tensix, pipe, p_tensix->replay_buf[pipe][p_tensix->replay_play_index[pipe]]);
+             p_tensix->replay_play_index[pipe]++;
+             p_tensix->replay_play_left[pipe]--;
+@@ -299,6 +328,15 @@
+         return;
+     }
+     uint32_t opcode = bits<31,24>(inst);
++    if (a13_tile < 0 && pipe == 1) {
++        a13_tile = (int)p_tensix->tile_id; // the first tile whose TRISC1 pushes anything runs the compute kernel
++    }
++    if (a13_on(p_tensix, pipe)) {
++        ttsim_printf("A13 T%u push %-8s 0x%08x\n", pipe, a13_opname[opcode], inst);
++    }
++    if (opcode == TENSIX_OPCODE_MOP) {
++        a13_mops[pipe]++;
++    }
+     switch (opcode) {
+         case TENSIX_OPCODE_MOP: mop_ingest(p_tensix, pipe, inst); break;
+         case TENSIX_OPCODE_MOP_CFG: mop_cfg(p_tensix, pipe, inst); break;
