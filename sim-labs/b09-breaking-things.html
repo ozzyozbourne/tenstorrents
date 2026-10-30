@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B09 · Breaking things on purpose · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  table.t td.n { text-align: right; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a17-dispatch-host.html">&larr; Prev</a>
+  <a href="../chapters/a18-ttnn-user.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B09</span><span class="tag">Prerequisites: A11, A12, A17, B00 (B05 helps)</span>
+  <h1><span class="num">B09.</span> Breaking things on purpose</h1>
+  <p class="subtitle">Seven bugs a kernel author will meet, each provoked on purpose with a kernel overlay. For each one you get the exact message, how to read it, and the fix. Then you put a debugger inside the simulator, and finally drive <code>libttsim.so</code> by hand with no tt-metal at all.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. The bracketed clock numbers in every log below (<code>[4362]</code> and so on) count simulator steps that the host drove. They are not silicon cycles and say nothing about speed. Several bugs on this page behave <i>differently</i> on silicon. ttsim stops at the first rule broken, while the hardware might round, stall or carry on silently. Each section says which. Where the silicon behaviour comes from the ISA documentation and not from a run, the page says so.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">0. Setup</a></li>
+      <li><a href="#taxonomy">1. How ttsim says no: the error taxonomy</a></li>
+      <li><a href="#tree">2. A map: symptom, tool, cause</a></li>
+      <li><a href="#classes">3. Four kernel bugs, four categories</a></li>
+      <li><a href="#watcher">4. Watcher's nets: the sanitizer and ASSERT</a></li>
+      <li><a href="#hang">5. A hang across five RISC-Vs</a></li>
+      <li><a href="#lldb">6. Debugging the simulator itself with lldb</a></li>
+      <li><a href="#blind">7. What ttsim cannot see</a></li>
+      <li><a href="#harness">8. Capstone: drive libttsim with no tt-metal</a></li>
+      <li><a href="#exercises">9. Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here are four one-line changes to the 57-line kernel of <code>add_2_integers_in_riscv</code>, the example that adds 14 and 7 on one BRISC (<a href="../chapters/a10-first-program.html">A10</a>):</p>
+  <ol>
+    <li>Read the first input through <code>(uint32_t*)(src0_l1 + 2)</code> instead of <code>src0_l1</code>.</li>
+    <li>Store one byte to a NoC register: <code>*(volatile uint8_t*)NOC_AT_LEN_BE = 4;</code></li>
+    <li>Read the first input through the DRAM buffer address <code>src0_dram</code>, which is not an L1 address at all.</li>
+    <li>Copy 32 bytes into the last 16 bytes of the core's own L1.</li>
+  </ol>
+  <p>Run each one in ttsim. All four stop within a few clocks of each other, around clock 4362, and each prints one line. But the lines carry four <em>different</em> labels: <code>NonContractualBehavior</code>, <code>UnsupportedFunctionality</code>, <code>UnimplementedFunctionality</code>, <code>UndefinedBehavior</code>. Silicon would treat these four bugs in four different ways too. It would compute the right answer for the first and quietly do the wrong thing for the second. For the third it would probably hang, and for the fourth nobody can say.</p>
+  <p>So what do the labels mean, and who is at fault: you, the simulator, or the spec? And what about the bugs that print nothing at all, the hang where five CPUs sit still while the host waits forever? This lab breaks kernels on purpose, one bug at a time, until the messages feel familiar. Everything below was run in this orb on the Wormhole model, at tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code>. Outputs are real and trimmed only where marked.</p>
+
+  <h2 id="setup">0. Setup</h2>
+<pre><code>export LAB_HOME=$HOME/ttlab/b09
+source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
+OV=/home/user/workspace/tenstorrent-from-zero/sim-labs/overlays/b09
+use() { rm -rf $LAB_HOME/kernels/tt_metal; cp -r $OV/$1/. $LAB_HOME/kernels/; }   # switch overlay
+export TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS=localhost:50909   # see the warning in section 5</code></pre>
+  <p>Each bug is a <em>kernel overlay</em> (<a href="b00-workbench.html">B00</a>): a modified copy of a stock kernel under <code>sim-labs/overlays/b09/&lt;case&gt;/</code>, at the same relative path the example's host code passes to <code>CreateKernel</code>. The function <code>use</code> swaps one in, and nothing has to be rebuilt. The cases are:</p>
+  <table class="t">
+    <tr><th>Overlay</th><th>Kernel</th><th>Bug</th><th>Section</th></tr>
+    <tr><td><code>ncb-unaligned</code></td><td>add_2_integers_in_riscv (BRISC)</td><td>4-byte load from <code>src0_l1 + 2</code></td><td>3</td></tr>
+    <tr><td><code>unsup-byte-mmio</code></td><td>same</td><td>1-byte store to <code>NOC_AT_LEN_BE</code></td><td>3</td></tr>
+    <tr><td><code>ub-dram-deref</code></td><td>same</td><td>DRAM bank address used as a pointer</td><td>3</td></tr>
+    <tr><td><code>noc-oob</code></td><td>same</td><td>32-byte NoC write ending 16 B past the top of L1</td><td>3, 4</td></tr>
+    <tr><td><code>assert</code></td><td>same</td><td><code>ASSERT(*dat0 &lt; 10 &amp;&amp; *dat1 &lt; 10)</code> with inputs 14 and 7</td><td>4</td></tr>
+    <tr><td><code>hang-dst</code></td><td>eltwise_binary compute</td><td><code>tile_regs_release()</code> forgotten</td><td>5</td></tr>
+    <tr><td><code>hang-sem</code></td><td>NoC_tile_transfer <code>reader1.cpp</code></td><td>"ready" semaphore never posted</td><td>5</td></tr>
+  </table>
+  <p>Two bugs from earlier pages are not repeated here. A11 already has a hang where the reader produces too few tiles (<a href="overlays/a11/hang/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>overlays/a11/hang</code></a>) and a CB overflow that trips Watcher's <code>cb_push_back</code> assert (<a href="overlays/a11/cb-overflow/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp"><code>overlays/a11/cb-overflow</code></a>), both explained in <a href="../chapters/a11-dataflow-and-cbs.html#watcher">A11's Watcher section</a>. <a href="b05-noc-and-dram.html#align">B05</a> has the misaligned NoC read that ttsim and Watcher both catch, and the DRAM overrun that only ttsim catches (<code>patches/b05-misalign-kernel.patch</code>, <code>b05-overrun-kernel.patch</code>). This lab cites them where they fit.</p>
+
+  <h2 id="taxonomy">1. How ttsim says no: the error taxonomy</h2>
+  <p>Before breaking anything, read how ttsim refuses. Every check in the simulator ends in a single function, and every message you will see has the shape <code>[clock] ERROR: Category: function: detail</code>. The category is one of nine:</p>
+  <div class="filename">ttsim/src/common.h:15-25 @b3620244</div>
+<pre><code>enum class TTSimErrorCategory {
+    UndefinedBehavior, // as defined in tt-isa-documentation
+    UnpredictableValue, // as defined in tt-isa-documentation
+    NonContractualBehavior, // as defined in tt-isa-documentation
+    AssertionFailure, // internal bug in simulator
+    UntestedFunctionality, // implemented, but inadequate test coverage to enable yet
+    UnimplementedFunctionality, // not implemented yet
+    UnsupportedFunctionality, // planned to never be implemented
+    SystemError, // OS errors and similar
+    ConfigurationError, // bad command line options, env vars, configuration files, etc.
+};</code></pre>
+  <p>Read the comments as a question about blame. The first three are about <b>your software</b>, and the comments say they mean what the ISA documentation's glossary defines. The next four are about <b>the simulator</b>: one is a bug in it, and three mark parts of the chip it does not model. The last two are about <b>the environment</b>. The checks themselves are the macros <code>TTSIM_VERIFY(cond, Category, fmt, ...)</code> and <code>TTSIM_ERROR(Category, fmt, ...)</code> (<code>common.h:27-38</code>). Both call this:</p>
+  <div class="filename">ttsim/src/common.cpp:33-45 @b3620244</div>
+<pre><code>void ttsim_error(TTSimErrorCategory category, const char *func, const char *fmt, ...) {
+    uint64_t clock = ttsim_get_clock();
+    const char *category_str = ttsim_error_category_name(category);
+    printf("[%" PRId64 "] ERROR: %s: %s%s", clock, category_str, func, fmt ? ": " : "\n");
+    ...
+    fflush(stdout);
+    _Exit(1);
+}</code></pre>
+  <p>Three facts follow from these lines. The bracketed number is the simulator clock when the check fired. The second field is the C++ function holding the check, so you can grep for it. And the process ends with <code>_Exit(1)</code>: no destructors, no <code>atexit</code> handlers, no exception for tt-metal to catch. The ttsim team explains the choice at length. After a failed check, "the simulator's internal state has been established as inconsistent with the architectural contract it is modeling", and running anyone's cleanup code over it causes secondary crashes that hide the first one (<code>ttsim/docs/sim_error_handling.md:40-71</code>). In practice this means you always get <b>exit status 1 and exactly one error line, for the first violation only</b>.</p>
+  <p>How often does each category appear? Counting the single-line <code>TTSIM_ERROR</code>/<code>TTSIM_VERIFY</code>/<code>TTSIM_ERROR_NOFMT</code> call sites in <code>src/</code> with ripgrep gives the numbers below. They are lower bounds: calls split over several lines are missed, and so are the register-decoder checks that <code>src/tile_gen_regs.py</code> generates at build time.</p>
+  <table class="t">
+    <tr><th>Category</th><th>Call sites</th><th>Whose problem</th><th>What to do</th></tr>
+    <tr><td>UndefinedBehavior</td><td class="n">200</td><td>your kernel</td><td>Fix it. The spec promises nothing, "up to and including possible physical damage" (ISA <code>Glossary.md:27-38</code>).</td></tr>
+    <tr><td>NonContractualBehavior</td><td class="n">93</td><td>your kernel</td><td>Fix it. It "functions on current hardware but is not part of the architectural contract" (<code>Glossary.md:7-12</code>).</td></tr>
+    <tr><td>UnpredictableValue</td><td class="n">0</td><td>your kernel</td><td>Defined, but no single-line call site uses it at this commit.</td></tr>
+    <tr><td>UnsupportedFunctionality</td><td class="n">388</td><td>by design</td><td>Avoid the feature, or ask for it through the documented promotion process.</td></tr>
+    <tr><td>UnimplementedFunctionality</td><td class="n">327</td><td>ttsim (or a wild address)</td><td>Check your addresses first, then report it.</td></tr>
+    <tr><td>UntestedFunctionality</td><td class="n">4</td><td>ttsim</td><td>Report it.</td></tr>
+    <tr><td>AssertionFailure</td><td class="n">65</td><td>ttsim bug</td><td>Report it. <code>TTSIM_ASSERT</code> checks only exist in debug builds (<code>common.h:41-51</code>).</td></tr>
+    <tr><td>ConfigurationError, SystemError</td><td class="n">38, 9</td><td>the setup</td><td>Fix how the library is called.</td></tr>
+  </table>
+  <p>You have already met one <code>UnsupportedFunctionality</code> without seeing it. <code>env.sh</code> exports <code>TT_METAL_DISABLE_SFPLOADMACRO=1</code> because ttsim refuses the SFPU's <code>SFPLOADMACRO</code> instruction. The ttsim docs give the reasons for such carve-outs. About 30% of the Wormhole and Blackhole feature surface is left out on purpose: debug and test hardware, features with known silicon bugs, and anything whose cost in validation or speed is not worth paying (<code>ttsim/docs/unsupported_functionality.md:9-12, 50-58</code>).</p>
+  <div class="callout key">Read the category before the message. UB and NCB mean the bug is yours. Unsupported means you used something ttsim refuses on purpose. Unimplemented means ttsim has no model for what you touched, which is often your bug too: a wild pointer lands somewhere nobody models. AssertionFailure means the bug is ttsim's.</div>
+
+  <h2 id="tree">2. A map: symptom, tool, cause</h2>
+  <p>When something goes wrong you do not start with a category. You start with a symptom: an error line, a Watcher abort, silence, or wrong numbers. The figure below is the map this lab builds, one path per section. Step through it now for the overview, and come back to it at the end.</p>
+  <div class="viz" id="fig-tree"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-tree");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    var S = [
+      { id: "s1", y: 40,  t: ["Exit status 1", "[clk] ERROR: Category: fn: msg"] },
+      { id: "s2", y: 130, t: ["Abort (134)", "TT_THROW: Watcher detected ..."] },
+      { id: "s3", y: 220, t: ["Silence", "Finish() never returns"] },
+      { id: "s4", y: 310, t: ["Exit 0, wrong numbers", "host check fails"] },
+      { id: "s5", y: 400, t: ["Passes on ttsim,", "fails on silicon"] }
+    ];
+    var T = [
+      { id: "t1", y: 40,  t: ["Read the category;", "lldb: break on ttsim_error"] },
+      { id: "t2", y: 130, t: ["Watcher message", "+ watcher.log"] },
+      { id: "t3", y: 220, t: ["Watcher waypoints, exalens", "CB counters, lldb attach"] },
+      { id: "t4", y: 310, t: ["DPRINT, compare", "against the host"] },
+      { id: "t5", y: 400, t: ["The blind-spot list", "(section 7)"] }
+    ];
+    var K = [
+      { id: "c1", y: 20,  t: ["UB / NCB: your kernel"] },
+      { id: "c2", y: 66,  t: ["Unsupported / Unimplemented"] },
+      { id: "c3", y: 112, t: ["Sanitizer: bad NoC access"] },
+      { id: "c4", y: 158, t: ["ASSERT tripped on line N"] },
+      { id: "c5", y: 220, t: ["Protocol deadlock:", "nobody posts / releases"] },
+      { id: "c6", y: 310, t: ["Data hazard, run-ahead", "producer, wrong count"] },
+      { id: "c7", y: 400, t: ["Missing barrier, race,", "timing, uninitialised L1"] }
+    ];
+    var E = [["s1","t1"],["s2","t2"],["s3","t3"],["s4","t4"],["s5","t5"],
+             ["t1","c1"],["t1","c2"],["t2","c3"],["t2","c4"],["t3","c5"],["t4","c6"],["t4","c7"],["t5","c7"]];
+    var pos = {};
+    function place(list, x, w, h) { list.forEach(function (n) { pos[n.id] = { x: x, y: n.y, w: w, h: h, t: n.t }; }); }
+    place(S, 20, 230, 48); place(T, 335, 230, 48); place(K, 650, 230, 38);
+    var steps = [
+      { on: [], text: "<b>The map.</b> Left: what you observe. Middle: the first tool to reach for. Right: the usual causes. Each later step lights up one path, with a real message from this lab." },
+      { on: ["s1","t1","c1","c2"], text: "<b>An error line, exit status 1.</b> ttsim stopped at its first broken rule. Example from section 3: <code>[4362] ERROR: NonContractualBehavior: rv32_mem_rd: unaligned addr=0x16dfe2 size=4</code>. UB and NCB are kernel bugs. Unsupported and Unimplemented mean ttsim has no model. To see where in the simulator it stopped, break on <code>ttsim_error</code> in lldb (section 6)." },
+      { on: ["s2","t2","c3","c4"], text: "<b>A Watcher abort.</b> Code compiled into the kernel caught the problem before the hardware, real or simulated, saw it: <code>... (NOC target address overflow)</code> or <code>BRISC tripped an assert on line 43</code> (section 4). The exit status is 134, from <code>std::terminate</code>." },
+      { on: ["s3","t3","c5"], text: "<b>Silence.</b> Nothing crashes. Some CPU is spinning on a condition that will never come true. Watcher's waypoints show which CPU is stuck and where; the CB counters and the coprocessor state show why. Example: a forgotten <code>tile_regs_release()</code> (section 5)." },
+      { on: ["s4","t4","c6","c7"], text: "<b>Wrong numbers.</b> The run finishes and the host's comparison fails. Print the values on the device and compare them with the host. On real hardware the cause can be a race. In ttsim it is more often a protocol slip, such as a producer that runs ahead or a page count that is off by one." },
+      { on: ["s5","t5","c7"], text: "<b>ttsim says yes, silicon says no.</b> Some bugs depend on time. Every NoC transfer in stock ttsim completes inside the instruction that starts it, so a missing barrier never shows up (<a href='b05-noc-and-dram.html#barrier'>B05</a>). Section 7 lists these blind spots." }
+    ];
+    function wrapDraw(n, lit) {
+      var col = lit ? C.yellow : C.border;
+      TT.box(ctx, n.x, n.y, n.w, n.h, { fill: lit ? C.bg3 : C.bg2, stroke: col, lw: lit ? 2.5 : 1.2 });
+      var lines = n.t, lh = 16, y0 = n.y + n.h / 2 - (lines.length - 1) * lh / 2;
+      lines.forEach(function (s, k) {
+        TT.text(ctx, s, n.x + n.w / 2, y0 + k * lh, { align: "center", font: k === 0 ? "bold 13px" : "12px", color: lit ? C.fg : C.muted, mono: s.indexOf("[") >= 0 || s.indexOf("TT_THROW") >= 0 });
+      });
+    }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var on = steps[i].on;
+      TT.text(ctx, "SYMPTOM", 135, 12, { align: "center", font: "bold 12px", color: C.blue });
+      TT.text(ctx, "FIRST TOOL", 450, 12, { align: "center", font: "bold 12px", color: C.blue });
+      TT.text(ctx, "USUAL CAUSE", 765, 12, { align: "center", font: "bold 12px", color: C.blue });
+      E.forEach(function (e) {
+        var a = pos[e[0]], b = pos[e[1]], lit = on.indexOf(e[0]) >= 0 && on.indexOf(e[1]) >= 0;
+        ctx.globalAlpha = lit ? TT.lerp(0.3, 1, t) : 0.35;
+        TT.arrow(ctx, a.x + a.w, a.y + a.h / 2, b.x - 4, b.y + b.h / 2, { color: lit ? C.yellow : C.border, lw: lit ? 2.5 : 1.2, head: 7 });
+        ctx.globalAlpha = 1;
+      });
+      Object.keys(pos).forEach(function (k) { wrapDraw(pos[k], on.indexOf(k) >= 0); });
+    }});
+  })();
+  </script>
+
+  <h2 id="classes">3. Four kernel bugs, four categories</h2>
+  <p>All four overlays change the same 57-line BRISC kernel. Each was run with Watcher off. (With <code>TT_METAL_WATCHER=1</code>, the first three print the same line at a later clock, 6916 or 6917, the same in every rerun, because Watcher's code adds instructions before the kernel gets there. The fourth is caught by Watcher first, as section 4.1 shows.) Here is the relevant part of the stock kernel. It reads one <code>uint32_t</code> from each input buffer in DRAM into L1, adds them on the RISC-V, and writes the sum back:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:30-43 @7aad8aac</div>
+<pre><code>    uint64_t src0_dram_noc_addr = src0.get_noc_addr(0);
+    uint64_t src1_dram_noc_addr = src1.get_noc_addr(0);
+    noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
+    noc_async_read(src1_dram_noc_addr, src1_l1, sizeof(uint32_t));
+    noc_async_read_barrier();
+
+    // Do simple add in RiscV core
+    uint32_t* dat0 = (uint32_t*)src0_l1;
+    uint32_t* dat1 = (uint32_t*)src1_l1;
+    uint32_t* out0 = (uint32_t*)dst_l1;
+
+    DPRINT("Adding integers: {} + {}\n", *dat0, *dat1);
+
+    (*out0) = (*dat0) + (*dat1);</code></pre>
+
+  <h3>3.1 NonContractualBehavior: an unaligned load</h3>
+  <p>The classic way to write this bug is to parse a packed byte buffer and cast a pointer into the middle of it. The overlay does it in the plainest way:</p>
+<pre><code>-    uint32_t* dat0 = (uint32_t*)src0_l1;
++    uint32_t* dat0 = (uint32_t*)(src0_l1 + 2);  // B09 bug: a 4-byte load from a 2-byte-aligned address</code></pre>
+<pre><code>use ncb-unaligned &amp;&amp; $EX/metal_example_add_2_integers_in_riscv; echo "exit=$?"
+[0] 0.1 seconds (0.0 KHz)
+[4362] ERROR: NonContractualBehavior: rv32_mem_rd: unaligned addr=0x16dfe2 size=4
+exit=1</code></pre>
+  <p><b>How to read it.</b> The category says the spec does not promise what happens here. <code>rv32_mem_rd</code> is the RISC-V load path, and the detail gives the faulting address and the access size. The address <code>0x16dfe2</code> is <code>src0_l1</code> (0x16dfe0, the last 32 bytes of allocatable L1, as <a href="b05-noc-and-dram.html#overrun">B05</a> found) plus 2. The check is the first line of every 32-bit load:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:637 @b3620244 (stores: line 689)</div>
+<pre><code>    TTSIM_VERIFY(!(addr &amp; (size - 1)), NonContractualBehavior, "unaligned addr=0x%llx size=%d", uint64_t(addr), size);</code></pre>
+  <p><b>What silicon does.</b> The ISA documentation is explicit: "The baby RISCV cores cannot fault. … Unaligned memory accesses are silently rounded down to the nearest aligned address. This is a <code>NonContractualBehavior</code>" (<code>tt-isa-documentation/WormholeB0/TensixTile/BabyRISCV/README.md:110-111</code>). Rounded down, <code>0x16dfe2</code> becomes <code>0x16dfe0</code>, which is exactly <code>src0_l1</code>. So on a Wormhole this broken kernel would most likely print <code>Success: Result is 21</code>. ttsim refuses because the rounding is not a promise: a later chip may handle the access differently. I did not run this on silicon; the prediction comes from the ISA text. <b>Fix:</b> load the bytes one at a time, or <code>memcpy</code> into an aligned local.</p>
+  <div class="callout gpu">On a GPU, an unaligned global load either works more slowly or raises a misaligned-address error that kills the kernel. A baby RISC-V has no trap mechanism at all: no faults, no exceptions. That is why the simulator has to be the strict one.</div>
+
+  <h3>3.2 UnsupportedFunctionality: a byte store to a register</h3>
+<pre><code>     noc_async_read_barrier();
++    *(volatile uint8_t*)NOC_AT_LEN_BE = 4;  // B09 bug: a 1-byte store to a 32-bit NoC register</code></pre>
+<pre><code>use unsup-byte-mmio &amp;&amp; $EX/metal_example_add_2_integers_in_riscv
+[4363] ERROR: UnsupportedFunctionality: rv32_mem_wr: 8-bit MMIO stores write the entire 32-bit register, not just the addressed byte
+exit=1</code></pre>
+  <p><b>How to read it.</b> <code>NOC_AT_LEN_BE</code> is <code>0xFFB20020</code>, a NoC command-buffer register (<code>noc_parameters.h:29,50</code>). It is not in L1 or in the core's local RAM, so the store takes the MMIO path. On Wormhole that path has no case for one-byte stores:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:701-711 @b3620244</div>
+<pre><code>    if constexpr (size == 1) {
+#if TT_ARCH_VERSION == 0
+        TTSIM_ERROR(UnsupportedFunctionality, "8-bit MMIO stores write the entire 32-bit register, not just the addressed byte");
+#else
+        TTSIM_ERROR(UnsupportedFunctionality, "8-bit MMIO store");
+#endif
+    } else if constexpr (size == 2) {
+        ...</code></pre>
+  <p>The message tells you why the feature is refused: the Wormhole store would clobber the other three bytes. If that is right, this is a case of the "features with known hardware bugs" carve-out (<code>unsupported_functionality.md:56-58</code>). Modelling it would either copy the bug into the simulator or break bit-exactness. I could not find the clobbering described in tt-isa-documentation, so take ttsim's word for it. <b>Fix:</b> read the whole register, modify it, and write all 32 bits back. Other refusals of the same kind: <code>fence.i</code> ("does not flush the instruction cache on babyrisc", <code>riscv_impl.h:1128</code>) and <code>ebreak</code>, which you will meet in section 4.</p>
+
+  <h3>3.3 UnimplementedFunctionality: dereferencing a DRAM address</h3>
+<pre><code>-    uint32_t* dat0 = (uint32_t*)src0_l1;
++    uint32_t* dat0 = (uint32_t*)src0_dram;  // B09 bug: a DRAM buffer address used as an L1 pointer</code></pre>
+<pre><code>use ub-dram-deref &amp;&amp; $EX/metal_example_add_2_integers_in_riscv
+[4362] ERROR: UnimplementedFunctionality: t_tile_mmio_rd32: addr=0x2d4c40
+exit=1</code></pre>
+  <p>I expected <code>UndefinedBehavior</code> here, and the overlay's name still says so. ttsim answered differently, and its answer teaches something. <code>src0_dram</code> is a bank-local address (0x2d4c40, the same one B05 saw in its NoC log). A RISC-V cannot reach DRAM with a load at all: DRAM is only reachable through the NoC (<a href="../chapters/a09-memory.html">A09</a>). To the core, 0x2d4c40 lies above L1 and below the MMIO region, so the load falls through every case of the register decoder to its <code>default</code>: <code>TTSIM_ERROR(UnimplementedFunctionality, "addr=0x%llx", addr)</code> (<code>tile.cpp:2229</code>). For silicon the ISA says "Loads from unmapped memory will usually stall forever" (<code>BabyRISCV/README.md:112</code>). So on hardware this bug is a <em>hang</em> with no message. In ttsim it is an error line naming the address. <b>Fix:</b> fetch DRAM data with <code>noc_async_read</code> into L1, as the stock kernel does.</p>
+  <div class="callout warn">Do not read <code>UnimplementedFunctionality</code> as "the simulator's fault, so it's not my problem". Often it means your pointer went somewhere nothing is modelled, because nothing should be there.</div>
+
+  <h3>3.4 UndefinedBehavior: a NoC write off the top of L1</h3>
+  <p>The fourth bug is the most realistic: a transfer whose start address is valid but whose length is wrong.</p>
+<pre><code>     noc_async_read_barrier();
++    // B09 bug: copy 32 bytes to this core's own L1, at a slot 16 bytes below the end of L1.
++    // The slot is real, the length is not: the last 16 bytes land past the top of L1.
++    uint64_t tail_noc_addr = get_noc_addr(my_x[noc_index], my_y[noc_index], src0_l1 + 16);
++    noc_async_write(src1_l1, tail_noc_addr, 32);
++    noc_async_write_barrier();</code></pre>
+<pre><code>use noc-oob &amp;&amp; $EX/metal_example_add_2_integers_in_riscv
+[4382] ERROR: UndefinedBehavior: tile_wr_bytes: access past end of tensix_sram
+exit=1</code></pre>
+  <p>The destination is <code>0x16dff0</code> and the length is 32, so the write would end at <code>0x16e010</code>. Wormhole L1 is 1464 KiB = <code>0x16e000</code> (<code>ttsim/src/config.h:29</code>; tt-metal's <code>MEM_L1_SIZE</code> agrees, <code>dev_mem_map.h:33</code>). The check lives where the NoC model writes bytes into a Tensix tile:</p>
+  <div class="filename">ttsim/src/tile.cpp:2868-2871 @b3620244</div>
+<pre><code>    } else if (tile_type == 'T') {
+        if (addr &lt; sizeof(g_t_tiles[tile_id].sram)) {
+            TTSIM_VERIFY(addr + size &lt;= sizeof(g_t_tiles[tile_id].sram), UndefinedBehavior, "access past end of tensix_sram");
+            memcpy(&amp;g_t_tiles[tile_id].sram[addr], p, size);</code></pre>
+  <p>This message is less helpful than the others: it names neither the address nor the core. Section 6 recovers both with a debugger. <b>Fix:</b> make the length match the slot. Sanitize lengths, not just addresses.</p>
+  <div class="callout sim">Two more UB cases are covered in <a href="b05-noc-and-dram.html#align">B05</a>: a DRAM→L1 read whose two addresses are not congruent mod 32 (<code>noc_cmd_ctrl: read: alignment of src_addr=… and dst_addr=… does not match</code>), and a read that runs off the end of a 2 GiB DRAM controller (<code>tile_rd_bytes: DRAM read overrun</code>).</div>
+
+  <h2 id="watcher">4. Watcher's nets: the sanitizer and ASSERT</h2>
+  <p>ttsim checks the hardware contract when an instruction executes. tt-metal's Watcher checks it earlier, in code compiled into your kernel when <code>TT_METAL_WATCHER</code> is set. That code runs before the store that would start a NoC transfer. The two nets overlap without being nested, as B05 showed.</p>
+
+  <h3>4.1 The sanitizer catches the same NoC write</h3>
+<pre><code>use noc-oob &amp;&amp; time TT_METAL_WATCHER=1 $EX/metal_example_add_2_integers_in_riscv
+… | warning  | Metal | Watcher detected NOC error and stopped device: (watcher_device_reader.cpp:957)
+… | warning  | Metal | Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): BRISC using noc0 tried to unicast write 32 bytes
+      from local L1[0x16dfc0] to Tensix core w/ virtual coords 18-18 L1[addr=0x0016dff0] (NOC target address overflow).
+… | info     | Metal | Last waypoint: NAWW,   W,   W,   W,   W (watcher_device_reader.cpp:1339)
+… | info     | Metal |  BRISC: tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+… | critical | Always | TT_THROW: Device 0 worker core(x= 0,y= 0) … (NOC target address overflow). (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'
+real	0m12.690s          (exit status 134)</code></pre>
+  <p>This message has everything the ttsim line lacked: which core, which RISC-V, which NoC, the direction, the length, both addresses and the reason. The last waypoint is <code>NAWW</code>, "NoC async write wait", which is where <code>noc_async_write</code> sanitizes its arguments. ttsim printed nothing this time, because the bad command never reached the simulated NIU. The kernel stopped itself first. The test that fired:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/debug/sanitize.h:190-212 @7aad8aac (Quasar branch elided)</div>
+<pre><code>inline uint16_t debug_valid_worker_addr(uint64_t addr, uint64_t len, bool write, bool is_local_buffer = false) {
+    if (addr + len &lt;= addr) {
+        return DebugSanitizeNocAddrZeroLength;
+    }
+    if (addr &lt; MEM_L1_BASE) {
+        return DebugSanitizeNocAddrUnderflow;
+    }
+    ...
+    if (addr + len &gt; MEM_L1_BASE + MEM_L1_SIZE) {
+        return DebugSanitizeNocAddrOverflow;
+    }</code></pre>
+  <p>The same function also refuses writes below <code>MEM_MAP_READ_ONLY_END</code> (<code>DebugSanitizeNocAddrMailbox</code>, lines 215-223). That rule protects the firmware mailboxes, something ttsim knows nothing about, since to ttsim those bytes are ordinary L1. The full list of codes is in <code>hw/inc/hostdev/dev_msgs.h:284-305</code>: underflow, overflow, zero length, invalid XY, bad multicast, alignment, mixed virtual/physical, inline write to DRAM, mailbox, linked transactions, and a few more for L1, Ethernet, CB bounds and transaction IDs. The price of all this is about 12.7 s for a run that takes 0.36 s without Watcher.</p>
+
+  <h3>4.2 ASSERT: three builds of the same line</h3>
+  <p>Your own invariants can go into the kernel as asserts. The overlay states the kernel's contract, single-digit inputs, and the host then passes 14 and 7:</p>
+<pre><code> #include "ckernel.h"
++#include "api/debug/assert.h"  // B09
+ ...
+     DPRINT("Adding integers: {} + {}\n", *dat0, *dat1);
++    ASSERT(*dat0 &lt; 10 &amp;&amp; *dat1 &lt; 10);  // B09: this kernel's contract says single-digit inputs</code></pre>
+  <p>What <code>ASSERT</code> turns into depends on how the kernel was built:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/debug/assert_common.h:14-41 @7aad8aac (trimmed)</div>
+<pre><code>#if defined(WATCHER_ENABLED) &amp;&amp; !defined(WATCHER_DISABLE_ASSERT) &amp;&amp; !defined(FORCE_WATCHER_OFF)
+#define ASSERT(condition, ...) (void(not(condition) ? assert_and_hang(__LINE__, ##__VA_ARGS__), 0 : 0))
+#elif defined(LIGHTWEIGHT_KERNEL_ASSERTS)
+FORCE_INLINE void lightweight_assert_trap() { asm("ebreak"); }
+#define ASSERT(condition, ...) (void(not(condition) ? lightweight_assert_trap(), 0 : 0))
+#else
+#define ASSERT(condition, ...) (void(sizeof(decltype(not(condition)))))
+#endif</code></pre>
+  <p>I ran all three:</p>
+<pre><code>use assert
+$EX/metal_example_add_2_integers_in_riscv                                       # 1. plain build
+Success: Result is 21
+[4501] 0.2 seconds (22.8 KHz)
+
+TT_METAL_WATCHER=1 $EX/metal_example_add_2_integers_in_riscv                    # 2. Watcher
+… | warning | Metal | Watcher stopped the device due to tripped assert, see watcher log for more details
+… | warning | Metal | Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): BRISC tripped an assert on line 43.
+      Note that file name reporting is not yet implemented, and the reported line number for the assert may be
+      from a different file. Current kernel: tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp.
+… | info    | Metal | Last waypoint: NRBD,   W,   W,   W,   W
+… | critical | Always | TT_THROW: Watcher detected tripped assert and stopped device. (assert.hpp:104)
+real	0m9.632s          (exit status 134)
+
+TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS=1 $EX/metal_example_add_2_integers_in_riscv  # 3. lightweight
+[4368] ERROR: UnsupportedFunctionality: rv32_ecall_ebreak: inst=0x100073
+exit=1</code></pre>
+  <ol>
+    <li><b>Plain build:</b> the assert compiles to nothing, and the run "succeeds" with a result the kernel's own contract forbids.</li>
+    <li><b>Watcher:</b> <code>assert_and_hang</code> writes the line number into a mailbox and spins. Watcher's host thread finds it and throws. Line 43 is the <code>ASSERT</code> line in the overlay. The last waypoint, <code>NRBD</code> ("NoC read barrier done"), shows the reads had finished. The warning in the message is real: an assert inside an included header reports that header's line number, not your file's.</li>
+    <li><b>Lightweight:</b> the assert is a single <code>ebreak</code> (<code>0x00100073</code>). ttsim handles <code>ecall</code>/<code>ebreak</code> on the 32-bit cores in <code>rv32_ecall_ebreak</code>, which has no case for <code>ebreak</code> and ends in <code>TTSIM_ERROR(UnsupportedFunctionality, "inst=0x%x", inst)</code> (<code>riscv_impl.h:1180</code>). On silicon, <code>ebreak</code> "will pause the core, as if a pause was requested via the GDB/Debug interface" (<code>BabyRISCV/README.md:114</code>). So the same build that hangs a real core quietly at the assert gives you an error line in ttsim. The two clocks measure different things: <code>[4501]</code> is the end of a complete run, and <code>[4368]</code> is where the <code>ebreak</code> fired.</li>
+  </ol>
+  <div class="callout warn">The Watcher docs at this pin include the header as <code>#include "debug/assert.h"</code> (<code>docs/source/tt-metalium/tools/watcher.rst:144</code>; <code>debug/waypoint.h</code> the same way at lines 81 and 145). In this tree the file is <code>tt_metal/hw/inc/api/debug/assert.h</code>, and there is no <code>hw/inc/debug/</code> directory. With the docs' spelling the kernel build fails with <code>fatal error: debug/assert.h: No such file or directory</code>. The overlay uses <code>api/debug/assert.h</code>, which compiled.</div>
+
+  <h2 id="hang">5. A hang across five RISC-Vs</h2>
+  <p>Errors are the easy case: something tells you. A hang tells you nothing. Here is the bug, in the compute kernel of <code>eltwise_binary</code> (64 tiles of <i>a</i> + <i>b</i>, two-page CBs, reader on BRISC, writer on NCRISC, compute on the three TRISCs):</p>
+<pre><code>         cb_pop_front(cb_in0, 1);
+         cb_pop_front(cb_in1, 1);
+-        // Release the held register
+-        tile_regs_release();
++        // B09 bug: tile_regs_release() forgotten, so the packer never hands the Dst half back
+     }</code></pre>
+<pre><code>use hang-dst &amp;&amp; time timeout 60 $EX/metal_example_eltwise_binary
+[0] 0.0 seconds (0.0 KHz)
+real	1m0.007s          (exit status 124: killed by timeout; the stock kernel passes in 0.45 s)</code></pre>
+  <p>No error, no output, no exit. Where do you start?</p>
+
+  <h3>5.1 Waypoints: where each CPU last was</h3>
+  <p>With <code>TT_METAL_WATCHER=1</code>, a host thread dumps the state of every core once a second into <code>$TT_METAL_LOGS_PATH/generated/watcher/watcher.log</code>. For each core it prints the last <em>waypoint</em> of each of the five RISC-Vs, a code of up to four characters that the kernel APIs write into an L1 mailbox at interesting points. By convention a final <code>W</code> means "waiting at the top of a loop" and a final <code>D</code> means "done waiting" (<code>watcher.rst:90-99</code>). The macro is a single store (<code>api/debug/waypoint.h:41</code>), and you can put your own anywhere. I ran the hang under <code>timeout 150</code> and got 149 dumps for core (0,0). The figure replays one such run. Watcher samples on wall-clock time, so the writer's exact <code>NAWW</code>/<code>NWBD</code> pattern and the dumps around the packer's finish differ a little from run to run. The lanes of the other four cores and the frozen final state came out the same when I reran it.</p>
+  <div class="viz" id="fig-wp"></div>
+  <script>
+  (function () {
+    var lanes = [[[0.4,0.4,"GW"],[1.4,1.4,"GD"],[2.4,6.4,"R"],[7.4,13.4,"NARW"],[14.4,149.3,"CRBW"]],[[0.4,1.4,"W"],[2.4,6.4,"R"],[7.4,8.4,"CWFW"],[9.4,9.4,"NAWW"],[10.4,10.4,"NWBD"],[11.4,38.6,"NAWW"],[39.6,39.6,"NWBD"],[40.6,40.6,"NWBW"],[41.6,43.6,"NAWW"],[44.6,44.6,"NWBD"],[45.6,45.6,"NAWW"],[46.6,46.6,"CWFD"],[47.6,50.6,"NAWW"],[51.6,51.6,"NWBD"],[52.6,59.7,"NAWW"],[60.7,60.7,"NWBD"],[61.7,61.7,"NAWW"],[62.7,63.8,"NWBD"],[64.8,78.8,"NAWW"],[79.8,83.9,"NKFD"],[84.9,149.3,"W"]],[[0.4,1.4,"W"],[2.4,2.4,"R"],[3.4,8.4,"K"],[9.4,149.3,"UABD"]],[[0.4,1.4,"W"],[2.4,3.4,"R"],[4.4,149.3,"MWDD"]],[[0.4,1.4,"W"],[2.4,2.4,"R"],[3.4,76.8,"K"],[77.8,78.8,"KD"],[79.8,149.3,"W"]]];
+    var names = ["BRISC  reader", "NCRISC writer", "TRISC0 unpack", "TRISC1 math", "TRISC2 pack"];
+    var root = document.getElementById("fig-wp");
+    var g = TT.canvas(root, 900, 400), ctx = g.ctx, C = TT.C;
+    var X0 = 140, X1 = 880, TMAX = 150, Y0 = 50, LH = 46;
+    function tx(t) { return X0 + (X1 - X0) * t / TMAX; }
+    function colour(s) {
+      if (s === "CRBW" || s === "CWFW") return C.red;
+      if (/^N[AW]/.test(s) || s === "NARW") return C.blue;
+      if (s === "W" || s === "GW" || s === "GD" || s === "KD" || s === "NKFD") return "#3a4250";
+      return C.green;
+    }
+    function stateAt(k, t) { var s = "", L = lanes[k]; for (var j = 0; j < L.length; j++) if (L[j][0] <= t + 0.01) s = L[j][2]; return s; }
+    var steps = [
+      { t: 1.4, text: "<b>Dump 2, 1.4 s.</b> Watcher has attached and nothing has launched. BRISC is in its firmware's idle loop (<code>GW</code>, then <code>GD</code>), and the four subordinate cores show <code>W</code>." },
+      { t: 2.4, text: "<b>Dump 3, 2.4 s.</b> The launch message arrives and all five RISC-Vs enter their kernels (<code>R</code>, \"run\"). The TRISCs then show <code>K</code> (in kernel)." },
+      { t: 4.4, text: "<b>Dump 5, 4.4 s.</b> TRISC1 (math) reaches <code>MWDD</code>, \"math wait for dest: done\", and <i>never changes again</i>. Odd, since a <code>D</code> means done waiting. Keep this in mind for section 5.3." },
+      { t: 7.4, text: "<b>Dump 8, 7.4 s.</b> The reader (BRISC) is reading tiles (<code>NARW</code>), and the writer (NCRISC) waits for output in <code>cb_wait_front</code> (<code>CWFW</code>)." },
+      { t: 14.4, text: "<b>Dump 15, 14.4 s.</b> The reader stops in <code>cb_reserve_back</code> (<code>CRBW</code>), waiting for a free page in the input CB. It stays there for the remaining 135 dumps. TRISC0 (unpack) has been at <code>UABD</code> since 9.4 s." },
+      { t: 40, text: "<b>40 s.</b> The surprise: the <i>writer</i> is still busy, alternating <code>NAWW</code>/<code>NWBD</code> (writing tiles to DRAM, barrier done), and the packer is still in its kernel (<code>K</code>). The input side is stuck, yet the output side keeps producing tiles." },
+      { t: 79.8, text: "<b>Dumps 78-80, 77.8-79.8 s.</b> TRISC2 (pack) finishes its kernel (<code>KD</code> at 77.8 s, then <code>W</code>). It has packed all 64 tiles, from only the few inputs that math ever consumed. The writer reaches <code>NKFD</code> (\"kernel finished, done\")." },
+      { t: 84.9, text: "<b>Dumps 85-149.</b> Sixty-five identical dumps: <code>CRBW, W, UABD, MWDD, W</code>. Nothing changes, so this is a hang, not slowness. Two CPUs have finished, the reader is stuck waiting, and the two TRISCs that are not waiting on anything visible are stuck too." },
+      { t: 149.3, text: "<b>The diagnosis (sections 5.2-5.3).</b> CB counters read with tt-exalens: in0 and in1 have 4 pushed and 2 popped, out has 64 and 64. So math consumed only 2 tiles. In the coprocessor, the math pipe sits on a <code>SEMWAIT</code> for the MATH_PACK semaphore, which is at its maximum of 2: the packer never gave a Dst half back." }
+    ];
+    TT.stepper({ root: root, steps: steps, draw: function (i, tt) {
+      TT.clear(ctx, g.W, g.H);
+      var prev = i > 0 ? steps[i - 1].t : 0, cur = TT.lerp(prev, steps[i].t, tt);
+      for (var s = 0; s <= 150; s += 25) {
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(tx(s), Y0 - 10); ctx.lineTo(tx(s), Y0 + 5 * LH); ctx.stroke();
+        TT.text(ctx, s + " s", tx(s), Y0 + 5 * LH + 14, { align: "center", font: "11px", color: C.muted });
+      }
+      TT.text(ctx, "Watcher dumps of core (0,0), host wall time (Watcher on)", X0, 12, { font: "12px", color: C.muted });
+      for (var k = 0; k < 5; k++) {
+        var y = Y0 + k * LH;
+        TT.text(ctx, names[k], 12, y + 16, { font: "13px", mono: true, color: C.fg });
+        lanes[k].forEach(function (seg) {
+          var a = seg[0] - 0.5, b = Math.min(seg[1] + 0.5, cur + 0.5);
+          if (a > cur) return;
+          var x = tx(Math.max(a, 0)), w = Math.max(2, tx(b) - x);
+          ctx.fillStyle = colour(seg[2]); ctx.globalAlpha = 0.85; ctx.fillRect(x, y + 4, w, 26); ctx.globalAlpha = 1;
+          if (w > 34) TT.text(ctx, seg[2], x + w / 2, y + 17, { align: "center", font: "bold 11px", mono: true, color: "#000" });
+        });
+      }
+      var cx = tx(cur);
+      ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, Y0 - 12); ctx.lineTo(cx, Y0 + 5 * LH); ctx.stroke();
+      TT.text(ctx, cur.toFixed(1) + " s", Math.min(cx + 4, 840), Y0 - 14, { font: "bold 12px", color: C.yellow });
+      var lg = [[C.red, "waiting on a CB"], [C.blue, "NoC traffic / barrier"], [C.green, "in kernel code"], ["#3a4250", "idle / finished"]];
+      lg.forEach(function (l, j) { ctx.fillStyle = l[0]; ctx.fillRect(X0 + j * 180, 338, 14, 12); TT.text(ctx, l[1], X0 + j * 180 + 20, 344, { font: "12px", color: C.muted }); });
+      if (i === steps.length - 1) {
+        TT.text(ctx, "exalens: cb0 received 4 / acked 2   cb1 received 4 / acked 2   cb16 received 64 / acked 64", 12, 372, { font: "12px", mono: true, color: C.yellow });
+        TT.text(ctx, "lldb:    math pipe head = SEMWAIT on MATH_PACK, which is 2 = its maximum", 12, 390, { font: "12px", mono: true, color: C.yellow });
+      } else {
+        TT.text(ctx, "current: " + [0,1,2,3,4].map(function (k) { return stateAt(k, cur) || "-"; }).join(", "), 12, 380, { font: "12px", mono: true, color: C.fg });
+      }
+    }});
+  })();
+  </script>
+  <p>Read the final, frozen state as Watcher prints it, BRISC first (<code>watcher.rst:99</code>):</p>
+<pre><code>grep "worker core(x= 0,y= 0)" $LAB_HOME/logs/generated/watcher/watcher.log | sed 's/.*18)://' | uniq -c | tail -3
+      1  CRBW,NAWW,UABD,MWDD,   D  rmsg:H0G|BNT h_id:  0 smsg:GGGD
+      5  CRBW,NKFD,UABD,MWDD,   W  rmsg:H0G|BNT h_id:  0 smsg:GGGD
+     65  CRBW,   W,UABD,MWDD,   W  rmsg:H0G|BNT h_id:  0 smsg:DGGD</code></pre>
+  <p>The tempting reading is wrong. <code>CRBW</code> on the reader does not mean the reader is broken. It means its output, the input CB, is full because nobody pops it. Follow the chain downstream. The unpacker pops the inputs, and its last waypoint is <code>UABD</code>, "unpack A/B done", so it is stuck somewhere with no waypoint of its own. The math thread shows <code>MWDD</code>, which claims it is done waiting for Dst. And the packer and writer, the last stage of the pipeline, are <em>finished</em>. In a pipeline hang, look for the stage that broke the protocol, not the one that is waiting. Here it is the stage that finished too early.</p>
+  <p><code>smsg:DGGD</code> is the subordinate run message (NCRISC, TRISC0, TRISC1, TRISC2): D = done, G = go. It confirms that NCRISC and TRISC2 completed while TRISC0 and TRISC1 are still running.</p>
+
+  <h3>5.2 Counting tiles from outside: tt-exalens on a live ttsim</h3>
+  <p>Waypoints say <em>where</em> each CPU is, but not <em>how many</em> tiles have moved. The CB counters hold that. On Wormhole they are two 16-bit stream scratch registers per CB, <code>tiles_received</code> (bumped by the producer) and <code>tiles_acked</code> (bumped by the consumer) (<code>hw/inc/internal/tt-1xx/wormhole/stream_io_map.h:24-32</code>, explained in A11). To read them from another process while the app hangs, tt-metal can serve the simulated chip over a UNIX socket:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/rtoptions.cpp:945-952 @7aad8aac</div>
+<pre><code>        // TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS
+        // Expose each simulated chip over a per-chip socket so a separate process (a debug tool) can
+        // attach to this run as a client.
+        // Default: false (disabled)
+        // Usage: export TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1</code></pre>
+  <p>The workbench script <code>py/b09_cbpeek.py</code> attaches tt-exalens (installed in tt-metal's <code>python_env</code>) to that socket and reads the six counters:</p>
+<pre><code>use hang-dst
+TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1 timeout 600 $EX/metal_example_eltwise_binary &gt; hang.log 2&gt;&amp;1 &amp;
+grep "serving sockets" hang.log
+… | info | UMD | Simulation host serving sockets in /tmp/tt-umd-sim-server-0 (cluster.cpp:956)
+source $TT_METAL_HOME/python_env/bin/activate
+python -I $W/py/b09_cbpeek.py /tmp/tt-umd-sim-server-0
+cb  0: tiles_received=  4 tiles_acked=  2 in_flight=2
+cb  1: tiles_received=  4 tiles_acked=  2 in_flight=2
+cb 16: tiles_received= 64 tiles_acked= 64 in_flight=0</code></pre>
+  <p>Now the story has numbers. Compute popped exactly <b>2</b> tiles from each input. The reader pushed 4 and is waiting to push a fifth into a full 2-page CB. Yet compute pushed all <b>64</b> output tiles, and the writer drained them. The pipeline produced 64 outputs from 2 inputs, so 62 of those tiles must be garbage. A hang and silent corruption came from the same missing line.</p>
+  <h3>And tt-triage?</h3>
+  <p>tt-metal ships <code>tools/triage/triage.py</code>, which builds callstacks, CB dumps and semaphore dumps from Inspector data plus a tt-exalens connection (<code>docs/source/tt-metalium/tools/triage.rst:7-12</code>). I ran it against the same live, socket-served ttsim. tt-exalens attached fine, but triage could not get to the per-core scripts:</p>
+<pre><code>python $TT_METAL_HOME/tools/triage/triage.py --llm-output --skip-version-check --inspector-rpc-port=50909
+(condensed: one line per script)
+dispatcher_data.py:
+  Data provider script failed: No devices to inspect, so there is no generation to pick dispatcher data for.
+…--dev=0 added:
+dispatcher_data.py:
+  Data provider script failed: Failed to get firmware path from Inspector RPC: 0
+callstack_provider.py:      Skipping: dependency dispatcher_data.py failed
+dump_circular_buffers.py:   Skipping: dependency circular_buffer_provider.py failed
+dump_semaphores.py:         Skipping: dependency semaphore_provider.py failed</code></pre>
+  <p>The cause, which I found by querying both sides by hand: Inspector maps metal device 0 to unique ID <code>1649267441665</code>, but the tt-exalens device attached over the socket reports <code>unique_id 0</code>. Triage keys its build-environment cache on that ID (<code>tools/triage/dispatcher_data.py:134-150</code>, <code>metal_device_id_mapping.py:42-45</code>), so the lookup fails, and the error's trailing <code>0</code> is the missing key. In this setup, at these pins, triage over a ttsim socket did not get past <code>dispatcher_data.py</code>; I did not look for a workaround. Watcher's log and a direct tt-exalens read are the tools that worked.</p>
+  <div class="callout warn">Inspector's RPC server listens on <code>localhost:50051</code> by default, for every tt-metal process. When I first ran triage, another lab's process on this machine held that port, and triage read <em>its</em> configuration: the dumped <code>TT_METAL_KERNEL_PATH</code> was that lab's. If you run more than one tt-metal process, give each its own port with <code>TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS=localhost:&lt;port&gt;</code> (<code>rtoptions.cpp:1636-1651</code>), and pass the same port to triage with <code>--inspector-rpc-port</code>.</div>
+
+  <h3>5.3 Inside the coprocessor: why MWDD lies</h3>
+  <p>Why does TRISC1 say <code>MWDD</code> (done waiting) when math is plainly stuck? Look at the wait it just "passed":</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_math_common_api.h:54-58 and tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cmath_common.h:307-310 @7aad8aac</div>
+<pre><code>inline void llk_math_wait_for_dest_available() {
+    WAYPOINT("MWDW");
+    _llk_math_wait_for_dest_available_&lt;DST_SYNC_MODE&gt;();
+    WAYPOINT("MWDD");
+}
+inline void math_dest_wait()
+{
+    TTI_SEMWAIT(p_stall::STALL_MATH | p_stall::STALL_SFPU | p_stall::STALL_SYNC, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_MAX);
+}</code></pre>
+  <p>The "wait" is a Tensix <em>instruction</em>, <code>SEMWAIT</code>. The RISC-V pushes it into the math pipe's instruction FIFO and moves on, so it writes <code>MWDD</code> at once. The <em>coprocessor</em> is what stalls (<a href="../chapters/a04-inside-tensix.html">A04</a>: "the RISC-V runs ahead"). Waypoints follow the RISC-V's program counter, not the Tensix pipes. To see the pipes, attach lldb to the hung process running the <a href="#lldb">debug ttsim</a>, and print the simulator's own state for tile 0 (its <code>noc_id_logical</code> is <code>0x492</code>, that is x = 18, y = 18: worker (0,0)):</p>
+<pre><code>lldb-20 -b -p $(pgrep -n metal_example_e) -o 'p g_chip-&gt;t_tiles[0].tensix[0].inst_rd_ptr' …
+(condensed: values only, comments added)
+(uint32_t[3])  ([0] = 66, [1] = 67, [2] = 236)          # inst_rd_ptr  per pipe: unpack, math, pack
+(uint32_t[3])  ([0] = 96, [1] = 120, [2] = 236)         # inst_wr_ptr: unpack and math have work queued, pack is empty
+(uint32_t) 0x00000003                                   # inst_pipes_active = pipes 0 and 1
+(uint32_t) 0xa6a1000a                                   # inst[1][67], head of the math pipe
+(uint32_t) 0x420080c1                                   # inst[0][66], head of the unpack pipe
+(uint8_t) '\x02'                                        # sem[1]     (MATH_PACK)
+(uint8_t) '\x02'                                        # sem_max[1]
+(uint32_t) 0x00000003  (uint32_t) 0x00000003            # src_a_valid, src_b_valid</code></pre>
+  <p>Decode the heads with ttsim's own opcode table (<code>ttsim/data/wh/tensix_isa.json</code>): <code>0xa6</code> is <code>SEMWAIT</code>, with <code>wait_sem_cond</code> = 2 (<code>STALL_ON_MAX</code>, <code>ckernel_instr_params.h:254</code>) and <code>sem_sel</code> = 2, which selects semaphore 1, <code>MATH_PACK</code>. That semaphore holds 2, which is its maximum. <code>0x42</code> is <code>UNPACR</code>, waiting because both SrcA and SrcB banks are still full (valid = 0b11), since math never consumed them. Now the whole chain fits:</p>
+  <ol>
+    <li>The packer's <code>tile_regs_wait()</code> is <code>SEMWAIT … STALL_ON_ZERO</code> on MATH_PACK (<code>llk_pack_common.h:26-29</code>). <code>tile_regs_release()</code> is the only thing that decrements it again (<code>reg_api.h:106-108</code> → <code>llk_pack_common.h:75-76</code>, a <code>SEMGET</code>).</li>
+    <li>With the release gone, math's two commits push MATH_PACK to 2, the SyncHalf maximum (<code>TTI_SEMINIT(2, 0, …)</code>, <code>llk_math_common.h:118-120</code>). The third <code>tile_regs_acquire()</code> stalls the math pipe forever.</li>
+    <li>MATH_PACK never returns to zero, so the packer's wait never blocks again. It packs 64 "tiles" from whatever Dst holds, and the writer ships them.</li>
+    <li>Math no longer consumes SrcA/SrcB, so the unpacker stalls, the inputs are not popped after tile 2, and the reader blocks in <code>CRBW</code> with 4 pushed and 2 acked.</li>
+  </ol>
+  <p><b>Fix:</b> restore <code>tile_regs_release()</code>. The stock kernel prints <code>Test Passed</code>. The general lesson: <code>acquire/commit/wait/release</code> is two semaphore handshakes (<a href="../chapters/a12-compute-kernels.html">A12</a>). Forgetting either half does not crash anything. It shows up as a stall somewhere upstream.</p>
+  <div class="callout gpu">On a GPU, a missing <code>__syncthreads()</code> is a data race: wrong answers, sometimes. Here a missing handshake is a deadlock <em>and</em> wrong answers, because the "threads" are separate CPUs and pipes linked only by counters. Each counter has exactly one writer, and a stage that skips its write starves the stage that waits on it.</div>
+
+  <h3>5.4 The same disease in L1: a semaphore nobody posts</h3>
+  <p>Metalium semaphores (L1 words, not the Tensix Sync-unit semaphores above; see the glossary in <a href="../chapters/a16-multicast-sync.html">A16</a>) fail the same way. In <code>NoC_tile_transfer</code>, core (0,1)'s reader tells core (0,0)'s writer it is ready with <code>noc_semaphore_inc</code>. The overlay comments that out:</p>
+<pre><code>-    noc_semaphore_inc(sem_addr, 1);
+-    noc_async_atomic_barrier();
++    // B09 bug: the "I am ready" post to core 0 is missing
++    // noc_semaphore_inc(sem_addr, 1);
++    // noc_async_atomic_barrier();</code></pre>
+<pre><code>use hang-sem
+timeout 25 env TT_METAL_DPRINT_CORES='(0,0),(0,1)' $EX/metal_example_noc_tile_transfer
+0:0-0:NC: 1. READER 0: Reading input data to L1 src0 CB
+0:0-1:NC: 5. READER 1: Preparing for data transfer
+0:0-0:NC:  &gt; Data in buffer: 14
+0:0-0:BR: 3. WRITER 0: Data available in src0 CB
+0:0-0:NC: 2. READER 0: Data in src0 CB pushed from reader0
+(exit 124: messages 4 and 6 never come; lines from the two cores can interleave differently between runs)
+timeout 60 env TT_METAL_WATCHER=1 $EX/metal_example_noc_tile_transfer      # last dump of each core:
+core(x= 0,y= 0) virtual(x=18,y=18):  NSW,   W,   W,   W,   W  rmsg:H1G|BNt h_id:  0 smsg:DDDD
+core(x= 0,y= 1) virtual(x=18,y=19): CWFW, NSW,   W,   W,   W  rmsg:H1G|BNt h_id:  0 smsg:GDDD</code></pre>
+  <p>Core (0,0)'s BRISC (writer0) is in <code>noc_semaphore_wait</code> (<code>NSW</code>, <code>dataflow_api.h:2115</code>) for the "ready" that was deleted. Core (0,1)'s NCRISC (reader1) is in its own <code>NSW</code>, waiting for "data sent", which writer0 will never send. Its BRISC (writer1) waits on the CB that reader1 would have filled (<code>CWFW</code>). The <code>k_ids</code> lines map each column to a kernel file (<code>2|1</code> and <code>4|3</code>; file names at the end of each dump). It is a circular wait across two cores, and the waypoints show it directly.</p>
+
+  <h2 id="lldb">6. Debugging the simulator itself with lldb</h2>
+  <p>The UB in section 3.4 printed "access past end of tensix_sram", with no address and no core. When a message is not enough, debug the simulator. Its source is in the workbench, and lldb-20 is installed (gdb is not). Build a debug copy:</p>
+  <div class="filename">ttsim/src/rules.py:33-36 @b3620244</div>
+<pre><code>    config_compile_opts = {
+        'debug': ['-g', '-Og', '-DDEBUG'],
+        'release': ['-O2'],
+    }</code></pre>
+<pre><code>$W/build_ttsim.sh dbg wh debug          # third argument picks the flavour; about 2 s
+copied ttsim source to /home/user/ttlab/b09/ttsim-dbg (edit files in /home/user/ttlab/b09/ttsim-dbg/src/)
+export TT_METAL_SIMULATOR=/home/user/ttlab/b09/sim-dbg-wh-debug/libttsim.so</code></pre>
+  <p><code>-DDEBUG</code> also switches on the internal <code>TTSIM_ASSERT</code> checks (<code>common.h:41-51</code>). The debug build ran stock <code>eltwise_binary</code> to <code>Test Passed</code> in the same 7959 clocks. Now put a breakpoint on the one function every error goes through. lldb sets it as "pending", because <code>libttsim.so</code> is <code>dlopen</code>ed later by UMD:</p>
+<pre><code>use noc-oob
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-dbg-wh-debug/libttsim.so
+lldb-20 -b -o "breakpoint set -n ttsim_error" -o run -o "bt 12" -o "frame select 2" \
+        -o "p/x src_addr" -o "p/x dst_addr" -o "p noc_at_len_be" -o "p/x dst_coordinate" \
+        -o "frame select 6" -o "p/x p_hart-&gt;pc" -o "p p_hart-&gt;riscv_id" -o "p/x addr" -o kill \
+        -- $EX/metal_example_add_2_integers_in_riscv
+(lldb) breakpoint set -n ttsim_error
+Breakpoint 1: no locations (pending).
+(lldb) run
+1 location added to breakpoint 1
+* thread #1, name = 'metal_example_a', stop reason = breakpoint 1.1
+    frame #0: 0x00007fffd8005546 libttsim.so`ttsim_error(category=UndefinedBehavior, func="tile_wr_bytes", fmt="access past end of tensix_sram\n") at common.cpp:33:87
+(lldb) bt 12
+  * frame #0: … libttsim.so`ttsim_error(category=UndefinedBehavior, func="tile_wr_bytes", fmt="access past end of tensix_sram\n") at common.cpp:33:87
+    frame #1: … libttsim.so`tile_wr_bytes(coord=65, addr=1499120, p=0x00007fffd81ba69c, size=32) at tile.cpp:2870:13
+    frame #2: … libttsim.so`noc_cmd_ctrl&lt;'T'&gt;(tile_id=0, noc_instance=0, cmd_buf=0) at tile.cpp:1591:22
+    frame #3: … libttsim.so`noc_regs_wr32&lt;'T'&gt;(tile_id=&lt;unavailable&gt;, noc_instance=&lt;unavailable&gt;, offset=&lt;unavailable&gt;, data=&lt;unavailable&gt;) at tile.cpp:1716:36
+    frame #4: … libttsim.so`t_tile_mmio_wr32(tile_id=&lt;unavailable&gt;, riscv_id=&lt;unavailable&gt;, addr=4289855528, data=1) at tile.cpp:2248:31
+    frame #5: … libttsim.so`tile_mmio_wr32(tile_type=&lt;unavailable&gt;, tile_id=&lt;unavailable&gt;, riscv_id=&lt;unavailable&gt;, addr=4289855528, data=1) at tile.cpp:2440:32
+    frame #6: … libttsim.so`rv32_mem_wr&lt;unsigned int&gt;(p_hart=0x00007fffd803d140, addr=4289855528, data=1) at riscv_impl.h:714:30
+    frame #7: … libttsim.so`rv32_store&lt;unsigned int&gt;(p_hart=0x00007fffd803d140, inst=&lt;unavailable&gt;) at riscv_impl.h:747:35
+    frame #8: … libttsim.so`rv32_step(p_hart=0x00007fffd803d140) at riscv_impl.h:1969:31
+    frame #9: … libttsim.so`::clock_current_chip() at libttsim.cpp:256:26
+    frame #10: … libttsim.so`libttsim_clock(n_clocks=1) at libttsim.cpp:309:31
+    frame #11: … libtt-umd.so.0`tt::umd::TTSimCommunicator::advance_clock(unsigned int) + 69
+(lldb) frame select 2
+-&gt; 1591	        tile_wr_bytes(dst_coordinate, dst_addr, &amp;p_tile-&gt;sram[src_addr], noc_at_len_be);
+(lldb) p/x src_addr
+(uint64_t) 0x000000000016dfc0
+(lldb) p/x dst_addr
+(uint64_t) 0x000000000016dff0
+(lldb) p noc_at_len_be
+(uint32_t) 32
+(lldb) p/x dst_coordinate
+(uint32_t) 0x00000041
+(lldb) frame select 6
+(lldb) p/x p_hart-&gt;pc
+(uint32_t) 0x00008c80
+(lldb) p p_hart-&gt;riscv_id
+(uint32_t) 0
+(lldb) p/x addr
+(uint_xlen_t) 0xffb20028</code></pre>
+  <p>(If you also run <code>frame variable</code>, or print Tensix state as in section 5.3, lldb first prints several hundred warnings, 374 in one run, about bitfield DWARF in the generated register structs. They are harmless, and <code>grep -v ^warning</code> removes them.) Read the backtrace from the bottom up. It is the whole simulator in twelve frames:</p>
+  <ul>
+    <li><b>#11 → #10:</b> UMD's host thread drives time one clock at a time: <code>libttsim_clock(n_clocks=1)</code>. Without that call, nothing in the chip moves (<code>docs/libttsim_api.md:108</code>).</li>
+    <li><b>#9 → #8:</b> the clock loop steps each active RISC-V of each busy Tensix tile (<code>libttsim.cpp:256</code>). The core is <code>riscv_id 0</code>, the BRISC.</li>
+    <li><b>#7 → #4:</b> a 32-bit store (<code>rv32_store</code>) to address <code>0xffb20028</code>. That is <code>NOC_CMD_CTRL</code> = <code>NOC_REGS_START_ADDR + 0x28</code> (<code>noc_parameters.h:53</code>), and <code>data=1</code> means "send". So this is the last line of <code>noc_async_write</code>, which pressed the button. <code>p_hart-&gt;pc</code> is <code>0x8c80</code>, one instruction past the store, because ttsim advances the PC before executing (<code>riscv_impl.h:1965</code>).</li>
+    <li><b>#3 → #2:</b> the register write calls <code>noc_cmd_ctrl</code>, the NIU model. It has already passed the alignment checks: <code>0x16dfc0</code> and <code>0x16dff0</code> are both 0 mod 16.</li>
+    <li><b>#1 → #0:</b> the byte mover. <code>coord=65</code> = <code>0x41</code> = x 1, y 1 (packed <code>x | y &lt;&lt; 6</code>): physical NoC 0 (1,1), which Watcher calls virtual (18,18). <code>addr=1499120</code> = <code>0x16dff0</code>, and 32 bytes from there run 16 bytes past <code>0x16e000</code>.</li>
+  </ul>
+  <p>That is the same information Watcher printed, recovered this time from the simulator's side. You did not need to know beforehand which check would fire: one breakpoint covers more than 1100 call sites. The same session works for any category. Use <code>frame select</code> to walk up to the frame you care about and <code>p</code> its locals. <a href="b03-riscv-interpreter.html">B03</a> and <a href="b04-tensix-instructions.html">B04</a> show where to add your own <code>ttsim_printf</code> once you know what to log. A debugger also attaches to a <em>hung</em> process (<code>lldb-20 -p &lt;pid&gt;</code>), which is how section 5.3 read the Tensix FIFOs.</p>
+  <div class="callout warn">ttsim's documentation gives one more escape hatch, as a last resort. You may comment out a check in a local build to get unblocked, but you must never ship that simulator, and the expected lifetime of such a hack is "days, not weeks" (<code>sim_error_handling.md:330-366</code>). The check found a real problem. Silencing it does not fix the kernel.</div>
+
+  <h2 id="blind">7. What ttsim cannot see</h2>
+  <p>Every bug so far was caught by somebody. This list is the opposite: bugs that pass in ttsim, or that ttsim reports differently from the chip. Each item points to where it was shown.</p>
+  <table class="t">
+    <tr><th>Blind spot</th><th>Why</th><th>Evidence</th></tr>
+    <tr><td>Missing <code>noc_async_*_barrier()</code></td><td>Every NoC transfer in stock ttsim completes inside the store that starts it, so data is always there before the next instruction.</td><td><a href="b05-noc-and-dram.html#barrier">B05 §5</a> (a patched ttsim that delays reads makes it fail); <code>overlays/a11/no-barrier</code></td></tr>
+    <tr><td>Races, contention, latency</td><td>ttsim is not a timing model. The order in which cores run is fixed by the clock loop, so every run is identical.</td><td><a href="b01-meet-ttsim.html">B01</a>: same clock count every run</td></tr>
+    <tr><td>Reading memory nobody wrote</td><td>In ttsim, a fresh L1 reads as zeros.</td><td>A variant of the section 8 harness that reads L1 <code>0x100-0x10c</code> before writing anything gets <code>00000000</code></td></tr>
+    <tr><td>Everything after the first error</td><td><code>_Exit(1)</code> stops at the first violation.</td><td>Section 1</td></tr>
+    <tr><td>Bugs silicon would tolerate</td><td>ttsim refuses NCB that the hardware happens to handle. That is the opposite of a blind spot, but it surprises people.</td><td>Section 3.1 (unaligned load rounds down on WH)</td></tr>
+    <tr><td>Silicon hangs that ttsim reports as errors</td><td>ttsim names the address where the chip would stall forever.</td><td>Section 3.3 (unmapped load), 4.2 (<code>ebreak</code>)</td></tr>
+    <tr><td>Watcher's loose DRAM bound</td><td>Watcher checks DRAM addresses against the whole chip's DRAM, not one tile's.</td><td><a href="b05-noc-and-dram.html#overrun">B05 §6</a></td></tr>
+    <tr><td>Profiler data</td><td>The device profiler produced a CSV with only a header under ttsim.</td><td><code>research/06-feasibility.md</code></td></tr>
+  </table>
+  <div class="callout key">ttsim proves your kernel follows the <em>functional</em> contract on one fixed interleaving. It does not prove the kernel is free of timing bugs. Treat a pass in ttsim as necessary, not sufficient.</div>
+
+  <h2 id="harness">8. Capstone: drive libttsim with no tt-metal</h2>
+  <p>Everything above went through tt-metal and UMD. Underneath, the simulator is a library with ten exported functions (<code>src/libttsim.map</code>): config-space access, BAR reads and writes, a clock, and init/exit. <a href="b00-workbench.html">B00</a>'s harness <code>h.c</code> called three of them and read the PCI ID. This lab's <code>harness/b09_step.c</code> goes all the way. It writes a RISC-V program into a core's L1, releases that core from reset, steps the clock one cycle at a time, and reads the answer back. That is what UMD and tt-metal do for every launch (<a href="../chapters/a17-dispatch-host.html#pcie">A17</a>), done here by hand.</p>
+  <p>One shortcut is closed. <code>libttsim_tile_wr_bytes(x, y, addr, …)</code> is still exported, but on Wormhole and Blackhole it is "illegal and calling them fails as <code>UnsupportedFunctionality</code>" (<code>docs/libttsim_api.md:115-120</code>; the body is just <code>TTSIM_ERROR_NOFMT(UnsupportedFunctionality)</code>, <code>libttsim.cpp:197-207</code>). So the harness has to talk PCIe like a real host:</p>
+  <ol>
+    <li><b>Find BAR0</b> in config space (offsets 0x10 and 0x14). Memory decode is already on (<code>pcie.cpp:172</code>).</li>
+    <li><b>Program two TLB windows</b> (A17 has the layout). Window 0 maps 1 MiB of the core's L1 from address 0. Window 1 maps the core's register page at <code>0xFFB00000</code>. A 1 MiB TLB's config is <code>addr &gt;&gt; 20</code> in bits 15:0 and the coordinate <code>x | y &lt;&lt; 6</code> in the next 12 bits (<code>pcie.cpp:234-266</code>), written at BAR0 + <code>0x1FC00000</code> + 8 × index.</li>
+    <li><b>Write the program</b> at L1 address 0, because BRISC's reset PC is always 0 (<code>tile.cpp:1108</code>).</li>
+    <li><b>Release BRISC</b> by clearing bit 11 (<code>0x800</code>) of <code>RISCV_DEBUG_REG_SOFT_RESET_0</code> = <code>0xFFB121B0</code> (<code>hw/inc/internal/tt-1xx/wormhole/tensix.h:106,109</code>). The reset value is <code>0x47800</code>, all five cores held. In ttsim the bits are BRISC 0x800, TRISC0-2 0x1000/0x2000/0x4000, NCRISC 0x40000 (<code>tile.cpp:1096-1126</code>).</li>
+    <li><b>Clock and read.</b></li>
+  </ol>
+  <div class="filename">sim-labs/workbench/harness/b09_step.c (excerpt)</div>
+<pre><code>static uint64_t tlb_map(uint32_t index, uint32_t x, uint32_t y, uint64_t addr) {
+    uint64_t cfg = (addr &gt;&gt; 20) | ((uint64_t)(x | (y &lt;&lt; 6)) &lt;&lt; 16);
+    mem_wr(bar0 + TLB_CFG_BASE + 8 * index, &amp;cfg, 8);
+    return bar0 + (uint64_t)index * TLB_1M_SIZE;   // host address of the window
+}
+...
+    static const uint32_t prog[] = {
+        0x10000293,  // 0x00  li   t0, 0x100      result address
+        0x00000513,  // 0x04  li   a0, 0          running sum
+        0x00500593,  // 0x08  li   a1, 5          counter
+        0x00b50533,  // 0x0c  add  a0, a0, a1     loop:
+        0x00a2a023,  // 0x10  sw   a0, 0(t0)
+        0xfff58593,  // 0x14  addi a1, a1, -1
+        0xfe059ae3,  // 0x18  bnez a1, loop
+        0x0000006f,  // 0x1c  j    .              park
+    };
+    mem_wr(l1, prog, sizeof prog);
+    wr32(l1 + 0x100, 0xdeadbeef);                     // poison the result word
+    wr32(soft_reset, rd32(soft_reset) &amp; ~0x800u);     // release BRISC only
+    for (uint32_t c = 1; c &lt;= clocks; c++) {
+        sim_clock(1);
+        ...print L1[0x100] whenever it changes...</code></pre>
+  <p>The words were assembled with the SFPI toolchain's <code>riscv-tt-elf-as -march=rv32i</code>. The <code>-march</code> matters: no compressed instructions allowed. A 32-bit RISC-V word whose low two bits are not <code>0b11</code> is not a compressed instruction to a baby core. ttsim hands it to the Tensix instruction path instead (<code>riscv_impl.h:1967-1971</code>, the "TTI escape" from <a href="b03-riscv-interpreter.html">B03</a>).</p>
+<pre><code>gcc -O2 -Wall -o b09_step $W/harness/b09_step.c -ldl &amp;&amp; ./b09_step ~/sim/wh/libttsim_wh.so
+BAR0 at 0x100000000, command=0x2
+L1[0x0..0x1c] written, L1[0x100] = 0xdeadbeef, SOFT_RESET_0 = 0x47800
+SOFT_RESET_0 = 0x47000 (BRISC running)
+after clock  5: L1[0x100] = 5
+after clock  9: L1[0x100] = 9
+after clock 13: L1[0x100] = 12
+after clock 17: L1[0x100] = 14
+after clock 21: L1[0x100] = 15
+final: L1[0x100] = 15 (expected 5+4+3+2+1 = 15)
+[30] 0.0 seconds (8.7 KHz)</code></pre>
+  <p>It works with no tt-metal, no UMD and no firmware. The core runs exactly what we wrote, nothing else. The sum appears every 4 clocks, one per loop iteration of four instructions. The harness cannot see registers, only memory, so to watch the core itself, run the harness under lldb on the debug build. This breakpoint fires on every BRISC step:</p>
+<pre><code>breakpoint set -n rv32_step -c "p_hart-&gt;tile_type == 'T'"
+breakpoint command add 1
+p g_clock
+p/x p_hart-&gt;pc
+p/d p_hart-&gt;x_regs[5]
+p/d p_hart-&gt;x_regs[10]
+p/d p_hart-&gt;x_regs[11]
+continue
+DONE
+run</code></pre>
+<pre><code>lldb-20 -b -s trace.lldb -- ./b09_step $LAB_HOME/sim-dbg-wh-debug/libttsim.so 18 18 24</code></pre>
+  <p>It printed 24 snapshots, one per clock, of the state <em>on entry</em> to <code>rv32_step</code>, before that clock's instruction runs. The figure replays them exactly.</p>
+  <div class="viz" id="fig-step"></div>
+  <script>
+  (function () {
+    // [g_clock, pc, t0, a0, a1] captured with lldb-20 on the debug build (state on entry to rv32_step)
+    var rows = [[0,0x00,0,0,0],[1,0x04,256,0,0],[2,0x08,256,0,0],[3,0x0c,256,0,5],[4,0x10,256,5,5],[5,0x14,256,5,5],[6,0x18,256,5,4],[7,0x0c,256,5,4],[8,0x10,256,9,4],[9,0x14,256,9,4],[10,0x18,256,9,3],[11,0x0c,256,9,3],[12,0x10,256,12,3],[13,0x14,256,12,3],[14,0x18,256,12,2],[15,0x0c,256,12,2],[16,0x10,256,14,2],[17,0x14,256,14,2],[18,0x18,256,14,1],[19,0x0c,256,14,1],[20,0x10,256,15,1],[21,0x14,256,15,1],[22,0x18,256,15,0],[23,0x1c,256,15,0]];
+    var prog = [["0x00","10000293","li   t0, 0x100"],["0x04","00000513","li   a0, 0"],["0x08","00500593","li   a1, 5"],["0x0c","00b50533","add  a0, a0, a1"],["0x10","00a2a023","sw   a0, 0(t0)"],["0x14","fff58593","addi a1, a1, -1"],["0x18","fe059ae3","bnez a1, loop"],["0x1c","0000006f","j    ."]];
+    // L1[0x100] as seen on entry to clock c: last sw executed at an earlier clock
+    function l1At(c) { var v = null; for (var j = 0; j < c && j < rows.length; j++) if (rows[j][1] === 0x10) v = rows[j][3]; return v; }
+    var root = document.getElementById("fig-step");
+    var g = TT.canvas(root, 900, 360), ctx = g.ctx, C = TT.C;
+    var steps = rows.map(function (r, k) {
+      var ins = prog[r[1] / 4][2], note = "";
+      if (r[1] === 0x10) note = " The store writes a0 = " + r[3] + " into L1[0x100]. The harness sees it after this clock, which it counts as clock " + (r[0] + 1) + ".";
+      if (r[1] === 0x18) note = r[4] ? " a1 = " + r[4] + " is not zero, so the branch goes back to 0x0c." : " a1 is 0: fall through to the parking loop.";
+      if (r[1] === 0x1c) note = " The core parks here and spins forever. L1[0x100] = 15.";
+      if (k === 0) note = " BRISC has just left reset at PC 0 (tile.cpp:1108). All registers are 0.";
+      return { dur: 0.6, text: "<b>g_clock = " + r[0] + ".</b> pc = 0x" + ("0" + r[1].toString(16)).slice(-2) + ": <code>" + ins + "</code>." + note };
+    });
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var r = rows[i];
+      TT.text(ctx, "Program in L1 (written over the PCIe BAR)", 20, 22, { font: "bold 13px", color: C.blue });
+      prog.forEach(function (p, k) {
+        var y = 44 + k * 34, cur = (r[1] / 4 === k);
+        TT.box(ctx, 20, y, 440, 28, { fill: cur ? C.yellow : C.bg2, alpha: cur ? TT.lerp(0.25, 0.9, t) : 1, stroke: cur ? C.yellow : C.border });
+        TT.text(ctx, p[0], 32, y + 14, { font: "13px", mono: true, color: cur ? "#000" : C.muted });
+        TT.text(ctx, p[1], 90, y + 14, { font: "13px", mono: true, color: cur ? "#000" : C.muted });
+        TT.text(ctx, p[2], 190, y + 14, { font: "bold 13px", mono: true, color: cur ? "#000" : C.fg });
+        if (k === 3) TT.text(ctx, "loop:", 380, y + 14, { font: "12px", mono: true, color: cur ? "#000" : C.purple });
+      });
+      TT.text(ctx, "pc", 470, 44 + (r[1] / 4) * 34 + 14, { font: "bold 13px", mono: true, color: C.yellow });
+      TT.text(ctx, "BRISC registers (lldb)", 520, 22, { font: "bold 13px", color: C.blue });
+      var regs = [["g_clock", r[0]], ["pc", "0x" + ("0" + r[1].toString(16)).slice(-2)], ["t0 (x5)", r[2]], ["a0 (x10)", r[3]], ["a1 (x11)", r[4]]];
+      regs.forEach(function (q, k) {
+        var y = 44 + k * 38, prevRow = i > 0 ? rows[i - 1] : null;
+        var changed = prevRow && ((k === 2 && prevRow[2] !== r[2]) || (k === 3 && prevRow[3] !== r[3]) || (k === 4 && prevRow[4] !== r[4]));
+        TT.box(ctx, 520, y, 170, 30, { fill: changed ? C.green : C.bg2, alpha: changed ? 0.35 : 1, stroke: changed ? C.green : C.border });
+        TT.text(ctx, q[0], 532, y + 15, { font: "13px", mono: true, color: C.muted });
+        TT.text(ctx, String(q[1]), 680, y + 15, { font: "bold 14px", mono: true, color: C.fg, align: "right" });
+      });
+      TT.text(ctx, "L1[0x100] (harness)", 712, 22, { font: "bold 13px", color: C.blue });
+      var v = l1At(r[0]), fresh = i > 0 && rows[i - 1][1] === 0x10;
+      TT.box(ctx, 712, 44, 170, 60, { fill: fresh ? C.yellow : C.bg2, alpha: fresh ? 0.35 : 1, stroke: fresh ? C.yellow : C.border });
+      TT.text(ctx, v === null ? "0xdeadbeef" : String(v), 797, 74, { font: "bold 18px", mono: true, color: v === null ? C.red : C.fg, align: "center" });
+      TT.text(ctx, "running sum 5, 9, 12, 14, 15", 712, 124, { font: "12px", color: C.muted });
+      TT.text(ctx, "One instruction per clock: with no Tensix work, rv32_step", 520, 250, { font: "12px", color: C.muted });
+      TT.text(ctx, "runs once per active core per clock (libttsim.cpp:256).", 520, 268, { font: "12px", color: C.muted });
+      TT.text(ctx, "The state shown is on entry, before this clock's instruction.", 520, 286, { font: "12px", color: C.muted });
+      for (var c = 0; c < 24; c++) {
+        ctx.fillStyle = c < i ? C.blue : (c === i ? C.yellow : C.bg3);
+        ctx.fillRect(20 + c * 18.3, 330, 15, 12);
+      }
+      TT.text(ctx, "clock", 20, 318, { font: "12px", color: C.muted });
+    }});
+  })();
+  </script>
+  <p>Three things to take away. ttsim's BRISC retires one instruction per clock with no stalls in this loop. That is a property of the simulator, not a measurement of the chip. The values fit exactly: the store executes on <code>g_clock</code> 4, 8, 12, 16 and 20, and the harness, which counts clocks from 1, reports the new value "after clock 5, 9, 13, 17, 21". And registers come only from the debugger. A host program sees only what the core writes to memory, which is why kernels report through L1 mailboxes (DPRINT, Watcher) in the first place.</p>
+  <h3>The harness breaks things too</h3>
+  <p>The harness takes the coordinates as arguments, so it can be broken the same way:</p>
+<pre><code>./b09_step ~/sim/wh/libttsim_wh.so 1 1        # physical coords of the same core: also works, final 15
+./b09_step ~/sim/wh/libttsim_wh.so 0 0
+[0] ERROR: UndefinedBehavior: tile_rd_bytes: DRAM read overrun
+./b09_step ~/sim/wh/libttsim_wh.so 40 40
+[0] ERROR: UnimplementedFunctionality: remap_virtual_coordinate: invalid virtual coordinate 40,40
+./b09_step ~/sim/bh/libttsim_bh.so
+[0] ERROR: UnsupportedFunctionality: pcie_bar0_wr: bar0: offset=0x1fc00000 size=8</code></pre>
+  <p>Each is a lesson in miniature. (0,0) is not a Tensix tile but DRAM tile D0 (the SoC descriptor's first DRAM entry is <code>0-0</code>). Reading the soft-reset register there means reading DRAM at <code>0xFFB121B0</code>, past the 2 GiB channel (<code>tile.cpp:2785</code>). (40,40) is outside the 32 × 32 coordinate space (<code>tile.cpp:1152</code>). And Blackhole's TLB configs are three 32-bit words, not one 64-bit word, so an 8-byte write is refused (<code>pcie.cpp:637-641</code>). This harness is Wormhole only. The clock is <code>[0]</code> in all three because the error fires during setup, before the first <code>libttsim_clock</code>.</p>
+  <div class="callout gpu">A CUDA program never touches the GPU's BARs: the driver owns them. Here, with one <code>dlopen</code>, you are the driver. The ten-function surface is a stable ABI that ttsim promises to keep (<code>libttsim.map:4-7</code>), small enough to drive from C, Python or Rust.</div>
+
+  <h2 id="exercises">9. Exercises, with answers</h2>
+  <details class="quiz"><summary>1. Without running it on hardware, predict what a Wormhole would print for <code>ncb-unaligned</code>. Then change the overlay so ttsim accepts it and the result is still 21.</summary><p>The ISA says unaligned accesses are "silently rounded down" (<code>BabyRISCV/README.md:111</code>). <code>0x16dfe2</code> rounds down to <code>0x16dfe0</code> = <code>src0_l1</code>, so the load returns 14 and the kernel prints <code>Success: Result is 21</code>. For ttsim, read bytes and assemble them yourself, e.g. <code>uint8_t* b = (uint8_t*)src0_l1; uint32_t v = b[0] | b[1] &lt;&lt; 8 | b[2] &lt;&lt; 16 | b[3] &lt;&lt; 24;</code>. Byte loads from L1 are fine. Only MMIO refuses narrow accesses. Or simply drop the <code>+ 2</code>.</p></details>
+  <details class="quiz"><summary>2. Change <code>b09_step.c</code> so the same program runs on TRISC0 instead of BRISC. What two lines change?</summary><p>TRISC0's reset PC is <code>0x6000</code> unless overridden (<code>tile.cpp:1109-1111</code>), and its reset bit is <code>0x1000</code>. So write the program with <code>mem_wr(l1 + 0x6000, prog, sizeof prog)</code> and clear <code>0x1000</code> instead of <code>0x800</code>. I ran it: <code>SOFT_RESET_0 = 0x46800</code>, then the same 5, 9, 12, 14, 15 after clocks 5-21. The result address 0x100 is absolute (<code>li t0, 0x100</code>), so it does not move.</p></details>
+  <details class="quiz"><summary>3. In <code>hang-dst</code>, suppose the reader's input CBs were 64 pages instead of 2. Would the program still hang? Would the output be right?</summary><p>The reader could then push all 64 tiles and finish. The writer and packer finish anyway (they did in the real run). But math still stalls on its third <code>tile_regs_acquire</code> (MATH_PACK = 2 = max), and the unpacker behind it, so TRISC0 and TRISC1 never finish and the host still waits forever. The output would be wrong too: 64 packed tiles from 2 computed ones. Bigger buffers move a hang. They do not fix a protocol bug.</p></details>
+  <details class="quiz"><summary>4. For <code>noc-oob</code>, ttsim says <code>UndefinedBehavior</code> while Watcher says "NOC target address overflow". Which fires first when both are on, and why does ttsim then print nothing?</summary><p>Watcher's check is compiled into <code>noc_async_write</code> and runs on the RISC-V <em>before</em> the store to <code>NOC_CMD_CTRL</code>. When it fails, the kernel records the error in a mailbox and spins, so the command never reaches ttsim's NIU model, and the check in <code>tile_wr_bytes</code> (frame #1 in section 6) is never reached. The host's Watcher thread then reads the mailbox and throws.</p></details>
+  <details class="quiz"><summary>5. In <code>hang-sem</code>, add one waypoint that would have told you which semaphore core (0,1) is stuck on, without reading the source.</summary><p>Put <code>WAYPOINT("RDY1")</code> just before <code>noc_semaphore_wait(sem_ptr, 1)</code> in <code>reader1.cpp</code>, after including <code>api/debug/waypoint.h</code>. But <code>noc_semaphore_wait</code> writes <code>NSW</code> itself and would overwrite yours. A waypoint shows only the last one written. So put yours <em>after</em> the wait (<code>RDYD</code>) and read its absence. Or wrap the wait yourself: <code>WAYPOINT("S1W"); while (*sem_ptr != 1) { invalidate_l1_cache(); } WAYPOINT("S1D");</code>. The convention of ending in W/D comes from <code>watcher.rst:94-99</code>.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>ttsim reports exactly one error, the first, as <code>[clock] ERROR: Category: function: detail</code>, then calls <code>_Exit(1)</code>. UB and NCB are your bugs. Unsupported and Unimplemented mean you touched something ttsim does not model. AssertionFailure is ttsim's own bug.</li>
+    <li>The same bug can behave differently on silicon. An unaligned load rounds down and works, an unmapped load hangs, an <code>ebreak</code> pauses the core. ttsim turns all of them into messages.</li>
+    <li>Watcher checks run inside your kernel, before the hardware sees anything. The sanitizer names the core, NoC, addresses and length, and <code>ASSERT</code> reports a line number. Without Watcher, asserts compile to nothing.</li>
+    <li>A hang is diagnosed from waypoints that stop changing, plus counters. In a pipeline, the CPU that is waiting is rarely the one with the bug. Here the packer finished early because it never released Dst. TRISC waypoints follow the RISC-V, not the Tensix pipes, which can stall later.</li>
+    <li>Two practical tools for a live hang under ttsim: <code>TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1</code> plus tt-exalens to read L1 and registers, and lldb attached to a debug ttsim to read the coprocessor itself. tt-triage did not work over the socket at these pins.</li>
+    <li>For errors, <code>breakpoint set -n ttsim_error</code> in a debug build gives a backtrace from the failing check down to the RISC-V store that caused it.</li>
+    <li><code>libttsim.so</code> is a 10-function PCIe device. Find BAR0, program a TLB, write L1, clear a soft-reset bit, call <code>libttsim_clock</code>, and a core you loaded by hand runs one instruction per clock.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Your own kernel dies with <code>[4362] ERROR: UnimplementedFunctionality: t_tile_mmio_rd32: addr=0x2d4c40</code>. Is this a simulator bug you should report?</summary><p>Probably not, at least not first. The function is the Tensix register decoder, and the address is neither L1 (below 0x16e000) nor a register page (0xFFB…). A RISC-V load went somewhere nothing is mapped, most likely a pointer bug such as a DRAM bank address or a stale argument. On silicon, such a load "will usually stall forever". Check the pointer before you file anything.</p></details>
+  <details class="quiz"><summary>Why can't tt-metal catch a ttsim error and continue with the next test?</summary><p>ttsim ends the process with <code>_Exit(1)</code> inside the call that hit the check. No exception propagates, and no destructors or <code>atexit</code> handlers run. The ttsim docs argue this is deliberate: the simulator's state is known to be inconsistent at that point. Test runners are expected to isolate each test in its own process.</p></details>
+  <details class="quiz"><summary>Watcher shows <code>CRBW, W, UABD, MWDD, W</code> for 60 dumps. Which CPU should you suspect first: the BRISC in <code>CRBW</code>?</summary><p>No. <code>CRBW</code> means the reader cannot reserve space because its consumer stopped popping. Follow the data flow: the unpacker (TRISC0) and math (TRISC1) are stuck but still running, while the packer (TRISC2) and writer (NCRISC) finished. A stage that finishes early while its upstream is stuck is the one that broke the handshake. In this lab it was a missing <code>tile_regs_release()</code>.</p></details>
+  <details class="quiz"><summary>The TRISC1 waypoint is <code>MWDD</code>, "math wait for dest: done", yet the math pipe is stalled on that very wait. How?</summary><p>The wait is the Tensix instruction <code>SEMWAIT … STALL_ON_MAX</code>. The RISC-V only pushes it into the math pipe's FIFO and then writes the next waypoint. The pipe stalls later, when it reaches the instruction. Waypoints track the RISC-V's progress, not the coprocessor's. lldb on the debug ttsim showed <code>0xa6a1000a</code> (SEMWAIT) at the head of the math pipe and MATH_PACK at its maximum, 2.</p></details>
+  <details class="quiz"><summary>The harness prints the first sum "after clock 5", but lldb shows the <code>sw</code> at <code>g_clock</code> = 4. Which is right?</summary><p>Both. <code>g_clock</code> starts at 0 and is incremented after each clock (<code>libttsim.cpp:301-313</code>). The harness counts its <code>libttsim_clock(1)</code> calls from 1. The fifth call runs clock index 4, which executes the store, and the harness reads L1 after that call returns.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/sim_error_handling.md">ttsim: Simulator Error Handling</a>: why every error is fatal, the category definitions, and the supported paths when you hit one.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/unsupported_functionality.md">ttsim: UnsupportedFunctionality</a>: the taxonomy of features ttsim refuses on purpose, and how to ask for one.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/libttsim_api.md">ttsim: libttsim API and ABI</a>: the ten exported functions the harness drives, and the library's promises (single-threaded, no environment variables, no allocation after init).</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/Glossary.md">tt-isa-documentation: Glossary</a>: the normative definitions of UndefinedBehavior, NonContractualBehavior and UnpredictableValue.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/README.md">tt-isa-documentation: Baby RISC-V</a>: memory map and "Faults / exceptions", what silicon does instead of trapping.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/TLBs.md">tt-isa-documentation: PCIe TLBs</a>: the TLB window layout the harness programs.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">TT-Metalium docs: Watcher</a>: waypoints, asserts, NoC sanitization and every Watcher environment variable.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/triage.html">TT-Metalium docs: tt-triage</a>: the hang-analysis tool and its options.</li>
+    <li><a href="https://github.com/tenstorrent/tt-exalens">tt-exalens</a>: the low-level debugger library that section 5.2 attaches to a running ttsim.</li>
+    <li><a href="https://lldb.llvm.org/use/tutorial.html">LLDB tutorial</a> and the <a href="https://lldb.llvm.org/use/map.html">GDB to LLDB command map</a>: breakpoints, conditions, breakpoint commands and attaching.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a17-dispatch-host.html">&larr; A17 Dispatch, command queues and the host</a><a class="next" href="../chapters/a18-ttnn-user.html">A18 TT-NN as a user &rarr;</a></div>
+</main>
+</body>
+</html>
