@@ -1,0 +1,127 @@
+diff -ru a/src/libttsim.cpp b/src/libttsim.cpp
+--- a/src/libttsim.cpp	2026-10-25 12:05:43.000000000 +0000
++++ b/src/libttsim.cpp	2026-10-30 07:58:28.123526883 +0000
+@@ -67,6 +67,8 @@
+ };
+ 
+ static bool s_ttsim_running = false;
++extern uint64_t a17_bar_rd, a17_bar_rd_bytes, a17_bar_wr, a17_bar_wr_bytes, a17_tlb_cfg_wr, a17_win_wr, a17_win_rd;
++static uint64_t a17_dma_rd, a17_dma_rd_bytes, a17_dma_wr, a17_dma_wr_bytes, a17_clk;
+ static void (*s_pfn_libttsim_pci_dma_mem_rd_bytes)(uint64_t paddr, void *p, uint32_t size);
+ static void (*s_pfn_libttsim_pci_dma_mem_wr_bytes)(uint64_t paddr, const void *p, uint32_t size);
+ 
+@@ -81,6 +83,8 @@
+ extern "C" API_EXPORT void libttsim_exit() {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
++    ttsim_printf("A17COUNT clock_calls=%lu bar_rd=%lu (%lu B) bar_wr=%lu (%lu B) tlb_cfg_wr=%lu win_wr=%lu win_rd=%lu dev_reads_host=%lu (%lu B) dev_writes_host=%lu (%lu B)\n",
++        a17_clk, a17_bar_rd, a17_bar_rd_bytes, a17_bar_wr, a17_bar_wr_bytes, a17_tlb_cfg_wr, a17_win_wr, a17_win_rd, a17_dma_rd, a17_dma_rd_bytes, a17_dma_wr, a17_dma_wr_bytes);
+     ttsim_exit();
+     s_ttsim_running = false;
+ }
+@@ -181,6 +185,7 @@
+ 
+ void libttsim_pci_dma_mem_rd_bytes(uint64_t paddr, void *p, uint32_t size) {
+     TTSIM_VERIFY(s_pfn_libttsim_pci_dma_mem_rd_bytes, ConfigurationError, "DMA read callback not installed");
++    a17_dma_rd++; a17_dma_rd_bytes += size;
+     fpenv_write(s_host_fpenv);
+     s_pfn_libttsim_pci_dma_mem_rd_bytes(paddr, p, size);
+     s_host_fpenv = fpenv_read();
+@@ -189,6 +194,7 @@
+ 
+ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size) {
+     TTSIM_VERIFY(s_pfn_libttsim_pci_dma_mem_wr_bytes, ConfigurationError, "DMA write callback not installed");
++    a17_dma_wr++; a17_dma_wr_bytes += size;
+     fpenv_write(s_host_fpenv);
+     s_pfn_libttsim_pci_dma_mem_wr_bytes(paddr, p, size);
+     s_host_fpenv = fpenv_read();
+@@ -302,6 +308,7 @@
+ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
++    a17_clk += n_clocks;
+     uint32_t saved_chip_id = g_current_chip_id;
+     for (uint32_t i = 0; i < n_clocks; i++) {
+         for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+diff -ru a/src/pcie.cpp b/src/pcie.cpp
+--- a/src/pcie.cpp	2026-10-25 12:05:43.000000000 +0000
++++ b/src/pcie.cpp	2026-10-30 08:00:01.499526883 +0000
+@@ -224,6 +224,9 @@
+     *p_reg = (*p_reg & ~write_mask) | (data & write_mask);
+ }
+ 
++uint64_t a17_bar_rd, a17_bar_rd_bytes, a17_bar_wr, a17_bar_wr_bytes, a17_tlb_cfg_wr, a17_win_wr, a17_win_rd;
++static int a17_log_left = -1;
++static void a17_log_write(uint32_t offset, uint32_t size, const void *p);
+ struct TlbTarget {
+     uint32_t coord;
+     uint32_t coord_start;
+@@ -321,6 +324,8 @@
+ 
+ static void tlb_window_write(uint32_t offset, const void *p, uint32_t size) {
+     auto target = tlb_translate(offset, size);
++    a17_win_wr++;
++    a17_log_write(offset, size, p);
+     if (target.mcast) {
+         uint32_t start_x = target.coord_start & 63, end_x = target.coord & 63;
+         uint32_t start_y = target.coord_start >> 6, end_y = target.coord >> 6;
+@@ -347,6 +352,9 @@
+ 
+ static void tlb_window_read(uint32_t offset, void *p, uint32_t size) {
+     auto target = tlb_translate(offset, size);
++    a17_win_rd++;
++    { static int left = -1; if (left < 0) { const char *e = getenv("A17_RDLOG"); left = e ? atoi(e) : 0; }
++      if (left) { left--; ttsim_printf("A17RD x=%u y=%u addr=0x%llx size=%u\n", target.coord & 63, target.coord >> 6, (unsigned long long)target.addr, size); } }
+     TTSIM_VERIFY(!target.mcast, UndefinedBehavior, "multicast read");
+ #if TT_ARCH_VERSION == 1
+     // XXX add noc_instance param to tile_rd_bytes and move this code into it
+@@ -565,6 +573,7 @@
+ // the chip from the host physical address.
+ void pcie_mem_rd_bytes(uint64_t paddr, void *p, uint32_t size) {
+     TTSIM_VERIFY(size, UndefinedBehavior, "size=%d", size);
++    a17_bar_rd++; a17_bar_rd_bytes += size;
+     uint32_t bar;
+     uint64_t offset;
+     TTSIM_VERIFY(pcie_bar_decode(&g_p_tile, paddr, size, &bar, &offset), UndefinedBehavior,
+@@ -614,6 +623,7 @@
+         case 0x1FC00000 ... 0x1FC005CF: {
+             TTSIM_VERIFY(!(offset & (size - 1)), UnsupportedFunctionality, "bar0: misaligned offset=0x%x size=%d", offset, size);
+             uint32_t tlb_offset = offset - 0x1FC00000;
++            a17_tlb_cfg_wr++;
+             if (size == 8) {
+                 tlb_cfg_wr64(tlb_offset, mem_rd<uint64_t>(p));
+             } else if (size == 4) {
+@@ -697,6 +707,7 @@
+ }
+ 
+ void pcie_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size) {
++    a17_bar_wr++; a17_bar_wr_bytes += size;
+     uint32_t bar;
+     uint64_t offset;
+     TTSIM_VERIFY(pcie_bar_decode(&g_p_tile, paddr, size, &bar, &offset), UndefinedBehavior,
+@@ -708,3 +719,25 @@
+         default: TTSIM_ASSERT(!"invalid bar");
+     }
+ }
++
++#if TT_ARCH_VERSION == 0
++static void a17_log_write(uint32_t offset, uint32_t size, const void *p) {
++    if (a17_log_left < 0) { const char *e = getenv("A17_TLBLOG"); a17_log_left = e ? atoi(e) : 0; }
++    if (!a17_log_left) return;
++    a17_log_left--;
++    uint32_t tlb_index, window_bits;
++    if (offset < 0x9C00000) { tlb_index = offset / 0x100000; window_bits = 20; }
++    else if (offset < 0xB000000) { tlb_index = ((offset - 0x9C00000) / 0x200000) + 156; window_bits = 21; }
++    else { tlb_index = ((offset - 0xB000000) / 0x1000000) + 166; window_bits = 24; }
++    uint64_t cfg = g_p_tile.tlb_cfg[tlb_index];
++    uint32_t n = 36 - window_bits;
++    uint64_t addr = ((cfg & ((1ull << n) - 1)) << window_bits) | (offset & ((1u << window_bits) - 1));
++    uint64_t f = cfg >> n;
++    uint32_t w0 = size >= 4 ? mem_rd<uint32_t>(p) : 0;
++    ttsim_printf("A17TLB bar0_off=0x%08x tlb=%u (%uMiB) cfg=0x%011llx -> x=%u y=%u mcast=%u addr=0x%llx size=%u word0=0x%08x\n",
++        offset, tlb_index, (1u << window_bits) >> 20, (unsigned long long)cfg, uint32_t(f & 63), uint32_t((f >> 6) & 63),
++        uint32_t((f >> 25) & 1), (unsigned long long)addr, size, w0);
++}
++#else
++static void a17_log_write(uint32_t, uint32_t, const void *) {}
++#endif

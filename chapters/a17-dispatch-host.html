@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A17 · Dispatch, command queues and the host · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a16-multicast-sync.html">&larr; Prev</a>
+  <a href="a18-ttnn-user.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 17</span><span class="tag">Prerequisites: A08, A10, A16</span>
+  <h1><span class="num">17.</span> Dispatch, command queues and the host</h1>
+  <p class="subtitle">By the end you will be able to say, byte by byte, what travels between <code>EnqueueMeshWorkload</code> and a kernel starting. You will see why the host should never wait by reading the device, and why "fast dispatch" means the chip feeds itself.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#launch">What a launch has to deliver</a></li>
+      <li><a href="#pcie">How the host reaches a core: BARs and TLB windows</a></li>
+      <li><a href="#slow">Slow dispatch: the host does everything</a></li>
+      <li><a href="#fast">Fast dispatch: the chip feeds itself</a></li>
+      <li><a href="#firmware">Inside the prefetcher and the dispatcher</a></li>
+      <li><a href="#placement">Where the dispatch cores live, and why your grid shrank</a></li>
+      <li><a href="#cqs">Two command queues and events</a></li>
+      <li><a href="#trace">Trace: record once, replay many times</a></li>
+      <li><a href="#sim">Run it in the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="a10-first-program.html">A10</a> one line launched the kernel:</p>
+<pre><code>distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);</code></pre>
+  <p>A few microseconds later on silicon, the BRISC on core (0,0) is running <code>kernel_main</code>. But that BRISC has no idea what a "workload" is. It sits in a loop in its firmware and checks one byte of its own L1 over and over. Somebody has to put a program into its L1, put six argument words next to it, describe the circular buffers, and then flip that byte. Afterwards, somebody has to notice that the kernel has finished.</p>
+  <p><strong>What actually happens between <code>EnqueueMeshWorkload</code> and a kernel starting?</strong> And who is "somebody"?</p>
+  <p>There are two answers, and tt-metal implements both. In <em>slow dispatch</em> the host CPU does every step itself, one PCIe transaction at a time. In <em>fast dispatch</em> the host writes a compact list of commands into its own memory, and two Tensix cores on the chip, running firmware called the <em>prefetcher</em> and the <em>dispatcher</em>, fetch those commands and carry them out. This chapter takes both apart. Every count of PCIe transactions below was measured in the simulator with an instrumented copy of ttsim.</p>
+
+  <h2 id="launch">What a launch has to deliver</h2>
+  <p>Start from the worker's side, because that fixes what any dispatch scheme must do. Here is the loop the BRISC firmware spins in between kernels:</p>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisc.cc:404-407 @7aad8aac</div>
+<pre><code>volatile tt_l1_ptr go_msg_t* go_message;
+while (
+    ((go_message_signal = (go_message = current_go_message(mailboxes))->signal) != RUN_MSG_GO) &amp;&amp;
+    !(mailboxes-&gt;launch[mailboxes-&gt;launch_msg_rd_ptr].kernel_config.preload &amp; DISPATCH_ENABLE_FLAG_PRELOAD)) {</code></pre>
+  <p>The core polls a <em>go message</em> in a mailbox area of its L1. The go message is four bytes, and the last byte, <code>signal</code>, is the one that matters:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/hostdev/dev_msgs.h:101-107, 231-241 @7aad8aac</div>
+<pre><code>// Messages for host to tell brisc to go
+constexpr uint32_t RUN_MSG_INIT = 0x40;
+constexpr uint32_t RUN_MSG_GO = 0x80;
+constexpr uint32_t RUN_MSG_RESET_READ_PTR = 0xc0;
+constexpr uint32_t RUN_MSG_RESET_READ_PTR_FROM_HOST = 0xe0;
+constexpr uint32_t RUN_MSG_REPLAY_TRACE = 0xf0;
+constexpr uint32_t RUN_MSG_DONE = 0;
+...
+struct go_msg_t {
+    union {
+        uint32_t all;
+        struct {
+            uint8_t dispatch_message_offset;
+            uint8_t master_x;
+            uint8_t master_y;
+            uint8_t signal;  // INIT, GO, DONE, RESET_RD_PTR
+        };
+    };
+} __attribute__((packed));</code></pre>
+  <p>When <code>signal</code> becomes <code>RUN_MSG_GO</code> (0x80), the firmware reads the <em>launch message</em> next to it. The launch message is a <code>kernel_config_msg_t</code> (<code>dev_msgs.h:166-196</code>). It says where the kernel-config region is, where each processor's runtime args start (<code>rta_offset</code>), where each binary's text sits (<code>kernel_text_offset</code>), which circular-buffer slots are in use (<code>local_cb_mask</code>), which processors are enabled (<code>enables</code>), and a <code>mode</code> byte that says who launched it: the host or the dispatcher. So a launch has to deliver five things, and then detect a sixth:</p>
+  <ol>
+    <li><b>The binaries</b>, written into the core's L1 kernel-config region.</li>
+    <li><b>The runtime args</b> (and common runtime args), at the offsets the launch message names.</li>
+    <li><b>The circular-buffer configs</b>: address, size, page count and page size for each CB, and the semaphore initial values.</li>
+    <li><b>The launch message</b>.</li>
+    <li><b>The go message</b>, last, because flipping it is what starts the core.</li>
+    <li><b>Done.</b> When the kernel returns, the firmware sets <code>signal = RUN_MSG_DONE</code>. If a dispatcher launched it (<code>mode == DISPATCH_MODE_DEV</code>), the firmware also sends a NoC increment to that dispatcher's semaphore, using <code>master_x</code>/<code>master_y</code> from the go message to find it (<code>brisc.cc:600-616</code>).</li>
+  </ol>
+  <p>That last detail is the seed of everything in this chapter. A worker can report "done" in two ways: by changing a byte that somebody reads, or by pushing a message to somebody. The first way is cheap only if the reader is close by.</p>
+
+  <h2 id="pcie">How the host reaches a core: BARs and TLB windows</h2>
+  <p>Before comparing the two schemes, we need to know how the host writes a byte into the L1 of core (0,0) at all. The chip is a PCIe device. Linux exposes its memory-mapped regions, its <em>BARs</em> (base address registers), and Tenstorrent's kernel driver, <a href="https://github.com/tenstorrent/tt-kmd">tt-kmd</a>, lets user space <code>mmap</code> them through <code>/dev/tenstorrent/N</code>. UMD, the user-mode driver that tt-metal links, does exactly that (<code>tt-umd/src/pcie/pci_device.cpp:481-487</code>). On Wormhole, BAR0 is 512 MiB.</p>
+  <p>But the chip's address space is not flat. Every NoC address is a tile coordinate (x, y) plus a 36-bit address inside that tile (<a href="a08-noc.html">A08</a>). The host's loads and stores, though, carry only a linear offset into BAR0. The bridge between the two is a set of <em>TLB windows</em> in the PCIe tile. Each window is a slice of BAR0 that you point at an aligned region of one tile's address space by writing a 64-bit configuration register. The ISA documentation describes the layout:</p>
+  <blockquote>There are 186 configurable TLB windows, which collectively occupy the low 496 MiB of bar 0. The first 156 windows are each 1 MiB in size, the next 10 windows are each 2 MiB in size, and the final 20 windows are each 16 MiB in size. … The final 16 MiB window is reserved for use by the kernel driver. (<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/TLBs.md">WormholeB0/PCIExpressTile/TLBs.md</a>)</blockquote>
+  <p>The configuration array starts at BAR0 offset <code>0x1FC0_0000</code>. In each 64-bit entry, the low N bits are <code>local_offset</code>, the high bits of the 36-bit target address (N = 16, 15 or 12 for 1, 2 or 16 MiB windows). The next fields are <code>x_end</code>, <code>y_end</code>, <code>x_start</code> and <code>y_start</code> (6 bits each), then <code>noc_sel</code>, <code>mcast</code> and a 2-bit <code>ordering</code> mode. UMD has the same numbers (<code>wormhole_implementation.hpp:40-51, 196-205</code>), and so does ttsim, which shows the translation as code:</p>
+  <div class="filename">ttsim/src/pcie.cpp:237-264 @b3620244 (Wormhole branch, trimmed)</div>
+<pre><code>if (offset &lt; 0x9C00000) {
+    tlb_index = offset / 0x100000;
+    window_bits = 20; // 1 MiB TLBs (indices 0-155)
+} else if (offset &lt; 0xB000000) {
+    tlb_index = ((offset - 0x9C00000) / 0x200000) + 156;
+    window_bits = 21; // 2 MiB TLBs (indices 156-165)
+} else {
+    tlb_index = ((offset - 0xB000000) / 0x1000000) + 166;
+    window_bits = 24; // 16 MiB TLBs (indices 166-185)
+}
+uint32_t window_mask = (1 &lt;&lt; window_bits) - 1;
+offset &amp;= window_mask;
+uint32_t n_addr_bits = 36 - window_bits; // number of local_offset bits in TLB config
+...
+uint64_t tlb_cfg = g_p_tile.tlb_cfg[tlb_index];
+uint64_t addr_bits = tlb_cfg &amp; ((1ull &lt;&lt; n_addr_bits) - 1);
+uint64_t addr = (addr_bits &lt;&lt; window_bits) | offset;
+tlb_cfg &gt;&gt;= n_addr_bits;
+...
+bool mcast = bits&lt;25,25&gt;(tlb_cfg);
+...
+uint32_t coord = remap_virtual_coordinate(&amp;g_p_tile.base, 0, tlb_cfg &amp; 0xFFF);</code></pre>
+  <p>Step through three real writes captured from the simulator. Each one is a single host store into BAR0, which becomes a NoC write to one tile:</p>
+
+  <div class="viz" id="fig-tlb">
+    <div class="controls" id="tlb-modes">
+      <button class="tt on" data-m="0">Go message → worker</button>
+      <button class="tt" data-m="1">Input value → DRAM</button>
+      <button class="tt" data-m="2">Doorbell → prefetcher</button>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-tlb");
+    var g = TT.canvas(root, 900, 430), ctx = g.ctx, C = TT.C;
+    // Real writes logged by an instrumented ttsim (A17TLB lines), Wormhole, add_2 program.
+    var EX = [
+      { name: "go message", off: 0x0b0004a0, idx: 166, mib: 16, N: 12, cfg: "0x0_0049_2000", lo: 0x000, x: 18, y: 18,
+        addr: "0x4a0", data: "0x80000000", what: "the go message of worker (0,0): signal byte 0x80 = RUN_MSG_GO", col: C.green },
+      { name: "input", off: 0x0b2d4c40, idx: 166, mib: 16, N: 12, cfg: "0x0_002c_0000", lo: 0x000, x: 0, y: 11,
+        addr: "0x2d4c40", data: "0x0000000f", what: "src0 in DRAM bank 0 (value 15 on the second iteration)", col: C.orange },
+      { name: "doorbell", off: 0x0001a3fc, idx: 0, mib: 1, N: 16, cfg: "0x0_0692_0000", lo: 0x0000, x: 18, y: 26,
+        addr: "0x1a3fc", data: "0x00000006", what: "one fetch-queue entry in the prefetcher's L1: a 6 × 16 = 96-byte command is waiting", col: C.purple }
+    ];
+    var m = 0;
+    function hex(v, w) { var s = v.toString(16); while (s.length < w) s = "0" + s; return "0x" + s; }
+    function texts(e) {
+      var base = e.idx < 156 ? e.idx * 0x100000 : (e.idx < 166 ? 0x9C00000 + (e.idx - 156) * 0x200000 : 0xB000000 + (e.idx - 166) * 0x1000000);
+      var inwin = e.off - base;
+      return [
+        "<b>1. A host store.</b> UMD writes " + e.data + " to BAR0 offset " + hex(e.off, 8) + ". On silicon this is an ordinary CPU store into the mmapped BAR. In ttsim it arrives at <code>libttsim_pci_mem_wr_bytes</code>.",
+        "<b>2. Which window?</b> " + (e.mib === 1 ? "Offsets below 0x09C0_0000 are the 156 × 1 MiB windows, so window = offset / 1 MiB = " + e.idx + "." : "Offsets from 0x0B00_0000 up are the 16 MiB windows, so window = 166 + (offset − 0x0B00_0000) / 16 MiB = " + e.idx + ".") + " The offset inside the window is " + hex(inwin, 1) + ".",
+        "<b>3. Read its configuration.</b> Window " + e.idx + "'s 64-bit config register lives at 0x1FC0_0000 + 8 × " + e.idx + " = " + hex(0x1FC00000 + 8 * e.idx, 8) + ". UMD last programmed it to " + e.cfg + ". For a " + e.mib + " MiB window, N = " + e.N + ": the low " + e.N + " bits are local_offset, and the next 6 + 6 bits are x_end and y_end.",
+        "<b>4. Decode.</b> local_offset = " + hex(e.lo, 1) + ", x = " + e.x + ", y = " + e.y + ", mcast = 0. Target address = (local_offset &lt;&lt; " + (36 - e.N) + ") | " + hex(inwin, 1) + " = " + e.addr + ". These are <i>translated</i> coordinates, which the NoC maps to physical ones.",
+        "<b>5. A NoC write.</b> The PCIe tile turns the store into a NoC write of " + e.data + " to tile (" + e.x + "," + e.y + "), address " + e.addr + ": " + e.what + ". One store, one packet. Moving the window to a different tile means another config write first. In slow dispatch that is most of the traffic."
+      ];
+    }
+    var steps = [0, 1, 2, 3, 4].map(function () { return { dur: 1.3, text: "" }; });
+    function setTexts() { var t = texts(EX[m]); steps.forEach(function (s, i) { s.text = t[i]; }); }
+    setTexts();
+    // BAR0 strip geometry: 0 .. 0x20000000 mapped to x 40..860 (nonlinear by region for visibility)
+    var regs = [
+      { a: 0, b: 0x9C00000, label: "156 × 1 MiB", x0: 40, x1: 330, col: C.purple },
+      { a: 0x9C00000, b: 0xB000000, label: "10 × 2 MiB", x0: 330, x1: 410, col: C.teal },
+      { a: 0xB000000, b: 0x1E000000, label: "19 × 16 MiB", x0: 410, x1: 690, col: C.orange },
+      { a: 0x1E000000, b: 0x1F000000, label: "KMD", x0: 690, x1: 730, col: C.red },
+      { a: 0x1F000000, b: 0x1FC00000, label: "", x0: 730, x1: 760, col: C.border },
+      { a: 0x1FC00000, b: 0x20000000, label: "cfg · ARC", x0: 760, x1: 860, col: C.yellow }
+    ];
+    function xOf(off) {
+      for (var i = 0; i < regs.length; i++) { var r = regs[i]; if (off >= r.a && off < r.b) return TT.lerp(r.x0, r.x1, (off - r.a) / (r.b - r.a)); }
+      return 860;
+    }
+    function drawGrid(e, hi, t) {
+      // tiny chip: translated coords, highlight target
+      var gx = 560, gy = 250, cw = 34, ch = 22;
+      TT.text(ctx, "chip (NoC)", gx, gy - 14, { color: C.muted, font: "12px" });
+      for (var r = 0; r < 6; r++) for (var c = 0; c < 8; c++) {
+        TT.box(ctx, gx + c * (cw + 4), gy + r * (ch + 4), cw, ch, { fill: C.bg3, stroke: C.border, r: 3 });
+      }
+      // target positions (schematic)
+      var tx = e.x === 0 ? gx - 40 : gx + 0 * (cw + 4), ty = e.y === 26 ? gy + 5 * (ch + 4) : gy;
+      if (e.x === 0) { TT.box(ctx, gx - 46, gy + 40, 38, 60, { fill: C.orange, alpha: 0.2, stroke: C.orange, r: 3 }); TT.text(ctx, "DRAM", gx - 27, gy + 70, { color: C.orange, font: "11px", align: "center" }); }
+      var px = e.x === 0 ? gx - 27 : gx + cw / 2, py = e.x === 0 ? gy + 70 : (e.y === 26 ? gy + 5 * (ch + 4) + ch / 2 : gy + ch / 2);
+      if (e.y === 26) TT.text(ctx, "dispatch row (last row)", gx, gy + 6 * (ch + 4) + 8, { color: C.muted, font: "11px" });
+      if (hi) {
+        var sx = 470, sy = 395;
+        TT.box(ctx, sx - 30, sy - 14, 60, 28, { fill: C.bg2, stroke: C.blue, label: "PCIe", color: C.blue, font: "12px" });
+        var fx = TT.lerp(sx, px, t), fy = TT.lerp(sy - 14, py, t);
+        ctx.strokeStyle = e.col; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(sx, sy - 14); ctx.lineTo(px, py); ctx.stroke(); ctx.setLineDash([]);
+        TT.box(ctx, fx - 8, fy - 8, 16, 16, { fill: e.col, r: 4 });
+        if (t > 0.95) {
+          if (e.x !== 0) TT.box(ctx, px - cw / 2, py - ch / 2, cw, ch, { fill: e.col, alpha: 0.5, stroke: e.col, r: 3 });
+          TT.text(ctx, "(" + e.x + "," + e.y + ") @ " + e.addr, Math.min(px + 24, 780), py - 2 + (e.y === 26 ? -18 : 0), { color: e.col, font: "bold 12px", mono: true });
+        }
+      }
+    }
+    function draw(i, t) {
+      var e = EX[m];
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "BAR0 (512 MiB), drawn not to scale", 40, 22, { color: C.muted, font: "12px" });
+      regs.forEach(function (r) {
+        TT.box(ctx, r.x0, 34, r.x1 - r.x0 - 2, 34, { fill: r.col, alpha: 0.18, stroke: r.col, r: 3 });
+        if (r.label) TT.text(ctx, r.label, (r.x0 + r.x1) / 2, 51, { color: r.col, font: "11px", align: "center" });
+      });
+      TT.text(ctx, "0x0000_0000", 40, 82, { color: C.muted, font: "10px", mono: true });
+      TT.text(ctx, "0x1FC0_0000", 760, 82, { color: C.muted, font: "10px", mono: true });
+      var xo = xOf(e.off);
+      // step 0: arrow from host to the offset
+      TT.box(ctx, 40, 110, 250, 46, { fill: C.bg2, stroke: C.blue, r: 6 });
+      TT.text(ctx, "host CPU store", 165, 125, { color: C.blue, font: "bold 12px", align: "center" });
+      TT.text(ctx, "*(bar0 + " + hex(e.off, 8) + ") = " + e.data, 165, 143, { color: C.fg, font: "11px", mono: true, align: "center" });
+      if (i >= 0) {
+        var ay = i === 0 ? TT.lerp(110, 70, t) : 70;
+        TT.arrow(ctx, 290, 120, Math.max(xo, 300), ay, { color: C.blue, lw: 1.5 });
+      }
+      if (i >= 1) {
+        var wx0 = xo - 6, wx1 = xo + 6;
+        TT.box(ctx, wx0, 30, wx1 - wx0, 42, { stroke: C.yellow, lw: 2, r: 2 });
+        TT.text(ctx, "window " + e.idx + " (" + e.mib + " MiB)", Math.min(Math.max(xo, 100), 760), 98, { color: C.yellow, font: "bold 12px", align: "center" });
+      }
+      if (i >= 2) {
+        var cx = 790;
+        var a = i === 2 ? t : 1;
+        ctx.globalAlpha = a;
+        TT.arrow(ctx, cx, 72, cx - 60, 175, { color: C.yellow, lw: 1.5 });
+        TT.text(ctx, "cfg[" + e.idx + "] @ " + hex(0x1FC00000 + 8 * e.idx, 8) + " = " + e.cfg, 40, 190, { color: C.yellow, font: "13px", mono: true });
+        ctx.globalAlpha = 1;
+      }
+      if (i >= 3) {
+        // bit field bar for the cfg: [local_offset N][x_end 6][y_end 6][x_start 6][y_start 6][noc 1][mcast 1][ord 2]
+        var fields = [["local_offset", e.N, hex(e.lo, 1)], ["x_end", 6, String(e.x)], ["y_end", 6, String(e.y)], ["x_start", 6, "0"], ["y_start", 6, "0"], ["noc", 1, "0"], ["mc", 1, "0"], ["ord", 2, "0"]];
+        var total = 0; fields.forEach(function (f) { total += f[1]; });
+        var fx = 40, fw = 480;
+        var a2 = i === 3 ? t : 1;
+        ctx.globalAlpha = a2;
+        fields.forEach(function (f) {
+          var w = Math.max(26, fw * f[1] / total);
+          var col = (f[0] === "x_end" || f[0] === "y_end") ? C.green : (f[0] === "local_offset" ? C.blue : C.border);
+          TT.box(ctx, fx, 210, w - 2, 34, { fill: col, alpha: 0.2, stroke: col, r: 2 });
+          TT.text(ctx, f[0], fx + w / 2 - 1, 221, { color: C.muted, font: "9px", align: "center" });
+          TT.text(ctx, f[2], fx + w / 2 - 1, 235, { color: C.fg, font: "bold 11px", mono: true, align: "center" });
+          fx += w;
+        });
+        TT.text(ctx, "bit 0 →", 40, 254, { color: C.muted, font: "10px" });
+        var base = e.idx < 156 ? e.idx * 0x100000 : 0xB000000 + (e.idx - 166) * 0x1000000;
+        TT.text(ctx, "addr = (" + hex(e.lo, 1) + " << " + (36 - e.N) + ") | " + hex(e.off - base, 1) + " = " + e.addr, 40, 280, { color: C.fg, font: "13px", mono: true });
+        TT.text(ctx, "target tile = (" + e.x + ", " + e.y + ")  [translated coordinates]", 40, 302, { color: C.green, font: "13px", mono: true });
+        ctx.globalAlpha = 1;
+      }
+      drawGrid(e, i >= 4, i === 4 ? t : 1);
+      if (i >= 4) TT.text(ctx, e.what, 40, 340, { color: e.col, font: "12px" });
+    }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    document.querySelectorAll("#tlb-modes button").forEach(function (b) {
+      b.onclick = function () {
+        m = +b.dataset.m;
+        document.querySelectorAll("#tlb-modes button").forEach(function (o) { o.classList.toggle("on", o === b); });
+        setTexts(); api.render();
+      };
+    });
+  })();
+  </script>
+
+  <p>Two consequences follow. First, a window can point at only one tile (or one multicast rectangle of Tensix tiles) at a time. UMD keeps a few windows pinned to fixed targets and reprograms a shared 16 MiB window whenever it needs a new destination. In ttsim, UMD routes almost all of its writes through window 166, so a write to a new tile costs one or more config writes first. Second, the PCIe tile treats host <em>writes</em> and host <em>reads</em> very differently. A write is <em>posted</em>: the CPU sends it and moves on. A read is a round trip: the request crosses PCIe and then the NoC, and the CPU stalls until the data comes back. The ISA documentation measured this on one Zen 5 desktop. A host <code>memcpy</code> <em>to</em> device L1 ran at 22.65 GB/s through a write-combining, posted-writes TLB. A <code>memcpy</code> <em>from</em> device L1 ran at 0.10 GB/s, with a latency of at least 671 ns (<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/README.md#performance">PCIExpressTile/README.md, Performance</a>). The page's own conclusion is blunt: "For retrieving data from the device, none of the host-initiated operations are particularly good for throughput. Software is encouraged to use device-initiated operations instead."</p>
+  <div class="callout key">Host writes to the device are cheap and posted. Host reads from the device are slow round trips. A good dispatch scheme lets the host write and lets the device do all the reading, including reading the host's own memory.</div>
+  <p>The device can do that. The PCIe tile's NoC address space has a 3.999 GiB window at NoC address <code>0x8_0000_0000</code>, which goes through an <em>outbound iATU</em> to host memory (same README, "NoC to Host"). The memory has to be pinned so that it cannot move. UMD allocates 1 GiB hugepages (<code>tt-umd/src/hugepage.cpp:29</code> uses <code>/dev/hugepages-1G</code>) and asks the kernel driver to pin each one. The driver returns both a physical address and the NoC address at which the chip can reach it (<code>tt_pin_pages(…, &amp;physical_address, &amp;noc_address)</code>, <code>pci_device.cpp:684</code>). Measured from a Tensix core in the PCIe tile's row, device-initiated reads of host memory ran at 24.5 GB/s, and device-initiated writes at 26.4 GB/s.</p>
+  <p>Here is the whole stack, from the API down to the copper:</p>
+  <table>
+    <tr><th>Layer</th><th>What it is</th><th>Role in dispatch</th></tr>
+    <tr><td>tt-metal (<code>MeshCommandQueue</code>)</td><td>The C++ runtime you call</td><td>Turns enqueues into either direct writes (slow dispatch) or command bytes (fast dispatch)</td></tr>
+    <tr><td>UMD (tt-umd)</td><td>User-mode driver library</td><td>Owns the TLB windows, hugepages and the iATU setup; implements <code>write_core</code>/<code>read_core</code></td></tr>
+    <tr><td>KMD (tt-kmd)</td><td>Linux kernel driver, <code>/dev/tenstorrent/N</code></td><td>Maps the BARs, pins hugepages, provides TLB ioctls, reset</td></tr>
+    <tr><td>PCIe tile</td><td>On-chip bridge</td><td>TLB windows (host → NoC), outbound iATU (NoC → host), DMA engines</td></tr>
+    <tr><td>NoC</td><td>The on-chip network (A08)</td><td>Carries every byte to its tile</td></tr>
+  </table>
+  <div class="callout sim">In ttsim there is no kernel driver and no real hugepage. UMD's <code>TTSimTTDevice</code> reads the BAR addresses out of the simulated PCI config space (<code>tt_sim_tt_device.cpp:166-186</code>). A TLB-window write becomes a call to <code>libttsim_pci_mem_wr_bytes</code> with a physical address in BAR0 (<code>tt_sim_tlb_window.cpp</code>, <code>write_block</code>). The emulated host memory sits behind a callback. When a core reads the PCIe tile, ttsim calls <code>libttsim_pci_dma_mem_rd_bytes</code> (<code>ttsim/src/tile.cpp:2820</code>), and UMD serves the read from its <code>SimulationSysmemManager</code>. <a href="../sim-labs/b09-breaking-things.html">B09</a> drives these entry points by hand.</div>
+
+  <h2 id="slow">Slow dispatch: the host does everything</h2>
+  <p>Set <code>TT_METAL_SLOW_DISPATCH_MODE=1</code> and <code>EnqueueMeshWorkload</code> goes to <code>SDMeshCommandQueue</code>, which calls <code>slow_dispatch::LaunchProgramAsync</code>. Its comment states the order, and the five deliverables appear one after another:</p>
+  <div class="filename">tt-metal/tt_metal/impl/program/slow_dispatch.cpp:376-379, 391-395, 414-420 @7aad8aac (trimmed)</div>
+<pre><code>// First configure (allocate buffers + write configs/binaries), then write runtime args.
+ConfigureDeviceWithProgram(device, program, force_slow_dispatch);
+WriteRuntimeArgsToDevice(device, program, force_slow_dispatch);
+...
+metal_ctx.get_cluster().dram_barrier(device_id);
+// Note: the l1_barrier below is needed to be sure writes to cores that
+// don't get the GO mailbox (eg, storage cores) have all landed
+metal_ctx.get_cluster().l1_barrier(device_id);
+...
+tt::llrt::write_launch_msg_to_core(
+    MetalEnvAccessor(metal_ctx.get_env()).impl(), device_id, physical_core,
+    kg-&gt;launch_msg.view(), kg-&gt;go_msg.view(),
+    hal.get_dev_addr(programmable_core_type, HalL1MemAddrType::LAUNCH));</code></pre>
+  <p><code>ConfigureDeviceWithProgram</code> writes the binaries and the CB config vector with <code>write_core</code>, one core at a time (<code>slow_dispatch.cpp:145-190</code>). <code>WriteRuntimeArgsToDevice</code> loops over every core of every kernel group and writes its args (<code>:262-334</code>). Then the launch message goes out, and the go message goes last:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/llrt.cpp:210-219 @7aad8aac</div>
+<pre><code>msg.kernel_config().mode() = tt_metal::dev_msgs::DISPATCH_MODE_HOST;
+
+uint64_t launch_addr = hal.get_dev_noc_addr(dispatch_core_type, tt_metal::HalL1MemAddrType::LAUNCH);
+uint64_t go_addr = hal.get_dev_noc_addr(dispatch_core_type, tt_metal::HalL1MemAddrType::GO_MSG);
+
+cluster.write_core_immediate(msg.data(), msg.size(), {static_cast&lt;size_t&gt;(chip), core}, launch_addr);
+tt_driver_atomics::sfence();
+if (send_go) {
+    cluster.write_core_immediate(go_msg.data(), go_msg.size(), {static_cast&lt;size_t&gt;(chip), core}, go_addr);
+}</code></pre>
+  <p><code>mode = DISPATCH_MODE_HOST</code> tells the firmware not to send a NoC "done" anywhere. The <code>sfence</code> keeps the go message from overtaking the launch message on its way out of the CPU's write-combining buffers. Then the host waits. "Waiting" means reading each core's go message until it says DONE:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/llrt.cpp:338-342, 356 @7aad8aac</div>
+<pre><code>auto get_mailbox_is_done = [&amp;](uint64_t go_msg_addr) {
+    auto core_status = dev_msgs_factory.create&lt;tt_metal::dev_msgs::go_msg_t&gt;();
+    cluster.read_core(
+        core_status.data(), core_status.size(), {static_cast&lt;size_t&gt;(chip_id), core}, go_msg_addr &amp; ~0x3);
+    uint8_t run = core_status.view().signal();
+    ...
+    return run == tt_metal::dev_msgs::RUN_MSG_DONE;</code></pre>
+  <p>That read happens inside <code>wait_until_cores_done</code>, in a loop over every core that has not finished yet (<code>llrt.cpp:444-…</code>). It is exactly the kind of host read the ISA documentation warned about.</p>
+  <p>How much traffic is this for one tiny launch? I logged every TLB-window write in an instrumented ttsim, ran the add_2 program for one iteration and then for two, and diffed the logs. The extra iteration (write two inputs, launch, read the result) produced these 41 window writes, in this order:</p>
+  <table>
+    <tr><th>Writes</th><th>Target (translated x,y) @ address</th><th>Bytes</th><th>What it is</th></tr>
+    <tr><td>2</td><td>(0,11) @ 0x2d4c40, 0x2d4c60</td><td>4 + 4</td><td>The two inputs, 15 and 14, into DRAM bank 0</td></tr>
+    <tr><td>1</td><td>(18,18) @ 0x8a80</td><td>568</td><td>The kernel binary. First word <code>0xffb007b7</code>, a RISC-V <code>lui</code></td></tr>
+    <tr><td>1</td><td>(18,18) @ 0x8a60</td><td>24</td><td>Six runtime args. First word <code>0x2d4c40</code> is src0's address</td></tr>
+    <tr><td>36</td><td>(18,18) @ 0x20 … 0xac</td><td>4 each</td><td>The launch message, written one word at a time</td></tr>
+    <tr><td>1</td><td>(18,18) @ 0x4a0</td><td>4</td><td>The go message <code>0x80000000</code>: signal byte = 0x80 = <code>RUN_MSG_GO</code></td></tr>
+  </table>
+  <p>Logical core (0,0) appears as translated (18,18). Around these 41 data writes the host made 405 writes to TLB configuration registers, so the launch cost 446 BAR writes. It also made 364 BAR reads, almost all of them polls of address 0x4a0. Per launch, slow dispatch is <b>446 posted writes and 364 round-trip reads</b>, every one of them issued by the host CPU while it does nothing else.</p>
+  <div class="callout gpu">A GPU driver never polls a kernel's completion with MMIO reads in a loop. It writes commands into a ring buffer in host memory, rings a doorbell register, and the GPU's command processor fetches the commands and later writes a fence value back into host memory. Slow dispatch is what you get without a command processor. Fast dispatch, below, builds one out of two ordinary Tensix cores.</div>
+
+  <h2 id="fast">Fast dispatch: the chip feeds itself</h2>
+  <p>Fast dispatch is the default. It turns the problem around. The host never addresses the workers. It <em>describes</em> the work as a stream of command packets and writes that stream into a ring buffer in its own pinned memory, the <em>issue queue</em>. On the chip, a core running <code>cq_prefetch</code> pulls the packets across PCIe, and a core running <code>cq_dispatch</code> executes them: writes, multicasts, "send the go signal", "wait for the workers". Results and completion records come back into a second ring in host memory, the <em>completion queue</em>, which the host reads with ordinary loads from its own RAM. Toggle the two modes and step through. The counters are the per-launch numbers I measured.</p>
+
+  <div class="viz" id="fig-dispatch">
+    <div class="controls" id="disp-modes">
+      <button class="tt on" data-m="fast">Fast dispatch</button>
+      <button class="tt" data-m="slow">Slow dispatch</button>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-dispatch");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    var mode = "fast";
+    // geometry
+    var HOST = { x: 16, y: 40, w: 250, h: 360 };
+    var CPU = { x: 30, y: 70, w: 222, h: 60 };
+    var ISQ = { x: 30, y: 180, w: 222, h: 70 };
+    var CMQ = { x: 30, y: 300, w: 222, h: 70 };
+    var PCIE = { x: 300, y: 180, w: 56, h: 190 };
+    var CHIP = { x: 390, y: 40, w: 494, h: 360 };
+    var DRAM = { x: 404, y: 90, w: 60, h: 240 };
+    var WK = []; // worker grid 4x3
+    for (var r = 0; r < 3; r++) for (var c = 0; c < 5; c++) WK.push({ x: 500 + c * 74, y: 80 + r * 58, w: 62, h: 44 });
+    var W0 = WK[0];
+    var PF = { x: 500, y: 300, w: 140, h: 56 };
+    var DS = { x: 676, y: 300, w: 140, h: 56 };
+    function ctr(b) { return [b.x + b.w / 2, b.y + b.h / 2]; }
+    var cmds = [["wr 14", 96], ["wr 7", 96], ["program", 544], ["read", 128], ["read", 192]];
+    var FAST = [
+      { text: "<b>1. Build commands in host memory.</b> Each enqueue reserves space in the issue queue, a ring in a pinned hugepage, and <code>memcpy</code>s a command into it. On the second launch the five commands were 96, 96, 544, 128 and 192 bytes: two writes, the program, and two for the read-back. This is a copy into the host's own RAM, so <i>no PCIe traffic yet</i>.",
+        flows: [], fill: 1 },
+      { text: "<b>2. Ring the doorbell.</b> For each command the host writes one 4-byte entry, the command's size in 16-byte units, into the <i>fetch queue</i> in the prefetcher's L1, through a TLB window that stays pinned to that core (<code>fetch_queue_write</code>). That makes 5 BAR writes.",
+        flows: [["CPU", "PF", C.purple, "size"]], bw: 5 },
+      { text: "<b>3. The prefetcher pulls.</b> <code>cq_prefetch</code> sees new fetch-queue entries and reads each command out of host memory with a NoC read to the PCIe tile. These are <i>device-initiated</i> reads, the fast direction. Measured: 5 per launch, about 1 KiB in total.",
+        flows: [["ISQ", "PF", C.blue, "cmd"]], dr: 5 },
+      { text: "<b>4. Hand off to the dispatcher.</b> The prefetcher relays the commands page by page into the dispatcher's ring buffer, and the two keep in step with a pair of semaphores (page_ready, page_done). Kernel binaries were uploaded to DRAM once, and the prefetcher relays them from there, so they do not cross PCIe again.",
+        flows: [["PF", "DS", C.teal, "pages"], ["DRAM", "PF", C.orange, "bins"]] },
+      { text: "<b>5. The dispatcher writes.</b> <code>cq_dispatch</code> executes the commands: the inputs go to DRAM, and the binaries, CB configs, runtime args and launch message go into the worker's L1. These are WRITE_PACKED and WRITE_PACKED_LARGE commands, which can multicast one payload to a whole rectangle of cores. All of this is NoC traffic inside the chip.",
+        flows: [["DS", "DRAM", C.orange, "data"], ["DS", "W0", C.green, "cfg"]] },
+      { text: "<b>6. Go.</b> SEND_GO_SIGNAL writes the go message, with the dispatcher's own coordinates in <code>master_x</code>/<code>master_y</code>. Many cores can be started with one multicast.",
+        flows: [["DS", "W0", C.yellow, "GO"]] },
+      { text: "<b>7. Done, pushed rather than polled.</b> The kernel returns. Because <code>mode == DISPATCH_MODE_DEV</code>, the firmware sends a NoC increment to the dispatcher's semaphore (<code>notify_dispatch_core_done</code>). The dispatcher's WAIT command blocks until the count of finished workers reaches the expected value. The host is not involved.",
+        flows: [["W0", "DS", C.green, "+1"]] },
+      { text: "<b>8. Completion.</b> For the read, the prefetcher relays the result out of DRAM (RELAY_PAGED), and the dispatcher writes it into the completion queue in host memory (WRITE_LINEAR_H_HOST), followed by a completion record. That makes 4 device-initiated writes, 88 bytes. The host waits by reading <i>its own RAM</i>, then tells the dispatcher how far it has read (2 more 4-byte BAR writes). <b>Per launch: 7 BAR writes, 0 BAR reads.</b>",
+        flows: [["DS", "CMQ", C.pink, "result"], ["CPU", "DS", C.purple, "rd ptr"]], bw: 2, dw: 4 }
+    ];
+    var SLOW = [
+      { text: "<b>1. Inputs.</b> The host writes 14 and 7 (15 and 14 on the second launch) straight into DRAM bank 0 through a TLB window, after reprogramming the window to point at the DRAM tile.",
+        flows: [["CPU", "DRAM", C.orange, "4 B ×2"]], bw: 2 },
+      { text: "<b>2. Binary.</b> 568 bytes of RISC-V code go into worker L1 at 0x8a80. In slow dispatch this happens on <i>every</i> launch.",
+        flows: [["CPU", "W0", C.blue, "568 B"]], bw: 1 },
+      { text: "<b>3. Runtime args.</b> 24 bytes at 0x8a60.",
+        flows: [["CPU", "W0", C.blue, "args"]], bw: 1 },
+      { text: "<b>4. Launch message.</b> 36 separate 4-byte writes, to 0x20 through 0xac.",
+        flows: [["CPU", "W0", C.purple, "launch"]], bw: 36 },
+      { text: "<b>5. Go.</b> One 4-byte write of 0x80000000 to 0x4a0.",
+        flows: [["CPU", "W0", C.yellow, "GO"]], bw: 1 },
+      { text: "<b>6. TLB reprogramming.</b> Behind those 41 data writes the host made 405 writes to TLB config registers, steering the shared window from tile to tile. That brings the total to 446 BAR writes.",
+        flows: [["CPU", "PCIE", C.red, "cfg"]], bw: 405 },
+      { text: "<b>7. Poll.</b> The host reads the go message back, over and over, until the signal byte is RUN_MSG_DONE. Every read is a full round trip over PCIe and the NoC, and the CPU stalls on each one.",
+        flows: [["W0", "CPU", C.red, "DONE?"]], br: 363 },
+      { text: "<b>8. Read back.</b> One more BAR read fetches the result from DRAM. <b>Per launch: 446 BAR writes, 364 BAR reads</b>, all issued by the host CPU.",
+        flows: [["DRAM", "CPU", C.orange, "21"]], br: 1 }
+    ];
+    var BOX = { CPU: CPU, ISQ: ISQ, CMQ: CMQ, PCIE: PCIE, DRAM: DRAM, W0: W0, PF: PF, DS: DS };
+    function list() { return mode === "fast" ? FAST : SLOW; }
+    var steps = [];
+    function rebuild() { steps.length = 0; list().forEach(function (s) { steps.push({ dur: 1.6, text: s.text }); }); }
+    rebuild();
+    function totals(i, t) {
+      var L = list(), o = { bw: 0, br: 0, dr: 0, dw: 0 };
+      for (var k = 0; k <= i; k++) {
+        var f = k < i ? 1 : t;
+        ["bw", "br", "dr", "dw"].forEach(function (key) { if (L[k][key]) o[key] += L[k][key] * f; });
+      }
+      return o;
+    }
+    function route(a, b) {
+      // straight line, but route host<->chip flows through the PCIe tile
+      var pa = ctr(BOX[a]), pb = ctr(BOX[b]);
+      var hostSide = { CPU: 1, ISQ: 1, CMQ: 1 };
+      var pts = [pa];
+      if ((hostSide[a] && !hostSide[b] && b !== "PCIE") || (hostSide[b] && !hostSide[a] && a !== "PCIE")) {
+        var pc = ctr(PCIE);
+        pts.push([PCIE.x + (hostSide[a] ? 0 : PCIE.w), pa[1] * 0 + (hostSide[a] ? pa[1] : pb[1])].map(function (v, j) { return j === 1 ? Math.max(PCIE.y + 10, Math.min(PCIE.y + PCIE.h - 10, v)) : v; }));
+        pts.push([PCIE.x + (hostSide[a] ? PCIE.w : 0), pts[1][1]]);
+      }
+      pts.push(pb);
+      return pts;
+    }
+    function along(pts, t) {
+      var L = 0, seg = [];
+      for (var i = 1; i < pts.length; i++) { var d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); seg.push(d); L += d; }
+      var s = t * L;
+      for (var j = 0; j < seg.length; j++) {
+        if (s <= seg[j] || j === seg.length - 1) { var u = seg[j] ? Math.min(1, s / seg[j]) : 1; return [TT.lerp(pts[j][0], pts[j + 1][0], u), TT.lerp(pts[j][1], pts[j + 1][1], u)]; }
+        s -= seg[j];
+      }
+      return pts[pts.length - 1];
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var fast = mode === "fast";
+      TT.box(ctx, HOST.x, HOST.y, HOST.w, HOST.h, { fill: C.bg2, stroke: C.blue });
+      TT.text(ctx, "Host", HOST.x + 10, HOST.y + 16, { color: C.blue, font: "bold 13px" });
+      TT.box(ctx, CPU.x, CPU.y, CPU.w, CPU.h, { fill: C.bg3, stroke: C.blue, label: fast ? "CPU: builds commands" : "CPU: does every write and read", font: "12px" });
+      TT.text(ctx, "pinned hugepage (host RAM)", ISQ.x, ISQ.y - 12, { color: C.muted, font: "11px" });
+      TT.box(ctx, ISQ.x, ISQ.y, ISQ.w, ISQ.h, { fill: C.bg3, stroke: fast ? C.teal : C.border });
+      TT.text(ctx, "issue queue", ISQ.x + 8, ISQ.y + 13, { color: fast ? C.teal : C.muted, font: "11px" });
+      TT.box(ctx, CMQ.x, CMQ.y, CMQ.w, CMQ.h, { fill: C.bg3, stroke: fast ? C.pink : C.border });
+      TT.text(ctx, "completion queue", CMQ.x + 8, CMQ.y + 13, { color: fast ? C.pink : C.muted, font: "11px" });
+      if (!fast) { TT.text(ctx, "(unused in slow dispatch)", ISQ.x + 8, ISQ.y + 45, { color: C.muted, font: "11px" }); TT.text(ctx, "(unused)", CMQ.x + 8, CMQ.y + 45, { color: C.muted, font: "11px" }); }
+      // issue queue contents
+      if (fast) {
+        var nfill = i === 0 ? Math.floor(t * 5.99) : 5;
+        var x = ISQ.x + 6;
+        for (var k = 0; k < nfill; k++) {
+          var w = Math.max(24, cmds[k][1] / 544 * 70);
+          var consumed = i >= 2 && (i > 2 || t > (k + 1) / 5);
+          TT.box(ctx, x, ISQ.y + 24, w, 36, { fill: C.teal, alpha: consumed ? 0.12 : 0.45, stroke: C.teal, r: 3 });
+          TT.text(ctx, cmds[k][0], x + w / 2, ISQ.y + 36, { color: C.fg, font: "9px", align: "center" });
+          TT.text(ctx, cmds[k][1] + "B", x + w / 2, ISQ.y + 50, { color: C.muted, font: "9px", align: "center" });
+          x += w + 3;
+        }
+        if (i >= 7) {
+          var cf = i === 7 ? t : 1;
+          TT.box(ctx, CMQ.x + 6, CMQ.y + 24, 120 * cf, 36, { fill: C.pink, alpha: 0.4, stroke: C.pink, r: 3 });
+          if (cf > 0.9) TT.text(ctx, "result 21 + event", CMQ.x + 66, CMQ.y + 42, { color: C.fg, font: "10px", align: "center" });
+        }
+      }
+      // PCIe tile
+      TT.box(ctx, PCIE.x, PCIE.y, PCIE.w, PCIE.h, { fill: C.bg2, stroke: C.muted });
+      TT.text(ctx, "PCIe", PCIE.x + PCIE.w / 2, PCIE.y + 14, { color: C.muted, font: "11px", align: "center" });
+      TT.text(ctx, "tile", PCIE.x + PCIE.w / 2, PCIE.y + 28, { color: C.muted, font: "11px", align: "center" });
+      TT.text(ctx, "TLBs", PCIE.x + PCIE.w / 2, PCIE.y + 80, { color: C.muted, font: "10px", align: "center" });
+      TT.text(ctx, "iATU", PCIE.x + PCIE.w / 2, PCIE.y + 130, { color: C.muted, font: "10px", align: "center" });
+      // chip
+      TT.box(ctx, CHIP.x, CHIP.y, CHIP.w, CHIP.h, { fill: C.bg2, stroke: C.green });
+      TT.text(ctx, "Wormhole chip", CHIP.x + 10, CHIP.y + 16, { color: C.green, font: "bold 13px" });
+      TT.box(ctx, DRAM.x, DRAM.y, DRAM.w, DRAM.h, { fill: C.orange, alpha: 0.15, stroke: C.orange, label: "DRAM", color: C.orange, font: "12px" });
+      WK.forEach(function (b, k) { TT.box(ctx, b.x, b.y, b.w, b.h, { fill: k === 0 ? C.green : C.bg3, alpha: k === 0 ? 0.25 : 1, stroke: k === 0 ? C.green : C.border, label: k === 0 ? "worker (0,0)" : "", font: "10px" }); });
+      TT.text(ctx, "compute grid", 500, 254, { color: C.muted, font: "11px" });
+      TT.text(ctx, "dispatch row (last Tensix row)", 500, 288, { color: fast ? C.yellow : C.muted, font: "11px" });
+      TT.box(ctx, PF.x, PF.y, PF.w, PF.h, { fill: fast ? C.blue : C.bg3, alpha: fast ? 0.2 : 1, stroke: fast ? C.blue : C.border, label: fast ? "prefetcher (18,26)" : "idle Tensix", font: "11px" });
+      TT.box(ctx, DS.x, DS.y, DS.w, DS.h, { fill: fast ? C.purple : C.bg3, alpha: fast ? 0.2 : 1, stroke: fast ? C.purple : C.border, label: fast ? "dispatcher (19,26)" : "idle Tensix", font: "11px" });
+      // flows
+      var L = list();
+      var flows = L[i].flows || [];
+      flows.forEach(function (f) {
+        var pts = route(f[0], f[1]);
+        ctx.strokeStyle = f[2]; ctx.globalAlpha = 0.5; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (var q = 1; q < pts.length; q++) ctx.lineTo(pts[q][0], pts[q][1]); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+        var reps = (!fast && (L[i].br > 50 || L[i].bw > 50)) ? 4 : 1;
+        for (var rr = 0; rr < reps; rr++) {
+          var tt = reps > 1 ? ((t * 2 + rr / reps) % 1) : t;
+          var p = along(pts, tt);
+          TT.box(ctx, p[0] - 22, p[1] - 9, 44, 18, { fill: f[2], r: 4, label: f[3], color: "#000", font: "bold 10px" });
+        }
+      });
+      // counters
+      var o = totals(i, t);
+      var y = 428;
+      TT.text(ctx, "per launch, so far:", 20, y, { color: C.muted, font: "12px" });
+      TT.text(ctx, "host BAR writes " + Math.round(o.bw), 150, y, { color: C.purple, font: "bold 13px", mono: true });
+      TT.text(ctx, "host BAR reads " + Math.round(o.br), 360, y, { color: o.br > 0 ? C.red : C.green, font: "bold 13px", mono: true });
+      TT.text(ctx, "device reads host RAM " + Math.round(o.dr), 560, y, { color: C.blue, font: "13px", mono: true });
+      TT.text(ctx, "device writes host RAM " + Math.round(o.dw), 560, y + 22, { color: C.pink, font: "13px", mono: true });
+      TT.text(ctx, "measured with an instrumented ttsim (WH), second launch of add_2", 150, y + 22, { color: C.muted, font: "11px" });
+    }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    document.querySelectorAll("#disp-modes button").forEach(function (b) {
+      b.onclick = function () {
+        mode = b.dataset.m;
+        document.querySelectorAll("#disp-modes button").forEach(function (o) { o.classList.toggle("on", o === b); });
+        rebuild(); var cs = root.querySelectorAll(".controls"); cs[cs.length - 1].querySelectorAll("button")[3].click();
+      };
+    });
+  })();
+  </script>
+
+  <p>Put the two modes side by side and the difference is not the amount of data. Fast dispatch actually moves more bytes than slow dispatch's data writes (about 1.2 KB against 748 B per launch), because commands carry headers. The difference is <em>who waits for whom</em>. In slow dispatch the host stalls on 364 round trips. In fast dispatch the host's only device traffic is seven posted writes. Everything that must wait, such as "is the worker done?" or "has the command arrived?", waits on the chip, where the round trip is a few hundred nanoseconds of NoC rather than a trip across PCIe and back.</p>
+  <div class="callout key">Fast dispatch has a simple shape. The host writes commands into its own memory and rings a doorbell. The chip pulls the commands, executes them with NoC writes, collects "done" signals as NoC semaphore increments, and pushes completions back into host memory. The host never reads the device to make progress.</div>
+  <p>Here is the doorbell itself. Note the stall bit, which trace will use later:</p>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/system_memory_manager.cpp:884-893, 909-911 @7aad8aac</div>
+<pre><code>tt_driver_atomics::sfence();
+uint32_t entry_val = command_size_B &gt;&gt; DispatchSettings::PREFETCH_Q_LOG_MINSIZE;
+
+// stall_prefetcher is used for enqueuing traces, as replaying a trace will hijack the cmd_data_q
+// so prefetcher fetches multiple cmds that include the trace cmd, they will be corrupted by trace pulling data
+// from DRAM stall flag prevents pulling prefetch q entries that occur after the stall entry Stall flag for
+// prefetcher is MSB of FetchQ entry.
+if (stall_prefetcher) {
+    entry_val |= 1u &lt;&lt; shift_for_msb;
+}
+...
+    this-&gt;prefetch_q_windows[cq_id]-&gt;write32(this-&gt;prefetch_q_dev_ptrs[cq_id], entry_val);
+}
+this-&gt;prefetch_q_dev_ptrs[cq_id] += entry_bytes;</code></pre>
+  <p><code>PREFETCH_Q_LOG_MINSIZE</code> is 4 (<code>dispatch_settings.hpp:106</code>), so an entry holds the command size in 16-byte units. That is why the captured doorbell above wrote <code>0x6</code> for a 96-byte command. The <code>sfence</code> comes first so that the command bytes in host memory are visible before the prefetcher is told about them. The window was created once, pinned to the prefetcher core (<code>create_io_window</code>, <code>system_memory_manager.cpp:266-270</code>), so ringing the doorbell needs no TLB reprogramming. The fast-dispatch launches I measured made zero TLB-config writes.</p>
+  <p>The host's wait loop for the completion queue reads a pointer in host memory and, tellingly, contains a hook for the simulator:</p>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/system_memory_manager.cpp:780-786 @7aad8aac</div>
+<pre><code>auto wait_operation_body = [this, cq_id, &amp;write_ptr_and_toggle, &amp;write_ptr, &amp;write_toggle]() {
+    write_ptr_and_toggle = get_cq_completion_wr_ptr&lt;true&gt;(this-&gt;context_id, this-&gt;device_id, cq_id, this-&gt;cq_size);
+    write_ptr = write_ptr_and_toggle &amp; 0x7fffffff;
+    write_toggle = write_ptr_and_toggle &gt;&gt; 31;
+    // Yield to clock the simulator when running on TTSim; no-op on real hardware.
+    tt::tt_metal::MetalContext::instance(this-&gt;context_id).get_cluster().advance_device_execution(this-&gt;device_id);
+};</code></pre>
+  <p>On silicon the chip runs on its own clock while the host spins on its own memory. ttsim advances only when somebody calls <code>libttsim_clock</code>. In slow dispatch UMD clocks it once per device read (<code>after_read</code>, <code>tt_sim_tt_device.cpp:334-338</code>). Fast dispatch makes no device reads while it waits, so tt-metal has to clock the simulator explicitly. <a href="../sim-labs/b01-meet-ttsim.html">B01</a> shows how that changes the clock count.</p>
+  <p>How big are the two rings? Each command queue gets a region of the hugepage. A quarter of it, rounded down to 4 KiB pages, is the completion queue, and the rest is the issue queue (<code>system_memory_cq_interface.cpp:15-18</code>). Both are circular, with a <em>toggle</em> bit that flips on every wrap, so a reader can tell a full ring from an empty one. The read and write pointers count in 16-byte units.</p>
+
+  <h2 id="firmware">Inside the prefetcher and the dispatcher</h2>
+  <p>The two firmware kernels are ordinary data-movement kernels, compiled by the same JIT as yours. In the simulator's cache they appear as <code>kernels/cq_prefetch/…/brisc</code> and <code>kernels/cq_dispatch/…/brisc</code>, plus a <code>cq_dispatch_subordinate</code> built for NCRISC (and a <code>cq_dispatch_subordinate_compute</code> built for the three TRISCs). Their header comments are the best summary there is:</p>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/kernels/cq_prefetch.cpp:5-10 @7aad8aac</div>
+<pre><code>// Prefetch kernel
+//  - 3 flavors: _hd (host and dram), _h (host only), _d (DRAM only)
+//  - fetches commands from host (if applicable), executes
+//  - uses HostQ for host handshaking, ComDatQ for commands (from host),
+//    double buffered ScratchBuf for out of band data (e.g., from DRAM)
+//  - syncs w/ dispatcher via 2 semaphores, page_ready, page_done</code></pre>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/kernels/cq_dispatch.cpp:5-11 @7aad8aac</div>
+<pre><code>// Dispatch kernel
+//  - receives data in pages from prefetch kernel into the dispatch buffer ring buffer
+//  - processes commands with embedded data from the dispatch buffer to write/sync/etc w/ destination
+//  - sync w/ prefetcher is via 2 semaphores, page_ready, page_done
+//  - page size must be a power of 2
+//  - # blocks must evenly divide the dispatch buffer size
+//  - dispatch buffer base must be page size aligned</code></pre>
+  <p>The two "flavors" exist for multi-chip systems. A chip that is not wired to PCIe (the second ASIC of an n300, for instance) cannot read host memory itself, so an <code>_h</code> prefetcher on the chip with the PCIe link forwards its commands to a <code>_d</code> prefetcher on the remote chip over Ethernet. A single PCIe-attached chip, like ours, runs the combined <code>_hd</code> flavor. The command vocabulary is small and readable:</p>
+  <div class="filename">tt-metal/tt_metal/impl/dispatch/kernels/cq_commands.hpp:18-63 @7aad8aac (selected)</div>
+<pre><code>CQ_PREFETCH_CMD_RELAY_LINEAR = 1,          // relay banked/paged data from src_noc to dispatcher
+CQ_PREFETCH_CMD_RELAY_PAGED = 3,           // relay banked/paged data from src_noc to dispatcher
+CQ_PREFETCH_CMD_RELAY_INLINE = 5,          // relay (inline) data from CmdDatQ to dispatcher
+CQ_PREFETCH_CMD_EXEC_BUF = 7,              // execute commands from a buffer
+CQ_PREFETCH_CMD_EXEC_BUF_END = 8,  // finish executing commands from a buffer (return), payload like relay_inline
+CQ_PREFETCH_CMD_STALL = 9,         // drain pipe through dispatcher
+...
+CQ_DISPATCH_CMD_WRITE_LINEAR = 1,         // write data from dispatcher to dst_noc
+CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST = 3,  // like write, dedicated to writing to host
+CQ_DISPATCH_CMD_WRITE_PAGED = 4,          // write banked/paged data from dispatcher to dst_noc
+CQ_DISPATCH_CMD_WRITE_PACKED = 5,         // write to multiple noc addresses with packed data
+CQ_DISPATCH_CMD_WRITE_PACKED_LARGE = 6,   // write to multiple noc/dst addresses and varying lengnths w/ packed data
+CQ_DISPATCH_CMD_WAIT = 7,                 // wait until workers are done
+CQ_DISPATCH_CMD_SEND_GO_SIGNAL = 14,</code></pre>
+  <p>Read a program launch as a sentence in this language. Prefetcher commands say where the bytes come from: inline from the issue queue, or relayed from DRAM pages. Dispatcher commands say what to do with them: WRITE_PACKED for runtime args (one header, many destinations), WRITE_PACKED_LARGE for the binaries and kernel config, which can be multicast to rectangles of cores (<code>program/dispatch.cpp:1942-1957</code> pairs a WRITE_PACKED_LARGE of program binaries with a prefetcher RELAY_PAGED_PACKED from DRAM, or RELAY_RINGBUFFER when the prefetcher cache is in use). Then SEND_GO_SIGNAL, and a WAIT before anything that depends on the result. This is also why A16's multicast matters beyond kernels: the dispatcher sends one config payload to 64 cores with one multicast, where slow dispatch would make 64 separate trips.</p>
+  <p>Two layers of flow control keep the pipeline honest. The host must not overrun the fetch queue, so <code>fetch_queue_reserve_back</code> rereads the prefetcher's read pointer when it runs out of entries. That is a BAR read, but only when the queue is full (<code>system_memory_manager.cpp:705-724</code>). The prefetcher must not overrun the dispatcher's ring, which is what the page_ready/page_done semaphores are for. And the dispatcher must not reuse a worker's launch-message slot before the worker has finished with it, which is why workers keep a small ring of launch messages and increment the dispatcher's counter when done.</p>
+  <div class="callout warn">The prefetcher and the dispatcher spin even when there is no work. They are kernels that never return, polling their queues in L1. On silicon that costs nothing but the two cores. In ttsim each spinning RISC-V executes an instruction on every simulated clock, which is part of why the simulator is slower in fast dispatch (see the measurements below).</div>
+
+  <h2 id="placement">Where the dispatch cores live, and why your grid shrank</h2>
+  <p>Those two cores have to live somewhere. The choice is a <code>DispatchCoreConfig</code>, which you can pass to <code>create_unit_mesh</code>:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/dispatch_core_common.hpp:17-28 @7aad8aac</div>
+<pre><code>enum class DispatchCoreType : uint32_t { WORKER, ETH, COUNT };
+
+enum class DispatchCoreAxis { ROW, COL, COUNT };
+
+class DispatchCoreConfig {
+private:
+    DispatchCoreType type_;
+    std::optional&lt;DispatchCoreAxis&gt; axis_;
+
+public:
+    DispatchCoreConfig() : type_(DispatchCoreType::WORKER) {}</code></pre>
+  <p>The default is <code>WORKER</code>: Tensix cores. The resolver agrees (<code>type.value_or(DispatchCoreType::WORKER)</code>, <code>dispatch_core_common.cpp:36</code>). It also picks the axis: a column on Blackhole (unless the fabric is using Tensix cores), a row otherwise (<code>:37-40</code>).</p>
+  <div class="callout warn"><b>The guide and the code disagree.</b> <code>METALIUM_GUIDE.md:516</code> says fast dispatch dedicates "one RISC-V core per queue", "typically placed on an unused Ethernet tile". In the code at 7aad8aac, the default is Tensix (<code>WORKER</code>) cores. A single command queue uses at least two of them: a prefetcher and a dispatcher, each running on its core's BRISC, as the simulator run below shows. Ethernet placement is available on request (<code>DispatchCoreType::ETH</code>). The distributed trace example asks for it explicitly: "8 Chip Wormhole systems can only support 2 MeshCQs when Ethernet Dispatch is enabled" (<code>4_distributed_trace_and_events/distributed_trace_and_events.cpp:128-134</code>). Trust the code.</div>
+  <p>Which Tensix cores? The <em>core descriptor</em> YAML for the product decides. For a Wormhole n150, which tt-metal calls <code>nebula_x1</code> because one Tensix row is harvested, the one-queue, row-axis entry reads:</p>
+  <div class="filename">tt-metal/tt_metal/core_descriptors/wormhole_b0_80_arch.yaml:54-66 @7aad8aac</div>
+<pre><code>nebula_x1:
+  row:
+    1:
+      compute_with_storage_grid_range: # Logical only start and end [x, y]
+        start: [0, 0]
+        end: [7, 7]
+      ...
+      dispatch_cores:
+        [[0, -1], [1, -1], [2, -1], [3, -1], [4, -1], [5, -1], [6, -1], [7, -1]]</code></pre>
+  <p>Now the arithmetic of the shrinking grid is easy:</p>
+  <table>
+    <tr><th>Chip / product</th><th>Tensix on die</th><th>After harvesting</th><th>Dispatch reserves</th><th>compute_with_storage_grid_size</th></tr>
+    <tr><td>Wormhole n150 (<code>nebula_x1</code>)</td><td>8 × 10 = 80</td><td>8 × 9 = 72</td><td>the last row (8)</td><td><b>8 × 8 = 64</b> (measured on ttsim)</td></tr>
+    <tr><td>Wormhole n300, per chip (<code>nebula_x2</code>)</td><td>80</td><td>8 × 8 = 64</td><td>the last row</td><td>8 × 7 = 56 with Tensix dispatch; 8 × 8 with ETH dispatch (YAML)</td></tr>
+    <tr><td>Blackhole, 2 columns harvested (<code>2xharvested</code>)</td><td>14 × 10 = 140</td><td>12 × 10 = 120</td><td>the last column</td><td><b>11 × 10 = 110</b> (measured on ttsim)</td></tr>
+  </table>
+  <p>Harvesting comes first. Chips with a defective row or column ship with it fused off, and the product name in the YAML is literally keyed on how many were harvested (<code>core_descriptor.hpp:24-25</code>). ttsim's single-chip Wormhole models an N150 with harvesting mask <code>0x40</code>, and its single-chip Blackhole models a P150 with mask <code>0xC0</code> (<code>ttsim/src/tile.cpp:30, 41</code>). Then fast dispatch takes a row or a column off the end of the grid. You lose eight cores to run two firmware kernels because the grid must stay a rectangle for the logical-coordinate scheme. The other six cores in that row are simply not handed out.</p>
+  <p>On silicon, slow dispatch gives you the cores back: "When slow dispatch is on, use full logical grid (no dispatch cores to reserve)". But that rule has an exception for simulators (<code>core_descriptor.cpp:243-249</code>, condition <code>!fast_dispatch &amp;&amp; !is_simulator_or_emulated()</code>), so on ttsim you see 8 × 8 in both modes. I checked: my test program printed <code>compute grid 8x8</code> under slow dispatch, fast dispatch, two queues and ETH dispatch alike.</p>
+  <div class="callout gpu">A GPU's command processor is dedicated silicon that you never see in the SM count. Tenstorrent spends general-purpose cores on the job instead, which is flexible (the dispatcher is just C++ you can read and change) but visible: it is the row missing from your grid. Ethernet dispatch moves the job onto Ethernet cores. Those are RISC-V cores too, but they do not count toward the compute grid.</div>
+
+  <h2 id="cqs">Two command queues and events</h2>
+  <p>One queue executes strictly in order. That is the contract A10 relied on: "a read will not run before the prior kernel finishes". It also means a large input upload blocks the next program even when the two are independent. The fix is a second hardware queue: <code>num_command_queues = 2</code> (the maximum, <code>MAX_NUM_HW_CQS = 2</code> in <code>hostdevcommon/common_values.hpp:19</code>). Each queue gets its own issue and completion rings and its own prefetcher/dispatcher pipeline. The two run independently, so ordering <em>between</em> them is your job. You order them with events:</p>
+  <div class="filename">tt-metal/METALIUM_GUIDE.md:534-537 @7aad8aac</div>
+<pre><code>// Wait for the current tail operation on queue 0 to complete
+// before proceeding on command queue 1
+MeshEvent event = mesh_device-&gt;mesh_command_queue(0).enqueue_record_event();
+mesh_device-&gt;mesh_command_queue(1).enqueue_wait_for_event(event);</code></pre>
+  <p>An event is a counter. <code>enqueue_record_event</code> puts a command into queue A that, once everything before it has completed, writes a new event ID. The ID goes to the completion queue for the host, and to the other dispatcher's L1 for device-side waits. <code>enqueue_wait_for_event</code> puts a command into queue B that blocks B's dispatcher until that ID appears. Neither call blocks the host. The bookkeeping is visible in <code>SystemMemoryManager::get_next_event</code> and <code>set_last_completed_event</code> (<code>system_memory_manager.cpp:319-390</code>). The convention in the guide and the performance report is queue 0 for programs and queue 1 for I/O, so that the next input uploads while the current model runs (<a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md">AdvancedPerformanceOptimizationsForModels</a>, section 2).</p>
+  <p>My test program does exactly that dance on ttsim. It writes on CQ1, records an event, makes CQ0 wait, launches on CQ0, records again, makes CQ1 wait, and reads on CQ1. It gave correct results every iteration (<code>hw CQs 2 … bad=0</code>).</p>
+
+  <h2 id="trace">Trace: record once, replay many times</h2>
+  <p>Fast dispatch removed the host's waiting, but not its <em>thinking</em>. For each op the host still has to look up the program, assign runtime args, build the command bytes and copy them into the issue queue. A model of a few hundred small ops can be bound by that host work: the device sits idle in the gaps between ops while the host prepares the next one. The performance report shows exactly such a profile: "the device is stuck stalling waiting for the host in order to receive commands to run operations".</p>
+  <p>The fix is to do the thinking once. <em>Metal Trace</em> records the command bytes of a sequence of ops into a DRAM buffer, then replays that buffer with a single command. Step through capture and replay:</p>
+
+  <div class="viz" id="fig-trace"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-trace");
+    var g = TT.canvas(root, 900, 400), ctx = g.ctx, C = TT.C;
+    var HOSTB = { x: 16, y: 40, w: 230, h: 310 };
+    var CPU = { x: 30, y: 66, w: 202, h: 44 };
+    var BYP = { x: 30, y: 140, w: 202, h: 70 };
+    var ISQ = { x: 30, y: 250, w: 202, h: 70 };
+    var CHIP = { x: 300, y: 40, w: 584, h: 310 };
+    var TRB = { x: 316, y: 230, w: 220, h: 90 };
+    var PF = { x: 580, y: 230, w: 120, h: 50 };
+    var DS = { x: 740, y: 230, w: 120, h: 50 };
+    var WK = { x: 580, y: 80, w: 280, h: 90 };
+    var ops = ["op A", "op B", "op C"];
+    var steps = [
+      { dur: 1.4, text: "<b>1. Warm up.</b> Run the ops once normally. That compiles the kernels and uploads the binaries. A trace cannot compile or allocate, and the performance report says to have \"already compiled the target operations before we capture them\"." },
+      { dur: 1.4, text: "<b>2. begin_mesh_trace.</b> The command queue resets its view of worker state and switches every device's SystemMemoryManager into <i>bypass mode</i> (<code>set_bypass_mode(true, true)</code>, <code>fd_mesh_command_queue.cpp:1545-1547</code>). From now on, <code>issue_queue_reserve</code> hands out space in a host-side vector instead of the hugepage." },
+      { dur: 1.8, text: "<b>3. Enqueue the ops.</b> Each EnqueueMeshWorkload builds its usual command bytes, but they land in the bypass buffer. The fetch-queue doorbell returns early in bypass mode, so <i>nothing reaches the device</i>." },
+      { dur: 1.6, text: "<b>4. end_mesh_trace.</b> The recorded bytes, plus a closing EXEC_BUF_END, are written into a trace buffer in DRAM, carved from the <code>trace_region_size</code> reserved when opening the device (or, if that is 0, allocated from ordinary DRAM) (<code>MeshTrace::populate_mesh_buffer</code>, <code>mesh_trace.cpp:50-…</code>)." },
+      { dur: 1.6, text: "<b>5. replay_mesh_trace.</b> The host writes <i>one</i> small command sequence into the issue queue: a go signal of RUN_MSG_REPLAY_TRACE that resets the workers' launch-message pointers, a wait, and an <b>EXEC_BUF</b> naming the trace buffer's address and page count. The doorbell carries the stall bit (<code>trace/dispatch.cpp:149-157</code>)." },
+      { dur: 1.8, text: "<b>6. The prefetcher executes the buffer.</b> On EXEC_BUF, cq_prefetch stops reading the issue queue and fetches commands from the DRAM trace buffer instead. The stall bit keeps it from pre-fetching later issue-queue entries into a command buffer that the trace is about to reuse." },
+      { dur: 1.8, text: "<b>7. Business as usual.</b> The dispatcher cannot tell the difference. It writes args and configs, sends go signals and waits for workers, exactly as for live commands." },
+      { dur: 1.6, text: "<b>8. EXEC_BUF_END.</b> The prefetcher returns to the issue queue. The host spent one small enqueue for the whole sequence, however many ops it contained. Run it again with new inputs: same command bytes, same addresses, new data." }
+    ];
+    function arrow(a, b, col, lab, t) {
+      var x1 = a[0], y1 = a[1], x2 = b[0], y2 = b[1];
+      ctx.strokeStyle = col; ctx.globalAlpha = 0.5; ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      var x = TT.lerp(x1, x2, t), y = TT.lerp(y1, y2, t);
+      TT.box(ctx, x - 26, y - 9, 52, 18, { fill: col, r: 4, label: lab, color: "#000", font: "bold 10px" });
+    }
+    function c(b) { return [b.x + b.w / 2, b.y + b.h / 2]; }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.box(ctx, HOSTB.x, HOSTB.y, HOSTB.w, HOSTB.h, { fill: C.bg2, stroke: C.blue });
+      TT.text(ctx, "Host", HOSTB.x + 10, HOSTB.y + 14, { color: C.blue, font: "bold 13px" });
+      TT.box(ctx, CPU.x, CPU.y, CPU.w, CPU.h, { fill: C.bg3, stroke: C.blue, label: i <= 3 ? (i >= 1 ? "CPU: recording" : "CPU: warm-up") : "CPU: replay_mesh_trace", font: "12px" });
+      var byOn = i >= 1 && i <= 3;
+      TT.box(ctx, BYP.x, BYP.y, BYP.w, BYP.h, { fill: C.bg3, stroke: byOn ? C.yellow : C.border });
+      TT.text(ctx, "bypass buffer (host vector)", BYP.x + 6, BYP.y + 12, { color: byOn ? C.yellow : C.muted, font: "11px" });
+      TT.box(ctx, ISQ.x, ISQ.y, ISQ.w, ISQ.h, { fill: C.bg3, stroke: C.teal });
+      TT.text(ctx, "issue queue (hugepage)", ISQ.x + 6, ISQ.y + 12, { color: C.teal, font: "11px" });
+      TT.box(ctx, CHIP.x, CHIP.y, CHIP.w, CHIP.h, { fill: C.bg2, stroke: C.green });
+      TT.text(ctx, "chip", CHIP.x + 10, CHIP.y + 14, { color: C.green, font: "bold 13px" });
+      TT.box(ctx, TRB.x, TRB.y, TRB.w, TRB.h, { fill: C.orange, alpha: 0.1, stroke: C.orange });
+      TT.text(ctx, "DRAM trace buffer (trace_region)", TRB.x + 6, TRB.y + 12, { color: C.orange, font: "11px" });
+      TT.box(ctx, PF.x, PF.y, PF.w, PF.h, { fill: C.blue, alpha: 0.2, stroke: C.blue, label: "prefetcher", font: "12px" });
+      TT.box(ctx, DS.x, DS.y, DS.w, DS.h, { fill: C.purple, alpha: 0.2, stroke: C.purple, label: "dispatcher", font: "12px" });
+      TT.box(ctx, WK.x, WK.y, WK.w, WK.h, { fill: C.green, alpha: 0.1, stroke: C.green, label: "workers", color: C.green, font: "12px" });
+      // bypass buffer contents
+      var nrec = i < 2 ? 0 : (i === 2 ? Math.floor(t * 3.99) : 3);
+      if (i >= 1 && i <= 3) for (var k = 0; k < nrec; k++) TT.box(ctx, BYP.x + 8 + k * 64, BYP.y + 26, 58, 34, { fill: C.yellow, alpha: (i === 3 && t > 0.5) ? 0.15 : 0.45, stroke: C.yellow, label: ops[k] + " cmds", font: "10px" });
+      // trace buffer contents
+      var ntr = i < 3 ? 0 : (i === 3 ? Math.floor(t * 3.99) : 3);
+      for (var q = 0; q < ntr; q++) TT.box(ctx, TRB.x + 10 + q * 66, TRB.y + 26, 58, 30, { fill: C.orange, alpha: (i >= 5 && i <= 6) ? 0.6 : 0.35, stroke: C.orange, label: ops[q], font: "10px" });
+      if (ntr === 3) TT.text(ctx, "+ EXEC_BUF_END", TRB.x + 10, TRB.y + 72, { color: C.orange, font: "10px", mono: true });
+      // flows per step
+      if (i === 0) { arrow(c(ISQ), c(PF), C.teal, "cmds", t); TT.text(ctx, "normal fast dispatch, once per op", ISQ.x, ISQ.y + 62, { color: C.muted, font: "10px" }); }
+      if (i === 2) arrow(c(CPU), c(BYP), C.yellow, "record", t);
+      if (i === 2 && t > 0.6) TT.text(ctx, "device sees nothing", 470, 200, { color: C.muted, font: "12px" });
+      if (i === 3) arrow([BYP.x + BYP.w, BYP.y + 40], [TRB.x, TRB.y + 40], C.orange, "write", t);
+      if (i === 4) { TT.box(ctx, ISQ.x + 8, ISQ.y + 26, 120, 34, { fill: C.teal, alpha: 0.45, stroke: C.teal, label: "EXEC_BUF(trace)", font: "10px" }); arrow(c(ISQ), c(PF), C.teal, "1 cmd", t); }
+      if (i === 5) arrow([TRB.x + TRB.w, TRB.y + 40], [PF.x, PF.y + 25], C.orange, "pages", t);
+      if (i === 6) { arrow([PF.x + PF.w, PF.y + 25], [DS.x, DS.y + 25], C.teal, "relay", t); arrow([DS.x + 30, DS.y], [WK.x + 220, WK.y + WK.h], C.purple, "go", t); }
+      if (i === 7) { arrow([PF.x, PF.y + 10], [ISQ.x + ISQ.w, ISQ.y + 30], C.muted, "back", t); }
+      // host cost bar
+      TT.text(ctx, "host work per run:", 316, 372, { color: C.muted, font: "12px" });
+      var replay = i >= 4;
+      TT.box(ctx, 440, 362, replay ? 30 : 3 * 90, 18, { fill: replay ? C.green : C.red, alpha: 0.7, r: 3 });
+      TT.text(ctx, replay ? "one EXEC_BUF command, whatever the op count" : "build + copy commands for every op", replay ? 480 : 720, 371, { color: replay ? C.green : C.red, font: "12px" });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>Three rules follow from the mechanism, and the report states them all. Everything in a trace is frozen: "the input/output tensor shapes, addresses, etc. do not change". So inputs must live in preallocated, persistent buffers that you overwrite between replays. Trace "only supports capturing and executing operations, and not other commands such as reading/writing tensors". And the trace buffer needs DRAM. If you reserve a <code>trace_region_size</code> and the trace outgrows it, capture fails and tells you the size it needed ("Creating trace buffers of size …B … but only …B is allocated for trace region"). At 7aad8aac the default is 0 (<code>DEFAULT_TRACE_REGION_SIZE</code>), and then the trace buffer is allocated top-down in ordinary DRAM instead (<code>mesh_trace.cpp:65-83</code>).</p>
+  <p>Why is trace impossible in slow dispatch? Look at what replay is: a command that tells the <em>prefetcher</em> to read a DRAM buffer. With no prefetcher there is nothing to execute it, and slow dispatch never produces command bytes to record in the first place. The slow-dispatch queue says so directly:</p>
+  <div class="filename">tt-metal/tt_metal/distributed/sd_mesh_command_queue.cpp:487-493 @7aad8aac</div>
+<pre><code>void SDMeshCommandQueue::record_begin(const MeshTraceId&amp;, const std::shared_ptr&lt;MeshTraceDescriptor&gt;&amp;) {
+    TT_THROW("Not supported for slow dispatch");
+}
+
+void SDMeshCommandQueue::record_end() { TT_THROW("Not supported for slow dispatch"); }
+
+void SDMeshCommandQueue::enqueue_trace(const MeshTraceId&amp;, bool) { TT_THROW("Not supported for slow dispatch"); }</code></pre>
+  <div class="callout gpu">This is the same idea as CUDA Graphs: capture a stream's launches once, then launch the whole graph with one call to cut per-kernel CPU overhead. The constraints rhyme as well: fixed addresses and shapes, no allocation inside the capture, and a warm-up first.</div>
+
+  <h2 id="sim">Run it in the simulator</h2>
+  <div class="callout sim">The workbench is set up in <a href="../sim-labs/b00-workbench.html">B00</a>. <a href="../sim-labs/b01-meet-ttsim.html">B01</a> explains why fast dispatch costs more simulated clocks, and <a href="../sim-labs/b09-breaking-things.html">B09</a> drives the PCIe entry points of libttsim directly.</div>
+  <h3>1. The stock example in both modes</h3>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs     # env.sh cds away, so use absolute paths
+export LAB_HOME=$HOME/ttlab/a17
+source $W/workbench/env.sh wh      # sets TT_METAL_SLOW_DISPATCH_MODE=1
+/usr/bin/time -f "WALL %e s" $EX/metal_example_add_2_integers_in_riscv
+env -u TT_METAL_SLOW_DISPATCH_MODE /usr/bin/time -f "WALL %e s" $EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code># slow dispatch
+Success: Result is 21
+... JIT cache stats: 9/9 hits (100.0%) ...
+[4501] 0.2 seconds (22.5 KHz)
+WALL 0.39 s
+# fast dispatch
+Success: Result is 21
+... JIT cache stats: 15/15 hits (100.0%) ...
+[10946] 0.3 seconds (38.7 KHz)
+WALL 0.44 s</code></pre>
+  <p>Both are correct and both are deterministic: repeat runs gave <code>[4501]</code> / <code>[10946]</code> again, and 0.36–0.39 s / 0.44–0.46 s of wall time. Fast dispatch builds six more JIT binaries (15 against 9): <code>cq_prefetch</code> and <code>cq_dispatch</code> for BRISC, <code>cq_dispatch_subordinate</code> for NCRISC, and three TRISC binaries of <code>cq_dispatch_subordinate_compute</code>. It also takes <em>more</em> simulated clocks. That is not a paradox. ttsim is not a timing model, and its clock advances only when the host drives it (B01).</p>
+
+  <h3>2. Per-launch cost, with an out-of-tree host program</h3>
+  <p>A single run mixes device bring-up with the launch. To isolate one launch I wrote <code>a17_dispatch.cpp</code>, the add_2 program in a loop. Each iteration writes two new inputs, launches the kernel and reads back the sum, which is checked. Environment variables select a trace, two command queues, or Ethernet dispatch. The source is <a href="../sim-labs/workbench/host/a17_dispatch.cpp"><code>sim-labs/workbench/host/a17_dispatch.cpp</code></a>. Copy it into your lab directory and build it with the workbench (about 6 s; <code>build_host.sh</code> writes the binary next to the <code>.cpp</code>). Then run it with 1 and with 11 iterations, and divide the difference by 10.</p>
+<pre><code>mkdir -p $LAB_HOME/host &amp;&amp; cp $W/workbench/host/a17_dispatch.cpp $LAB_HOME/host/
+$W/workbench/build_host.sh $LAB_HOME/host/a17_dispatch.cpp       # produces $LAB_HOME/host/a17_dispatch</code></pre>
+  <p>To see the PCIe traffic I made an instrumented ttsim. The patch is <a href="../sim-labs/patches/a17-bar-count.patch"><code>sim-labs/patches/a17-bar-count.patch</code></a>, against ttsim b3620244. It adds counters to <code>pcie_mem_rd_bytes</code>/<code>pcie_mem_wr_bytes</code> (host BAR accesses), the TLB-config case of <code>pcie_bar0_wr</code>, and <code>libttsim_pci_dma_mem_rd/wr_bytes</code> (device accesses to host memory), plus an optional log of every TLB-window write (<code>A17_TLBLOG=N</code> logs the first N writes) and of every TLB-window read (<code>A17_RDLOG=N</code>). The counters print at <code>libttsim_exit</code>:</p>
+<pre><code>$W/workbench/build_ttsim.sh bar wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-bar &lt; $W/patches/a17-bar-count.patch
+$W/workbench/build_ttsim.sh bar wh                                # rebuild with the patch
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-bar-wh-release/libttsim.so
+A17_ITERS=1  $LAB_HOME/host/a17_dispatch
+A17_ITERS=11 $LAB_HOME/host/a17_dispatch
+A17_ITERS=11 env -u TT_METAL_SLOW_DISPATCH_MODE $LAB_HOME/host/a17_dispatch
+A17_ITERS=11 A17_TRACE=1 env -u TT_METAL_SLOW_DISPATCH_MODE $LAB_HOME/host/a17_dispatch</code></pre>
+<pre><code># slow dispatch, 1 then 11 iterations
+[4501] A17COUNT clock_calls=4501 bar_rd=4539 (18260 B) bar_wr=17361 (220168 B) tlb_cfg_wr=10913 win_wr=6411 win_rd=4501 dev_reads_host=0 (0 B) dev_writes_host=0 (0 B)
+[8141] A17COUNT clock_calls=8141 bar_rd=8179 (32820 B) bar_wr=21821 (260048 B) tlb_cfg_wr=14963 win_wr=6821 win_rd=8141 dev_reads_host=0 (0 B) dev_writes_host=0 (0 B)
+# fast dispatch, 1 then 11 iterations
+[10946] A17COUNT clock_calls=10946 bar_rd=4960 (19944 B) bar_wr=18426 (313132 B) tlb_cfg_wr=11651 win_wr=6738 win_rd=4922 dev_reads_host=11 (3616 B) dev_writes_host=6 (124 B)
+[46467] A17COUNT clock_calls=46467 bar_rd=4960 (19944 B) bar_wr=18496 (313412 B) tlb_cfg_wr=11651 win_wr=6808 win_rd=4922 dev_reads_host=61 (14304 B) dev_writes_host=46 (1004 B)
+# fast dispatch + trace, 1 then 11 replays
+[14500] A17COUNT clock_calls=14500 bar_rd=4968 (19976 B) bar_wr=18440 (313220 B) tlb_cfg_wr=11659 win_wr=6744 win_rd=4930 dev_reads_host=15 (5216 B) dev_writes_host=10 (196 B)
+[53889] A17COUNT clock_calls=53889 bar_rd=5336 (21448 B) bar_wr=18878 (316444 B) tlb_cfg_wr=12027 win_wr=6814 win_rd=5298 dev_reads_host=65 (11616 B) dev_writes_host=50 (1076 B)</code></pre>
+  <p>The single-run totals match B01's independent count (17,361 writes and 4,539 reads in slow dispatch). Per launch, as (11 − 1) / 10:</p>
+  <table>
+    <tr><th>Per launch (WH)</th><th>host BAR writes</th><th>of which TLB config</th><th>host BAR reads</th><th>device reads host RAM</th><th>device writes host RAM</th><th>sim clocks</th><th>wall time</th></tr>
+    <tr><td>Slow dispatch</td><td>446</td><td>405</td><td>364</td><td>0</td><td>0</td><td>364</td><td>≈ 4.2 ms</td></tr>
+    <tr><td>Fast dispatch (Tensix)</td><td><b>7</b></td><td>0</td><td><b>0</b></td><td>5 (≈ 1.07 KB)</td><td>4 (88 B)</td><td>3,552</td><td>≈ 38 ms</td></tr>
+    <tr><td>Fast dispatch + trace</td><td>≈ 44</td><td>≈ 37</td><td>≈ 37</td><td>5 (640 B)</td><td>4 (88 B)</td><td>3,939</td><td>≈ 41 ms</td></tr>
+    <tr><td>Fast dispatch, ETH cores</td><td>7</td><td>0</td><td>0</td><td>5</td><td>4</td><td>606</td><td>≈ 7 ms</td></tr>
+  </table>
+  <p>(Wall times are the program's own loop timer: slow 7.1 → 48.8 ms, fast 71.2 → 449.4 ms, trace 41.7 → 447.6 ms, ETH 13.8 → 85.8 ms, for 1 → 11 iterations. They are host CPU time spent simulating, not silicon time.)</p>
+  <p>Read the table in three passes.</p>
+  <ul>
+    <li><b>The host's PCIe traffic collapses.</b> 446 writes and 364 reads become 7 writes and 0 reads. The 7 are the doorbells and completion-pointer updates, and the TLB window log shows them: five 4-byte writes to translated (18,26) at <code>0x1a3fc…0x1a40c</code> with values 6, 6, 0x22, 8 and 0xc, and two to (19,26) at <code>0x19e80</code>. Those values are the five command sizes in 16-byte units: 96, 96, 544, 128 and 192 bytes. A variant of the program that skipped the launch logged only 6, 6, 8 and 0xc, which pins the 544-byte command as the program. The device read host memory exactly 5 times per launch, once per command.</li>
+    <li><b>Trace shrinks what crosses PCIe</b>, from about 1.07 KB of commands per launch to 640 B. For one tiny kernel that saving is small. It grows with the number of ops captured, because the replay command stays the same size. Replay did add about 37 BAR reads per iteration (each with a TLB reprogram): 4-byte reads of address 0x4a0, the go-message mailbox, on one core: physical (2,11) in ttsim's numbering, which by ttsim's Tensix row and column tables is translated (19,26), the dispatcher core. I did not track down which host routine issues them, and a two-iteration run showed 16 rather than 37, so the count varies.</li>
+    <li><b>The simulator gets slower, not faster.</b> In ttsim, wall time follows clock calls, at about 12 µs each in both modes. Fast dispatch needs ten times the clocks per launch: two firmware cores spin and interpret commands one instruction per clock, and the host's completion-queue loop clocks the chip while it waits. On silicon the comparison goes the other way, because silicon's costs are PCIe round trips, which fast dispatch removes. ETH dispatch costing far fewer clocks is a ttsim modelling detail, not a performance result. Do not draw performance conclusions from any of these clock numbers.</li>
+  </ul>
+  <div class="callout warn">The per-launch count for slow dispatch scales with the number of cores. Every core gets its own binary, args, launch message and go message, and then the host polls every core. The fast-dispatch count does not scale that way, because the dispatcher multicasts configs and the go signal and collects "done" as semaphore increments. A one-core example therefore <em>understates</em> the gap.</div>
+
+  <h3>3. Trace on ttsim: it works</h3>
+  <p>The research notes listed trace as untested. Here is the result: with fast dispatch, capture and replay work on ttsim. The replayed kernel saw the new inputs written before each replay, and all eleven sums were right:</p>
+<pre><code>$ A17_TRACE=1 A17_ITERS=11 env -u TT_METAL_SLOW_DISPATCH_MODE $LAB_HOME/host/a17_dispatch
+A17 compute grid 8x8, hw CQs 1
+A17 trace captured
+A17 iters=11 trace=1 cqs=1 bad=0 loop_ms=447.63 ms_per_iter=40.6937
+[53889] 0.8 seconds (66.4 KHz)</code></pre>
+  <p>Under the workbench default (slow dispatch) the same program stops at the capture, as the source promised:</p>
+<pre><code>$ A17_TRACE=1 $LAB_HOME/host/a17_dispatch
+A17 compute grid 8x8, hw CQs 1
+... | critical |          Always | TT_THROW: Not supported for slow dispatch (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'
+Not supported for slow dispatch</code></pre>
+  <p>Two queues with events (<code>A17_CQS=2</code>), and the two combined with trace, also ran correctly in fast dispatch (<code>hw CQs 2 … bad=0</code>). So did Ethernet dispatch (<code>A17_ETH=1</code>). The log showed that variant launching its dispatch firmware on three Ethernet cores, at translated (24,17), (20,16) and (23,16), instead of the Tensix row. On Blackhole the same program passed in slow dispatch, fast dispatch and fast dispatch with trace, and reported a compute grid of <code>11x10</code>. I did not adapt the full distributed trace example: it needs a 2×4 mesh, and only a 2×1 mesh works on ttsim. My program uses the same API calls on a 1×1 mesh (<code>begin_mesh_trace</code>, <code>end_mesh_trace</code>, <code>replay_mesh_trace</code>, <code>release_mesh_trace</code>, <code>enqueue_record_event</code>, <code>enqueue_wait_for_event</code>).</p>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A launch must deliver binaries, runtime args and CB configs into each core's L1, then a launch message, then a go message (<code>signal = RUN_MSG_GO = 0x80</code>), and then learn that the core has set <code>RUN_MSG_DONE</code>.</li>
+    <li>The host reaches the chip through BAR0's TLB windows: a store at a BAR offset becomes a NoC write to (x, y, addr), set by a 64-bit config register at <code>0x1FC0_0000 + 8·index</code>. Host writes are posted and cheap. Host reads are slow round trips.</li>
+    <li><b>Slow dispatch</b>: the host writes everything itself and polls every core's go message. One one-core launch cost 446 BAR writes (405 of them TLB reprogramming) and 364 BAR reads.</li>
+    <li><b>Fast dispatch</b>: the host copies commands into an issue queue in pinned host memory and rings a 4-byte doorbell per command. <code>cq_prefetch</code> pulls the commands, and <code>cq_dispatch</code> executes writes, multicasts, go signals and waits. Workers report done with NoC increments, and completions land in host memory. Per launch: 7 BAR writes, 0 BAR reads.</li>
+    <li>Dispatch cores default to Tensix (<code>WORKER</code>), on the last row (Wormhole) or column (Blackhole). With harvesting, that is why an n150 gives 8 × 8 and the simulated Blackhole 11 × 10. The guide's "typically an Ethernet tile" does not match the code's default.</li>
+    <li>Two hardware queues run independently and synchronise with events. Trace records command bytes into DRAM and replays them with one EXEC_BUF. It needs fast dispatch, and it works on ttsim.</li>
+  </ul>
+  <p>Next, <a href="a18-ttnn-user.html">A18</a> climbs above all of this. In TT-NN every op you call becomes one of these programs, and <code>ttnn.begin_trace_capture</code> is the trace you just watched.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Fast dispatch moved slightly more bytes across PCIe per launch than slow dispatch moved in its data writes. Why is it still the fast one on silicon?</summary><p>Because the cost is not bytes, it is waiting. Slow dispatch's 364 BAR reads are round trips: each one stalls the CPU for at least several hundred nanoseconds (≥ 671 ns in the ISA doc's measurement), and they happen in series. Its 405 TLB reprograms are serial too. Fast dispatch's host traffic is 7 posted writes, and all the reading is done by the device: the prefetcher reading host memory, and the dispatcher waiting on semaphores over the NoC. Device-initiated reads were measured at 24.5 GB/s, against 0.10 GB/s for a host memcpy from the device.</p></details>
+  <details class="quiz"><summary>The doorbell entry for a command was 0x22. How many bytes was the command, and why does the host write the size rather than a pointer?</summary><p>0x22 = 34 units of 16 bytes = 544 bytes (<code>PREFETCH_Q_LOG_MINSIZE</code> = 4). The issue queue is a ring that the prefetcher reads in order, so the prefetcher already knows where the next command starts: right after the previous one. It only needs to know how much to fetch. That keeps the doorbell to one 4-byte posted write. The most significant bit of the entry is spare for the stall flag that trace replay uses.</p></details>
+  <details class="quiz"><summary>You open an n150 with fast dispatch and get a 8 × 8 compute grid, yet the die has 80 Tensix cores. Account for all 16 missing cores.</summary><p>One row of 8 is harvested at the factory: an n150 is <code>nebula_x1</code>, with 72 functional Tensix (ttsim models this with harvesting mask 0x40). Of those 9 rows, the core descriptor reserves the last one for dispatch (<code>dispatch_cores: [[0,-1] … [7,-1]]</code>). One queue only needs two of its cores (a prefetcher and a dispatcher), but the compute grid must stay a rectangle. So that leaves 8 × 8 = 64.</p></details>
+  <details class="quiz"><summary>A colleague wants to trace a model under the simulator workbench and gets "Not supported for slow dispatch". What is going on, and what is the fix?</summary><p>The workbench's <code>env.sh</code> exports <code>TT_METAL_SLOW_DISPATCH_MODE=1</code>, so the command queue is an <code>SDMeshCommandQueue</code>, whose <code>record_begin</code> throws (<code>sd_mesh_command_queue.cpp:487-489</code>). Trace replay is an EXEC_BUF command executed by the prefetcher firmware, and slow dispatch has no prefetcher and produces no command bytes to record. Unset the variable (<code>env -u TT_METAL_SLOW_DISPATCH_MODE …</code>). Trace then works on ttsim. Do a warm-up run before capturing, and reserve a <code>trace_region_size</code> big enough for the trace (or leave it 0 to let this commit allocate the trace buffer dynamically).</p></details>
+  <details class="quiz"><summary>Queue 1 writes an input buffer. Queue 0 then launches a program that reads it. Without an event, what can go wrong, and why can't the single-queue FIFO rule save you?</summary><p>The two queues have independent issue rings and independent prefetcher/dispatcher pipelines, so nothing orders a command on one queue relative to a command on the other. The program on queue 0 can start before queue 1's write has landed, and read stale data. FIFO order holds only <em>within</em> one queue. <code>queue1.enqueue_record_event()</code> followed by <code>queue0.enqueue_wait_for_event(e)</code> makes queue 0's dispatcher block until queue 1 has completed everything before the event, without blocking the host.</p></details>
+  <details class="quiz"><summary>In ttsim, fast dispatch took 3,552 simulated clocks per launch against 364 for slow dispatch. Does that mean fast dispatch is slower?</summary><p>No. ttsim is functional, not a timing model, and its clock only advances when the host drives it. In slow dispatch that happens once per device read (UMD's <code>after_read</code>). In fast dispatch it happens through <code>advance_device_execution()</code> in the wait loops, while two firmware cores spin and interpret commands one instruction per clock. The clocks measure how the simulation was cranked, not how long silicon would take. On silicon, fast dispatch exists precisely because it removes the host's PCIe round trips.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/TLBs.md">Wormhole PCIe TLBs</a>: the authoritative layout of the 186 windows, the config bits and the ordering modes.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/README.md">Wormhole PCI Express tile</a>: BAR0/2/4 maps, the iATU, and the measured host-initiated and device-initiated bandwidths and latencies.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/PCIExpressTile/HostToDeviceTLBs.md">Blackhole host-to-device TLBs</a>: the same mechanism on Blackhole, with 2 MiB and 4 GiB windows.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: the official overview, including the fast-dispatch and two-queue sections quoted here (read its dispatch-core claim with the warning above in mind).</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md">Advanced Performance Optimizations for Models</a>: the tech report on Metal Trace and multiple command queues, with Tracy profiles before and after.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/impl/dispatch/kernels/cq_prefetch.cpp">cq_prefetch.cpp</a> and <a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/impl/dispatch/kernels/cq_dispatch.cpp">cq_dispatch.cpp</a>: the dispatch firmware itself, ordinary kernel C++.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/distributed/4_distributed_trace_and_events">distributed_trace_and_events</a>: the official example combining sub-devices, two MeshCQs, events and a MeshTrace.</li>
+    <li><a href="https://github.com/tenstorrent/tt-umd">tt-umd</a>: the user-mode driver: TLB windows, hugepages, and the ttsim device backend.</li>
+    <li><a href="https://github.com/tenstorrent/tt-kmd">tt-kmd</a>: the Linux kernel driver behind <code>/dev/tenstorrent</code>, BAR mapping, page pinning and the TLB ioctls.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator. <code>src/pcie.cpp</code> is a readable model of the PCIe tile.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/index.html">TT-Metalium documentation</a>: the official API documentation, including the command queue and trace APIs.</li>
+  </ul>
+
+  <div class="pager"><a href="a16-multicast-sync.html">&larr; 16 Multicast and cross-core synchronization</a><a class="next" href="a18-ttnn-user.html">18 TT-NN as a user &rarr;</a></div>
+</main>
+</body>
+</html>

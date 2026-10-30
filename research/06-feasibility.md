@@ -39,7 +39,7 @@ Unseeded errors by fidelity: HiFi2 1.511, HiFi3 1.505, HiFi4 1.505 (mean_abs_err
   - `wh_x2` with `MeshShape(2,1)` and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml` works: `host/dbrw.cpp` printed "devices=2 match=true" in 7.6 s.
   - CCLs and fabric are untested.
 - **SFPU examples** (eltwise_sfpu, custom_sfpi_add, sfpu_eltwise_chain, hello_world_datatypes) pass on both WH and BH.
-- **Trace** needs fast dispatch and is untested. Tracy is untested.
+- **Trace** needs fast dispatch; capture + replay works under ttsim in fast dispatch (A17, wh and bh). Tracy is untested.
 
 ## Build agent's final report: ttnn and the toolchain
 - Toolchain: clang 20.1.8, cmake 4.0.2, SFPI 7.92.0 (riscv-tt-elf-g++ 15.1.0). On Debian 12 the SFPI .deb fails; the SFPI tarball that CMake downloads works.
