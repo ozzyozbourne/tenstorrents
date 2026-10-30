@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A14 · One tile's journey · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .evcard { padding: .7rem .9rem; background: var(--bg2); border-top: 1px solid var(--border); font-size: 15px; min-height: 7.5em; }
+  .evcard .meta { color: var(--muted); font-size: 13px; }
+  .evcard .meta b { color: var(--yellow); }
+  .evcard .src { color: var(--teal); font-family: var(--mono); font-size: 13px; }
+  .evcard .raw { display: block; font-family: var(--mono); font-size: 12.5px; color: var(--fg); background: #000; border: 1px solid var(--border);
+    border-radius: 6px; padding: .3rem .5rem; margin: .4rem 0; white-space: pre-wrap; word-break: break-all; }
+  .qchoices { display: flex; flex-wrap: wrap; gap: .4rem; padding: .6rem .8rem; background: var(--bg2); border-top: 1px solid var(--border); }
+  .qchoices button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .6rem; cursor: pointer; font-size: 14px; }
+  .qchoices button.pick { border-color: var(--yellow); color: var(--yellow); }
+  .qchoices button.right { background: var(--green); color: #000; }
+  .qchoices button.wrong { background: var(--red); color: #000; }
+  td.mono, span.mono { font-family: var(--mono); font-size: 13px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a13-llk-mops-jit.html">&larr; Prev</a>
+  <a href="a15-matmul-one-to-many.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 14</span><span class="tag">Prerequisites: A03–A13</span>
+  <h1><span class="num">14.</span> One tile's journey</h1>
+  <p class="subtitle">One bf16 tile, followed from host memory to DRAM, across the NoC, through a circular buffer, into the Src registers, through an ELWADD into Dst, out through the packers and back to DRAM. All of it comes from a single instrumented ttsim run, and each step links back to the chapter that taught it.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#trace">One run, one trace</a></li>
+      <li><a href="#journey">The journey, at three zoom levels</a></li>
+      <li><a href="#chip">Zoom 1: the chip</a></li>
+      <li><a href="#core">Zoom 2: the core</a></li>
+      <li><a href="#regs">Zoom 3: the registers</a></li>
+      <li><a href="#hops">Every hop, with real values</a></li>
+      <li><a href="#clocks">What the clock numbers mean, and what they don't</a></li>
+      <li><a href="#where">Where is it now?</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Eleven chapters have each covered one piece of the machine. <a href="a03-chip-tour.html">A03</a> drew the grid, <a href="a08-noc.html">A08</a> the network, <a href="a09-memory.html">A09</a> the banks, <a href="a11-dataflow-and-cbs.html">A11</a> the circular buffers, <a href="a12-compute-kernels.html">A12</a> the three-thread compute kernel, and <a href="a13-llk-mops-jit.html">A13</a> the MOP expander. Each one made sense on its own. This chapter adds nothing new. It asks one question, again and again:</p>
+  <p style="font-size:1.25rem;color:var(--yellow);text-align:center">Where is this tile right now?</p>
+  <p>"This tile" is tile 0 of <code>metal_example_eltwise_binary</code>: the first 32&times;32 block of bf16 values in input A, its partner in input B, and the sum they become. The program adds two 64-tile tensors on one core, with the reader, compute and writer kernels you met in <a href="a11-dataflow-and-cbs.html#rw">A11</a>. We'll follow tile 0, and only tile 0, the whole way round, and we'll stop at every place it sits long enough to have an address.</p>
+  <p>The difference from the earlier chapters is that every number on this page, including every address, coordinate, bank, opcode, counter value and clock, comes from <em>one</em> run of the simulator. We don't stitch together facts from separate experiments. One trace file has them all, in the order the simulator did them.</p>
+
+  <h2 id="trace">One run, one trace</h2>
+  <p>Earlier chapters each built their own probe. A08 and B05 logged NoC commands in <code>noc_cmd_ctrl</code>. B03, B04 and A13 traced Tensix instructions and MOP expansion. A11 used DPRINT overlays to print CB pointers. For this chapter I combined them into one instrumented ttsim (Wormhole build, ttsim b3620244), made with the workbench's <code>build_ttsim.sh</code>. It folds in the existing patches <code>b05-noclog</code>, <code>b04-trace</code> and <code>b04-mop</code>, plus the opcode-name table from <code>b03-tti</code>, so it applies on its own to pristine ttsim (don't apply those patches first), and adds five small hooks that all write into the same file:</p>
+  <ul>
+    <li><b>Host writes and reads</b> that land in a DRAM tile, logged where the PCIe TLB window is decoded (<code>pcie.cpp</code>, <code>tlb_window_write</code>/<code>_read</code>).</li>
+    <li><b>NoC commands</b> issued by a Tensix core (the B05 hook, copied into the shared file).</li>
+    <li><b>CB counters</b>: every write to the overlay stream registers that tt-metal uses as <code>tiles_received</code>/<code>tiles_acked</code> (<a href="a11-dataflow-and-cbs.html#ring">A11</a>), and every read that returns a value the reading hart hasn't seen before. That second rule turns a spin loop into one line: the moment the wait is satisfied.</li>
+    <li><b>Operand details</b> inside <code>UNPACR</code> (L1 address, Src bank), <code>ELWADD</code> (banks, rows, first datum) and <code>PACR</code> (packer, Dst row, L1 address).</li>
+    <li><b>Semaphore values</b> after every <code>SEMINIT</code>/<code>SEMPOST</code>/<code>SEMGET</code>/<code>SEMWAIT</code>.</li>
+  </ul>
+  <p>Here is one of the hooks. It sits in ttsim's <code>UNPACR</code>, after the simulator has computed the L1 source address and before it copies any datums:</p>
+  <div class="filename">sim-labs/patches/a14-journey.patch (hunk in src/tensix.cpp, TENSIX_EXECUTE_UNPACR; upstream context is tensix.cpp:3153-3420 @b3620244)</div>
+<pre><code>    if (a14_on(p_tensix)) { // A14: where this UNPACR reads in L1 and which Src bank and rows it fills
+        fprintf(s_b04.f, "UNP %llu T%u src%c bank=%u l1=0x%x datums=%u first_row=%u fmt=%u\n", (unsigned long long)g_clock, pipe,
+            unpack_block_selection ? 'B' : 'A', src_bank, src_addr_bits &gt;&gt; 3, count, dst_addr / ROW_SIZE, in_data_format);
+    }
+    for (uint32_t i = 0; i &lt; count; i++) {
+        uint32_t sram_addr_bits = src_addr_bits + in_element_size_bits*(i &amp; (unpack_row_width - 1)) + ...</code></pre>
+  <p><code>g_clock</code> is ttsim's single global timebase (<code>libttsim.cpp:311</code>), the same number that appears in brackets in every ttsim log line. <code>src_bank</code> is the bank this unpacker writes to, and <code>src_addr_bits &gt;&gt; 3</code> is the byte address in L1. The run, and what it printed:</p>
+  <div class="filename">commands run in this orb (LAB_HOME=$HOME/ttlab/a14, tt-metal 7aad8aac)</div>
+<pre><code>export LAB_HOME=$HOME/ttlab/a14
+source sim-labs/workbench/env.sh wh
+sim-labs/workbench/build_ttsim.sh journey wh        # first call: copies pristine ttsim to $LAB_HOME/ttsim-journey
+cd $LAB_HOME/ttsim-journey &amp;&amp; patch -p1 &lt; .../sim-labs/patches/a14-journey.patch &amp;&amp; cd -
+sim-labs/workbench/build_ttsim.sh journey wh        # rebuild (~4 s)
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-journey-wh-release/libttsim.so
+B04_OUT=$LAB_HOME/journey.trace B04_TILE=0 $EX/metal_example_eltwise_binary
+...
+Test Passed
+[7959] 0.3 seconds (24.5 KHz)</code></pre>
+  <p>The clock count is <code>[7959]</code>, exactly what the stock simulator prints for this example (A11 and A13 report the same). The hooks only observe. The trace has 11,172 lines for core 0, including 192 NoC commands (64 tiles &times; two reads and one write). Two runs differ only in the data values, because input A is filled from <code>std::random_device</code> (<code>eltwise_binary.cpp:68-73</code>). With the datum fields removed, the two traces are identical, line for line. I then copied <a href="../sim-labs/overlays/a14/dprint/"><code>sim-labs/overlays/a14/dprint/</code></a> (A11's DPRINT overlay plus a <code>cb16</code> print in the writer) into <code>$LAB_HOME/kernels/</code> and reran with <code>TT_METAL_DPRINT_CORES=0,0</code> to confirm the CB addresses from the kernel's side. That run printed <code>cb0 fifo_addr=0x19e60 size=4096 limit=0x1ae60</code> and <code>cb16 fifo_addr=0x1be60 size=4096 limit=0x1ce60</code>, matching the addresses in the trace. (DPRINT shifts the clocks. We'll come back to that.)</p>
+  <p>The patch is saved as <a href="../sim-labs/patches/a14-journey.patch"><code>sim-labs/patches/a14-journey.patch</code></a>. I applied it to a fresh copy, rebuilt and reran, and got the same trace.</p>
+
+  <h2 id="journey">The journey, at three zoom levels</h2>
+  <p>Below, the trace for tile 0 is cut down to 48 events. Each one is a real line from <code>journey.trace</code> with its real clock. To pick the same 48 lines out of your own trace, run <code>python3 sim-labs/workbench/py/a14_journey.py $LAB_HOME/journey.trace</code> (<a href="../sim-labs/workbench/py/a14_journey.py">source</a>); only the <code>a0</code>/<code>b0</code>/<code>d0</code> datums should differ. The slider moves through them in trace order, which is the order in which ttsim executed them. The three panels show the same moment at three zoom levels: the <b>chip</b> (which tile of the 10&times;12 grid holds the data), the <b>core</b> (which RISC-V is acting, and which CB slot holds the data) and the <b>registers</b> (which Src bank, Dst rows, semaphore or packer). The tile glows wherever its newest copy is. A yellow outline marks the actor of the current event when that event moves no data. The strip at the bottom puts every event on a true clock axis. Notice the tower at 4523.</p>
+
+  <div class="viz" id="fig-journey">
+    <div class="controls" id="jctl">
+      <button id="jprev">Back</button><button id="jplay">Play</button><button id="jnext">Step</button><button id="jreset">Restart</button>
+      <input type="range" id="jslider" min="0" max="47" value="0" step="1" aria-label="event">
+      <span id="jinfo" style="color:var(--muted)"></span>
+    </div>
+    <div class="evcard" id="jcard"></div>
+  </div>
+
+  <div class="callout key">The tile is never "moved". Every hop is a copy: the host's <code>std::vector</code>, the DRAM page, the CB slot, the Src bank and the Dst rows each hold a version of tile 0 at once. The CB counters and the semaphore exist only to say <em>which copy is the live one</em> and when an old one may be overwritten.</div>
+
+  <h2 id="chip">Zoom 1: the chip</h2>
+  <p><b>Into DRAM.</b> At clock 4091 the host writes page 0 of A, 2048 bytes (32&times;32 bf16), into DRAM tile <span class="mono">D(0,11)</span> at <span class="mono">0x2d4c40</span>. Page 0 of B goes to the same tile at <span class="mono">0x2d7c40</span>. Why that tile? The buffers are interleaved with one tile per page, so page <i>i</i> goes to bank <i>i</i> mod 12 (<a href="a09-memory.html#pages">A09</a>). The soc descriptor maps bank 0 to channel 0's endpoint <span class="mono">0-11</span> (<code>soc_descriptors/wormhole_b0_80_arch.yaml:11-31</code>). <span class="mono">0x2d4c40</span> is the bottom of usable DRAM, the first buffer address A09's probe printed. So A, B and the output each start at the same offset in every bank: <span class="mono">0x2d4c40</span>, <span class="mono">0x2d7c40</span> and <span class="mono">0x2dac40</span>, 12&nbsp;KiB apart, because each of the 64-page buffers takes 6 pages = 12&nbsp;KiB of every bank. The trace logs 128 host writes of 2048&nbsp;B, all at clock 4091. ttsim only advances its clock when the host asks it to, so a burst of host writes shares a single clock value (<a href="a10-first-program.html#host">A10</a>; dispatch itself is <a href="a17-dispatch-host.html">A17</a>).</p>
+  <p><b>Across the NoC.</b> The reader runs on BRISC of logical core (0,0), which is NoC&nbsp;0 tile <span class="mono">T(1,1)</span> in ttsim's unharvested layout (<a href="a03-chip-tour.html#coords">A03</a>). At clock 4482 it issues a <code>READ</code> on NoC&nbsp;0, command buffer 1, from <span class="mono">D(0,11):0x2d4c40</span> to its own L1 at <span class="mono">0x19e60</span>. At 4486 it issues the matching read of B into <span class="mono">0x1ae60</span>. The route comes from <a href="a08-noc.html#routing">A08</a>, not from the simulator. NoC&nbsp;0 runs only right and down, so the one-flit request travels 9 hops right (wrapping) and 10 down, 19 in all. The 2&nbsp;KiB response rides the short leg, 1 right and 2 down (wrapping), 3 hops. ttsim models no routing. It copies the bytes inside the store that starts the command (<code>tile.cpp:1620</code>), which is why the read and the following <code>received=1</code> are only 17 clocks apart. In the figure, the hop paths are derived from the routing rule and the copy itself is real.</p>
+  <p><b>Back out.</b> The writer on NCRISC uses NoC&nbsp;1. At clock 4547 it issues a <code>WRITE</code>, command buffer 0, from <span class="mono">T(1,1):0x1be60</span> to <span class="mono">D(0,11):0x2dac40</span>, which is page 0 of the output buffer, also in bank 0. On NoC&nbsp;1 (up, then left) the data leg is 1 hop up, wrapping 1 more, then 1 left: 3 hops. That is the convention from <a href="a08-noc.html#one-way">A08</a> and <a href="a11-dataflow-and-cbs.html#rw">A11</a>: inbound on NoC&nbsp;0, outbound on NoC&nbsp;1, data on the short leg both times. Finally, at clock 7807, after <code>Finish</code>, the host reads <span class="mono">D(0,11):0x2dac40</span> back. It's the first of the output's 64 page reads.</p>
+
+  <div class="callout gpu">On a GPU, tile 0 would reach registers through <code>ld.global</code> and the cache hierarchy, and the addresses in between (L2 slice, L1 line) would be invisible and chosen by hardware. Here, three of the hops are explicit commands in your kernels (two NoC reads and one NoC write), and the destination of each is an address that your host code chose when it created the CBs.</div>
+
+  <h2 id="core">Zoom 2: the core</h2>
+  <p>Inside <span class="mono">T(1,1)</span>, five CPUs pass the tile along through three circular buffers in L1. The host made each CB 2 pages of 2048&nbsp;B (<code>eltwise_binary.cpp:90-108</code>), packed upward from the bottom of free L1. That gives c_0 at <span class="mono">0x19e60</span>, c_1 at <span class="mono">0x1ae60</span> and c_16 at <span class="mono">0x1be60</span>, each 0x1000 long. Tile 0 always uses slot 0 of each.</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp:34-57 @7aad8aac (comments removed)</div>
+<pre><code>    for (uint32_t i = 0; i &lt; n_tiles; i++) {
+        cb_wait_front(cb_in0, 1);                      // 36  TRISC0
+        cb_wait_front(cb_in1, 1);                      // 37  TRISC0
+        tile_regs_acquire();                           // 41  TRISC1: SEMWAIT MATH_PACK &lt; max
+        add_tiles(cb_in0, cb_in1, 0, 0, dst_reg);      // 43  TRISC0: unpack MOP; TRISC1: math MOP
+        tile_regs_commit();                            // 45  TRISC1: SEMPOST MATH_PACK
+        tile_regs_wait();                              // 46  TRISC2: SEMWAIT MATH_PACK &gt; 0
+        cb_reserve_back(cb_out0, 1);                   // 48  TRISC2
+        pack_tile(dst_reg, cb_out0);                   // 50  TRISC2: pack MOP
+        cb_push_back(cb_out0, 1);                      // 52  TRISC2
+        cb_pop_front(cb_in0, 1);                       // 53  TRISC0
+        cb_pop_front(cb_in1, 1);                       // 54  TRISC0
+        tile_regs_release();                           // 56  TRISC2: ZEROACC, SEMGET
+    }</code></pre>
+  <p>Read the trace against this listing and against the reader and writer loops from <a href="a11-dataflow-and-cbs.html#rw">A11</a>:</p>
+  <ul>
+    <li><b>4459, BRISC</b> reads c_0's counters (received 0, acked 0) in <code>reserve_back</code> (<code>read_tiles.cpp:44</code>): both slots are free.</li>
+    <li><b>4482/4486</b>, the two NoC reads. <b>4499, BRISC</b> writes c_0 <code>received=1</code> after <code>async_read_barrier</code> (lines 53-54). This is the publish from <a href="a11-dataflow-and-cbs.html#protocol">A11</a>. Until this store, the bytes at <span class="mono">0x19e60</span> exist, but no other CPU is allowed to believe them.</li>
+    <li><b>4501, TRISC0</b>, spinning in <code>cb_wait_front</code>, sees <code>received=1</code>. At 4508/4509 the same happens for c_1. Only TRISC0 runs these calls (<a href="a12-compute-kernels.html#cbs">A12</a>).</li>
+    <li><b>4507, TRISC2</b> is already in <code>cb_reserve_back(c_16)</code>. Its source line (48) comes <em>after</em> <code>tile_regs_wait</code>, but that call is only a queued <code>SEMWAIT</code>. The RISC-V pushes it and runs ahead (<a href="a04-inside-tensix.html#ahead">A04</a>).</li>
+    <li><b>4523, the Tensix side.</b> c_0 <code>acked=1</code> and c_1 <code>acked=1</code> are written by a <code>STOREREG</code> on the unpack thread (the trace's writer is <code>TENSIX</code>, not a RISC-V), and c_16 <code>received=1</code> by one on the pack thread. The LLK makes these counter updates wait behind <code>STALLWAIT</code> for the unpacker or packer (<code>llk_io_unpack.h:99-102</code>, <code>llk_io_pack.h:58-70</code>), so no other CPU can see "consumed" or "ready" early.</li>
+    <li><b>4523, NCRISC</b> sees c_16 <code>received=1</code> in the same clock. <b>4547</b>, the NoC write. <b>4560</b>, <code>acked=1</code> after the write barrier: slot 0 of c_16 is free again for tile 2.</li>
+  </ul>
+  <div class="callout warn">Source order and execution order differ. In the listing, line 48 (<code>cb_reserve_back</code>) comes after line 46 (<code>tile_regs_wait</code>), yet the trace shows TRISC2 at line 48 sixteen clocks before its <code>SEMWAIT</code> passes. Both lines run on TRISC2, but one is a RISC-V spin and the other is an instruction pushed into the coprocessor, which runs later. If you read a compute kernel as one sequential program, you will misread every trace like this.</div>
+
+  <h2 id="regs">Zoom 3: the registers</h2>
+  <p>The register story starts before the data arrives. At clock <b>4328</b>, MATH (thread T1) has passed <code>tile_regs_acquire</code>'s <code>SEMWAIT</code>, with MATH_PACK at 0 of max 2 (<a href="a12-compute-kernels.html#dst">A12</a>). At <b>4331</b> it pushes one <code>MOP</code>. The trace's ingest line shows the nine config words that <a href="a13-llk-mops-jit.html#template">A13</a> found in the binary: outer 4, inner 2, end op <span class="mono">SETRWC 0x37cc0003</span>, loop op <span class="mono">ELWADD 0x28000000</span>. The expander emits 12 instructions at once (8 ELWADD, 4 SETRWC). They are the same clocks, 4328 and 4331, that A13's own trace showed, because the run is deterministic. Then the first <code>ELWADD</code> waits at the wait gate. It retried 255 times over 192 clocks, because SrcA and SrcB had no valid bank (<a href="a04-inside-tensix.html#coproc">A04</a>). MATH was ready for tile 0 about 150 clocks before tile 0's bytes even reached the core's L1 (4482).</p>
+  <p>At <b>4523</b> TRISC0 pushes the unpack MOP (outer 2, inner 2, alternating <span class="mono">0x420080c1</span>/<span class="mono">0x428080c1</span>, which differ only in bit 23, the unpacker select). Everything else follows in the same clock:</p>
+  <div class="filename">$LAB_HOME/journey.trace, clock 4523 (trimmed: one face shown, P/E lines and other threads' bookkeeping removed). Fields: kind clock [round] thread …</div>
+<pre><code>M 4523 4376 T0 01800000 2 2 02000000 02000000 02000000 420080c1 428080c1 428080c1 428080c1
+UNP 4523 T0 srcA bank=0 l1=0x19e60 datums=256 first_row=0 fmt=5
+X 4523 4376 T0 420080c1 0 0 UNPACR
+UNP 4523 T0 srcB bank=0 l1=0x1ae60 datums=256 first_row=0 fmt=5
+X 4523 4377 T0 428080c1 0 0 UNPACR
+ELW 4523 T1 srca_bank=0 srca_row=0 srcb_bank=0 srcb_row=0 dst_row=0 a0=3eb5 b0=bf80
+ELWD 4523 T1 dst_row=0 d0=bf26
+X 4523 4377 T1 28000000 255 192 ELWADD
+ELW 4523 T1 srca_bank=0 srca_row=8 srcb_bank=0 srcb_row=8 dst_row=8 a0=3f74 b0=bf80
+X 4523 4378 T1 28000000 0 0 ELWADD
+X 4523 4379 T1 37cc0003 0 0 SETRWC
+...                                                  (faces 1-3: banks 1, 0, 1; Dst rows 16-63)
+X 4523 4391 T1 a4000008 0 0 SEMPOST sem1=1/2
+X 4523 4391 T2 a6008009 34 17 SEMWAIT sem1=1/2
+PCK 4523 T2 packer=0 dst_row=0 datums=256 l1=0x1be60 d0=bf26
+PCK 4523 T2 packer=1 dst_row=16 datums=256 l1=0x1c060 d0=bf53
+PCK 4523 T2 packer=2 dst_row=32 datums=256 l1=0x1c260 d0=bf55
+PCK 4523 T2 packer=3 dst_row=48 datums=256 l1=0x1c460 d0=bf33
+X 4523 4398 T2 41008f11 0 0 PACR
+X 4523 4404 T2 a5000008 0 0 SEMGET sem1=0/2</code></pre>
+  <p>Read it face by face, because that's how the hardware works:</p>
+  <ul>
+    <li><b>Unpack.</b> Each <code>UNPACR</code> moves one 16&times;16 face (256 datums, 512&nbsp;B) from L1 into a Src bank and sets that bank valid. Face 0 of A comes from <span class="mono">0x19e60</span>, face 1 from <span class="mono">0x1a060</span>, and so on, 0x200 apart. This is the face layout from <a href="a05-tiles-and-formats.html">A05</a> seen directly in L1. Format 5 is Float16_b.</li>
+    <li><b>Banks alternate per face.</b> The SrcA banks used are 0, 1, 0, 1 across the four faces, and the same for SrcB. <a href="a06-matrix-engine.html#registers">A06</a> said a bank <em>can</em> hold a whole tile. The eltwise LLK uses it one face at a time: after two ELWADDs, the MOP's end op <code>SETRWC(CLR_AB)</code> clears both valid bits and flips the matrix unit to the other bank, while the unpacker is already filling it (<a href="a13-llk-mops-jit.html#template">A13</a>).</li>
+    <li><b>Math.</b> Each <code>ELWADD</code> adds 8 rows of 16. Dst rows advance 0, 8, 16, … 56 through the RWC counter, so the instruction word is the same constant every time (<a href="a13-llk-mops-jit.html#encoding">A13</a>). The first datum in this run is A = <span class="mono">0x3eb5</span> (0.354), B = <span class="mono">0xbf80</span> (&minus;1.0), and Dst row 0 holds <span class="mono">0xbf26</span> (&minus;0.648). Tile 0 occupies Dst rows 0-63, in the first half. Tile 1 goes to row 512 (the <code>SETC16 … 0x200</code> in the trace), as A12's double-buffered Dst predicts.</li>
+    <li><b>Hand-off.</b> <code>SEMPOST</code> takes MATH_PACK from 0 to 1. PACK's <code>SEMWAIT</code> (queued 17 clocks earlier) passes in the same issue round.</li>
+    <li><b>Pack.</b> A <code>PACR</code> with Flush=1 (zero datums, fresh output addresses; <code>PACR.md:40</code>) comes first. Then the pack MOP's single <code>PACR</code> sends all four packers at once (PackerMask 15). Packer <i>k</i> reads Dst rows 16<i>k</i>…16<i>k</i>+15 and writes 256 datums to <span class="mono">0x1be60 + 0x200&middot;k</span>. Packer 0's first datum, <span class="mono">0xbf26</span>, is the same value ELWADD wrote. Then <code>ZEROACC</code> clears the half and <code>SEMGET</code> takes MATH_PACK back to 0.</li>
+  </ul>
+
+  <div class="callout sim">To build these probes yourself one at a time: <a href="../sim-labs/b04-tensix-instructions.html">B04 · Following Tensix instructions</a> (per-pipe opcode traces, MOP expansion, Src-valid stalls), <a href="../sim-labs/b05-noc-and-dram.html">B05 · NoC transactions, DRAM and the alignment trap</a> (the NoC log) and <a href="../sim-labs/b06-cbs-and-semaphores.html">B06 · Circular buffers and semaphores</a> (CB pointers and the Dst handshake).</div>
+
+  <h2 id="hops">Every hop, with real values</h2>
+  <p>Here is the same journey as a table. Each value is from <code>journey.trace</code> unless marked <i>derived</i>. "Round" is ttsim's issue-round counter for this core, explained in the next section.</p>
+  <table>
+    <tr><th>#</th><th>Hop</th><th>Real values</th><th>Clock</th><th>Code</th><th>Taught in</th></tr>
+    <tr><td>1</td><td>Host RAM → DRAM</td><td class="mono">D(0,11):0x2d4c40 (A), :0x2d7c40 (B), 2048 B each</td><td>4091</td><td class="mono">eltwise_binary.cpp:80-81</td><td><a href="a09-memory.html#pages">A09 pages</a>, <a href="a10-first-program.html#host">A10</a>, <a href="a03-chip-tour.html#map">A03 map</a></td></tr>
+    <tr><td>2</td><td>MATH arms itself (no data yet)</td><td class="mono">SEMWAIT 0xa6a1000a sem1=0/2; MOP 0x01800000 → 8 ELWADD + 4 SETRWC</td><td>4328, 4331</td><td class="mono">tiles_add.cpp:41,43</td><td><a href="a13-llk-mops-jit.html#pertile">A13 per tile</a>, <a href="a12-compute-kernels.html#dst">A12 Dst</a></td></tr>
+    <tr><td>3</td><td>Reader finds a free slot</td><td class="mono">c_0 received=0 acked=0 (BRISC)</td><td>4459</td><td class="mono">read_tiles.cpp:44</td><td><a href="a11-dataflow-and-cbs.html#protocol">A11 six calls</a></td></tr>
+    <tr><td>4</td><td>DRAM → L1 over NoC 0</td><td class="mono">READ noc=0 buf=1 D(0,11):0x2d4c40 → T(1,1):0x19e60; :0x2d7c40 → :0x1ae60; 19 + 3 hops <i>(derived)</i></td><td>4482, 4486</td><td class="mono">read_tiles.cpp:49,51</td><td><a href="a08-noc.html#routing">A08 routing</a>, <a href="a08-noc.html#sim">A08 sim</a>, <a href="a11-dataflow-and-cbs.html#barriers">A11 barriers</a></td></tr>
+    <tr><td>5</td><td>Publish to compute</td><td class="mono">c_0 received=1 (4499), c_1 received=1 (4508)</td><td>4499, 4508</td><td class="mono">read_tiles.cpp:53-55</td><td><a href="a11-dataflow-and-cbs.html#ring">A11 ring</a></td></tr>
+    <tr><td>6</td><td>UNPACK sees it</td><td class="mono">TRISC0 reads received=1</td><td>4501, 4509</td><td class="mono">tiles_add.cpp:36-37</td><td><a href="a12-compute-kernels.html#cbs">A12 CBs</a></td></tr>
+    <tr><td>7</td><td>L1 → SrcA/SrcB</td><td class="mono">unpack MOP (outer 2, inner 2) → 8 UNPACR; A faces from 0x19e60/0x1a060/0x1a260/0x1a460, B from 0x1ae60…0x1b460; banks 0,1,0,1</td><td>4523 (rounds 4376-4384)</td><td class="mono">tiles_add.cpp:43</td><td><a href="a06-matrix-engine.html#registers">A06 registers</a>, <a href="a13-llk-mops-jit.html#expander">A13 expander</a></td></tr>
+    <tr><td>8</td><td>SrcA + SrcB → Dst</td><td class="mono">8 × ELWADD 0x28000000, Dst rows 0-63; SETRWC 0x37cc0003 after each face</td><td>4523 (rounds 4377-4388)</td><td class="mono">tiles_add.cpp:43</td><td><a href="a13-llk-mops-jit.html#template">A13 template</a>, <a href="a04-inside-tensix.html#coproc">A04 wait gate</a></td></tr>
+    <tr><td>9</td><td>Inputs released</td><td class="mono">STOREREG: c_0 acked=1, c_1 acked=1</td><td>4523 (rounds 4389, 4401)</td><td class="mono">tiles_add.cpp:53-54</td><td><a href="a12-compute-kernels.html#cbs">A12 CBs</a></td></tr>
+    <tr><td>10</td><td>MATH → PACK</td><td class="mono">SEMPOST sem1 0→1; PACK SEMWAIT passes (34 tries, 17 clocks)</td><td>4523 (round 4391)</td><td class="mono">tiles_add.cpp:45-46</td><td><a href="a12-compute-kernels.html#dst">A12 Dst handshake</a>, <a href="a04-inside-tensix.html#sync">A04 Sync unit</a></td></tr>
+    <tr><td>11</td><td>Dst → L1</td><td class="mono">PACR 0x41008f11, 4 packers: rows 0/16/32/48 → 0x1be60/0x1c060/0x1c260/0x1c460</td><td>4523 (round 4398)</td><td class="mono">tiles_add.cpp:50</td><td><a href="a04-inside-tensix.html#coproc">A04 backend</a>, <a href="a12-compute-kernels.html#dst">A12</a></td></tr>
+    <tr><td>12</td><td>Publish to writer; free Dst</td><td class="mono">c_16 received=1 (STOREREG); ZEROACC; SEMGET sem1 1→0</td><td>4523 (rounds 4401-4404)</td><td class="mono">tiles_add.cpp:52,56</td><td><a href="a12-compute-kernels.html#dst">A12</a></td></tr>
+    <tr><td>13</td><td>L1 → DRAM over NoC 1</td><td class="mono">WRITE noc=1 buf=0 T(1,1):0x1be60 → D(0,11):0x2dac40; 3 hops <i>(derived)</i></td><td>4547</td><td class="mono">write_tile.cpp:30-32</td><td><a href="a08-noc.html#one-way">A08 one-way</a>, <a href="a11-dataflow-and-cbs.html#barriers">A11 barriers</a></td></tr>
+    <tr><td>14</td><td>Slot freed</td><td class="mono">c_16 acked=1 (NCRISC)</td><td>4560</td><td class="mono">write_tile.cpp:33-39</td><td><a href="a11-dataflow-and-cbs.html#protocol">A11</a></td></tr>
+    <tr><td>15</td><td>DRAM → host</td><td class="mono">host read D(0,11):0x2dac40, 2048 B</td><td>7807</td><td class="mono">eltwise_binary.cpp:163</td><td><a href="a10-first-program.html#journey">A10 journey</a>, <a href="a09-memory.html#dram">A09 DRAM</a></td></tr>
+  </table>
+  <p>Count the copies: host → DRAM → L1 → Src → Dst → L1 → DRAM → host. That's seven hops. Three of them are commands your data-movement kernels issue, three are Tensix instructions your compute kernel never names (UNPACR, ELWADD and PACR all come from MOPs), and one is the host driver. In between sit four synchronization points: two CB publishes, one semaphore post and one more CB publish. Each is a single counter changing value.</p>
+
+  <h2 id="clocks">What the clock numbers mean, and what they don't</h2>
+  <p>Look at the strip under the big figure again. Thirty-two of the 48 events share one clock value, 4523, and that's no coincidence. ttsim's main loop has a deliberate shortcut: "for simulator perf, we clock a tile repeatedly as long as it successfully executes at least one Tensix instruction" (<code>libttsim.cpp:252</code>). During one tick of <code>g_clock</code>, core 0 went round that inner loop from round 4375 to round 4404. That was 30 rounds, with 50 Tensix instructions executed and 144 trace lines. All of the unpacking, all eight ELWADDs, the semaphore hand-off and the packing landed in a single "clock". The B04 patch's round counter is what lets the figure keep them in order.</p>
+  <p>So, three rules for reading any ttsim trace, this one included:</p>
+  <ol>
+    <li><b>Clocks are not silicon timing.</b> ttsim is a functional, bit-exact model with no timing model (<a href="a09-memory.html#sim">A09</a>, <code>research/06-feasibility.md</code>). The host drives the clock, the NoC takes zero clocks (A08), and Tensix work is squeezed by the shortcut above. On silicon an ELWADD takes cycles, and a 2&nbsp;KiB NoC read takes hundreds of nanoseconds. The 192-clock ELWADD stall here says that MATH was early, not how early it would be on hardware.</li>
+    <li><b>Order along a dependency is meaningful.</b> Read → publish → wait satisfied → unpack → add → post → pack → publish → write → free. Each step causes the next through a counter, a valid bit or a semaphore, so no correct simulator, and no correct chip, can reorder them.</li>
+    <li><b>Order between independent actors is not.</b> I reran with the DPRINT overlay above (which polls the device and so adds host reads). The final clock rose from 7959 to 11479, and tile 0's add moved from clock 4523 to 6707. The 47 data-path and handshake events came out in exactly the same order. One event moved: TRISC2's <code>cb_reserve_back(c_16)</code>, which nothing on tile 0's path waits for, appeared earlier in the sequence, before the reader's <code>reserve_back</code> instead of after c_0's push. DPRINT runs are not even repeatable: the host's polling depends on wall time, and a second DPRINT run ended at 11507 with the add at 6744. In that run PACK's <code>SEMGET</code> also swapped places with NCRISC's <code>wait_front</code>, two more actors that do not wait on each other. The dependency chain kept its order both times.</li>
+  </ol>
+  <div class="callout warn">"Tile 0 was in Dst for zero clocks" is true of this ttsim run and false of any real chip. Never use ttsim clock gaps to argue about overlap or speed. Use them to argue about order, and only along a chain of synchronization. For timing on silicon, see the profiler in <a href="a20-performance.html">A20</a>.</div>
+
+  <h2 id="where">Where is it now?</h2>
+  <p>Test your model. Pick a clock value, either with a preset button or with the slider, and decide where the <em>newest live copy</em> of tile 0 is at the end of that clock. Then reveal the answer. The answer is worked out from the same 48 trace events as the figure above. Some choices are never correct in this run. Finding out which ones, and why, is the point of the exercise.</p>
+  <div class="viz" id="fig-where">
+    <div class="controls">
+      <label>clock <input type="range" id="wslider" min="4000" max="7900" value="4300" step="1"></label>
+      <span id="wclock" class="mono" style="color:var(--yellow);min-width:4.5em"></span>
+      <span id="wpresets"></span>
+    </div>
+    <div class="qchoices" id="wchoices"></div>
+    <div class="controls"><button id="wreveal">Reveal</button><span id="wscore" style="color:var(--muted);margin-left:auto"></span></div>
+    <div class="evcard" id="wcard">Pick a clock, choose a location, then press Reveal.</div>
+  </div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>Chip.</b> The host writes tile 0 of A and B into DRAM bank 0, tile <span class="mono">D(0,11)</span>, at <span class="mono">0x2d4c40</span> and <span class="mono">0x2d7c40</span>. BRISC reads them over NoC 0 into core <span class="mono">T(1,1)</span> (logical (0,0)). NCRISC writes the sum over NoC 1 to <span class="mono">D(0,11):0x2dac40</span>, and the host reads it back. On each NoC the data takes the 3-hop leg.</li>
+    <li><b>Core.</b> The data sits in slot 0 of c_0 (<span class="mono">0x19e60</span>), c_1 (<span class="mono">0x1ae60</span>) and c_16 (<span class="mono">0x1be60</span>). Ownership changes hands through counter values: BRISC <code>received=1</code>, then TRISC0 sees it, Tensix <code>STOREREG</code>s set <code>acked=1</code> and c_16 <code>received=1</code>, then NCRISC sees it and later sets <code>acked=1</code>.</li>
+    <li><b>Registers.</b> Two MOPs (unpack and math) and one pack MOP become 8 UNPACR, 8 ELWADD, 4 SETRWC and 1 PACR. Src banks alternate per face. Dst rows 0-63 hold the sum. MATH_PACK goes 0 → 1 → 0. Four packers write the four faces 0x200 apart.</li>
+    <li><b>Every hop is a copy.</b> Synchronization only decides which copy is live.</li>
+    <li><b>Clocks.</b> ttsim clocks give order, not time. Thirty-two of the 48 events share clock 4523 because ttsim runs a busy core for many rounds per clock. Order along a dependency chain survives instrumentation changes. Order between independent actors does not.</li>
+  </ul>
+  <p>Next, <a href="a15-matmul-one-to-many.html">A15</a> keeps this path but changes the arithmetic to matmul: the same CBs and handshakes, with MVMUL instead of ELWADD, and then many cores instead of one.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>The trace shows the first ELWADD of tile 0 "executed at 4523 after 255 tries over 192 clocks". Which clock was it pushed at, and what was it waiting for?</summary><p>It reached the wait gate at clock 4331, when MATH's MOP expanded into 8 ELWADDs and 4 SETRWCs (4523 &minus; 192 = 4331). The trace has a <code>D … T1 01800000 12</code> line at 4331. MATH never waits on a CB (<a href="a12-compute-kernels.html#cbs">A12</a>), so it got there early. The ELWADD waited for SrcA and SrcB to have a valid bank (<code>tensix_elw_op</code> returns false until both are valid, which the wait gate retries). Only TRISC0's UNPACRs at 4523 set those bits.</p></details>
+  <details class="quiz"><summary>Why does the trace attribute c_0's <code>acked=1</code> to "TENSIX" rather than to TRISC0, even though <code>cb_pop_front</code> is TRISC0 code?</summary><p>On the unpack core, <code>cb_pop_front</code> doesn't store to the stream register itself. It pushes <code>SETDMAREG</code>, <code>STALLWAIT(…UNPACK)</code> and <code>STOREREG</code> into the coprocessor (<code>llk_io_unpack.h:99-102</code>). The store happens when the STOREREG executes, after the unpacker has finished reading the slot, and ttsim performs it with no RISC-V id (<code>tensix.cpp</code> STOREREG calls <code>tile_mmio_wr32</code> with <code>0xFFFFFFFF</code>). That ordering is the guarantee: the reader can't reuse <span class="mono">0x19e60</span> while UNPACR might still be reading it.</p></details>
+  <details class="quiz"><summary>Page 0 of A, B and the output all live in DRAM bank 0 at 0x2d4c40, 0x2d7c40 and 0x2dac40. Why 0x3000 apart, and where would page 1 of A be?</summary><p>Each buffer is 64 pages of 2048 B, interleaved round-robin over 12 banks. 64/12 rounds up to 6 pages per bank, and 6 &times; 2048 = 12 KiB = 0x3000 of every bank, so consecutive buffers start 0x3000 apart in each bank. Page 1 goes to bank 1, which the trace shows as <span class="mono">D(0,1):0x402d4c40</span>: the same in-bank offset plus the 1 GiB <code>address_offset</code> that odd-numbered banks have on Wormhole (<a href="a09-memory.html#dram">A09</a>).</p></details>
+  <details class="quiz"><summary>The reader's two NoC reads and its <code>received=1</code> store are 13-17 clocks apart. On silicon, roughly how would that gap compare, and why can't ttsim tell you?</summary><p>On silicon the gap would be at least the NoC round trip plus DRAM latency for 2 KiB: a request travelling 19 hops and a 65-flit response on 3 hops, plus DRAM access. That's hundreds of cycles or more, and it varies with traffic. ttsim completes the copy inside the store that issues the command (<code>tile.cpp:1620</code>), so the gap it shows is just the RISC-V instructions between the two stores. It has no routing, no link contention and no DRAM model. The order (read, then barrier, then push) is meaningful. The gap is not.</p></details>
+  <details class="quiz"><summary>If you changed <code>tiles_per_cb</code> from 2 to 1 for c_16, which events in tile 0's journey would change, and which of tile 1's?</summary><p>Tile 0's path would be the same: c_16 starts empty, so PACK's <code>cb_reserve_back</code> passes at once and the addresses don't change (c_16 would still start at 0x1be60, at half the size). Tile 1 is different. With one page, PACK's <code>cb_reserve_back</code> for tile 1 must wait until NCRISC sets c_16 <code>acked=1</code> (clock 4560 for tile 0), so tile 1's pack can't overlap tile 0's NoC write. It would also pack into 0x1be60 instead of 0x1c660. This is A11's one-page versus two-page pipeline (<a href="a11-dataflow-and-cbs.html#pipeline">A11</a>), and ttsim would only show it as a change in event order, not as lost time.</p></details>
+  <details class="quiz"><summary>In this ttsim run, at the end of any clock, is tile 0 ever "in Dst"? What does that tell you about using the simulator?</summary><p>No. All of its Dst activity (8 ELWADDs, PACR, ZEROACC) happens inside clock 4523. At the end of 4523 the live copy is already c_16 in L1. Use ttsim to check where data goes and in what order the handshakes fire. Don't use it to check how long data stays anywhere.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/eltwise_binary.html">Eltwise binary example (TT-Metalium docs)</a>: the official walkthrough of the program traced here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix</a>: unpack → math → pack, and the Dst handshake, from Tenstorrent.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/RoutingPaths.md">RoutingPaths.md (tt-isa-documentation)</a>: the one-way NoC 0 / NoC 1 routing rules behind the derived hop counts.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/README.md">Tensix coprocessor overview</a>: threads, frontends, backend units and the shared registers.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md">SrcA and SrcB</a>: the two banks and their AllowedClient hand-off between unpackers and matrix unit.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/UNPACR.md">UNPACR</a> and <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/PACR.md">PACR</a>: the instructions at both ends of the register journey, including Flush and PackerMask.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/WaitGate.md">Wait gate</a>: why the ELWADD sat in the FIFO for 192 clocks.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">Sync unit</a>: the semaphores behind MATH_PACK.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: tt-metal's own architectural tour of the same reader/compute/writer pipeline.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">tenstorrent/ttsim</a>: the simulator instrumented here.</li>
+    <li><a href="https://www.corsix.org/content/tt-wh-part1">Tenstorrent Wormhole series, part 1 (corsix.org)</a>: an independent hands-on exploration of the same hardware from the bottom up.</li>
+  </ul>
+
+  <div class="pager"><a href="a13-llk-mops-jit.html">&larr; 13 Under the hood: LLK, MOPs and the JIT</a><a class="next" href="a15-matmul-one-to-many.html">15 Matmul on one core, then many &rarr;</a></div>
+</main>
+
+<script>
+/* The 48 tile-0 events below are lines of $LAB_HOME/journey.trace (ttsim b3620244 + a14-journey.patch,
+   metal_example_eltwise_binary, Wormhole), picked out with one regex per event by sim-labs/workbench/py/a14_journey.py; "n" is the trace line number. */
+var EV = [{"n":37,"clk":4091,"rnd":1874,"raw":"HOSTW 4091 D(0,11):0x2d4c40 len=2048","zoom":"chip","loc":"dram_in","src":"eltwise_binary.cpp:80 EnqueueWriteMeshBuffer(src0)","text":"Host writes page 0 of A (2048 B, bf16 tile 0) through a PCIe TLB window into DRAM bank 0, tile D(0,11), at 0x2d4c40."},{"n":101,"clk":4091,"rnd":1874,"raw":"HOSTW 4091 D(0,11):0x2d7c40 len=2048","zoom":"chip","loc":"dram_in","src":"eltwise_binary.cpp:81 EnqueueWriteMeshBuffer(src1)","text":"Page 0 of B (all -1.0) lands in the same bank at 0x2d7c40. Page 0 of every interleaved buffer goes to bank 0."},{"n":269,"clk":4328,"rnd":4117,"raw":"X 4328 4117 T1 a6a1000a 0 0 SEMWAIT sem1=0/2","zoom":"reg","loc":"math_wait","src":"tiles_add.cpp:41 tile_regs_acquire()","text":"TRISC1 (MATH) is already at tile 0: its SEMWAIT on MATH_PACK passes at once (value 0, max 2). No data has reached the core yet.","sem":0},{"n":273,"clk":4331,"rnd":4122,"raw":"M 4331 4122 T1 01800000 4 2 02000000 37cc0003 02000000 28000000 02000000 28000000 28000000","zoom":"reg","loc":"math_wait","src":"tiles_add.cpp:43 add_tiles() -> ckernel_template::run()","text":"MATH pushes one MOP. The expander samples the 9 config words (outer 4, inner 2) and emits 12 instructions: 8 ELWADD + 4 SETRWC."},{"n":286,"clk":4331,"rnd":4122,"raw":"D 4331 4122 T1 01800000 12","zoom":"reg","loc":"math_wait","src":"ckernel_template.h:16-26 (MOP template 1)","text":"Expansion done: 12 instructions sit in thread 1's FIFO. The first ELWADD now waits at the wait gate for SrcA and SrcB to become valid."},{"n":415,"clk":4459,"rnd":4288,"raw":"CBR 4459 BRISC cb=0 acked=0","zoom":"core","loc":"reader","src":"read_tiles.cpp:44 cb_in0_buf.reserve_back(1)","text":"BRISC (reader) reads c_0's counters: received 0, acked 0, so 2 of 2 pages are free. reserve_back returns.","cb":{"0":[0,0]}},{"n":441,"clk":4482,"rnd":4321,"raw":"NOC 4482 READ noc=0 core=T(1,1) tile=0 buf=1 src=D(0,11):0x2d4c40 dst=T(1,1):0x19e60 len=2048","zoom":"chip","loc":"noc_in","src":"read_tiles.cpp:49 noc.async_read(in0, cb_in0_buf, ...)","text":"BRISC programs NoC 0: READ 2048 B from D(0,11):0x2d4c40 into its own L1 at 0x19e60, c_0's first page. ttsim copies the bytes inside this one store.","noc":"read0"},{"n":464,"clk":4486,"rnd":4332,"raw":"NOC 4486 READ noc=0 core=T(1,1) tile=0 buf=1 src=D(0,11):0x2d7c40 dst=T(1,1):0x1ae60 len=2048","zoom":"chip","loc":"noc_in","src":"read_tiles.cpp:51 noc.async_read(in1, cb_in1_buf, ...)","text":"Second read on NoC 0: B's page 0 into c_1 at 0x1ae60. Same bank, same route: request 19 hops out, data 3 hops back (derived, not simulated).","noc":"read1"},{"n":465,"clk":4499,"rnd":4332,"raw":"CBW 4499 BRISC cb=0 received=1","zoom":"core","loc":"cb_in","src":"read_tiles.cpp:53-54 async_read_barrier(); push_back(1)","text":"After the read barrier, BRISC bumps c_0's received counter (stream register 0) to 1. The tile is now published.","cb":{"0":[1,0]}},{"n":466,"clk":4501,"rnd":4332,"raw":"CBR 4501 TRISC0 cb=0 received=1","zoom":"core","loc":"cb_in","src":"tiles_add.cpp:36 cb_wait_front(cb_in0, 1)","text":"TRISC0 (UNPACK), spinning in cb_wait_front, sees received=1 two clocks later. Only TRISC0 runs this call."},{"n":469,"clk":4507,"rnd":4357,"raw":"CBR 4507 TRISC2 cb=16 acked=0","zoom":"core","loc":"pack_ahead","src":"tiles_add.cpp:48 cb_reserve_back(cb_out0, 1)","text":"TRISC2 (PACK) is already in cb_reserve_back for c_16: its RISC-V ran past tile_regs_wait, which is only a queued SEMWAIT."},{"n":470,"clk":4508,"rnd":4357,"raw":"CBW 4508 BRISC cb=1 received=1","zoom":"core","loc":"cb_in","src":"read_tiles.cpp:55 cb_in1_buf.push_back(1)","text":"c_1 is published too.","cb":{"1":[1,0]}},{"n":471,"clk":4509,"rnd":4357,"raw":"CBR 4509 TRISC0 cb=1 received=1","zoom":"core","loc":"cb_in","src":"tiles_add.cpp:37 cb_wait_front(cb_in1, 1)","text":"TRISC0 sees B's tile. It now programs the unpackers' base addresses from the two CB read pointers."},{"n":481,"clk":4523,"rnd":4376,"raw":"M 4523 4376 T0 01800000 2 2 02000000 02000000 02000000 420080c1 428080c1 428080c1 428080c1","zoom":"reg","loc":"unpack","src":"tiles_add.cpp:43 add_tiles() -> _llk_unpack_AB_ (llk_unpack_AB.h)","text":"UNPACK pushes its MOP: outer 2, inner 2, two loop ops. Alternating gives A, B, A, B ... 8 UNPACRs, one face of A or B each."},{"n":491,"clk":4523,"rnd":4376,"raw":"UNP 4523 T0 srcA bank=0 l1=0x19e60 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 0)","text":"UNPACR reads face 0 of A (256 datums) from L1 0x19e60 into SrcA bank 0 and marks the bank valid.","src_sel":"A","bank":0,"face":0,"l1":"0x19e60"},{"n":494,"clk":4523,"rnd":4377,"raw":"UNP 4523 T0 srcB bank=0 l1=0x1ae60 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 1)","text":"UNPACR reads face 0 of B (256 datums) from L1 0x1ae60 into SrcB bank 0 and marks the bank valid.","src_sel":"B","bank":0,"face":0,"l1":"0x1ae60"},{"n":496,"clk":4523,"rnd":4377,"raw":"ELW 4523 T1 srca_bank=0 srca_row=0 srcb_bank=0 srcb_row=0 dst_row=0 a0=3eb5 b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 0 rows 0-7 + SrcB bank 0 rows 0-7 -> Dst rows 0-7. This ELWADD was queued at clock 4331 and retried 255 times over 192 clocks at the wait gate.","bank":0,"face":0,"dst_row":0,"a0":"3eb5","b0":"bf80","d0":"bf26"},{"n":500,"clk":4523,"rnd":4378,"raw":"UNP 4523 T0 srcA bank=1 l1=0x1a060 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 0)","text":"UNPACR reads face 1 of A (256 datums) from L1 0x1a060 into SrcA bank 1 and marks the bank valid.","src_sel":"A","bank":1,"face":1,"l1":"0x1a060"},{"n":502,"clk":4523,"rnd":4378,"raw":"ELW 4523 T1 srca_bank=0 srca_row=8 srcb_bank=0 srcb_row=8 dst_row=8 a0=3f74 b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 0 rows 8-15 + SrcB bank 0 rows 8-15 -> Dst rows 8-15.","bank":0,"face":0,"dst_row":8,"a0":"3f74","b0":"bf80","d0":"bd40"},{"n":507,"clk":4523,"rnd":4379,"raw":"UNP 4523 T0 srcB bank=1 l1=0x1b060 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 1)","text":"UNPACR reads face 1 of B (256 datums) from L1 0x1b060 into SrcB bank 1 and marks the bank valid.","src_sel":"B","bank":1,"face":1,"l1":"0x1b060"},{"n":509,"clk":4523,"rnd":4379,"raw":"X 4523 4379 T1 37cc0003 0 0 SETRWC","zoom":"reg","loc":"src","src":"MOP end op SETRWC(CLR_AB) (llk_math_eltwise_binary.h:141-151)","text":"End of face 0: SETRWC clears both Src valid bits and flips the matrix unit to the other bank, so the unpacker can refill this one.","face":0,"flip":true},{"n":511,"clk":4523,"rnd":4380,"raw":"UNP 4523 T0 srcA bank=0 l1=0x1a260 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 0)","text":"UNPACR reads face 2 of A (256 datums) from L1 0x1a260 into SrcA bank 0 and marks the bank valid.","src_sel":"A","bank":0,"face":2,"l1":"0x1a260"},{"n":513,"clk":4523,"rnd":4380,"raw":"ELW 4523 T1 srca_bank=1 srca_row=0 srcb_bank=1 srcb_row=0 dst_row=16 a0=3e33 b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 1 rows 0-7 + SrcB bank 1 rows 0-7 -> Dst rows 16-23.","bank":1,"face":1,"dst_row":16,"a0":"3e33","b0":"bf80","d0":"bf53"},{"n":517,"clk":4523,"rnd":4381,"raw":"UNP 4523 T0 srcB bank=0 l1=0x1b260 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 1)","text":"UNPACR reads face 2 of B (256 datums) from L1 0x1b260 into SrcB bank 0 and marks the bank valid.","src_sel":"B","bank":0,"face":2,"l1":"0x1b260"},{"n":519,"clk":4523,"rnd":4381,"raw":"ELW 4523 T1 srca_bank=1 srca_row=8 srcb_bank=1 srcb_row=8 dst_row=24 a0=3ea7 b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 1 rows 8-15 + SrcB bank 1 rows 8-15 -> Dst rows 24-31.","bank":1,"face":1,"dst_row":24,"a0":"3ea7","b0":"bf80","d0":"bf2d"},{"n":523,"clk":4523,"rnd":4382,"raw":"X 4523 4382 T1 37cc0003 0 0 SETRWC","zoom":"reg","loc":"src","src":"MOP end op SETRWC(CLR_AB) (llk_math_eltwise_binary.h:141-151)","text":"End of face 1: SETRWC clears both Src valid bits and flips the matrix unit to the other bank, so the unpacker can refill this one.","face":1,"flip":true},{"n":525,"clk":4523,"rnd":4383,"raw":"UNP 4523 T0 srcA bank=1 l1=0x1a460 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 0)","text":"UNPACR reads face 3 of A (256 datums) from L1 0x1a460 into SrcA bank 1 and marks the bank valid.","src_sel":"A","bank":1,"face":3,"l1":"0x1a460"},{"n":527,"clk":4523,"rnd":4383,"raw":"ELW 4523 T1 srca_bank=0 srca_row=0 srcb_bank=0 srcb_row=0 dst_row=32 a0=3e2d b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 0 rows 0-7 + SrcB bank 0 rows 0-7 -> Dst rows 32-39.","bank":0,"face":2,"dst_row":32,"a0":"3e2d","b0":"bf80","d0":"bf55"},{"n":534,"clk":4523,"rnd":4384,"raw":"UNP 4523 T0 srcB bank=1 l1=0x1b460 datums=256 first_row=0 fmt=5","zoom":"reg","loc":"src","src":"llk_unpack_AB.h MOP -> UNPACR (unpacker 1)","text":"UNPACR reads face 3 of B (256 datums) from L1 0x1b460 into SrcB bank 1 and marks the bank valid.","src_sel":"B","bank":1,"face":3,"l1":"0x1b460"},{"n":536,"clk":4523,"rnd":4384,"raw":"ELW 4523 T1 srca_bank=0 srca_row=8 srcb_bank=0 srcb_row=8 dst_row=40 a0=3e5d b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 0 rows 8-15 + SrcB bank 0 rows 8-15 -> Dst rows 40-47.","bank":0,"face":2,"dst_row":40,"a0":"3e5d","b0":"bf80","d0":"bf49"},{"n":542,"clk":4523,"rnd":4385,"raw":"X 4523 4385 T1 37cc0003 0 0 SETRWC","zoom":"reg","loc":"src","src":"MOP end op SETRWC(CLR_AB) (llk_math_eltwise_binary.h:141-151)","text":"End of face 2: SETRWC clears both Src valid bits and flips the matrix unit to the other bank, so the unpacker can refill this one.","face":2,"flip":true},{"n":545,"clk":4523,"rnd":4386,"raw":"ELW 4523 T1 srca_bank=1 srca_row=0 srcb_bank=1 srcb_row=0 dst_row=48 a0=3e9a b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 1 rows 0-7 + SrcB bank 1 rows 0-7 -> Dst rows 48-55.","bank":1,"face":3,"dst_row":48,"a0":"3e9a","b0":"bf80","d0":"bf33"},{"n":550,"clk":4523,"rnd":4387,"raw":"ELW 4523 T1 srca_bank=1 srca_row=8 srcb_bank=1 srcb_row=8 dst_row=56 a0=3f74 b0=bf80","zoom":"reg","loc":"dst","src":"MOP -> ELWADD 0x28000000 (llk_math_eltwise_binary.h)","text":"ELWADD adds 8 rows: SrcA bank 1 rows 8-15 + SrcB bank 1 rows 8-15 -> Dst rows 56-63.","bank":1,"face":3,"dst_row":56,"a0":"3f74","b0":"bf80","d0":"bd40"},{"n":554,"clk":4523,"rnd":4388,"raw":"X 4523 4388 T1 37cc0003 0 0 SETRWC","zoom":"reg","loc":"src","src":"MOP end op SETRWC(CLR_AB) (llk_math_eltwise_binary.h:141-151)","text":"End of face 3: SETRWC clears both Src valid bits and flips the matrix unit to the other bank, so the unpacker can refill this one.","face":3,"flip":true},{"n":556,"clk":4523,"rnd":4389,"raw":"CBW 4523 TENSIX cb=0 acked=1","zoom":"core","loc":"cb_in","src":"tiles_add.cpp:53 cb_pop_front(cb_in0) (llk_io_unpack.h:99-102)","text":"c_0's acked becomes 1, written by a STOREREG on the UNPACK thread after STALLWAIT for the unpacker. The reader may reuse the slot.","cb":{"0":[1,1]}},{"n":575,"clk":4523,"rnd":4391,"raw":"X 4523 4391 T1 a4000008 0 0 SEMPOST sem1=1/2","zoom":"reg","loc":"sem","src":"tiles_add.cpp:45 tile_regs_commit() -> SEMPOST MATH_PACK","text":"MATH waits for the FPU (STALLWAIT), then SEMPOST: MATH_PACK goes 0 -> 1. Dst rows 0-63 now belong to PACK.","sem":1},{"n":576,"clk":4523,"rnd":4391,"raw":"X 4523 4391 T2 a6008009 34 17 SEMWAIT sem1=1/2","zoom":"reg","loc":"sem","src":"tiles_add.cpp:46 tile_regs_wait() -> SEMWAIT on zero","text":"PACK's SEMWAIT (queued 17 clocks earlier, 34 retries) passes in the same issue round.","sem":1},{"n":597,"clk":4523,"rnd":4398,"raw":"PCK 4523 T2 packer=0 dst_row=0 datums=256 l1=0x1be60 d0=bf26","zoom":"reg","loc":"pack","src":"tiles_add.cpp:50 pack_tile(dst_reg, cb_out0) -> MOP -> PACR","text":"Packer 0 reads Dst rows 0-15 (face 0, 256 datums) and writes them to L1 0x1be60 in c_16.","packer":0,"dst_row":0,"l1":"0x1be60","d0":"bf26"},{"n":598,"clk":4523,"rnd":4398,"raw":"PCK 4523 T2 packer=1 dst_row=16 datums=256 l1=0x1c060 d0=bf53","zoom":"reg","loc":"pack","src":"tiles_add.cpp:50 pack_tile(dst_reg, cb_out0) -> MOP -> PACR","text":"Packer 1 reads Dst rows 16-31 (face 1, 256 datums) and writes them to L1 0x1c060 in c_16.","packer":1,"dst_row":16,"l1":"0x1c060","d0":"bf53"},{"n":599,"clk":4523,"rnd":4398,"raw":"PCK 4523 T2 packer=2 dst_row=32 datums=256 l1=0x1c260 d0=bf55","zoom":"reg","loc":"pack","src":"tiles_add.cpp:50 pack_tile(dst_reg, cb_out0) -> MOP -> PACR","text":"Packer 2 reads Dst rows 32-47 (face 2, 256 datums) and writes them to L1 0x1c260 in c_16.","packer":2,"dst_row":32,"l1":"0x1c260","d0":"bf55"},{"n":600,"clk":4523,"rnd":4398,"raw":"PCK 4523 T2 packer=3 dst_row=48 datums=256 l1=0x1c460 d0=bf33","zoom":"reg","loc":"pack","src":"tiles_add.cpp:50 pack_tile(dst_reg, cb_out0) -> MOP -> PACR","text":"Packer 3 reads Dst rows 48-63 (face 3, 256 datums) and writes them to L1 0x1c460 in c_16.","packer":3,"dst_row":48,"l1":"0x1c460","d0":"bf33"},{"n":610,"clk":4523,"rnd":4401,"raw":"CBW 4523 TENSIX cb=1 acked=1","zoom":"core","loc":"cb_in","src":"tiles_add.cpp:54 cb_pop_front(cb_in1)","text":"c_1's slot is released the same way.","cb":{"1":[1,1]}},{"n":612,"clk":4523,"rnd":4401,"raw":"CBW 4523 TENSIX cb=16 received=1","zoom":"core","loc":"cb_out","src":"tiles_add.cpp:52 cb_push_back(cb_out0) (llk_io_pack.h:58-70)","text":"c_16's received becomes 1, by a STOREREG on the PACK thread after STALLWAIT for the packer.","cb":{"16":[1,0]}},{"n":619,"clk":4523,"rnd":4404,"raw":"X 4523 4404 T2 a5000008 0 0 SEMGET sem1=0/2","zoom":"reg","loc":"sem","src":"tiles_add.cpp:56 tile_regs_release() -> ZEROACC, SEMGET","text":"PACK clears the Dst half it just packed (ZEROACC) and SEMGET: MATH_PACK back to 0.","sem":0},{"n":620,"clk":4523,"rnd":4404,"raw":"CBR 4523 NCRISC cb=16 received=1","zoom":"core","loc":"cb_out","src":"write_tile.cpp:30 cb_out.wait_front(1)","text":"NCRISC (writer), spinning on c_16, sees received=1 in the same clock."},{"n":631,"clk":4547,"rnd":4430,"raw":"NOC 4547 WRITE noc=1 core=T(1,1) tile=0 buf=0 src=T(1,1):0x1be60 dst=D(0,11):0x2dac40 len=2048","zoom":"chip","loc":"noc_out","src":"write_tile.cpp:32 noc.async_write(cb_out, out0, ...)","text":"NCRISC programs NoC 1: WRITE 2048 B from L1 0x1be60 to D(0,11):0x2dac40, page 0 of the output buffer. On NoC 1 the data leg is 3 hops (derived).","noc":"write"},{"n":640,"clk":4560,"rnd":4445,"raw":"CBW 4560 NCRISC cb=16 acked=1","zoom":"core","loc":"cb_out","src":"write_tile.cpp:33-39 async_write_barrier(); pop_front(1)","text":"After the write barrier, NCRISC frees c_16's slot: acked = 1.","cb":{"16":[1,1]}},{"n":11078,"clk":7807,"rnd":9761,"raw":"HOSTR 7807 D(0,11):0x2dac40 len=2048","zoom":"chip","loc":"host","src":"eltwise_binary.cpp:163 EnqueueReadMeshBuffer(result)","text":"After Finish, the host reads page 0 of the output back from D(0,11):0x2dac40 and checks it against A + B on the CPU."}];
+</script>
+
+<script>
+(function () {
+  var C = TT.C;
+  var root = document.getElementById("fig-journey");
+  var g = TT.canvas(root, 1040, 580), ctx = g.ctx;
+  var slider = document.getElementById("jslider"), card = document.getElementById("jcard"), info = document.getElementById("jinfo");
+  var bPlay = document.getElementById("jplay");
+  slider.max = EV.length - 1;
+  var N = EV.length;
+
+  // ---- per-event derived fields
+  EV.forEach(function (e) {
+    var f = e.raw.split(" ");
+    var k = f[0];
+    e.kind = k;
+    if (k === "CBR" || k === "CBW") {
+      e.who = f[2];
+      if (e.who === "TENSIX") e.who = /cb=16/.test(e.raw) ? "TRISC2" : "TRISC0";
+    } else if (k === "NOC") e.who = /noc=0/.test(e.raw) ? "BRISC" : "NCRISC";
+    else if (k === "HOSTW" || k === "HOSTR") e.who = "HOST";
+    else if (k === "UNP") e.who = "TRISC0";
+    else if (k === "ELW") e.who = "TRISC1";
+    else if (k === "PCK") e.who = "TRISC2";
+    else { var m = / T([012]) /.exec(e.raw); e.who = m ? "TRISC" + m[1] : "?"; }
+    e.data = ["dram_in", "noc_in", "src", "dst", "pack", "noc_out", "host"].indexOf(e.loc) >= 0 ||
+             (e.kind === "CBW" && /received=1/.test(e.raw));
+  });
+  // events that share a clock with another event get a round label
+  var perClk = {};
+  EV.forEach(function (e) { perClk[e.clk] = (perClk[e.clk] || 0) + 1; });
+
+  function stateAt(k) {
+    var s = { cb: { "0": [0, 0], "1": [0, 0], "16": [0, 0] }, sem: 0, slot: { c0: false, c1: false, c16: false },
+              dramIn: false, dramOut: false, hostBack: false, srcA: [null, null], srcB: [null, null], vA: [false, false], vB: [false, false],
+              dst: 0, dstCleared: false, packed: [false, false, false, false], loc: "host0", act: {}, mathQueued: 0, unpackMop: false };
+    for (var i = 0; i <= k; i++) {
+      var e = EV[i];
+      s.act[e.who] = e.src.replace(/^[a-z_]+\.(cpp|h):[0-9,\-]+ /, "");
+      if (e.cb) for (var c in e.cb) s.cb[c] = e.cb[c].slice();
+      if (e.sem !== undefined) s.sem = e.sem;
+      if (e.kind === "HOSTW") { s.dramIn = true; s.loc = "dram_in"; }
+      if (e.kind === "NOC" && e.noc === "read0") { s.slot.c0 = true; s.loc = "noc_in"; }
+      if (e.kind === "NOC" && e.noc === "read1") { s.slot.c1 = true; s.loc = "noc_in"; }
+      if (e.kind === "CBW" && /cb=0 received=1/.test(e.raw)) s.loc = "cb_in";
+      if (e.kind === "M" && / T1 /.test(e.raw)) s.mathQueued = 12;
+      if (e.kind === "M" && / T0 /.test(e.raw)) s.unpackMop = true;
+      if (e.kind === "UNP") {
+        if (e.src_sel === "A") { s.srcA[e.bank] = e.face; s.vA[e.bank] = true; } else { s.srcB[e.bank] = e.face; s.vB[e.bank] = true; }
+        s.loc = "src";
+      }
+      if (e.kind === "ELW") { s.dst = Math.max(s.dst, e.dst_row / 8 + 1); s.loc = "dst"; s.mathQueued = Math.max(0, 12 - (s.dst + Math.floor(s.dst / 2))); }
+      if (e.flip) { var b = e.face % 2; s.vA[b] = false; s.vB[b] = false; }
+      if (e.kind === "PCK") { s.packed[e.packer] = true; s.slot.c16 = true; s.loc = "pack"; }
+      if (e.kind === "CBW" && /cb=16 received=1/.test(e.raw)) s.loc = "cb_out";
+      if (e.kind === "X" && /SEMGET/.test(e.raw)) s.dstCleared = true;
+      if (e.kind === "NOC" && e.noc === "write") { s.dramOut = true; s.loc = "noc_out"; }
+      if (e.kind === "CBW" && /cb=16 acked=1/.test(e.raw)) s.loc = "dram_out";
+      if (e.kind === "HOSTR") { s.hostBack = true; s.loc = "host"; }
+    }
+    return s;
+  }
+
+  // ---- drawing helpers
+  function glow(x, y, w, h, col, on) {
+    if (!on) return;
+    ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 18;
+    TT.box(ctx, x, y, w, h, { stroke: col, lw: 3, r: 5 }); ctx.restore();
+  }
+  function actor(x, y, w, h) { TT.box(ctx, x - 3, y - 3, w + 6, h + 6, { stroke: C.yellow, lw: 2, r: 7 }); }
+  function panel(x, y, w, h, title) {
+    TT.box(ctx, x, y, w, h, { fill: C.bg2, stroke: C.border, r: 8 });
+    TT.text(ctx, title, x + 10, y + 14, { color: C.yellow, font: "bold 12px" });
+  }
+
+  // ---- chip panel geometry (NoC 0 coordinates, 10 x 12)
+  var GX = 52, GY = 72, CS = 24;
+  function cx(x) { return GX + x * CS + CS / 2; }
+  function cy(y) { return GY + y * CS + CS / 2; }
+  function ttype(x, y) {
+    if (x === 0 && y === 10) return "A";
+    if (x === 0 && y === 3) return "P";
+    if (x === 0 && (y === 2 || y === 4 || y === 8 || y === 9)) return "R";
+    if (x === 0 || x === 5) return "D";
+    if (y === 0 || y === 6) return "E";
+    return "T";
+  }
+  var TCOL = { D: C.orange, E: C.purple, T: C.blue, A: C.muted, P: C.green, R: C.border };
+  // a path is a list of [x,y] cells; a wrap is marked by null between cells
+  var P_REQ0 = [[1,1],[2,1],[3,1],[4,1],[5,1],[6,1],[7,1],[8,1],[9,1],"wx",[0,1],[0,2],[0,3],[0,4],[0,5],[0,6],[0,7],[0,8],[0,9],[0,10],[0,11]];
+  var P_RSP0 = [[0,11],[1,11],"wy",[1,0],[1,1]];
+  var P_WR1 = [[1,1],[1,0],"wy1",[1,11],[0,11]];
+  function drawPath(p, col, lw, dash) {
+    ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = lw; if (dash) ctx.setLineDash(dash);
+    ctx.beginPath();
+    for (var i = 0; i < p.length; i++) {
+      var q = p[i];
+      if (typeof q === "string") {
+        var a = p[i - 1], b = p[i + 1];
+        if (q === "wx") { ctx.lineTo(GX + 10 * CS, cy(a[1])); ctx.moveTo(GX, cy(b[1])); }
+        if (q === "wy") { ctx.lineTo(cx(a[0]), GY + 12 * CS); ctx.moveTo(cx(b[0]), GY); }
+        if (q === "wy1") { ctx.lineTo(cx(a[0]), GY); ctx.moveTo(cx(b[0]), GY + 12 * CS); }
+        continue;
+      }
+      if (i === 0) ctx.moveTo(cx(q[0]), cy(q[1])); else ctx.lineTo(cx(q[0]), cy(q[1]));
+    }
+    ctx.stroke(); ctx.restore();
+  }
+
+  function drawChip(s, e) {
+    panel(8, 8, 330, 400, "CHIP · Wormhole, NoC 0 coordinates");
+    // host box
+    var hostOn = (s.loc === "host0" || s.loc === "host");
+    TT.box(ctx, GX, 26, 10 * CS, 26, { fill: C.bg3, stroke: C.green, r: 5 });
+    TT.text(ctx, s.hostBack ? "HOST · result_vec (read back)" : "HOST · a_data, b_data (std::vector)", GX + 5 * CS, 39, { align: "center", font: "12px", color: C.fg });
+    glow(GX, 26, 10 * CS, 26, C.yellow, hostOn);
+    for (var x = 0; x < 10; x++) {
+      TT.text(ctx, String(x), cx(x), GY - 8, { align: "center", font: "10px", color: C.muted });
+      for (var y = 0; y < 12; y++) {
+        var t = ttype(x, y);
+        TT.box(ctx, GX + x * CS + 1, GY + y * CS + 1, CS - 2, CS - 2, { fill: TCOL[t], alpha: t === "R" ? 0.5 : 0.22, r: 3 });
+        if (t !== "T") TT.text(ctx, t, cx(x), cy(y), { align: "center", font: "10px", color: C.muted });
+      }
+    }
+    for (var yy = 0; yy < 12; yy++) TT.text(ctx, String(yy), GX - 8, cy(yy), { align: "right", font: "10px", color: C.muted });
+    // paths
+    var inRead = e.kind === "NOC" && e.noc !== "write", inWrite = e.kind === "NOC" && e.noc === "write";
+    if (inRead) { drawPath(P_REQ0, C.muted, 1.5, [4, 3]); drawPath(P_RSP0, C.yellow, 4); }
+    if (inWrite) { drawPath(P_WR1, C.yellow, 4); }
+    if (e.kind === "HOSTW" || e.kind === "HOSTR") {
+      TT.arrow(ctx, e.kind === "HOSTW" ? GX + 30 : cx(0) + 6, e.kind === "HOSTW" ? 52 : cy(11) - 8,
+               e.kind === "HOSTW" ? cx(0) + 6 : GX + 30, e.kind === "HOSTW" ? cy(11) - 8 : 52, { color: C.green, lw: 2 });
+    }
+    // T(1,1) and D(0,11)
+    TT.box(ctx, GX + CS + 1, GY + CS + 1, CS - 2, CS - 2, { stroke: C.blue, lw: 2.5, r: 3 });
+    TT.box(ctx, GX + 1, GY + 11 * CS + 1, CS - 2, CS - 2, { stroke: C.orange, lw: 2.5, r: 3 });
+    var coreOn = ["cb_in", "src", "dst", "pack", "cb_out"].indexOf(s.loc) >= 0 || (s.loc === "noc_in" && !inRead);
+    var dramOn = s.loc === "dram_in" || s.loc === "dram_out" || (s.loc === "noc_out" && !inWrite);
+    glow(GX + CS + 1, GY + CS + 1, CS - 2, CS - 2, C.yellow, coreOn || inRead);
+    glow(GX + 1, GY + 11 * CS + 1, CS - 2, CS - 2, C.yellow, dramOn || inWrite);
+    TT.box(ctx, 18, 366, 12, 12, { stroke: C.blue, lw: 2.5, r: 2 });
+    TT.text(ctx, "T(1,1) = logical core (0,0)", 35, 372, { font: "11px", color: C.blue });
+    TT.box(ctx, 182, 366, 12, 12, { stroke: C.orange, lw: 2.5, r: 2 });
+    TT.text(ctx, "D(0,11) = DRAM bank 0", 199, 372, { font: "11px", color: C.orange });
+    var cap = inRead ? "NoC 0 READ · request 19 hops (dashed) · data 3 (bold) · derived" :
+              inWrite ? "NoC 1 WRITE · data 3 hops: up, wrap, left · derived" :
+              (e.kind === "HOSTW" ? "PCIe TLB write into D(0,11)" : e.kind === "HOSTR" ? "PCIe TLB read from D(0,11)" : "");
+    TT.text(ctx, "D DRAM · E Ethernet · P PCIe · A ARC · R router · blank = Tensix", 18, 387, { font: "10px", color: C.muted });
+    TT.text(ctx, cap, 18, 401, { font: "11px", color: e.kind === "NOC" ? C.yellow : C.muted });
+  }
+
+  // ---- core panel
+  var RISCS = [["BRISC", "reader · NoC 0"], ["NCRISC", "writer · NoC 1"], ["TRISC0", "UNPACK"], ["TRISC1", "MATH"], ["TRISC2", "PACK"]];
+  function drawCore(s, e) {
+    var X = 352;
+    panel(X, 8, 330, 400, "CORE T(1,1) · five RISC-Vs and L1");
+    for (var i = 0; i < 5; i++) {
+      var bx = X + 12 + (i % 2) * 156, by = 28 + Math.floor(i / 2) * 50, bw = 150, bh = 42;
+      if (i === 4) { bx = X + 12; by = 128; bw = 306; }
+      TT.box(ctx, bx, by, bw, bh, { fill: C.bg3, stroke: C.border, r: 5 });
+      TT.text(ctx, RISCS[i][0] + "  " + RISCS[i][1], bx + 6, by + 12, { font: "bold 11px", color: C.fg });
+      var a = s.act[RISCS[i][0]] || "—";
+      if (a.length > (i === 4 ? 46 : 23)) a = a.slice(0, i === 4 ? 45 : 22) + "…";
+      TT.text(ctx, a, bx + 6, by + 29, { font: "10.5px", color: C.teal, mono: true });
+      if (e.who === RISCS[i][0]) actor(bx, by, bw, bh);
+    }
+    // CBs
+    var cbs = [["c_0", "0", 0x19e60, "c0"], ["c_1", "1", 0x1ae60, "c1"], ["c_16", "16", 0x1be60, "c16"]];
+    for (var j = 0; j < 3; j++) {
+      var y0 = 192 + j * 62, cb = cbs[j];
+      TT.text(ctx, cb[0] + " @0x" + cb[2].toString(16), X + 12, y0 + 6, { font: "bold 11px", color: C.fg, mono: true });
+      var cnt = s.cb[cb[1]];
+      TT.text(ctx, "received " + cnt[0] + " · acked " + cnt[1], X + 318, y0 + 6, { font: "11px", color: C.yellow, align: "right", mono: true });
+      for (var sl = 0; sl < 2; sl++) {
+        var sx = X + 12 + sl * 154, sw = 150;
+        var full = sl === 0 && s.slot[cb[3]] && !(cb[1] !== "16" && cnt[1] >= 1 && s.loc !== "cb_in" && false);
+        TT.box(ctx, sx, y0 + 16, sw, 30, { fill: full ? C.blue : C.bg3, alpha: full ? 0.35 : 1, stroke: C.border, r: 4 });
+        TT.text(ctx, "0x" + (cb[2] + sl * 0x800).toString(16) + (sl === 0 ? (full ? "  tile 0" : "") : "  (tile 1)"), sx + 6, y0 + 31, { font: "11px", color: sl ? C.muted : C.fg, mono: true });
+        var on = sl === 0 && ((cb[3] !== "c16" && (s.loc === "noc_in" || s.loc === "cb_in")) || (cb[3] === "c16" && (s.loc === "pack" || s.loc === "cb_out" || s.loc === "noc_out")));
+        if (cb[3] === "c0" && e.kind === "NOC" && e.noc === "read1") on = false;
+        if (cb[3] === "c1" && e.kind === "NOC" && e.noc === "read0") on = false;
+        glow(sx, y0 + 16, sw, 30, C.yellow, on);
+      }
+    }
+    // coprocessor hint
+    var inCop = s.loc === "src" || s.loc === "dst";
+    TT.box(ctx, X + 12, 378, 306, 24, { fill: C.bg3, stroke: inCop ? C.yellow : C.border, lw: inCop ? 2.5 : 1, r: 5 });
+    TT.text(ctx, inCop ? "tile 0 is in the coprocessor → registers panel" : "Tensix coprocessor (unpackers · FPU · packers)", X + 165, 390, { align: "center", font: "11px", color: inCop ? C.yellow : C.muted });
+  }
+
+  // ---- register panel
+  function drawRegs(s, e) {
+    var X = 696;
+    panel(X, 8, 336, 400, "REGISTERS · Tensix coprocessor of T(1,1)");
+    // MOP expanders
+    var mops = [["T0 unpack", s.unpackMop ? "MOP → 8 UNPACR" : "—"], ["T1 math", s.mathQueued ? s.mathQueued + " at wait gate" : (s.dst >= 8 ? "MOP done" : "—")], ["T2 pack", s.packed[0] ? "MOP → 1 PACR" : "—"]];
+    for (var i = 0; i < 3; i++) {
+      var bx = X + 10 + i * 107;
+      TT.box(ctx, bx, 26, 103, 38, { fill: C.bg3, stroke: C.border, r: 4 });
+      TT.text(ctx, mops[i][0], bx + 5, 37, { font: "bold 10.5px" });
+      TT.text(ctx, mops[i][1], bx + 5, 54, { font: "10px", color: C.teal });
+      if (e.who === "TRISC" + i && (e.kind === "M" || e.kind === "D" || (e.kind === "X" && !/SEM/.test(e.raw)))) actor(bx, 26, 103, 38);
+    }
+    // Src banks
+    function bank(lbl, x, y, face, valid, on) {
+      TT.box(ctx, x, y, 72, 40, { fill: valid ? C.green : C.bg3, alpha: valid ? 0.3 : 1, stroke: C.border, r: 4 });
+      TT.text(ctx, lbl, x + 5, y + 11, { font: "10px", color: C.muted });
+      TT.text(ctx, face === null ? "empty" : "face " + face + (valid ? " ✓" : ""), x + 5, y + 28, { font: "11px", color: face === null ? C.muted : C.fg });
+      glow(x, y, 72, 40, C.yellow, on);
+    }
+    TT.text(ctx, "SrcA", X + 10, 80, { font: "bold 11px", color: C.blue });
+    TT.text(ctx, "SrcB", X + 172, 80, { font: "bold 11px", color: C.blue });
+    var unpOn = e.kind === "UNP";
+    bank("bank 0", X + 10, 88, s.srcA[0], s.vA[0], unpOn && e.src_sel === "A" && e.bank === 0);
+    bank("bank 1", X + 86, 88, s.srcA[1], s.vA[1], unpOn && e.src_sel === "A" && e.bank === 1);
+    bank("bank 0", X + 172, 88, s.srcB[0], s.vB[0], unpOn && e.src_sel === "B" && e.bank === 0);
+    bank("bank 1", X + 248, 88, s.srcB[1], s.vB[1], unpOn && e.src_sel === "B" && e.bank === 1);
+    if (e.kind === "ELW") {
+      var ax = X + 10 + e.bank * 76 + 36, bx2 = X + 172 + e.bank * 76 + 36;
+      TT.arrow(ctx, ax, 130, X + 120, 168, { color: C.yellow, lw: 2 });
+      TT.arrow(ctx, bx2, 130, X + 140, 168, { color: C.yellow, lw: 2 });
+    }
+    // Dst: full bar + zoom of rows 0..63
+    TT.text(ctx, "Dst (1024 rows × 16)", X + 10, 176, { font: "bold 11px", color: C.blue });
+    TT.box(ctx, X + 10, 186, 24, 200, { fill: C.bg3, stroke: C.border, r: 3 });
+    TT.box(ctx, X + 10, 186, 24, 100, { fill: C.blue, alpha: 0.15, r: 3 });
+    ctx.save(); ctx.translate(X + 22, 246); ctx.rotate(-Math.PI / 2); TT.text(ctx, "half 0", 0, 0, { align: "center", font: "10px", color: C.muted }); ctx.restore();
+    ctx.save(); ctx.translate(X + 22, 336); ctx.rotate(-Math.PI / 2); TT.text(ctx, "half 1", 0, 0, { align: "center", font: "10px", color: C.muted }); ctx.restore();
+    TT.box(ctx, X + 10, 186, 24, 200 * 64 / 1024, { fill: C.yellow, alpha: 0.7, r: 1 });
+    ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X + 34, 186); ctx.lineTo(X + 80, 186); ctx.moveTo(X + 34, 199); ctx.lineTo(X + 80, 386); ctx.stroke();
+    for (var r = 0; r < 8; r++) {
+      var yb = 186 + r * 25, filled = r < s.dst && !s.dstCleared;
+      TT.box(ctx, X + 80, yb, 90, 23, { fill: filled ? C.blue : C.bg3, alpha: filled ? 0.4 : 1, stroke: C.border, r: 3 });
+      TT.text(ctx, (s.dstCleared && r < s.dst ? "" : "rows ") + (r * 8) + "-" + (r * 8 + 7) + (s.dstCleared && r < s.dst ? " cleared" : ""), X + 85, yb + 12, { font: "10px", color: filled ? C.fg : C.muted, mono: true });
+      glow(X + 80, yb, 90, 23, C.yellow, e.kind === "ELW" && e.dst_row === r * 8);
+      if (r % 2 === 0) TT.text(ctx, "face " + (r / 2), X + 174, yb + 24, { font: "10px", color: C.muted });
+    }
+    // Sync unit
+    TT.box(ctx, X + 222, 176, 104, 52, { fill: C.bg3, stroke: C.border, r: 4 });
+    TT.text(ctx, "MATH_PACK sem", X + 228, 189, { font: "bold 10.5px" });
+    for (var q = 0; q < 2; q++) TT.box(ctx, X + 230 + q * 26, 200, 20, 20, { fill: q < s.sem ? C.yellow : C.bg2, stroke: C.border, r: 10 });
+    TT.text(ctx, s.sem + " / 2", X + 290, 210, { font: "11px", color: C.yellow });
+    if (e.loc === "sem" || e.loc === "math_wait") actor(X + 222, 176, 104, 52);
+    // Packers
+    TT.text(ctx, "Packers", X + 222, 244, { font: "bold 11px", color: C.blue });
+    for (var p = 0; p < 4; p++) {
+      var py = 252 + p * 34;
+      TT.box(ctx, X + 222, py, 104, 30, { fill: s.packed[p] ? C.teal : C.bg3, alpha: s.packed[p] ? 0.3 : 1, stroke: C.border, r: 4 });
+      TT.text(ctx, "P" + p + " rows " + (16 * p) + "-" + (16 * p + 15), X + 227, py + 9, { font: "10px" });
+      TT.text(ctx, "→ 0x" + (0x1be60 + 0x200 * p).toString(16), X + 227, py + 22, { font: "10px", color: C.muted, mono: true });
+      glow(X + 222, py, 104, 30, C.yellow, e.kind === "PCK" && e.packer === p);
+    }
+  }
+
+  // ---- timeline strip (true clock axis with a break before the host read)
+  var TL = { x0: 60, x1: 900, c0: 4060, c1: 4580, y: 520 };
+  function tx(c) { return c > TL.c1 ? 980 : TL.x0 + (c - TL.c0) / (TL.c1 - TL.c0) * (TL.x1 - TL.x0); }
+  var ZC = { chip: C.orange, core: C.blue, reg: C.green };
+  function drawStrip(k) {
+    TT.box(ctx, 8, 420, 1024, 152, { fill: C.bg2, stroke: C.border, r: 8 });
+    TT.text(ctx, "ttsim g_clock (true scale; break before the host read-back). Ticks are events, coloured by zoom: chip, core, registers.", 18, 434, { font: "11px", color: C.muted });
+    ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(TL.x0, TL.y); ctx.lineTo(TL.x1 + 10, TL.y); ctx.moveTo(960, TL.y); ctx.lineTo(1000, TL.y); ctx.stroke();
+    TT.text(ctx, "//", 930, TL.y, { align: "center", color: C.muted });
+    for (var c = 4100; c <= 4550; c += 50) {
+      ctx.beginPath(); ctx.moveTo(tx(c), TL.y); ctx.lineTo(tx(c), TL.y + 5); ctx.stroke();
+      TT.text(ctx, String(c), tx(c), TL.y + 14, { align: "center", font: "10px", color: C.muted });
+    }
+    TT.text(ctx, "7807", 980, TL.y + 14, { align: "center", font: "10px", color: C.muted });
+    var stack = {};
+    for (var i = 0; i < N; i++) {
+      var e = EV[i], h = stack[e.clk] || 0; stack[e.clk] = h + 1;
+      var x = tx(e.clk), y = TL.y - 6 - h * 2.6;
+      ctx.fillStyle = i === k ? C.yellow : ZC[e.zoom]; ctx.globalAlpha = i <= k ? 1 : 0.35;
+      ctx.fillRect(x - 3, y - 2, 6, 2.2); ctx.globalAlpha = 1;
+      if (i === k) { ctx.strokeStyle = C.yellow; ctx.beginPath(); ctx.moveTo(x, TL.y + 22); ctx.lineTo(x, y - 6); ctx.stroke(); }
+    }
+    TT.text(ctx, (stack[4523] || 0) + " events at clock 4523 →", tx(4523) - 8, 456, { align: "right", font: "11px", color: C.yellow });
+    TT.text(ctx, "event " + (k + 1) + " of " + N + " · clock " + EV[k].clk, TL.x0, TL.y + 38, { font: "12px", color: C.yellow });
+  }
+
+  function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function render() {
+    var k = +slider.value, e = EV[k], s = stateAt(k);
+    TT.clear(ctx, g.W, g.H);
+    drawChip(s, e); drawCore(s, e); drawRegs(s, e); drawStrip(k);
+    var when = "clock " + e.clk + (perClk[e.clk] > 1 && e.zoom !== "chip" ? " · round " + e.rnd : "");
+    card.innerHTML = '<div class="meta"><b>' + when + "</b> · trace line " + e.n + " · " + e.who + '</div><div class="src">' + esc(e.src) +
+      '</div><code class="raw">' + esc(e.raw) + "</code>" + esc(e.text) +
+      (e.a0 ? " <span class=\"meta\">(first datum: A=0x" + e.a0 + ", B=0x" + e.b0 + ", Dst=0x" + e.d0 + ")</span>" : "");
+    info.textContent = (k + 1) + " / " + N;
+  }
+  var playing = false, timer = null;
+  function stop() { playing = false; bPlay.textContent = "Play"; if (timer) clearInterval(timer); }
+  bPlay.onclick = function () {
+    if (playing) { stop(); return; }
+    if (+slider.value >= N - 1) slider.value = 0;
+    playing = true; bPlay.textContent = "Pause";
+    timer = setInterval(function () { if (+slider.value >= N - 1) { stop(); return; } slider.value = +slider.value + 1; render(); }, 1100);
+    render();
+  };
+  document.getElementById("jnext").onclick = function () { stop(); slider.value = Math.min(N - 1, +slider.value + 1); render(); };
+  document.getElementById("jprev").onclick = function () { stop(); slider.value = Math.max(0, +slider.value - 1); render(); };
+  document.getElementById("jreset").onclick = function () { stop(); slider.value = 0; render(); };
+  slider.oninput = function () { stop(); render(); };
+  render();
+})();
+</script>
+
+<script>
+(function () {
+  var C = TT.C;
+  var root = document.getElementById("fig-where");
+  var g = TT.canvas(root, 1040, 190), ctx = g.ctx;
+  var slider = document.getElementById("wslider"), clk = document.getElementById("wclock"), card = document.getElementById("wcard");
+  var choicesDiv = document.getElementById("wchoices"), presets = document.getElementById("wpresets"), score = document.getElementById("wscore");
+  function ev(re) { for (var i = 0; i < EV.length; i++) if (re.test(EV[i].raw)) return EV[i]; return null; }
+  // the clocks at which the newest live copy changes, read from the trace events
+  var T = {
+    hostW: ev(/^HOSTW .*0x2d4c40/), rdA: ev(/^NOC .*READ .*0x2d4c40/), pubA: ev(/^CBW .*BRISC cb=0 received=1/),
+    unp: ev(/^UNP /), pub16: ev(/^CBW .*cb=16 received=1/), wr: ev(/^NOC .*WRITE/), hostR: ev(/^HOSTR /)
+  };
+  var LOCS = [
+    ["host", "Host memory"], ["dram_in", "DRAM bank 0, input buffers"], ["noc", "On the NoC, in flight"],
+    ["l1_unpub", "L1 c_0/c_1, not yet pushed"], ["l1_pub", "L1 c_0/c_1, pushed"], ["src", "SrcA / SrcB"], ["dst", "Dst"],
+    ["c16", "L1 c_16"], ["dram_out", "DRAM bank 0, output buffer"], ["host_back", "Host memory (result)"]
+  ];
+  function answer(c) {
+    if (c < T.hostW.clk) return "host";
+    if (c < T.rdA.clk) return "dram_in";
+    if (c < T.pubA.clk) return "l1_unpub";
+    if (c < T.unp.clk) return "l1_pub";
+    if (c < T.wr.clk) return "c16";
+    if (c < T.hostR.clk) return "dram_out";
+    return "host_back";
+  }
+  function why(c, a) {
+    var L = function (e) { return "<code class=\"raw\">" + e.raw.replace(/</g, "&lt;") + "</code>"; };
+    switch (a) {
+      case "host": return "Before clock " + T.hostW.clk + " the only copy is the host's std::vector a_data. The first trace line that touches tile 0 is:" + L(T.hostW);
+      case "dram_in": return "The host wrote page 0 to bank 0 at " + T.hostW.clk + ", and nothing has read it yet. Next to happen:" + L(T.rdA);
+      case "l1_unpub": return "The NoC read already copied A's bytes into c_0 (and from clock 4486 B's into c_1); ttsim does it inside the store, so they are never 'in flight'. BRISC has not pushed yet. No other CPU may use them." + L(T.rdA) + "Next:" + L(T.pubA);
+      case "l1_pub": return "c_0 is published (received=1)" + (c < 4508 ? "; B's c_1 follows at 4508" : " and so is c_1") + ". UNPACK has seen it, but no UNPACR has run yet. MATH's ELWADDs are waiting at the wait gate." + L(T.pubA) + "Next:" + L(T.unp);
+      case "c16": return (c === T.unp.clk ? "<b>Trap!</b> During clock " + c + " tile 0 passed through SrcA/SrcB, Dst and the packers: " + EV.filter(function (x) { return x.clk === c; }).length + " of the figure's events, in 30 issue rounds (4375-4404) of one ttsim clock. At the end of the clock the newest copy is already in c_16. " : "The packed sum sits in c_16 at 0x1be60, published, and NCRISC has seen it. ") + L(T.pub16) + "Next:" + L(T.wr);
+      case "dram_out": return "NCRISC wrote the sum to bank 0's output page at " + T.wr.clk + ". The host has not read it yet." + L(T.wr) + "Next:" + L(T.hostR);
+      case "host_back": return "The host read page 0 of the result at " + T.hostR.clk + "." + L(T.hostR);
+    }
+  }
+  var pick = null, revealed = false, tries = 0, right = 0;
+  var btns = {};
+  LOCS.forEach(function (l) {
+    var b = document.createElement("button"); b.textContent = l[1];
+    b.onclick = function () { if (revealed) reset(); pick = l[0]; for (var k in btns) btns[k].className = k === pick ? "pick" : ""; draw(); };
+    btns[l[0]] = b; choicesDiv.appendChild(b);
+  });
+  [4000, 4300, 4485, 4505, 4515, 4523, 4530, 4552, 6000, 7807].forEach(function (c) {
+    var b = document.createElement("button"); b.textContent = c; b.style.marginLeft = ".3rem";
+    b.onclick = function () { slider.value = c; reset(); draw(); };
+    presets.appendChild(b);
+  });
+  function reset() { revealed = false; for (var k in btns) btns[k].className = k === pick ? "pick" : ""; card.innerHTML = "Choose a location, then press Reveal."; }
+  slider.oninput = function () { reset(); draw(); };
+  document.getElementById("wreveal").onclick = function () {
+    var c = +slider.value, a = answer(c);
+    revealed = true;
+    if (pick) { tries++; if (pick === a) right++; }
+    for (var k in btns) btns[k].className = k === a ? "right" : (k === pick ? "wrong" : "");
+    var extra = "";
+    if (pick === "noc") extra = " <b>Never correct in ttsim:</b> a NoC transfer completes inside the store that issues it (tile.cpp:1620), so it is in flight for zero clocks. On silicon it would be in flight for real.";
+    if (pick === "src" || pick === "dst") extra = " <b>Never correct at the end of a clock in this run:</b> all Src and Dst activity for tile 0 happened inside clock 4523.";
+    card.innerHTML = "<b style=\"color:var(--yellow)\">End of clock " + c + ": " + LOCS.filter(function (l) { return l[0] === a; })[0][1] + ".</b> " + why(c, a) + extra +
+      " <span class=\"meta\">The DRAM input copy also still exists: copies are never destroyed, only superseded.</span>";
+    score.textContent = tries ? right + " / " + tries + " correct" : "";
+    draw();
+  };
+  function draw() {
+    var c = +slider.value; clk.textContent = String(c);
+    TT.clear(ctx, g.W, g.H);
+    var w = 96, gap = 6, x0 = 12;
+    var a = answer(c);
+    for (var i = 0; i < LOCS.length; i++) {
+      var x = x0 + i * (w + gap), id = LOCS[i][0];
+      var col = revealed && id === a ? C.green : (id === pick ? C.yellow : C.border);
+      TT.box(ctx, x, 40, w, 70, { fill: C.bg3, stroke: col, lw: col === C.border ? 1 : 3, r: 6 });
+      var words = LOCS[i][1].split(" "), line = "", ly = 60, lines = [];
+      words.forEach(function (wd) { if ((line + " " + wd).length > 13) { lines.push(line); line = wd; } else line = line ? line + " " + wd : wd; });
+      lines.push(line);
+      lines.forEach(function (ln, j) { TT.text(ctx, ln, x + w / 2, 58 + j * 15, { align: "center", font: "11px", color: C.fg }); });
+      if (i < LOCS.length - 1) TT.arrow(ctx, x + w + 1, 75, x + w + gap - 1, 75, { color: C.muted, lw: 1, head: 4 });
+    }
+    // chip / core / registers bands
+    var bands = [[0, 0, "host", C.green], [1, 2, "chip", C.orange], [3, 4, "core (L1)", C.blue], [5, 6, "registers", C.teal], [7, 7, "core", C.blue], [8, 8, "chip", C.orange], [9, 9, "host", C.green]];
+    bands.forEach(function (b) {
+      var xa = x0 + b[0] * (w + gap), xb = x0 + b[1] * (w + gap) + w;
+      ctx.fillStyle = b[3]; ctx.globalAlpha = 0.6; ctx.fillRect(xa, 120, xb - xa, 4); ctx.globalAlpha = 1;
+      TT.text(ctx, b[2], (xa + xb) / 2, 136, { align: "center", font: "11px", color: b[3] });
+    });
+    TT.text(ctx, "Where is the newest live copy of tile 0 at the end of clock " + c + "?", 12, 18, { font: "bold 13px", color: C.yellow });
+    if (revealed) {
+      var idx = LOCS.map(function (l) { return l[0]; }).indexOf(a), gx = x0 + idx * (w + gap) + w / 2;
+      ctx.save(); ctx.shadowColor = C.yellow; ctx.shadowBlur = 16;
+      TT.box(ctx, gx - 22, 150, 44, 26, { fill: C.yellow, r: 5, label: "tile 0", color: "#000", font: "bold 11px" }); ctx.restore();
+    }
+  }
+  draw();
+})();
+</script>
+</body>
+</html>

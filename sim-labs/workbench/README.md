@@ -78,8 +78,16 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
 - `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
   on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
+- `py/a14_journey.py` (chapter A14): picks tile 0's 48 journey events out of a trace written by ttsim +
+  `patches/a14-journey.patch`: `python3 $W/py/a14_journey.py $LAB_HOME/journey.trace [--json]`.
+- `py/a20_count.py`, `py/a20_summary.py` (chapter A20): run one ttnn op (format, fidelity, block size, fusion,
+  sharding cases) under a ttsim built with `../patches/a20-counters.patch`, then summarise its exact DRAM/NoC byte
+  counts and Tensix instruction counts. Counts only; the simulator's clocks are not performance.
 - `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
   built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
+- `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
+  program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
+  Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.
 
 ## Common errors
 
