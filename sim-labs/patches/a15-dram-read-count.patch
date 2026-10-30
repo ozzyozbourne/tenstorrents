@@ -1,0 +1,46 @@
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -14,6 +14,23 @@
+ static std::pair<char, uint32_t> coord_to_tile(uint32_t coord);
+ static uint32_t tile_to_coord(char tile_type, uint32_t tile_id);
+ 
++// A15 instrumentation: bytes and NoC read commands that each Tensix tile pulls from DRAM tiles.
++static uint64_t a15_dram_rd_bytes[NUM_T_TILES];
++static uint64_t a15_dram_rd_cmds[NUM_T_TILES];
++void a15_dump_dram_reads() {
++    uint64_t total = 0, cmds = 0; uint32_t cores = 0;
++    for (uint32_t t = 0; t < NUM_T_TILES; t++) {
++        if (!a15_dram_rd_bytes[t]) continue;
++        uint32_t c = tile_to_coord('T', t);
++        ttsim_printf("A15 dram_rd tile(%u,%u) bytes=%llu cmds=%llu tiles2048=%llu\n", c & 63, c >> 6,
++            (unsigned long long)a15_dram_rd_bytes[t], (unsigned long long)a15_dram_rd_cmds[t],
++            (unsigned long long)(a15_dram_rd_bytes[t] / 2048));
++        total += a15_dram_rd_bytes[t]; cmds += a15_dram_rd_cmds[t]; cores++;
++    }
++    ttsim_printf("A15 dram_rd TOTAL cores=%u bytes=%llu cmds=%llu tiles2048=%llu\n", cores,
++        (unsigned long long)total, (unsigned long long)cmds, (unsigned long long)(total / 2048));
++}
++
+ template<char tile_type>
+ static inline auto get_tile(uint32_t tile_id) {
+     static_assert((tile_type == 'T') || (tile_type == 'E'));
+@@ -1603,6 +1620,7 @@
+         TTSIM_VERIFY((src_tile_type == 'D') || (src_tile_type == 'T') || (src_tile_type == 'E') || (src_tile_type == 'P') || (src_tile_type == 'A'),
+             UnimplementedFunctionality, "read: src_tile_type=%c", src_tile_type);
+         if (src_tile_type == 'D') { // DRAM -> L1
++            if (tile_type == 'T') { a15_dram_rd_bytes[tile_id] += noc_at_len_be; a15_dram_rd_cmds[tile_id]++; }
+ #if TT_ARCH_VERSION == 1
+             TTSIM_VERIFY((src_addr & 63) == (dst_addr & 63), UndefinedBehavior, "read: alignment of src_addr=0x%llx and dst_addr=0x%llx does not match",
+                 src_addr, dst_addr);
+--- a/src/sim.cpp
++++ b/src/sim.cpp
+@@ -51,7 +51,9 @@
+     g_chip = &g_chips[chip_id];
+ }
+ 
++void a15_dump_dram_reads();
+ void ttsim_exit() {
++    a15_dump_dram_reads();
+     ttsim_heartbeat();
+     for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+         ttsim_select_chip(chip_id);

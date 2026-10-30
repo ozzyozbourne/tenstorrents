@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A15 · Matmul on one core, then many · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a14-one-tiles-journey.html">&larr; Prev</a>
+  <a href="a16-multicast-sync.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 15</span><span class="tag">Prerequisites: A01, A06, A09, A11, A12</span>
+  <h1><span class="num">15.</span> Matmul on one core, then many</h1>
+  <p class="subtitle">Three real tt-metal programs compute the same 640×640 matmul. They read 16,000, 16,000 and 2,400 tiles from DRAM. By the end you will be able to predict those numbers from the loops, and explain why the third program uses only 5 of 64 cores on purpose.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#tilize">Getting the data into tiles</a></li>
+      <li><a href="#single">One core: the triple loop</a></li>
+      <li><a href="#multi">Many cores: splitting the output</a></li>
+      <li><a href="#wall">Why 64 cores don't give 64×</a></li>
+      <li><a href="#blocking">Blocking: per_core_M, per_core_N, in0_block_w</a></li>
+      <li><a href="#subblocks">Subblocks, Dst, and the partials buffer</a></li>
+      <li><a href="#intensity">Arithmetic intensity per block</a></li>
+      <li><a href="#sim">In the simulator: counting every DRAM byte</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>You have written a matmul kernel that runs on one Tensix core and takes time <i>T</i>. The chip has 64 worker cores in the configuration we simulate (an 8×8 grid). You copy the kernel to all 64, give each core 1/64 of the output, and launch. Does it finish in <i>T</i>/64?</p>
+  <p>Usually it does not, and the reason is not the compute. To see why, count something you can count exactly: tiles read from DRAM. tt-metal ships three versions of the same program in <code>programming_examples/matmul/</code>, and each multiplies two 640×640 bf16 matrices. In tiles that is <i>M</i><sub>t</sub> = <i>K</i><sub>t</sub> = <i>N</i><sub>t</sub> = 20, so A, B and C each have 400 tiles.</p>
+  <table>
+    <tr><th>Example</th><th>Cores</th><th>DRAM tile reads</th><th>Times each input tile is fetched</th></tr>
+    <tr><td><code>matmul_single_core</code></td><td>1</td><td>16,000</td><td>20</td></tr>
+    <tr><td><code>matmul_multi_core</code></td><td>64</td><td>16,000</td><td>20</td></tr>
+    <tr><td><code>matmul_multicore_reuse</code></td><td>5</td><td>2,400</td><td>A: 5, B: 1</td></tr>
+  </table>
+  <p>These are not estimates. They come from the loops, and later in this chapter an instrumented ttsim counts every byte that every core pulls from DRAM and gets exactly these numbers. The minimum, if every input tile were fetched once, would be 800. Spreading the work over 64 cores did not reduce the DRAM traffic at all. It made 64 cores compete for the same 12 DRAM banks.</p>
+  <p>This chapter builds the matmul up in the order the examples do. First one core and its triple loop, then splitting output tiles over cores, then blocking, which is what actually saves the traffic.</p>
+
+  <h2 id="tilize">Getting the data into tiles</h2>
+  <p>Before the device sees anything, the host rearranges each matrix. Every example does the same thing right after it builds its random inputs:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/matmul_single_core.cpp:225-232 @7aad8aac (condensed)</div>
+<pre><code>src0_vec = tilize_nfaces(src0_vec, M, K);
+src1_vec = tilize_nfaces(src1_vec, K, N);
+...
+matmul_single_core(src0_vec, src1_vec, result_vec, false, M, N, K, mesh_device);
+// Reverse the tilization to get the result in the row-major format that the CPU expects
+result_vec = untilize_nfaces(result_vec, M, N);</code></pre>
+  <p>A row-major 640×640 matrix stores row 0 (640 values), then row 1, and so on. One 32×32 tile is scattered over 32 different rows, 1280 bytes apart. <code>tilize_nfaces</code> gathers each tile into one contiguous 2048-byte run. Inside the tile it uses the face order from <a href="a05-tiles-and-formats.html">A05</a>: four 16×16 faces (top-left, top-right, bottom-left, bottom-right), each stored row by row. Tiles are emitted in row-major tile order, so tile <code>(mt, kt)</code> of A becomes tile number <code>mt·K<sub>t</sub> + kt</code>:</p>
+  <div class="filename">tt-metal/tt_metal/impl/data_format/tilize_utils.cpp:309-317 @7aad8aac</div>
+<pre><code>for (size_t row_tile = 0; row_tile &lt; row_tiles; row_tile++) {
+    size_t row_tile_start = tile_start;
+    for (size_t col_tile = 0; col_tile &lt; col_tiles; col_tile++) {
+        if (!transpose_face_order) {
+            for (size_t face_h_index = 0; face_h_index &lt; tile_H / face_H; face_h_index++) {
+                for (size_t face_w_index = 0; face_w_index &lt; tile_W / face_W; face_w_index++) {
+                    size_t src_idx = row_tile_start + (face_w_index * face_W) + (face_h_index * face_H * W);
+                    write_face(src_idx, face_H, face_W, W);</code></pre>
+  <p>So element (r, c) of the original matrix ends up at offset <code>tile·1024 + face·256 + (r mod 16)·16 + (c mod 16)</code>, where <code>tile = ⌊r/32⌋·(W/32) + ⌊c/32⌋</code> and <code>face = 2·⌊(r mod 32)/16⌋ + ⌊(c mod 32)/16⌋</code>. Why do this on the host? Because the DRAM buffer is created with <code>page_size = single_tile_size</code> (2048 bytes, line 82-88), and <a href="a09-memory.html">A09</a> showed that pages are dealt round-robin to the 12 DRAM banks. After tilizing, "page <i>p</i>" and "tile <i>p</i>" are the same thing, so a reader kernel can fetch tile <code>(mt, kt)</code> with one call: <code>noc_async_read_page(mt*Kt + kt, ...)</code>. The output comes back tiled too, which is why the host calls <code>untilize_nfaces</code> before comparing with its CPU golden result.</p>
+  <div class="callout warn">Tilizing on the host is a teaching shortcut, not the production path. It costs a full pass over each matrix on the CPU. TT-NN can tilize on the device with a dedicated op, and keeps activations in TILE layout from one op to the next so the conversion happens rarely (<a href="a18-ttnn-user.html">A18</a>).</div>
+
+  <h2 id="single">One core: the triple loop</h2>
+  <p>A tile matmul is block matrix multiplication with 32×32 blocks. Output tile C(mt, nt) is the sum over kt of A(mt, kt) · B(kt, nt), exactly like the scalar formula, but every "number" is a 32×32 tile. The single-core example splits this across the three kernels of <a href="a12-compute-kernels.html">A12</a>: a reader that fetches tiles, a compute kernel that multiplies them, and a writer that stores results.</p>
+  <h3>The reader streams A(mt, kt) and B(kt, nt)</h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/kernels/dataflow/reader_single_core_mm.cpp:30-52 @7aad8aac (condensed)</div>
+<pre><code>for (uint32_t mt = 0; mt &lt; Mt; mt++) {
+    for (uint32_t nt = 0; nt &lt; Nt; nt++) {
+        for (uint32_t kt = 0; kt &lt; Kt; kt++) {
+            {                                          // Read A's tile at (mt, kt)
+                uint32_t a_tile_index = mt * Kt + kt;  // A is MK, so we stride by Kt
+                cb_reserve_back(cb_id_in0, 1);
+                uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
+                noc_async_read_page(a_tile_index, s0, l1_write_addr_in0);
+                noc_async_read_barrier();
+                cb_push_back(cb_id_in0, 1);
+            }
+            {                                          // Read B's tile at (kt, nt)
+                uint32_t b_tile_index = kt * Nt + nt;  // B is KN, so we stride by Nt
+                ... same four calls on cb_id_in1 ...
+            }
+        }  // Kt loop
+    }  // Nt loop
+}</code></pre>
+  <p>The loop order is (mt, nt, kt), with kt innermost. For each output tile the reader walks along row mt of A and down column nt of B. It pushes them as a pair into two circular buffers, <code>c_0</code> and <code>c_1</code>, each two tiles deep (<code>num_input_tiles = 2</code>, host lines 104-115), so the reader can fetch the next pair while compute uses the current one. Count the reads: the body runs <i>M</i><sub>t</sub>·<i>N</i><sub>t</sub>·<i>K</i><sub>t</sub> times and reads two tiles each time, so 2 · 20 · 20 · 20 = <b>16,000</b>. Row mt of A is read again for every nt, which is <i>N</i><sub>t</sub> = 20 times. Nothing in the kernel remembers that it already fetched those tiles.</p>
+  <h3>The compute kernel accumulates over kt inside one acquire</h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/kernels/compute/mm.cpp:50-87 @7aad8aac (comments trimmed)</div>
+<pre><code>compute_kernel_hw_startup&lt;SrcOrder::Reverse&gt;(cb_in0, cb_in1, cb_out);
+matmul_init(cb_in0, cb_in1);
+
+for (uint32_t mt = 0; mt &lt; Mt; ++mt) {
+    for (uint32_t nt = 0; nt &lt; Nt; ++nt) {
+        tile_regs_acquire();
+        for (uint32_t kt = 0; kt &lt; Kt; kt++) {
+            cb_wait_front(cb_in0, 1);
+            cb_wait_front(cb_in1, 1);
+            matmul_tiles(cb_in0, cb_in1, 0, 0, 0);   // Dst[0] += in0 · in1
+            cb_pop_front(cb_in0, 1);
+            cb_pop_front(cb_in1, 1);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        cb_reserve_back(cb_out, 1);
+        pack_tile(0, cb_out);
+        cb_push_back(cb_out, 1);
+        tile_regs_release();
+    }
+}</code></pre>
+  <p>Three details matter here.</p>
+  <ul>
+    <li><b><code>matmul_tiles</code> accumulates.</b> Its documentation says it computes C = A·B "and accumulates the result to DST (DST += C)" (<code>matmul.h:150-152</code>). So the kt loop needs no explicit add. Twenty calls with the same <code>idst = 0</code> leave the full dot product in Dst tile 0. Each call is 16 MVMULs per fidelity phase, as <a href="a06-matrix-engine.html">A06</a> showed.</li>
+    <li><b>The accumulation lives inside one acquire/commit pair.</b> <code>tile_regs_acquire()</code> hands the math thread a half of Dst that is already zero. The zeroing is done by the packer when the previous owner released it: <code>_llk_pack_dest_section_done_</code> issues a <code>ZEROACC</code> of that half before signalling math (<code>tt_llk_wormhole_b0/llk_lib/llk_pack_common.h:59-76</code>). If you moved <code>acquire</code> and <code>commit</code> inside the kt loop, each partial product would be packed separately and the sum would be lost.</li>
+    <li><b>in0 goes to SrcB and in1 to SrcA.</b> The hardware instruction is <code>MVMUL: Dst += SrcB @ SrcA</code>, an 8×16 slab of SrcB times a 16×16 block of SrcA (<code>MVMUL.md:1-3</code>). The left matrix of the instruction is SrcB, so the left matrix of your matmul, in0, has to be unpacked into SrcB. That is the reverse of every other two-input op, where in0 lands in SrcA. The template tag on the startup call tells the hardware configuration about the swap:</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/compute/src_order.h:28-31 and compute_kernel_hw_startup.h:68-70 @7aad8aac</div>
+<pre><code>enum class SrcOrder : uint8_t {
+    Regular = 0,  // icb0 -&gt; SrcA, icb1 -&gt; SrcB
+    Reverse = 1,  // icb0 -&gt; SrcB, icb1 -&gt; SrcA
+};
+...
+    constexpr bool reverse = (src_order == SrcOrder::Reverse);
+    const uint32_t src_a_cb = reverse ? icb1 : icb0;
+    const uint32_t src_b_cb = reverse ? icb0 : icb1;</code></pre>
+  <p>The startup function programs per-register state (data formats and tile sizes for SrcA and SrcB) once, at the start of the kernel. If in0 and in1 had different formats, say bf16 activations and bfp8 weights, configuring them the "regular" way round would give each register the other operand's format. The comment on <code>matmul_init</code> states the rule: "Matmul maps in0 -&gt; SrcB and in1 -&gt; SrcA (the reverse of other ops), which is why compute_kernel_hw_startup must use SrcOrder::Reverse" (<code>matmul.h:89-91</code>). A06 explained why the swap is not cosmetic: SrcA gets the 5-bit side of the multiplier and SrcB the 7-bit side, so in1 (usually the weights) is the operand that loses more bits at low fidelity.</p>
+  <p>Step through the loop for a tiny case, <i>M</i><sub>t</sub> = <i>N</i><sub>t</sub> = 2 and <i>K</i><sub>t</sub> = 3. Watch the read badges on A and B. Every A tile ends up read twice, and so does every B tile.</p>
+
+  <div class="viz" id="fig-loop"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-loop");
+    var g = TT.canvas(root, 960, 430), ctx = g.ctx, C = TT.C;
+    var Mt = 2, Nt = 2, Kt = 3, TW = 46, TH = 30;
+    var Apos = function (m, k) { return { x: 30 + k * (TW + 6), y: 70 + m * (TH + 6) }; };
+    var Bpos = function (k, n) { return { x: 30 + n * (TW + 6), y: 170 + k * (TH + 6) }; };
+    var Cpos = function (m, n) { return { x: 30 + n * (TW + 6), y: 330 + m * (TH + 6) }; };
+    var CB0 = { x: 300, y: 70 }, CB1 = { x: 300, y: 180 }, SB = { x: 500, y: 70 }, SA = { x: 500, y: 180 };
+    var DST = { x: 730, y: 125 }, C16 = { x: 730, y: 290 };
+    var steps = [{ dur: 1.6, kind: "intro", text: "<b>Setup.</b> A is 2×3 tiles, B is 3×2 tiles, C is 2×2 tiles, all tilized pages in DRAM. Loop order (mt, nt, kt): for every output tile, walk row mt of A and column nt of B. Press Play or Step." }];
+    for (var m = 0; m < Mt; m++) for (var n = 0; n < Nt; n++) {
+      for (var k = 0; k < Kt; k++) {
+        steps.push({ dur: 1.4, kind: "mm", m: m, n: n, k: k,
+          text: (k === 0 ? "<b>C(" + m + "," + n + "), acquire.</b> tile_regs_acquire() gives math a zeroed half of Dst. " : "<b>C(" + m + "," + n + "), kt=" + k + ".</b> ") +
+            "Reader fetches A(" + m + "," + k + ") into c_0 and B(" + k + "," + n + ") into c_1. The unpacker puts in0 → <b>SrcB</b> and in1 → <b>SrcA</b>; matmul_tiles adds their product into Dst[0]" +
+            (k === Kt - 1 ? ", which now holds the full sum over kt = 0…2." : ".") });
+      }
+      steps.push({ dur: 1.3, kind: "pack", m: m, n: n,
+        text: "<b>commit, pack, write.</b> tile_regs_commit/wait, then pack_tile(0, c_16) and the writer stores C(" + m + "," + n + ") to DRAM. release() lets the packer zero that Dst half for the next tile." +
+          (m === 0 && n === 0 ? " Next, C(0,1) needs row 0 of A <i>again</i>." : "") });
+    }
+    steps.push({ dur: 1.5, kind: "end", text: "<b>Done.</b> 12 loop bodies × 2 reads = <b>24 DRAM tile reads</b> for 12 distinct input tiles: every A tile was read N<sub>t</sub> = 2 times and every B tile M<sub>t</sub> = 2 times. For 640×640 (20×20×20 tiles) the same loop makes 2·20·20·20 = 16,000 reads." });
+
+    function readsBefore(i) { // count completed mm steps before step i, per tile
+      var a = {}, b = {}, tot = 0;
+      for (var j = 1; j < i; j++) { var s = steps[j]; if (s.kind === "mm") { a[s.m + "," + s.k] = (a[s.m + "," + s.k] || 0) + 1; b[s.k + "," + s.n] = (b[s.k + "," + s.n] || 0) + 1; tot += 2; } }
+      return { a: a, b: b, tot: tot };
+    }
+    function tile(x, y, lab, col, alpha) { TT.box(ctx, x, y, TW, TH, { fill: col, alpha: alpha == null ? 0.35 : alpha, stroke: col, label: lab, font: "12px", mono: true }); }
+    function badge(x, y, n) { if (!n) return; ctx.fillStyle = n > 1 ? C.red : C.orange; ctx.beginPath(); ctx.arc(x + TW - 2, y + 2, 9, 0, 7); ctx.fill(); TT.text(ctx, "" + n, x + TW - 2, y + 2, { color: "#000", font: "bold 11px", align: "center" }); }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var s = steps[i];
+      var r = readsBefore(i + (s.kind === "mm" && t > 0.02 ? 1 : 0));
+      TT.text(ctx, "DRAM (tilized pages)", 30, 40, { color: C.muted, font: "bold 13px" });
+      TT.text(ctx, "A  (in0)", 196, 122, { color: C.blue, font: "12px" });
+      TT.text(ctx, "B  (in1)", 140, 240, { color: C.green, font: "12px" });
+      TT.text(ctx, "C", 140, 381, { color: C.yellow, font: "12px" });
+      for (var mm = 0; mm < Mt; mm++) for (var kk = 0; kk < Kt; kk++) { var p = Apos(mm, kk); tile(p.x, p.y, "A" + mm + kk, C.blue, 0.25); badge(p.x, p.y, r.a[mm + "," + kk]); }
+      for (kk = 0; kk < Kt; kk++) for (var nn = 0; nn < Nt; nn++) { p = Bpos(kk, nn); tile(p.x, p.y, "B" + kk + nn, C.green, 0.25); badge(p.x, p.y, r.b[kk + "," + nn]); }
+      // C done state
+      for (mm = 0; mm < Mt; mm++) for (nn = 0; nn < Nt; nn++) {
+        p = Cpos(mm, nn); var idx = mm * Nt + nn, cur = (s.m === mm && s.n === nn);
+        var done = false;
+        for (var j = 1; j <= i; j++) if (steps[j].kind === "pack" && steps[j].m === mm && steps[j].n === nn && (j < i || t > 0.85)) done = true;
+        TT.box(ctx, p.x, p.y, TW, TH, { fill: done ? C.yellow : C.bg3, alpha: done ? 0.45 : 1, stroke: cur ? C.yellow : C.border, label: "C" + mm + nn, font: "12px", mono: true, lw: cur ? 2.5 : 1 });
+      }
+      // boxes
+      TT.box(ctx, CB0.x - 10, CB0.y - 28, 2 * TW + 30, TH + 40, { stroke: C.border }); TT.text(ctx, "CB c_0 (2 tiles)", CB0.x - 4, CB0.y - 16, { color: C.muted, font: "12px" });
+      TT.box(ctx, CB1.x - 10, CB1.y - 28, 2 * TW + 30, TH + 40, { stroke: C.border }); TT.text(ctx, "CB c_1 (2 tiles)", CB1.x - 4, CB1.y - 16, { color: C.muted, font: "12px" });
+      TT.box(ctx, SB.x - 10, SB.y - 28, TW + 100, TH + 40, { stroke: C.blue }); TT.text(ctx, "SrcB  ← in0", SB.x - 4, SB.y - 16, { color: C.blue, font: "bold 12px" });
+      TT.box(ctx, SA.x - 10, SA.y - 28, TW + 100, TH + 40, { stroke: C.green }); TT.text(ctx, "SrcA  ← in1", SA.x - 4, SA.y - 16, { color: C.green, font: "bold 12px" });
+      TT.box(ctx, 655, 110, 50, 60, { stroke: C.purple, label: "FPU", color: C.purple, font: "bold 12px" });
+      TT.arrow(ctx, 640, 98, 655, 125, { color: C.border, lw: 1.5 }); TT.arrow(ctx, 640, 208, 655, 158, { color: C.border, lw: 1.5 });
+      TT.box(ctx, DST.x - 10, DST.y - 30, 200, 72, { stroke: C.yellow }); TT.text(ctx, "Dst[0]  (accumulator)", DST.x - 4, DST.y - 18, { color: C.yellow, font: "bold 12px" });
+      TT.arrow(ctx, 705, 140, DST.x - 12, 140, { color: C.border, lw: 1.5 });
+      TT.box(ctx, C16.x - 10, C16.y - 28, TW + 100, TH + 40, { stroke: C.border }); TT.text(ctx, "CB c_16 (out)", C16.x - 4, C16.y - 16, { color: C.muted, font: "12px" });
+      TT.text(ctx, "reader", 225, 72, { color: C.muted, font: "11px" }); TT.text(ctx, "unpack", 425, 72, { color: C.muted, font: "11px" });
+      TT.text(ctx, "pack", 840, 215, { color: C.muted, font: "11px" }); TT.text(ctx, "writer", 420, 308, { color: C.muted, font: "11px" });
+      var ac = { color: C.border, lw: 1.5 };
+      TT.arrow(ctx, 192, 86, 286, 86, ac); TT.arrow(ctx, 140, 196, 286, 196, ac);
+      TT.arrow(ctx, 414, 86, 486, 86, ac); TT.arrow(ctx, 414, 196, 486, 196, ac);
+      TT.arrow(ctx, 830, 168, 830, 258, ac); TT.arrow(ctx, 716, 306, 136, 334, ac);
+      // Dst content
+      var dtxt = "0 (zeroed)";
+      if (s.kind === "mm") { var hi = t > 0.8 ? s.k : s.k - 1; dtxt = hi < 0 ? "0 (zeroed)" : "Σ k=0.." + hi + "  A" + s.m + "k·Bk" + s.n; }
+      if (s.kind === "pack") dtxt = "Σ k=0..2  A" + s.m + "k·Bk" + s.n;
+      if (s.kind !== "intro" && s.kind !== "end") TT.text(ctx, dtxt, DST.x, DST.y + 16, { font: "13px", mono: true });
+      // moving tiles
+      if (s.kind === "mm") {
+        var a0 = Apos(s.m, s.k), b0 = Bpos(s.k, s.n);
+        var u1 = Math.min(1, t / 0.45), u2 = Math.max(0, Math.min(1, (t - 0.45) / 0.35));
+        var ax = u2 > 0 ? TT.lerp(CB0.x, SB.x, u2) : TT.lerp(a0.x, CB0.x, u1), ay = u2 > 0 ? TT.lerp(CB0.y, SB.y, u2) : TT.lerp(a0.y, CB0.y, u1);
+        var bx = u2 > 0 ? TT.lerp(CB1.x, SA.x, u2) : TT.lerp(b0.x, CB1.x, u1), by = u2 > 0 ? TT.lerp(CB1.y, SA.y, u2) : TT.lerp(b0.y, CB1.y, u1);
+        tile(ax, ay, "A" + s.m + s.k, C.blue, 0.7); tile(bx, by, "B" + s.k + s.n, C.green, 0.7);
+        if (t > 0.8) { ctx.globalAlpha = (t - 0.8) / 0.2; TT.text(ctx, "+= A" + s.m + s.k + "·B" + s.k + s.n, 640, 195 + 0, { color: C.purple, font: "12px", mono: true }); ctx.globalAlpha = 1; }
+      }
+      if (s.kind === "pack") {
+        var cp = Cpos(s.m, s.n), u = t;
+        var px = u < 0.5 ? TT.lerp(DST.x, C16.x, u * 2) : TT.lerp(C16.x, cp.x, (u - 0.5) * 2), py = u < 0.5 ? TT.lerp(DST.y, C16.y, u * 2) : TT.lerp(C16.y, cp.y, (u - 0.5) * 2);
+        tile(px, py, "C" + s.m + s.n, C.yellow, 0.7);
+      }
+      TT.text(ctx, "DRAM tile reads: " + r.tot, 940, 30, { align: "right", font: "bold 15px", color: r.tot > 12 ? C.red : C.fg });
+      TT.text(ctx, "distinct input tiles: 12", 940, 52, { align: "right", font: "12px", color: C.muted });
+      TT.text(ctx, "badge = times that tile was fetched", 940, 410, { align: "right", font: "12px", color: C.muted });
+    } });
+  })();
+  </script>
+
+  <h3>The writer, and a bug that hides in square matrices</h3>
+  <p>The writer is the mirror image: wait for a tile in <code>c_16</code>, write it to page <code>m·N<sub>t</sub> + n</code>, pop. One detail is worth showing because it is a real latent bug in the example, and a good lesson about runtime arguments:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/matmul_single_core.cpp:169 and kernels/dataflow/writer_single_core_mm.cpp:9-11 @7aad8aac</div>
+<pre><code>tt_metal::SetRuntimeArgs(program, writer_id, core, {dst_addr, Mt, Kt, Nt});   // host
+...
+uint32_t dst_addr = get_arg_val&lt;uint32_t&gt;(0);                                // writer kernel
+uint32_t Mt = get_arg_val&lt;uint32_t&gt;(1);
+uint32_t Nt = get_arg_val&lt;uint32_t&gt;(2);   // index 2 is Kt, not Nt</code></pre>
+  <div class="callout warn">Runtime arguments are a bare array of <code>uint32_t</code> with no names and no type checking. The host passes <code>{dst_addr, Mt, Kt, Nt}</code>, but the writer reads index 2 as <code>Nt</code> and gets <code>Kt</code>. The example works only because K = N = 640. Change N to 320 and the writer would loop over the wrong number of columns. It would wait for 400 output tiles that compute never produces (compute only makes 200), and hang. When a kernel hangs or writes garbage, check the argument indices first.</div>
+
+  <h2 id="multi">Many cores: splitting the output</h2>
+  <p>Every output tile is independent, so the obvious parallel version gives each core a share of the output tiles and lets each core run the single-core algorithm on its share. The question is how to divide 400 tiles among 64 cores when 64 does not divide 400. tt-metal has a helper for that:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_multi_core/matmul_multi_core.cpp:110-122 @7aad8aac (comments trimmed)</div>
+<pre><code>auto core_grid = mesh_device-&gt;compute_with_storage_grid_size();
+auto num_output_tiles_total = (M * N) / TILE_HW;
+auto [num_cores, all_cores, core_group_1, core_group_2, work_per_core1, work_per_core2] =
+    split_work_to_cores(core_grid, num_output_tiles_total);</code></pre>
+  <p>The implementation is short enough to read whole. If there are at least as many units as cores, it uses every core. Each core gets ⌊units / cores⌋, and the remainder is spread as one extra unit to the first few cores:</p>
+  <div class="filename">tt-metal/tt_metal/common/work_split.cpp:350-400 @7aad8aac (condensed)</div>
+<pre><code>if (units_to_divide &gt;= max_num_cores) {
+    target_num_cores = max_num_cores;
+    all_cores = CoreRangeSet(CoreRange({0, 0}, {num_cores_x - 1, num_cores_y - 1}));
+} else { ... }
+uint32_t units_per_core_group_1 = units_to_divide / target_num_cores;
+uint32_t num_cores_with_more_work = units_to_divide % target_num_cores;
+if (units_to_divide % target_num_cores == 0) {
+    core_group_1 = all_cores;
+} else {
+    core_group_1 = num_cores_to_corerangeset(num_cores_with_more_work, grid_size, row_wise);
+    ... core_group_2 = the remaining cores, starting right after group 1 ...
+    units_per_core_group_2 = units_per_core_group_1;
+    units_per_core_group_1++;
+}</code></pre>
+  <p>For 400 tiles on 64 cores, ⌊400/64⌋ = 6 and 400 mod 64 = 16. So <b>group 1 is 16 cores doing 7 tiles each, and group 2 is 48 cores doing 6</b>: 16·7 + 48·6 = 400. <code>row_wise</code> defaults to false, so the cores are filled column by column. Group 1 is therefore logical columns x = 0 and 1. The instrumented run below confirms both the split and the placement.</p>
+  <p>The host then walks both groups and gives each core a starting tile id and a count. The reader converts each linear output-tile id back to (row, column) and runs the same kt loop as before:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_multi_core/kernels/dataflow/reader_mm_output_tiles_partitioned.cpp:34-54 @7aad8aac (condensed)</div>
+<pre><code>for (uint32_t output_tile = 0; output_tile &lt; num_output_tiles; output_tile++) {
+    uint32_t current_tile_id = output_tile_start_id + output_tile;
+    uint32_t out_row = current_tile_id / Nt;  // Which row in output
+    uint32_t out_col = current_tile_id % Nt;  // Which col in output
+    for (uint32_t k = 0; k &lt; Kt; k++) {
+        uint32_t tile_A = out_row * Kt + k;  // A is MK, so we stride by Kt
+        ...
+        uint32_t tile_B = k * Nt + out_col;  // B is KN, so we stride by Nt</code></pre>
+  <p>Count again. Each output tile still costs 2·<i>K</i><sub>t</sub> = 40 reads, whichever core computes it. A group-1 core reads 7·40 = 280 tiles and a group-2 core 6·40 = 240. In total that is 400·40 = <b>16,000</b>, exactly the single-core number. The work is spread over 64 cores, but the traffic is not reduced at all. The 7 tiles one core computes are consecutive tile ids, so they mostly share one row of A, and the reader fetches that row again for each of them.</p>
+  <div class="callout key">Splitting output tiles over cores divides the <i>compute</i> by the core count but leaves the <i>DRAM traffic</i> unchanged. The traffic depends only on how many times each input tile is fetched, and with one output tile at a time, each input tile is fetched once per output tile that needs it.</div>
+
+  <h2 id="wall">Why 64 cores don't give 64×</h2>
+  <p>Now put numbers on it, using two limits only. This is a back-of-envelope model, not a measurement:</p>
+  <ul>
+    <li><b>Compute.</b> At HiFi4, one 32×32×32 tile matmul takes 64 FPU cycles (<code>GEMM_FLOPS.md:107</code>: LoFi 16, HiFi2 32, HiFi4 64), at 1 GHz on Wormhole.</li>
+    <li><b>DRAM.</b> Wormhole's 12 GDDR6 channels give 288 GB/s in total (<a href="a09-memory.html">A09</a>), shared by every core.</li>
+  </ul>
+  <p>One naive tile-matmul step reads 2 tiles (4096 bytes) for 64 cycles of work, so one core needs 64 bytes per cycle, or 64 GB/s at 1 GHz. Sixty-four cores running the naive loop would need 4096 GB/s, 14 times what the DRAM can deliver. The best speed-up the naive multi-core version can reach is therefore about 288/64 = <b>4.5×</b>, however many cores you add. A matmul whose loop re-fetches its inputs is a memory-bound kernel, and adding cores does not move you along a memory-bound line.</p>
+  <p>The fix is to make each fetched tile do more work. Suppose a core owns a <i>b</i>×<i>b</i> block of output tiles rather than one tile. For each kt it reads <i>b</i> tiles of A (a column slice of its rows) and <i>b</i> tiles of B (a row slice of its columns): 2<i>b</i> reads. With them it performs <i>b</i>² tile matmuls, because every A tile meets every B tile. Reads grow like <i>b</i>, work like <i>b</i>². Drag the block size below and play the run. The problem is 2048×2048×2048 (64×64×64 tiles) on an 8×8 grid. Every counter is computed exactly from the loop structure.</p>
+
+  <div class="viz" id="fig-aha"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-aha");
+    var g = TT.canvas(root, 960, 585), ctx = g.ctx, C = TT.C;
+    var T = 64, KT = 64, W = 2, BW = 288; // tiles per side, Kt, in0_block_w, GB/s
+    var BS = [1, 2, 4, 8, 16, 32, 64];
+    var bi = 0, cyc = 64, prog = 0, playing = false, last = 0;
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    ctrl.innerHTML = '<button id="ah-play">Play</button><button id="ah-end">Finish</button><button id="ah-reset">Restart</button>' +
+      '<label>block b×b <input type="range" id="ah-b" min="0" max="6" step="1" value="0"><span id="ah-bv" style="color:#ffd866;min-width:4.5em">1×1</span></label>' +
+      '<label>fidelity <select id="ah-f"><option value="16">LoFi</option><option value="32">HiFi2</option><option value="64" selected>HiFi4</option></select></label>';
+    var narr = document.createElement("div"); narr.className = "narration";
+    root.appendChild(ctrl); root.appendChild(narr);
+    function cfg(b) {
+      var nb = T / b, blocks = nb * nb, cores = Math.min(64, blocks), side = Math.round(Math.sqrt(cores)), bpc = blocks / cores;
+      var perCore = bpc * 2 * b * KT, total = perCore * cores;
+      var l1 = 2 * b * W + 2 * W * b + b * b; // tiles: double-buffered in0, in1 blocks + output block
+      var compUs = bpc * b * b * KT * cyc / 1000, dramUs = total * 2048 / (BW * 1000);
+      var t1 = Math.max(T * T * KT * cyc / 1000, 2 * T * T * KT * 2048 / (BW * 1000));
+      return { b: b, nb: nb, cores: cores, side: side, bpc: bpc, perCore: perCore, total: total, l1: l1, compUs: compUs, dramUs: dramUs, t: Math.max(compUs, dramUs), t1: t1, ai: 16 * b };
+    }
+    function fmt(n) { return n.toLocaleString("en-US"); }
+    function coreRegion(c, cx, cy) { // returns [r0, c0, size] of the region owned by core
+      if (c.b <= 8) return [cy * 8, cx * 8, 8];
+      return [cy * c.b, cx * c.b, c.b];
+    }
+    function blockAt(c, cx, cy, j) { // tile row/col of block j of this core
+      var R = coreRegion(c, cx, cy), per = R[2] / c.b;
+      return [R[0] + Math.floor(j / per) * c.b, R[1] + (j % per) * c.b];
+    }
+    function draw() {
+      var c = cfg(BS[bi]);
+      var ticks = c.bpc * KT, tick = Math.min(ticks, Math.floor(prog * ticks + 1e-9));
+      var blk = Math.min(c.bpc - 1, Math.floor(tick / KT)), kt = tick - blk * KT, finished = tick >= ticks;
+      TT.clear(ctx, g.W, g.H);
+      // --- C matrix
+      var X0 = 20, Y0 = 52, cs = 5;
+      TT.text(ctx, "Output C: 64×64 tiles", X0, 34, { font: "bold 13px" });
+      ctx.fillStyle = C.bg3; ctx.fillRect(X0, Y0, T * cs, T * cs);
+      for (var cy = 0; cy < c.side; cy++) for (var cx = 0; cx < c.side; cx++) {
+        for (var j = 0; j < c.bpc; j++) {
+          var p = blockAt(c, cx, cy, j), st = (j < blk || finished) ? 1 : (j === blk ? 2 : 0);
+          if (!st) continue;
+          ctx.fillStyle = st === 1 ? C.green : C.yellow; ctx.globalAlpha = st === 1 ? 0.35 : 0.9;
+          ctx.fillRect(X0 + p[1] * cs, Y0 + p[0] * cs, c.b * cs, c.b * cs); ctx.globalAlpha = 1;
+        }
+        var R = coreRegion(c, cx, cy);
+        ctx.strokeStyle = C.blue; ctx.lineWidth = 1; ctx.strokeRect(X0 + R[1] * cs + 0.5, Y0 + R[0] * cs + 0.5, R[2] * cs - 1, R[2] * cs - 1);
+      }
+      TT.text(ctx, "blue = one core's region · yellow = block in progress", X0, Y0 + T * cs + 16, { color: C.muted, font: "11px" });
+      TT.text(ctx, "green = blocks done", X0, Y0 + T * cs + 31, { color: C.muted, font: "11px" });
+      if (c.b === 1) TT.text(ctx, "(matmul_multi_core gives each core 64", X0, Y0 + T * cs + 46, { color: C.muted, font: "11px" });
+      if (c.b === 1) TT.text(ctx, " consecutive tiles: same read counts)", X0, Y0 + T * cs + 61, { color: C.muted, font: "11px" });
+      // --- core grid
+      var GX = 368, GY = 52, gc = 40;
+      TT.text(ctx, "8×8 cores: DRAM tile reads so far", GX, 34, { font: "bold 13px" });
+      for (var y = 0; y < 8; y++) for (var x = 0; x < 8; x++) {
+        var used = x < c.side && y < c.side;
+        var n = used ? tick * 2 * c.b : 0;
+        TT.box(ctx, GX + x * gc, GY + y * gc, gc - 3, gc - 3, { fill: used ? C.blue : C.bg3, alpha: used ? 0.12 + 0.5 * (n / 8192) : 1, stroke: used ? C.blue : C.border, r: 4 });
+        TT.text(ctx, used ? fmt(n) : "idle", GX + x * gc + (gc - 3) / 2, GY + y * gc + (gc - 3) / 2, { align: "center", font: used ? "11px" : "10px", mono: used, color: used ? C.fg : C.muted });
+      }
+      // --- stats panel
+      var SX = 735, sy = 40, lh = 21;
+      function line(lbl, val, col) { TT.text(ctx, lbl, SX, sy, { color: C.muted, font: "12px" }); TT.text(ctx, val, 950, sy, { align: "right", font: "bold 13px", color: col || C.fg }); sy += lh; }
+      line("block per core", c.b + "×" + c.b + " tiles", C.yellow);
+      line("cores used", c.cores + " of 64", c.cores < 64 ? C.orange : C.fg);
+      line("blocks per core", "" + c.bpc);
+      line("reads per core", fmt(c.perCore));
+      line("total reads (live)", fmt(c.cores * tick * 2 * c.b), C.blue);
+      line("total reads (final)", fmt(c.total));
+      line("vs. minimum 8,192", "×" + (c.total / 8192));
+      line("fetches per A tile", "" + (T / c.b));
+      line("L1 per core (KiB)", "" + (c.l1 * 2), c.l1 > 680 ? C.red : (c.l1 > 400 ? C.orange : C.fg));
+      line("intensity", c.ai + " FLOP/B");
+      sy += 6;
+      TT.text(ctx, "Model: 1 GHz, " + cyc + " cyc/tile, 288 GB/s", SX, sy, { color: C.muted, font: "11px" }); sy += 18;
+      line("compute / core", (c.compUs / 1000).toFixed(3) + " ms");
+      line("DRAM (all cores)", (c.dramUs / 1000).toFixed(3) + " ms");
+      var bound = c.dramUs > c.compUs ? "DRAM-bound" : "compute-bound";
+      line("time", (c.t / 1000).toFixed(3) + " ms", c.dramUs > c.compUs ? C.red : C.green);
+      line("speed-up vs 1 core", (c.t1 / c.t).toFixed(1) + "×", C.yellow);
+      TT.text(ctx, bound, 950, sy, { align: "right", font: "12px", color: c.dramUs > c.compUs ? C.red : C.green }); sy += 18;
+      if (c.l1 > 680) TT.text(ctx, "does not fit in 1360 KiB of L1", SX, sy + 4, { color: C.red, font: "bold 12px" });
+      else if (c.l1 > 400) TT.text(ctx, "over bmm_op's 400-tile budget", SX, sy + 4, { color: C.orange, font: "12px" });
+      // --- bars
+      var BY = 482, BH = 72;
+      TT.text(ctx, "Total DRAM tile reads by block size (log scale)", 20, BY - 34, { font: "bold 12px" });
+      for (var k = 0; k < BS.length; k++) {
+        var ck = cfg(BS[k]);
+        var bx = 20 + k * 132, cur = k === bi;
+        var hh = BH * (Math.log2(ck.total) - 12) / 7;
+        TT.box(ctx, bx, BY + BH - hh, 90, hh, { fill: cur ? C.yellow : C.blue, alpha: cur ? 0.8 : 0.35, r: 3 });
+        TT.text(ctx, fmt(ck.total), bx + 45, BY + BH - hh - 9, { align: "center", font: "11px", mono: true, color: cur ? C.yellow : C.muted });
+        TT.text(ctx, BS[k] + "×" + BS[k] + " · " + ck.cores + " cores", bx + 45, BY + BH + 12, { align: "center", font: "11px", color: cur ? C.yellow : C.muted });
+      }
+      document.getElementById("ah-bv").textContent = c.b + "×" + c.b;
+      var msg;
+      if (c.b === 1) msg = "<b>Naive (one output tile at a time).</b> Each core reads 2 tiles per kt per output tile: 64 tiles × 2 × 64 = 8,192 reads per core, 524,288 in total. Each A tile is fetched 64 times. The cores are idle most of the time waiting on 288 GB/s.";
+      else if (c.b < 8) msg = "<b>" + c.b + "×" + c.b + " blocks.</b> Each core still owns an 8×8 region but does it in " + c.bpc + " blocks of " + c.b + "×" + c.b + ". Per kt it reads " + 2 * c.b + " tiles and does " + c.b * c.b + " tile matmuls. Reads halve each time b doubles.";
+      else if (c.b === 8) msg = "<b>8×8 blocks: one block per core.</b> 1,024 reads per core, 65,536 total: 8× fewer than naive, yet each A tile is still fetched by all 8 cores in its row. Removing that last factor is the job of multicast (A16).";
+      else if (c.b < 64) msg = "<b>" + c.b + "×" + c.b + " blocks.</b> Traffic keeps falling, but there are only " + c.cores + " blocks, so " + (64 - c.cores) + " cores sit idle. Reuse traded for parallelism." + (c.l1 > 680 ? " The block also no longer fits in L1." : "");
+      else msg = "<b>One core, one block.</b> Every input tile is read exactly once (8,192 reads, the minimum), but one core does all the work, and the block needs ~9 MiB of L1. Impossible and pointless.";
+      narr.innerHTML = msg;
+      document.getElementById("ah-play").textContent = playing ? "Pause" : "Play";
+    }
+    function frame(now) { if (!playing) return; prog += (now - last) / 1000 / 6; last = now; if (prog >= 1) { prog = 1; playing = false; } draw(); if (playing) requestAnimationFrame(frame); }
+    document.getElementById("ah-play").onclick = function () { if (!playing && prog >= 1) prog = 0; playing = !playing; last = performance.now(); draw(); if (playing) requestAnimationFrame(frame); };
+    document.getElementById("ah-end").onclick = function () { playing = false; prog = 1; draw(); };
+    document.getElementById("ah-reset").onclick = function () { playing = false; prog = 0; draw(); };
+    document.getElementById("ah-b").oninput = function () { bi = +this.value; draw(); };
+    document.getElementById("ah-f").onchange = function () { cyc = +this.value; draw(); };
+    draw();
+  })();
+  </script>
+
+  <p>Things to notice as you move the slider:</p>
+  <ul>
+    <li><b>Reads halve each time the block side doubles</b>, from 524,288 at 1×1 to 65,536 at 8×8. The formula is total = (number of blocks) × 2<i>b</i>·<i>K</i><sub>t</sub>, so each A tile is fetched 64/<i>b</i> times: once by every block in its block-row.</li>
+    <li><b>The model speed-up climbs from 4.5× to 36× at HiFi4</b> as <i>b</i> goes from 1 to 8, and it is DRAM-bound the whole way. At 16×16 the kernel becomes compute-bound, but only 16 blocks exist, so 48 cores are idle and the speed-up drops to 16×. Larger blocks also need more L1, and past 16×16 they do not fit.</li>
+    <li><b>Switch to LoFi.</b> The compute gets 4× faster, so the DRAM wall is hit sooner. At 1×1 the 64-core version is only 1.1× faster than one core. Faster math makes data reuse <i>more</i> important, not less.</li>
+  </ul>
+  <div class="callout warn">The model ignores everything except the two roofs: NoC link limits, DRAM bank conflicts, read latency (the simple readers wait on a barrier after every tile), host dispatch, and the 72-core grid of a real n150. Most of these make the naive multi-core version worse. Some also slow the one-core baseline the speed-ups are measured against: the naive loop at HiFi4 needs 64 GB/s into one core, but one NoC link carries about 32 GB/s (<a href="a09-memory.html">A09</a>), and the per-tile barrier adds latency. A real single core is therefore slower than the model assumes, so the ratios are not strict ceilings. Treat them as showing the trend. The read counts, by contrast, are exact.</div>
+  <div class="callout gpu">A GPU GEMM uses the same hierarchy under different names. A thread block computes an output tile staged in shared memory (here, a core's per-core block in L1). A warp computes a smaller tile held in registers (here, a subblock in Dst). The loop marches along K in slices (here, <code>in0_block_w</code>). CUTLASS's "Efficient GEMM" note walks through exactly this structure. One difference matters a lot: on a GPU, the L2 cache catches many of the re-reads between thread blocks, so naive tiling is forgiven to some extent. Here there is no cache, so every re-read is a real DRAM read. Cross-core reuse has to be explicit, and that is A16's multicast.</div>
+  <p>Analogy: 64 cooks share one pantry door. If each cook fetches a carrot every time a recipe mentions one, the doorway is jammed, and hiring more cooks only lengthens the queue. If each cook takes a crate of carrots back to the bench and makes many dishes from it, the door is free. Where the analogy breaks: this pantry has twelve doors (DRAM banks), and the tiles are dealt across all of them, so the queue forms at every door at once. And a cook's bench is small (1.4 MiB), so the crate size is limited.</p>
+
+  <h2 id="blocking">Blocking: per_core_M, per_core_N, in0_block_w</h2>
+  <p><code>matmul_multicore_reuse</code> is the blocked version. Each core owns a <code>per_core_M</code> × <code>per_core_N</code> block of output tiles. It marches along K in steps of <code>in0_block_w</code> tiles. At each step it pulls an in0 slab (per_core_M × in0_block_w tiles) and an in1 slab (in0_block_w × per_core_N tiles) into L1, and uses every tile of both slabs for the whole block. This is the "K-block" scheme from the docs' Lab 2 (<code>labs/matmul/lab2/lab2.rst:434-503</code>). The reader makes it concrete:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout.cpp:59-94 @7aad8aac (condensed)</div>
+<pre><code>for (uint32_t block = 0; block &lt; num_blocks; block++) {            // num_blocks = Kt / in0_block_w
+    cb_reserve_back(cb_id_in0, in0_block_num_tiles);
+    cb_reserve_back(cb_id_in1, in1_block_num_tiles);
+    for (uint32_t h = 0; h &lt; in0_block_h; h++)                        // per_core_M rows of A
+        for (uint32_t w = 0; w &lt; in0_block_w; w++)
+            noc_async_read_page(in0_tensor_tile_id, s0, l1_write_addr_in0), ...;
+    for (uint32_t h = 0; h &lt; in1_block_h; h++)                        // in0_block_w rows of B
+        for (uint32_t w = 0; w &lt; in1_block_w; w++)                    // per_core_N columns
+            noc_async_read_page(in1_tensor_tile_id, s1, l1_write_addr_in1), ...;
+    noc_async_read_barrier();                                         // one barrier per slab pair
+    cb_push_back(cb_id_in0, in0_block_num_tiles);
+    cb_push_back(cb_id_in1, in1_block_num_tiles);
+}</code></pre>
+  <p>Each core reads (per_core_M + per_core_N) · in0_block_w tiles per K-block and <i>K</i><sub>t</sub>/in0_block_w K-blocks, so (per_core_M + per_core_N)·<i>K</i><sub>t</sub> tiles in total. Notice that <code>in0_block_w</code> cancels out: it changes how big each slab is, not how many times a tile is fetched. Notice also that the reader issues a whole slab of reads before a single barrier. Many reads are in flight at once, unlike the one-tile-then-wait readers above.</p>
+  <h3>How the example picks its block</h3>
+  <p>The host fixes <code>in0_block_w = 2</code> and asks a helper for the rest (<code>matmul_multicore_reuse.cpp:98-109</code>). The helper's core rule is an L1 budget:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_common/bmm_op.hpp:66-72 @7aad8aac</div>
+<pre><code>inline uint32_t get_maximum_block_dim(int32_t block_dim, int32_t in0_block_w) {
+    int32_t other_dim = (400 - 2 * in0_block_w * block_dim) / (2 * in0_block_w + block_dim);
+    if (other_dim &gt; 0) {
+        return other_dim;
+    }
+    return 0;
+}</code></pre>
+  <p>The source gives no comment, but the formula can be solved backwards. Rearranging <code>N ≤ (400 − 2wM)/(2w + M)</code> gives <code>2wM + 2wN + MN ≤ 400</code>. That is exactly the tile count of the three circular buffers the host creates: in0 double-buffered (2·per_core_M·w), in1 double-buffered (2·per_core_N·w), and one output block (per_core_M·per_core_N) (<code>matmul_multicore_reuse.cpp:123-131</code>). So the budget is 400 tiles, 800 KiB at 2 KiB per tile, out of the ~1360 KiB of free L1 that A09 measured. This reading is my inference from the arithmetic.</p>
+  <p>For our 640×640 problem, the helper walks candidate <code>per_core_N</code> values in increasing order (products of N<sub>t</sub>'s prime factors 2, 2, 5). For each it takes the largest <code>per_core_M</code> that fits the budget, and accepts the first pair whose block grid fits on 8×8 cores. N = 2 needs 10 columns of cores, which is too many. N = 4 gives M = 20 (the budget would allow 48), a 1×5 grid of blocks. The run prints exactly that:</p>
+<pre><code> -- Metalium Core Sizing --
+ -- per_core_M= 20 -- per_core_N= 4 -- out_subblock_h= 4 -- out_subblock_w= 2 --</code></pre>
+  <p>So each of 5 cores reads (20 + 4)·20 = 480 tiles, <b>2,400 in total</b>. All of A goes to every core (5× each) and B is split (1× each), so 2000 + 400 = 2400. The block uses 2·20·2 + 2·4·2 + 80 = 176 tiles of L1, and its intensity is 32·20·4/24 ≈ 107 FLOP/B (next section).</p>
+  <div class="callout warn">The helper maximises the block size within the L1 budget. It does not maximise the number of cores. For this small problem, that means 5 busy cores and 59 idle ones. In the two-roof model above, the reuse version (5 cores, compute-bound, 1,600 tile matmuls per core ≈ 102 µs at HiFi4) and the naive multi-core version (64 cores, DRAM-bound, 32.8 MB ≈ 114 µs) come out about even. Blocking is not automatically faster. It trades parallelism for traffic, and the right block depends on the shape. TT-NN's production matmul (<code>MatmulMultiCoreReuseMultiCastProgramConfig</code>, <a href="a18-ttnn-user.html">A18</a>) combines both: every core gets a block, and multicast removes the remaining duplication (<a href="a16-multicast-sync.html">A16</a>).</div>
+
+  <h2 id="subblocks">Subblocks, Dst, and the partials buffer</h2>
+  <p>A 20×4 output block is 80 tiles. Dst holds far fewer. The register file is 1024 rows of 16 datums (<code>Dst.md:3</code>), and a tile is 64 such rows (four 16×16 faces). So Dst holds 16 bf16 tiles. Two halves are needed so math can fill one while the packer drains the other, which leaves 8. With <code>fp32_dest_acc_en</code> it is 4. TT-NN encodes exactly this rule:</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/core/compute_kernel/compute_kernel_config.cpp:142-150 @7aad8aac</div>
+<pre><code>uint32_t available_reg_count = (DEST_REGISTER_FULL_SIZE * DATUMS_PER_ROW) / (tile_width * tile_height);
+if (!compute_kernel_config.dst_full_sync_en) {
+    available_reg_count /= 2;
+}
+...
+if (compute_kernel_config.fp32_dest_acc_en) {
+    available_reg_count /= 2;
+}</code></pre>
+  <p>(<code>DEST_REGISTER_FULL_SIZE = 64 * DEST_FACE_HEIGHT</code> = 1024 rows, <code>tensix_types.h:192</code>.) So the per-core block is computed as a sequence of <b>subblocks</b> of <code>out_subblock_h × out_subblock_w ≤ 8</code> tiles. That is why every entry in the example's <code>SUBBLOCK_HW_CHOICES</code> has h·w ≤ 8, ordered from 8 tiles ({4,2}, {2,4}, {8,1}, {1,8}) down to {1,1} (<code>bmm_op.hpp:112-115</code>). The helper picks the first entry that divides the block, so 20×4 gets 4×2: 5 × 2 = 10 subblocks.</p>
+  <p>A subblock can only be finished after all K-blocks have passed, but each K-block's slabs leave L1 before the next arrive. So between K-blocks every subblock's running sum has to be parked somewhere. It is parked in L1, in an intermediate CB, <code>c_24</code>. The compute kernel's structure:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_common/kernels/compute/bmm_large_block_zm.cpp:33-106 @7aad8aac (condensed)</div>
+<pre><code>for (uint32_t block = 0; block &lt; num_blocks; block++) {               // K-blocks
+    bool last_out = block == (num_blocks - 1);
+    cb_wait_front(c_0, in0_block_num_tiles);  cb_wait_front(c_1, in1_block_num_tiles);
+    for (in0_subblock ...) for (in1_subblock ...) {                    // subblocks, row-major
+        tile_regs_acquire();
+        if (enable_reload) {                                            // K-block &gt; 0
+            copy_init(c_24); cb_wait_front(c_24, out_subblock_num_tiles);
+            for (i ...) copy_tile(c_24, i, i);                          // partials back into Dst
+            cb_pop_front(c_24, out_subblock_num_tiles);
+            matmul_init(c_0, c_1);
+        }
+        for (h ...) for (w ...) {                                       // dst_index = h*w_sb + w
+            for (inner_dim = 0; inner_dim &lt; in0_block_w; inner_dim++)
+                matmul_tiles(c_0, c_1, in0_index, in1_index, dst_index);
+            dst_index++;
+        }
+        tile_regs_commit(); tile_regs_wait();
+        if (last_out) { pack all tiles to c_16 }                        // final result
+        else {
+            if (block == 0) { cb_reserve_back(c_16, out_num_tiles_to_wait); out_num_tiles_to_wait += ...; }
+            pack all tiles to c_24 (reserve, pack_tile, push)           // partial result
+        }
+        tile_regs_release();
+    }
+    if (spill) enable_reload = true;
+    cb_pop_front(c_0, in0_block_num_tiles);  cb_pop_front(c_1, in1_block_num_tiles);
+}</code></pre>
+  <p>And the host gives <code>c_16</code> and <code>c_24</code> the <i>same memory</i>: one <code>CircularBufferConfig</code> with two indices, sized for one full output block:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_multicore_reuse/matmul_multicore_reuse.cpp:218-225 @7aad8aac</div>
+<pre><code>uint32_t output_cb_index = tt::CBIndex::c_16;
+uint32_t interm0_cb_index = 24;
+std::map&lt;uint8_t, tt::DataFormat&gt; output_cb_data_format_spec{
+    {output_cb_index, cb_data_format}, {interm0_cb_index, cb_data_format}};
+CircularBufferConfig cb_output_config = CircularBufferConfig(out_CB_size, output_cb_data_format_spec)
+                                            .set_page_size(output_cb_index, single_tile_size)
+                                            .set_page_size(interm0_cb_index, single_tile_size);</code></pre>
+  <p>This works because partial and final results are never alive at the same time. Lab 2 describes it as "a single circular buffer allocation and exposing it through two logical views (two different CB indices) that point into the same physical memory" (<code>lab2.rst:857-867</code>). The odd <code>cb_reserve_back(c_16, ...)</code> in K-block 0 is the guard that makes the sharing safe. Before the first partial goes into a slice of the shared space, compute reserves that slice through the <i>output</i> view. That makes it wait until the writer has drained any final tiles still sitting there (from a previous batch). The kernel's own comment: "Wait for tiles in output buffer to be written out since interm and output share memory" (line 82).</p>
+  <p>Step through a small version: an 8×4-tile block, 4×2 subblocks (what the helper would pick for 8×4), in0_block_w = 2 and K<sub>t</sub> = 6, so 3 K-blocks.</p>
+
+  <div class="viz" id="fig-sub"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-sub");
+    var g = TT.canvas(root, 960, 425), ctx = g.ctx, C = TT.C;
+    var PM = 8, PN = 4, SH = 4, SW = 2, WB = 2, NB = 3, NS = (PM / SH) * (PN / SW);
+    var steps = [{ dur: 1.5, text: "<b>Setup.</b> Per-core block 8×4 tiles, subblocks 4×2 = 8 tiles (half of Dst). K<sub>t</sub> = 6, in0_block_w = 2, so 3 K-blocks. c_16 and c_24 share one 32-tile region." }];
+    for (var b = 0; b < NB; b++) for (var s = 0; s < NS; s++) {
+      var sh = Math.floor(s / (PN / SW)), sw = s % (PN / SW);
+      var txt = "<b>K-block " + b + ", subblock (" + sh + "," + sw + ").</b> acquire Dst half " + ((b * NS + s) % 2) + ". ";
+      if (b > 0) txt += "Reload 8 partials from c_24 with copy_tile. ";
+      txt += "16 matmul_tiles calls (4 rows × 2 cols × in0_block_w 2): in0 rows " + (sh * SH) + "–" + (sh * SH + 3) + " of c_0, in1 cols " + (sw * SW) + "–" + (sw * SW + 1) + " of c_1. ";
+      txt += b < NB - 1 ? "Pack 8 <b>partials</b> to c_24." : "Last K-block: pack 8 <b>final</b> tiles to c_16 for the writer.";
+      if (b === 0 && s === 0) txt += " (First, cb_reserve_back(c_16, 8) checks the writer has freed these slots.)";
+      steps.push({ dur: 1.3, b: b, s: s, sh: sh, sw: sw, text: txt });
+    }
+    steps.push({ dur: 1.5, text: "<b>Done.</b> 12 subblock passes × 16 = 192 matmul_tiles = 8·4·6. Each output tile was packed 3 times (twice as a partial) and reloaded twice. A larger in0_block_w means fewer K-blocks and fewer round-trips through c_24, at the cost of bigger input CBs." });
+    var cell = 26;
+    var IN0 = { x: 40, y: 130 }, IN1 = { x: 130, y: 50 }, OUT = { x: 130, y: 130 }, DST = { x: 330, y: 130 }, RING = { x: 330, y: 330 };
+    function state(i) { // per subblock: 0 empty, 1+b partial through block b, 9 final
+      var st = []; for (var q = 0; q < NS; q++) st.push(0);
+      for (var j = 1; j < i; j++) { var sj = steps[j]; if (sj.b == null) continue; st[sj.s] = sj.b < NB - 1 ? sj.b + 1 : 9; }
+      return st;
+    }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var S = steps[i], cur = S.b != null, st = state(i + (cur && t > 0.85 ? 1 : 0));
+      var calls = 0; for (var j = 1; j < i; j++) if (steps[j].b != null) calls += 16; if (cur) calls += Math.round(16 * Math.min(1, t / 0.85));
+      // in0 block (c_0)
+      TT.text(ctx, "c_0: in0 slab", IN0.x - 10, IN0.y - 14, { color: C.blue, font: "bold 12px" });
+      TT.text(ctx, "8×2", IN0.x + 8, IN0.y + PM * cell + 14, { color: C.muted, font: "11px" });
+      for (var r = 0; r < PM; r++) for (var c = 0; c < WB; c++) {
+        var hl = cur && r >= S.sh * SH && r < S.sh * SH + SH;
+        TT.box(ctx, IN0.x + c * cell, IN0.y + r * cell, cell - 3, cell - 3, { fill: C.blue, alpha: hl ? 0.85 : 0.2, r: 3 });
+      }
+      // in1 block (c_1)
+      TT.text(ctx, "c_1: in1 slab 2×4", IN1.x, IN1.y - 14, { color: C.green, font: "bold 12px" });
+      for (r = 0; r < WB; r++) for (c = 0; c < PN; c++) {
+        hl = cur && c >= S.sw * SW && c < S.sw * SW + SW;
+        TT.box(ctx, IN1.x + c * cell, IN1.y + r * cell, cell - 3, cell - 3, { fill: C.green, alpha: hl ? 0.85 : 0.2, r: 3 });
+      }
+      if (cur) TT.text(ctx, "K-block " + S.b + " of 0–2  (kt " + (2 * S.b) + "–" + (2 * S.b + 1) + ")", IN1.x + PN * cell + 14, IN1.y + 20, { color: C.fg, font: "bold 13px" });
+      // output block
+      TT.text(ctx, "per-core output block 8×4", OUT.x, OUT.y + PM * cell + 14, { color: C.muted, font: "11px" });
+      for (var q = 0; q < NS; q++) {
+        var qh = Math.floor(q / 2), qw = q % 2, x = OUT.x + qw * SW * cell, y = OUT.y + qh * SH * cell;
+        var v = st[q], col = v === 9 ? C.green : (v > 0 ? C.orange : C.bg3), al = v === 9 ? 0.6 : (v > 0 ? 0.15 + 0.2 * v : 1);
+        for (r = 0; r < SH; r++) for (c = 0; c < SW; c++) TT.box(ctx, x + c * cell, y + r * cell, cell - 3, cell - 3, { fill: col, alpha: al, r: 3 });
+        var isCur = cur && q === S.s;
+        ctx.strokeStyle = isCur ? C.yellow : C.border; ctx.lineWidth = isCur ? 3 : 1.5; ctx.strokeRect(x - 2, y - 2, SW * cell + 1, SH * cell + 1);
+        var lab = v === 9 ? "final" : (v > 0 ? "Σ blk 0–" + (v - 1) : "");
+        if (lab) { ctx.fillStyle = "rgba(0,0,0,0.75)"; ctx.fillRect(x + 1, y + SH * cell / 2 - 9, SW * cell - 5, 16); TT.text(ctx, lab, x + SW * cell / 2 - 1, y + SH * cell / 2 - 1, { align: "center", font: "10px", color: C.fg }); }
+      }
+      // Dst
+      TT.text(ctx, "Dst: 16 tile slots (bf16), two halves of 8", DST.x, DST.y - 14, { color: C.yellow, font: "bold 12px" });
+      var half = cur ? (S.b * NS + S.s) % 2 : -1;
+      for (var hfi = 0; hfi < 2; hfi++) {
+        for (var d = 0; d < 8; d++) {
+          var dx = DST.x + d * 34 + hfi * 290, dy = DST.y;
+          var active = hfi === half;
+          var lbl = active ? "C" + (S.sh * SH + Math.floor(d / 2)) + (S.sw * SW + d % 2) : "";
+          TT.box(ctx, dx, dy, 30, 30, { fill: active ? C.yellow : C.bg3, alpha: active ? 0.25 + 0.6 * Math.min(1, t / 0.85) : 1, stroke: active ? C.yellow : C.border, r: 3 });
+          if (lbl) TT.text(ctx, lbl, dx + 15, dy + 15, { align: "center", font: "10px", mono: true });
+        }
+        TT.text(ctx, "half " + hfi + (hfi === half ? " ← math" : ""), DST.x + hfi * 290, DST.y + 46, { color: hfi === half ? C.yellow : C.muted, font: "11px" });
+      }
+      if (cur) {
+        var lines = [];
+        if (S.b > 0) lines.push("1. copy_tile × 8   c_24 → Dst   (reload partials)");
+        lines.push((S.b > 0 ? "2. " : "1. ") + "matmul_tiles × 16 → Dst[0..7] += in0·in1");
+        lines.push((S.b > 0 ? "3. " : "2. ") + "pack_tile × 8 → " + (S.b < NB - 1 ? "c_24 (partial)" : "c_16 (final → writer)"));
+        for (var li = 0; li < lines.length; li++) TT.text(ctx, lines[li], DST.x, DST.y + 80 + li * 22, { font: "12px", mono: true, color: li === lines.length - 1 && S.b === NB - 1 ? C.green : C.fg });
+      }
+      // shared ring
+      TT.text(ctx, "One 32-tile L1 region, two CB views: c_24 (partials) and c_16 (final output)", RING.x, RING.y - 14, { color: C.orange, font: "bold 12px" });
+      for (q = 0; q < NS; q++) {
+        for (d = 0; d < 8; d++) {
+          var rx = RING.x + (q * 8 + d) * 17, v2 = st[q];
+          TT.box(ctx, rx, RING.y, 14, 34, { fill: v2 === 9 ? C.green : (v2 > 0 ? C.orange : C.bg3), alpha: v2 === 9 ? 0.6 : (v2 > 0 ? 0.6 : 1), r: 2 });
+        }
+        TT.text(ctx, "subblock (" + Math.floor(q / 2) + "," + (q % 2) + ")", RING.x + q * 8 * 17 + 4, RING.y + 50, { color: C.muted, font: "11px" });
+      }
+      TT.text(ctx, "orange = partial in c_24 · green = final in c_16", RING.x, RING.y + 74, { color: C.muted, font: "11px" });
+      TT.text(ctx, "matmul_tiles calls: " + calls + " / 192", 940, 28, { align: "right", font: "bold 14px" });
+    } });
+  })();
+  </script>
+
+  <p>Two points are easy to miss in the animation.</p>
+  <ul>
+    <li><b>Reuse happens at two levels.</b> In DRAM terms, every tile in the c_0 and c_1 slabs was fetched once and is used for the whole block. In L1 terms, inside one subblock each in0 tile feeds <code>out_subblock_w</code> matmuls and each in1 tile feeds <code>out_subblock_h</code>, all from the same CB slot. In this figure each in1 slab tile is used by 2 subblocks × 4 rows = 8 matmuls per K-block.</li>
+    <li><b>Spilling has a cost.</b> With <i>K</i><sub>t</sub>/in0_block_w K-blocks, every output tile goes through Dst → L1 → Dst that many times minus one. For the real example (K<sub>t</sub> = 20, in0_block_w = 2), each of the 80 output tiles per core is packed 10 times and reloaded 9 times. That is L1 traffic, which is cheap compared with DRAM but not free. It is also why <code>in0_block_w</code> is worth tuning even though it does not change DRAM reads.</li>
+  </ul>
+  <div class="callout warn">The subblock limit of 8 assumes a bf16 Dst in half-sync mode. Turn on <code>fp32_dest_acc_en</code> (A06 showed why you might) and Dst holds 4 tiles per half. The 4×2 subblock chosen by <code>SUBBLOCK_HW_CHOICES</code> would then overflow. That table is example code with no knowledge of the compute config, and nothing in the example checks it. TT-NN's matmul does: it compares <code>out_subblock_h × out_subblock_w</code> against <code>get_dest_reg_count</code> and refuses configs that do not fit (<code>ttnn/.../matmul/device/matmul_device_operation.cpp:654-660</code>).</div>
+
+  <h2 id="intensity">Arithmetic intensity per block</h2>
+  <p>Now connect this to the roofline from <a href="a01-why-new-hardware.html">A01</a>. For one K-block, a core with a <i>M</i><sub>b</sub>×<i>N</i><sub>b</sub> block and slab width <i>w</i> does:</p>
+  <ul>
+    <li>FLOPs: 2 · (32<i>M</i><sub>b</sub>) · (32<i>w</i>) · (32<i>N</i><sub>b</sub>) = 65,536 · <i>M</i><sub>b</sub><i>N</i><sub>b</sub><i>w</i></li>
+    <li>DRAM bytes (bf16): 2048 · <i>w</i> · (<i>M</i><sub>b</sub> + <i>N</i><sub>b</sub>)</li>
+  </ul>
+  <p style="text-align:center;font-family:var(--mono)">intensity = 32 · M<sub>b</sub>·N<sub>b</sub> / (M<sub>b</sub> + N<sub>b</sub>) FLOP per byte</p>
+  <p>The slab width <i>w</i> cancels again. For square blocks this is 16<i>b</i>:</p>
+  <table>
+    <tr><th>Block (tiles)</th><th>Intensity (FLOP/B)</th><th>Where it sits (Wormhole, HiFi4, 64 cores: ridge ≈ 228 FLOP/B)</th></tr>
+    <tr><td>1×1 (single_core, multi_core)</td><td>16</td><td>deep in the memory-bound slope</td></tr>
+    <tr><td>20×4 (multicore_reuse at 640³)</td><td>107</td><td>still memory-bound at full-chip scale</td></tr>
+    <tr><td>8×8</td><td>128</td><td>memory-bound</td></tr>
+    <tr><td>16×16</td><td>256</td><td>just past the ridge</td></tr>
+  </table>
+  <p>The ridge is 64 cores × 1.024 TFLOP/s (one tile matmul per 64 cycles at 1 GHz) ÷ 288 GB/s ≈ 228 FLOP/B. With the 72 cores of an n150, A01's 74 TF / 288 GB/s gives 257. At LoFi the ridge moves 4× to the right (~910 FLOP/B), which no single-core block that fits in L1 can reach on its own. This is the quantitative reason the production matmul shares tiles <i>between</i> cores (multicast in <a href="a16-multicast-sync.html">A16</a>) and shards weights next to their DRAM banks for decode (A09's DRAM-sharded matmul). Per-core blocking alone lifts intensity by a factor of <i>b</i>. Cross-core sharing is what lifts it the rest of the way.</p>
+  <div class="callout key">The traffic of a blocked matmul depends on the block's perimeter (M<sub>b</sub> + N<sub>b</sub>) and its work on the block's area (M<sub>b</sub>·N<sub>b</sub>). Big, square blocks win, and L1 capacity and core count decide how big they can be.</div>
+
+  <h2 id="sim">In the simulator: counting every DRAM byte</h2>
+  <p>All three examples run unchanged on ttsim (Wormhole build, slow dispatch). I ran each from <code>$LAB_HOME/run</code>:</p>
+  <div class="filename">$ export LAB_HOME=$HOME/ttlab/a15; source sim-labs/workbench/env.sh wh; $EX/metal_example_matmul_single_core   # then _multi_core, _multicore_reuse (info lines trimmed)</div>
+<pre><code>== matmul_single_core
+Output vector of size 409600
+Metalium vs Golden -- PCC = 0.98065174
+Test Passed
+[330591] 9.1 seconds (36.5 KHz)
+
+== matmul_multi_core
+Output vector of size 409600
+Metalium vs Golden -- PCC = 0.999856
+Test Passed
+[10860] 5.5 seconds (2.0 KHz)
+
+== matmul_multicore_reuse
+ -- Metalium Core Sizing --
+ -- per_core_M= 20 -- per_core_N= 4 -- out_subblock_h= 4 -- out_subblock_w= 2 --
+Output vector of size 409600
+Metalium vs Golden -- PCC = 0.99930096
+Test Passed
+[17560] 5.5 seconds (3.3 KHz)</code></pre>
+  <p>Do not compare the PCCs across examples. The inputs differ: single_core draws from [0, 1), multi_core from [−0.5, 0.5), and reuse uses fixed-seed vectors. The first two are reseeded on every run, so their PCC changes slightly between runs (0.98117, 0.98065 and 0.98099 for single_core in three of my runs). All-positive inputs with a bf16 Dst accumulate rounding error in one direction, which is why single_core has the lowest PCC (<a href="a06-matrix-engine.html">A06</a> measured this in detail). The pass thresholds are 0.97 for the first two and 0.99 for reuse.</p>
+  <h3>Instrumenting ttsim to count DRAM reads</h3>
+  <p>The read counts in this chapter came from reading loops. To check them independently, I patched a copy of ttsim (made with <code>build_ttsim.sh dramcount wh</code>). Every NoC read command whose source is a DRAM tile adds its length to a per-core counter, and the totals print when the simulator exits. The patch is one line in the read path of <code>noc_cmd_ctrl</code> plus a dump function called from <code>ttsim_exit</code>. It is saved as <a href="../sim-labs/patches/a15-dram-read-count.patch"><code>sim-labs/patches/a15-dram-read-count.patch</code></a>:</p>
+  <div class="filename">ttsim/src/tile.cpp, inside noc_cmd_ctrl's read branch @b3620244 (patched copy)</div>
+<pre><code>if (src_tile_type == 'D') { // DRAM -&gt; L1
+    if (tile_type == 'T') { a15_dram_rd_bytes[tile_id] += noc_at_len_be; a15_dram_rd_cmds[tile_id]++; }</code></pre>
+  <div class="filename">$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-dramcount-wh-release/libttsim.so; $EX/metal_example_matmul_multi_core   # etc. (trimmed)</div>
+<pre><code>== matmul_single_core
+[330591] A15 dram_rd tile(1,1) bytes=32768000 cmds=16000 tiles2048=16000
+[330591] A15 dram_rd TOTAL cores=1 bytes=32768000 cmds=16000 tiles2048=16000
+
+== matmul_multi_core
+[10860] A15 dram_rd tile(1,1) bytes=573440 cmds=280 tiles2048=280
+[10860] A15 dram_rd tile(2,1) bytes=573440 cmds=280 tiles2048=280
+[10860] A15 dram_rd tile(3,1) bytes=491520 cmds=240 tiles2048=240
+[10860] A15 dram_rd tile(4,1) bytes=491520 cmds=240 tiles2048=240
+...      (every row of cores repeats this pattern: x=1,2 read 280, x=3,4,6,7,8,9 read 240)
+[10860] A15 dram_rd tile(9,10) bytes=491520 cmds=240 tiles2048=240
+[10860] A15 dram_rd TOTAL cores=64 bytes=32768000 cmds=16000 tiles2048=16000
+
+== matmul_multicore_reuse
+[17560] A15 dram_rd tile(1,1) bytes=983040 cmds=480 tiles2048=480
+[17560] A15 dram_rd tile(2,1) bytes=983040 cmds=480 tiles2048=480
+[17560] A15 dram_rd tile(3,1) bytes=983040 cmds=480 tiles2048=480
+[17560] A15 dram_rd tile(4,1) bytes=983040 cmds=480 tiles2048=480
+[17560] A15 dram_rd tile(6,1) bytes=983040 cmds=480 tiles2048=480
+[17560] A15 dram_rd TOTAL cores=5 bytes=4915200 cmds=2400 tiles2048=2400</code></pre>
+  <p>Every prediction holds, byte for byte:</p>
+  <ul>
+    <li><b>single_core</b>: 16,000 reads of 2048 B = 32,768,000 B, all from one core.</li>
+    <li><b>multi_core</b>: also exactly 32,768,000 B, now from 64 cores. The two physical columns x = 1 and 2 (logical columns 0 and 1, since <code>split_work_to_cores</code> fills column-major) read 280 tiles each, which is group 1 with 7 tiles × 40. The other 48 cores read 240, which is group 2 with 6 × 40. Physical column 5 is missing because it is a DRAM column (<a href="a09-memory.html">A09</a>). Rows y = 6 (Ethernet), 8 and 11 are absent too: row 6 has no Tensix cores, and rows 8 and 11 are not part of the 8×8 compute grid this build exposes.</li>
+    <li><b>multicore_reuse</b>: 5 cores (logical (0,0) to (4,0)) × 480 = 2,400 reads, 4,915,200 B: <b>6.67× less</b> DRAM traffic for the same matmul, with each command exactly one tile.</li>
+  </ul>
+  <p>"tile(x,y)" in the log is ttsim's word for a NoC node, not a 32×32 data tile. <i>Tile</i> means three things in this series: a 32×32 block of data, a Tensix tile on the chip, and a ttsim NoC node. Here the log uses the third and the counts use the first.</p>
+  <div class="callout warn">The bracketed numbers ([330591], [10860], [17560]) are ttsim clock counts, and the seconds are host CPU time. Neither is performance. ttsim is a functional, bit-exact model whose clock advances when the host polls it. The single-core run shows 30× more "clocks" than the multi-core run mostly because the host waited longer for it, not because silicon would show that ratio. The byte counts, by contrast, are exact: ttsim moves every byte a kernel asks for. Use the simulator to count traffic, and silicon with the profiler to measure time.</div>
+  <div class="callout sim">Go deeper in <a href="../sim-labs/b07-matmul-fidelity.html">B07, Matmul and math fidelity, bit for bit</a>. It runs the single-core matmul at every fidelity with a fixed seed, dumps one MVMUL's SrcA, SrcB and Dst from an instrumented ttsim (watch in0 arrive in SrcB), and reproduces the bits in Python. To repeat this chapter's count, apply <code>a15-dram-read-count.patch</code> to a <code>build_ttsim.sh</code> copy. Then try <code>metal_example_matmul_multicore_reuse_mcast</code>, the A16 version, and predict its count first.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>Tilize on the host</b> (<code>tilize_nfaces</code>) turns each 32×32 tile into one contiguous 2048-byte page, with faces in order, so page id = tile id and a reader fetches tile (mt, kt) with one <code>noc_async_read_page</code>.</li>
+    <li><b>The single-core kernel</b> loops (mt, nt, kt). The reader streams A(mt, kt) and B(kt, nt) through c_0/c_1. <code>matmul_tiles</code> accumulates into Dst[0] across kt inside one acquire/commit, starting from a Dst half the packer has already zeroed. in0 → SrcB and in1 → SrcA because MVMUL is <code>Dst += SrcB @ SrcA</code>, and <code>compute_kernel_hw_startup&lt;SrcOrder::Reverse&gt;</code> tells the hardware configuration.</li>
+    <li><b><code>split_work_to_cores</code></b> divides units over a grid as group 1 (⌈u/c⌉ each) and group 2 (⌊u/c⌋ each): 400 tiles → 16 × 7 + 48 × 6, filled column-major by default.</li>
+    <li><b>Splitting the output does not split the traffic.</b> Naive single-core and 64-core runs both read 2·M<sub>t</sub>·N<sub>t</sub>·K<sub>t</sub> = 16,000 tiles. With 64 cores the DRAM is the wall (≈4.5× ceiling at HiFi4 in the two-roof model).</li>
+    <li><b>Blocking</b> with per_core_M × per_core_N makes each fetched tile serve a whole block row or column: reads become (M<sub>b</sub> + N<sub>b</sub>)·K<sub>t</sub> per core. 640³ drops to 2,400 reads, confirmed byte for byte in ttsim. <code>in0_block_w</code> sets slab size and L1 use, not DRAM reads.</li>
+    <li><b>Subblocks</b> of h×w ≤ 8 tiles (bf16 Dst, half-sync; 4 with FP32) fit the block through Dst. Partials wait in c_24 between K-blocks, sharing memory with c_16.</li>
+    <li><b>Intensity per block</b> is 32·M<sub>b</sub>N<sub>b</sub>/(M<sub>b</sub>+N<sub>b</sub>) FLOP/B: 16 for one tile, 128 for 8×8, against a ridge of ~228 (HiFi4) or ~910 (LoFi). Reaching it takes cross-core sharing, which is the next chapter.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>You change the single-core example to M = 640, K = 1280, N = 640 (fixing the writer bug first). How many DRAM tile reads does the reader make?</summary><p>M<sub>t</sub> = 20, K<sub>t</sub> = 40, N<sub>t</sub> = 20. The reader loop body runs M<sub>t</sub>·N<sub>t</sub>·K<sub>t</sub> = 16,000 times and reads 2 tiles each time, so 32,000 reads (65.5 MB). Doubling K doubles the reads, because every output tile's dot product is twice as long and nothing is reused.</p></details>
+  <details class="quiz"><summary>Why must a matmul compute kernel call compute_kernel_hw_startup&lt;SrcOrder::Reverse&gt;, while an eltwise add uses the default?</summary><p>The matrix unit's instruction is <code>Dst += SrcB @ SrcA</code>: the left operand of the product comes from SrcB. For C = in0 · in1, in0 must therefore be unpacked into SrcB and in1 into SrcA, the reverse of eltwise ops, where in0 → SrcA. The startup call programs per-register state (formats, tile sizes) once, so it must know which CB feeds which register. With Reverse, it configures SrcA from in1's CB and SrcB from in0's CB. With mismatched formats (bf16 activations, bfp8 weights), getting this wrong would decode each operand with the other's format.</p></details>
+  <details class="quiz"><summary>split_work_to_cores on an 8×8 grid with 100 units: what are the two groups?</summary><p>100 ≥ 64, so all 64 cores are used. ⌊100/64⌋ = 1 and 100 mod 64 = 36, so group 1 has 36 cores doing 2 units each and group 2 has 28 cores doing 1: 72 + 28 = 100. With row_wise = false, group 1 fills columns 0–3 (32 cores) and the first 4 cores of column 4. Group 2 starts right after.</p></details>
+  <details class="quiz"><summary>In matmul_multicore_reuse, someone doubles in0_block_w from 2 to 4. What happens to DRAM reads, L1 use, and spills, for the 640³ problem?</summary><p>DRAM reads do not change: each core still reads (per_core_M + per_core_N)·K<sub>t</sub> tiles, since in0_block_w cancels. The input CBs double (in0: 2·20·4 = 160 tiles, in1: 2·4·4 = 32) and the number of K-blocks halves (10 → 5), so each output tile goes through c_24 4 times instead of 9. Also, the helper's budget 2wM + 2wN + MN ≤ 400 is evaluated with w = 4, so it might pick a different block. Here it still gives M = 20 (the bound for N = 4 is (400 − 32)/12 = 30).</p></details>
+  <details class="quiz"><summary>A 4×4-tile output block, bf16, reading A and B from DRAM interleaved. What is its arithmetic intensity, and is it memory- or compute-bound on Wormhole at HiFi2 with all 64 cores busy?</summary><p>32·16/8 = 64 FLOP/B. At HiFi2 a tile matmul takes 32 cycles, so 64 cores deliver 64 × 65,536/32 GFLOP/s ≈ 131 TFLOP/s, and the ridge is 131e12 / 288e9 ≈ 455 FLOP/B. 64 is far below it: memory-bound by a factor of about 7.</p></details>
+  <details class="quiz"><summary>The instrumented ttsim shows matmul_single_core at 330,591 clocks and matmul_multi_core at 10,860. Can you conclude the multi-core version is 30× faster on silicon?</summary><p>No. ttsim's clock is driven by the host polling the device, not by modelled hardware timing, so clock counts measure how long the host waited. (A06 showed LoFi taking <i>more</i> clocks than HiFi4 in ttsim, the opposite of silicon.) What ttsim does tell you exactly is the traffic: both moved 32,768,000 bytes from DRAM. On silicon, both would be DRAM-limited, and the model above suggests the multi-core version tops out around 4.5× at HiFi4.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/matmul">tt-metal matmul programming examples</a>: the source of single_core, multi_core, multicore_reuse and multicore_reuse_mcast, and the shared <code>matmul_common</code> kernels.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab1/lab1.html">TT-Metalium Lab 1: single-core matmul</a>: loop tiling, tilized layout and the reader/compute/writer split, with exercises.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab2/lab2.html">TT-Metalium Lab 2: multi-core and data reuse</a>: split_work_to_cores, K-blocking, the 972 vs 324 tile-read example, and shared output/intermediate CBs.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/matmul_multi_core.html">Matmul multi-core example walkthrough</a>: the official docs page for the 64-core version.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/prog_examples/matmul_multi_core_optimized/data_reuse.md">Data reuse in matmul_multicore_reuse</a>: tech report on get_large_matmul_params, subblocks and the c_24 intermediate buffer.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md">Matrix multiply FLOPS tech report</a>: cycles per tile by fidelity, the utilisation formula, and measured TFLOPS on Wormhole and Blackhole.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/matrix_engine/matrix_engine.md">Matrix engine tech report</a>: SrcA/SrcB/Dst, fidelity and the fp32_dest_acc_en trade-off.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md">ISA docs: MVMUL</a>: <code>Dst += SrcB @ SrcA</code>, the instruction behind in0 → SrcB.</li>
+    <li><a href="https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/efficient_gemm.md">CUTLASS: Efficient GEMM in CUDA</a>: the thread-block / warp / thread tiling hierarchy that per-core blocks and subblocks mirror.</li>
+    <li><a href="https://siboehm.com/articles/22/CUDA-MMM">How to optimize a CUDA matmul kernel</a> (Simon Boehm): a step-by-step blocking story on a GPU, with the same "count the global memory reads" reasoning.</li>
+    <li><a href="https://www.cs.utexas.edu/~flame/pubs/GotoTOMS_revision.pdf">Goto &amp; van de Geijn, Anatomy of high-performance matrix multiplication</a>: the classic paper on choosing block sizes so they fit each memory level.</li>
+    <li><a href="https://jax-ml.github.io/scaling-book/roofline/">All about rooflines</a> (JAX scaling book): arithmetic intensity and ridge points applied to matmuls on accelerators.</li>
+  </ul>
+
+  <div class="pager"><a href="a14-one-tiles-journey.html">&larr; 14 One tile's journey</a><a class="next" href="a16-multicast-sync.html">16 Multicast and cross-core synchronization &rarr;</a></div>
+</main>
+</body>
+</html>

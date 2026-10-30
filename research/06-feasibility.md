@@ -11,7 +11,7 @@
 - **`build_host.sh file.cpp`** builds a host program out of tree against `build_Release` in about 6 s. Example: `host/mm_fid.cpp` is a single-core matmul that takes `MM_FIDELITY=0|2|3|4` (numeric MathFidelity: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; parsed with atoi, so names silently mean LoFi) and `MM_SEED`, and prints `mean_abs_err` and `result_hash`.
 - **`build_ttsim.sh <name> [wh|bh] [release|debug]`** copies ttsim into `$LAB_HOME/ttsim-<name>`, builds it (about 3.5 s), packages the `.so` next to `soc_descriptor.yaml`, and prints the `export TT_METAL_SIMULATOR=...` line.
 - **Kernel path search order** (`tt_metal/impl/kernels/kernel.cpp:50-95`): absolute path, then cwd, then `TT_METAL_KERNEL_PATH`, then the system kernel directory, then the runtime root. Running from `TT_METAL_HOME` therefore silently uses the stock kernels.
-- **Editing a kernel and rerunning needs no rebuild.** The JIT cache keys on the source content.
+- **Editing a kernel and rerunning needs no rebuild.** Edits are detected via `.dephash` dependency hashes; the kernel hash directory itself is keyed on path, args and config (kernel.cpp:134,832-848), not file contents.
 
 ## Verified results
 | Test | Result |
