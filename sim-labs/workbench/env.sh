@@ -13,8 +13,13 @@ if [ -z "$TTSIM_HOME" ]; then
     TTSIM_HOME=$HOME/ttsim
     [ -f "$TTSIM_HOME/make.py" ] || [ ! -d "$HOME/workspace/refs/ttsim" ] || TTSIM_HOME=$HOME/workspace/refs/ttsim
 fi
-export TT_METAL_HOME TTSIM_HOME
-export LAB_HOME=${LAB_HOME:-$HOME/ttlab}                               # scratch space for lab output
+LAB_HOME=${LAB_HOME:-$HOME/ttlab}                                      # scratch space for lab output
+mkdir -p "$LAB_HOME"
+# Make the paths absolute: the script cds away at the end, so relative values would break.
+TT_METAL_HOME=$(CDPATH= cd -- "$TT_METAL_HOME" 2>/dev/null && pwd || echo "$TT_METAL_HOME")
+TTSIM_HOME=$(CDPATH= cd -- "$TTSIM_HOME" 2>/dev/null && pwd || echo "$TTSIM_HOME")
+LAB_HOME=$(CDPATH= cd -- "$LAB_HOME" && pwd)
+export TT_METAL_HOME TTSIM_HOME LAB_HOME
 
 # The simulator: a libttsim.so that sits next to a soc_descriptor.yaml (tt-metal requires it).
 export TT_METAL_SIMULATOR=${SIM:-$HOME/sim/$ARCH/libttsim_$ARCH.so}
@@ -26,7 +31,14 @@ export TT_METAL_DISABLE_SFPLOADMACRO=1        # SFPLOADMACRO is UnsupportedFunct
 # Run from a lab directory, not from TT_METAL_HOME: kernel paths are searched in the
 # current directory first, so running from TT_METAL_HOME would silently pick the stock kernels.
 export TT_METAL_RUNTIME_ROOT=$TT_METAL_HOME   # where firmware and system kernels live
-export TT_METAL_KERNEL_PATH=${TT_METAL_KERNEL_PATH:-$LAB_HOME/kernels}  # your kernel overlay
+# Your kernel overlay. A value you exported is kept, but one set by an earlier `source env.sh`
+# follows the new LAB_HOME, so labs never share an overlay by accident.
+if [ -z "$TT_METAL_KERNEL_PATH" ] || [ "$TT_METAL_KERNEL_PATH" = "$_TTLAB_KERNEL_PATH" ]; then
+    TT_METAL_KERNEL_PATH=$LAB_HOME/kernels; _TTLAB_KERNEL_PATH=$TT_METAL_KERNEL_PATH
+else
+    _TTLAB_KERNEL_PATH=
+fi
+export TT_METAL_KERNEL_PATH
 export TT_METAL_LOGS_PATH=$LAB_HOME/logs      # watcher / dprint / inspector output
 export TT_METAL_PROFILER_DIR=$LAB_HOME/profiler
 export EX=$TT_METAL_HOME/build_Release/programming_examples   # prebuilt example binaries

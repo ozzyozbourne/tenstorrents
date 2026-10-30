@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B00 · Setting up the workbench · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border: 1px solid var(--orange); background: var(--bg2); border-radius: 8px; padding: .7rem 1rem; margin: 1rem 0 1.5rem; }
+  .honesty b { color: var(--orange); }
+  .out { border-color: #3a4a2a; }
+  .provenance { font-size: 13px; color: var(--muted); margin: -.3rem 0 .8rem; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a03-chip-tour.html">&larr; Prev</a>
+  <a href="b01-meet-ttsim.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B00</span><span class="tag">Prerequisites: none (A01–A03 help)</span>
+  <h1><span class="num">B00.</span> Setting up the workbench</h1>
+  <p class="subtitle">Build the exact environment used in this series on a fresh Linux x86_64 machine: ttsim, tt-metal, three small scripts, and a smoke test that prints <code>Success: Result is 21</code> with no Tenstorrent card in sight.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <em>functional, bit-exact</em> simulator: it computes the same bits silicon would. It is <em>not a timing model</em>. The clock counts it prints, such as <code>[4501]</code>, measure how far the host let the simulation run, not how fast a real chip would be. Every lab in this series uses them only as a determinism check, never as a performance number.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#stack">What talks to what</a></li>
+      <li><a href="#overview">The recipe at a glance</a></li>
+      <li><a href="#clone">Step 1: Clone and pin</a></li>
+      <li><a href="#ttsim">Step 2: Build ttsim (or download it)</a></li>
+      <li><a href="#soc">Step 3: Put each .so next to its soc_descriptor.yaml</a></li>
+      <li><a href="#metal">Step 4: Install dependencies and build tt-metal</a></li>
+      <li><a href="#ttnn">Step 5 (optional): ttnn and python_env</a></li>
+      <li><a href="#workbench">Step 6: The workbench scripts</a></li>
+      <li><a href="#smoke">Step 7: Smoke test</a></li>
+      <li><a href="#trouble">Troubleshooting</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Here is the program we want to run. It is the smallest example in tt-metal: copy two integers into a Tensix core's SRAM, add them on one of the core's little RISC-V processors, and copy the answer back.</p>
+<pre><code>$EX/metal_example_add_2_integers_in_riscv
+...
+Success: Result is 21</code></pre>
+  <p>On a machine with a Wormhole card, that binary talks to a driver, the driver talks to PCIe, and PCIe reaches the chip. We have no card. So the real question of this lab is:</p>
+  <p><b>What exactly must be on your disk, and in your environment, for that same unmodified binary to print "Result is 21" when there is no chip at all?</b></p>
+  <p>The answer turns out to be short: one shared library that <em>is</em> the chip, one YAML file sitting next to it, a built tt-metal tree, and about a dozen environment variables. But each of those pieces has a trap, and every trap in this lab is one we actually fell into while building the environment for this series in an Amp orb (Debian 12, 8 vCPUs, 15 GiB RAM). Everything below was run there, and every output block is pasted from a real run.</p>
+
+  <h2 id="stack">What talks to what</h2>
+  <p>Before typing commands, it helps to see where the simulator plugs in. Think of tt-metal as a tall building. The top floors (your program, the Metalium runtime, the user-mode driver) don't care what is in the basement. On silicon the basement is a kernel driver and a PCIe link. Under ttsim the basement is a single <code>.so</code> file loaded into the same process.</p>
+
+  <div class="viz" id="fig-stack"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-stack");
+    var g = TT.canvas(root, 880, 470), ctx = g.ctx, C = TT.C;
+    var SX = 20, HX = 520, CW = 340;          // sim column x, silicon column x, column width
+    var rows = [60, 135, 210, 300, 385], RH = [55, 55, 60, 60, 62];
+    var L = [
+      { same: true, t: "your host program", s: "metal_example_add_2_integers_in_riscv", c: C.blue },
+      { same: true, t: "libtt_metal.so", s: "JIT-compiles kernels, sends commands", c: C.blue },
+      { same: true, t: "libtt-umd.so (user-mode driver)", sSim: "device class: TTSimTTDevice", sSil: "device class: TTDevice + PCIDevice", c: C.teal },
+      { tSim: "libttsim.so, dlopen()ed into the process", sSim: "libttsim_pci_mem_rd/wr_bytes, _clock",
+        tSil: "tt-kmd: /dev/tenstorrent/0", sSil: "ioctl + mmap of the PCIe BARs", cSim: C.green, cSil: C.purple },
+      { tSim: "simulated Wormhole, in host RAM", sSim: "C++ state; runs only inside _clock()",
+        tSil: "real Wormhole / Blackhole chip", sSil: "behind a PCIe link, on its own clocks", cSim: C.green, cSil: C.orange }
+    ];
+    function layer(k, col, a) {
+      var d = L[k], x = col === 0 ? SX : HX, y = rows[k], h = RH[k];
+      var title = d.t || (col === 0 ? d.tSim : d.tSil);
+      var sub = d.s || (col === 0 ? d.sSim : d.sSil);
+      var c = d.c || (col === 0 ? d.cSim : d.cSil);
+      ctx.globalAlpha = a;
+      TT.box(ctx, x, y, CW, h, { fill: c, alpha: 0.16 * a, stroke: c });
+      ctx.globalAlpha = a;
+      TT.text(ctx, title, x + CW / 2, y + h / 2 - 9, { align: "center", font: "bold 14px" });
+      TT.text(ctx, sub, x + CW / 2, y + h / 2 + 11, { align: "center", font: "12px", color: C.muted, mono: true });
+      ctx.globalAlpha = 1;
+    }
+    function dashed(x1, y, x2, color) {
+      ctx.save(); ctx.setLineDash([6, 5]); ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke(); ctx.restore();
+    }
+    function packet(x, y, label, color) {
+      TT.box(ctx, x - 36, y - 11, 72, 22, { fill: color, alpha: 0.9, r: 11 });
+      TT.text(ctx, label, x, y, { align: "center", font: "bold 11px", color: "#000" });
+    }
+    var steps = [
+      { dur: 1.4, text: "<b>Same top floors.</b> Your program, <code>libtt_metal.so</code> and the user-mode driver <code>libtt-umd.so</code> are the very same files in both worlds. Nothing is recompiled for the simulator." },
+      { dur: 1.4, text: "<b>One environment variable picks the basement.</b> When <code>TT_METAL_SIMULATOR</code> is set, tt-metal's runtime options switch the target device to <code>Simulator</code> (rtoptions.cpp:527-531) and UMD creates a <code>TTSimTTDevice</code> instead of a PCIe device." },
+      { dur: 1.4, text: "<b>Different next floor down.</b> On silicon, UMD opens <code>/dev/tenstorrent/N</code>, which the kernel driver tt-kmd provides, and maps the card's BARs. Under ttsim, UMD calls <code>dlopen()</code> on <code>libttsim.so</code> and resolves its flat C entry points." },
+      { dur: 1.4, text: "<b>The chip itself.</b> On silicon it sits across the PCIe link. Under ttsim it is plain data inside your own process: one Linux process contains everything from <code>main()</code> to the Tensix cores." },
+      { dur: 2.2, text: "<b>A write.</b> tt-metal copies a kernel binary into a core's L1. On silicon this becomes stores into a mapped BAR window, which travel as PCIe transactions. Under ttsim the same UMD call ends in a function call, <code>libttsim_pci_mem_wr_bytes()</code>." },
+      { dur: 2.2, text: "<b>A read, and the clock.</b> A real chip runs whether or not you look at it. ttsim runs <em>only</em> inside <code>libttsim_clock(n)</code>, and UMD advances it by one clock after every read (tt_sim_tt_device.cpp:334-338). That is why the clock count tracks host polling, not chip speed." },
+      { dur: 1.6, text: "<b>The takeaway.</b> Everything above the red line is identical, byte for byte. ttsim replaces the two floors below it. A bug you see above the line in the simulator is a bug on silicon too; timing below the line is not modelled." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        TT.text(ctx, "under ttsim (this series)", SX + CW / 2, 30, { align: "center", font: "bold 15px", color: C.green });
+        TT.text(ctx, "on silicon", HX + CW / 2, 30, { align: "center", font: "bold 15px", color: C.orange });
+        var a01 = i === 0 ? t : 1;
+        for (var k = 0; k < 3; k++) { layer(k, 0, a01); layer(k, 1, a01); }
+        if (i >= 1 && i <= 3) {
+          var a = i === 1 ? t : 1;
+          ctx.globalAlpha = a;
+          TT.text(ctx, "TT_METAL_SIMULATOR", 440, 222, { align: "center", font: "bold 12px", mono: true, color: C.yellow });
+          TT.arrow(ctx, 425, 234, SX + CW + 8, 254, { color: C.green, lw: 1.5 });
+          TT.arrow(ctx, 455, 234, HX - 8, 254, { color: C.orange, lw: 1.5 });
+          TT.text(ctx, "set", 395, 272, { align: "center", font: "12px", color: C.green });
+          TT.text(ctx, "unset", 485, 272, { align: "center", font: "12px", color: C.orange });
+          ctx.globalAlpha = 1;
+        }
+        if (i >= 2) {
+          var b = i === 2 ? t : 1;
+          layer(3, 0, b); layer(3, 1, b);
+          ctx.globalAlpha = b;
+          dashed(HX, 285, HX + CW, C.muted);
+          TT.text(ctx, "user | kernel", HX + CW - 4, 278, { align: "right", font: "11px", color: C.muted });
+          ctx.globalAlpha = 1;
+        }
+        if (i >= 3) {
+          var c3 = i === 3 ? t : 1;
+          layer(4, 0, c3); layer(4, 1, c3);
+          ctx.globalAlpha = c3;
+          dashed(HX, 372, HX + CW, C.orange);
+          TT.text(ctx, "PCIe link", HX + CW - 4, 365, { align: "right", font: "11px", color: C.orange });
+          ctx.save(); ctx.setLineDash([3, 4]); ctx.strokeStyle = C.green; ctx.lineWidth = 1.2;
+          ctx.strokeRect(SX - 8, rows[0] - 8, CW + 16, rows[4] + RH[4] - rows[0] + 16); ctx.restore();
+          TT.text(ctx, "one Linux process", SX - 4, rows[4] + RH[4] + 15, { font: "12px", color: C.green });
+          ctx.globalAlpha = 1;
+        }
+        if (i === 4) {
+          var yy = TT.lerp(rows[1] + 28, rows[4] + 30, t);
+          packet(SX + CW + 42, yy, "write", C.yellow);
+          packet(HX - 42, yy, "write", C.yellow);
+          if (t > 0.55) TT.text(ctx, "a function call", SX + 14, rows[3] + 74, { font: "11px", color: C.yellow });
+          if (t > 0.55) TT.text(ctx, "a PCIe write", HX + 14, rows[3] + 62, { font: "11px", color: C.yellow });
+        }
+        if (i === 5) {
+          var y2 = TT.lerp(rows[4] + 30, rows[1] + 28, t);
+          packet(SX + CW + 42, y2, "read", C.blue);
+          packet(HX - 42, y2, "read", C.blue);
+          var n = Math.floor(TT.lerp(0, 12, t));
+          TT.box(ctx, SX + 10, rows[3] + 66, 150, 18, { fill: C.bg3, r: 4 });
+          TT.text(ctx, "libttsim_clock(1) x" + n, SX + 16, rows[3] + 75, { font: "11px", mono: true, color: C.green });
+        }
+        if (i === 6) {
+          ctx.save(); ctx.strokeStyle = C.red; ctx.lineWidth = 2.5; ctx.setLineDash([10, 6]);
+          var ly = rows[3] - 13;
+          ctx.beginPath(); ctx.moveTo(8, ly); ctx.lineTo(TT.lerp(8, 872, t), ly); ctx.stroke(); ctx.restore();
+          TT.text(ctx, "identical", 440, ly - 40, { align: "center", font: "bold 12px", color: C.yellow });
+          TT.text(ctx, "binaries above", 440, ly - 24, { align: "center", font: "bold 12px", color: C.yellow });
+          TT.text(ctx, "ttsim replaces", 440, ly + 24, { align: "center", font: "bold 12px", color: C.red });
+          TT.text(ctx, "what is below", 440, ly + 40, { align: "center", font: "bold 12px", color: C.red });
+        }
+      }
+    });
+  })();
+  </script>
+
+  <p>Two facts from ttsim's own API document make this possible. The library exports a flat C interface (config-space reads, BAR reads and writes, and <code>libttsim_clock</code>), and it is deliberately small: it "reads no environment variables", "never calls <code>dlopen</code>", and links only against the C library (<code>refs/ttsim/docs/libttsim_api.md</code>, "Hidden API" and "ABI" sections). You can check the last claim yourself:</p>
+<pre class="out"><code>$ ldd ~/sim/wh/libttsim_wh.so
+	linux-vdso.so.1 (0x00007fff2fc2d000)
+	libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007f599d61e000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f59a5749000)</code></pre>
+
+  <div class="callout gpu">The layering mirrors a GPU stack: <code>libtt-umd</code> plays the role of a user-mode driver library such as <code>libcuda</code>, and <code>tt-kmd</code> plays the role of the kernel module. What is unusual is the bottom: instead of an emulator that pretends to be a PCIe device, the "device" is a library the user-mode driver links in directly. That is why setup is so light: no kernel module, no VM, no root privileges at run time.</div>
+
+  <div class="callout key">tt-metal does not know it is talking to a simulator above the UMD line. So the host program, the kernels and the firmware you run here are the same ones you would run on a card. What changes is <em>where the clock comes from</em>.</div>
+
+  <h2 id="overview">The recipe at a glance</h2>
+  <p>Here is everything we installed, with the versions that worked together. Pin these and you get the environment every lab in this series was run against.</p>
+  <table>
+    <tr><th>Piece</th><th>Version used</th><th>Where it came from</th></tr>
+    <tr><td>OS</td><td>Debian GNU/Linux 12 (bookworm), x86_64, glibc 2.36</td><td>the orb's base image</td></tr>
+    <tr><td>tt-metal</td><td><code>7aad8aacd5bb557ee53ab7470b751cb2adadfecd</code> (2026-10-30)</td><td>git, plus 3 submodules (umd at <code>1507ff75</code>)</td></tr>
+    <tr><td>ttsim</td><td><code>b3620244b3fedaa2e5abd645fa4f5f53c5d456b1</code> = tag <code>v1.15.0</code></td><td>git (built from source) or GitHub Releases</td></tr>
+    <tr><td>Host compiler</td><td>clang 20.1.8 (Debian package from apt.llvm.org)</td><td><code>llvm.sh 20</code></td></tr>
+    <tr><td>CMake / Ninja</td><td>4.0.2 / 1.11.1</td><td><code>install_dependencies.sh</code> / apt</td></tr>
+    <tr><td>Device compiler</td><td>SFPI 7.92.0 (<code>riscv-tt-elf-g++</code> 15.1.0)</td><td>tarball downloaded by CMake into <code>runtime/sfpi</code></td></tr>
+    <tr><td>ttsim compiler</td><td>g++ 12.2.0, Python 3.11.6</td><td>Debian packages</td></tr>
+    <tr><td>Python env (optional)</td><td>CPython 3.11.16 in <code>python_env/</code></td><td><code>create_venv.sh --python-version 3.11</code></td></tr>
+  </table>
+  <p>Wall-clock time and disk: ttsim builds in about 10 seconds. tt-metal took about half an hour of build time on 8 vCPUs (next figure). The finished tt-metal tree is about 11 GB including the build, the CPM source cache, SFPI and <code>python_env</code>, plus 3.4 GB of uv cache in <code>~/.cache/uv</code>. Plan for 20 GB free.</p>
+
+  <div class="viz" id="fig-time"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-time");
+    var g = TT.canvas(root, 880, 340), ctx = g.ctx, C = TT.C;
+    // Seconds taken from the "real" line at the end of each log in refs/build-logs/.
+    var bars = [
+      { n: "install_dependencies.sh", s: 32.9, c: C.red, note: "fails at the SFPI .deb" },
+      { n: "llvm.sh 20", s: 26.2, c: C.purple },
+      { n: "git submodule update", s: 3.35, c: C.muted },
+      { n: "ttsim ./make.py :build", s: 10.4, c: C.green },
+      { n: "build_metal.sh --configure-only", s: 172.8, c: C.blue },
+      { n: "ninja programming_examples", s: 383.4, c: C.blue, note: "libraries + profiler examples" },
+      { n: "ninja metal_example_*", s: 28.1, c: C.blue },
+      { n: "ninja install (ttnn)", s: 974.5, c: C.teal, note: "optional" },
+      { n: "create_venv.sh", s: 96.6, c: C.teal, note: "optional" }
+    ];
+    var X0 = 250, XW = 520, MAX = 1000, Y0 = 26, BH = 26, GAP = 6;
+    function fmt(s) { return s >= 60 ? Math.floor(s / 60) + " min " + Math.round(s % 60) + " s" : s.toFixed(1) + " s"; }
+    var steps = bars.map(function (b, k) {
+      return { dur: 0.6, text: "<b>" + b.n + "</b>: " + fmt(b.s) + (b.note ? " (" + b.note + ")" : "") + "." };
+    });
+    steps.push({ dur: 1.0, text: "<b>Total: about 29 minutes</b> of logged wall-clock time, about 90 percent of it tt-metal's configure and C++ build. Without ttnn and the Python env it is about 11 minutes. ttsim itself is the cheapest piece by far." });
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        for (var k = 0; k < bars.length; k++) {
+          var b = bars[k], y = Y0 + k * (BH + GAP);
+          TT.text(ctx, b.n, X0 - 10, y + BH / 2, { align: "right", font: "12px", mono: true, color: k <= i ? C.fg : C.border });
+          if (k > i) continue;
+          var f = (k === i && i < bars.length) ? t : 1;
+          var w = Math.max(3, XW * Math.min(b.s, MAX) / MAX * f);
+          TT.box(ctx, X0, y, w, BH, { fill: b.c, alpha: 0.75, r: 3 });
+          TT.text(ctx, fmt(b.s), X0 + w + 8, y + BH / 2, { font: "12px", color: C.muted });
+        }
+        var tot = 0; for (var j = 0; j <= Math.min(i, bars.length - 1); j++) tot += bars[j].s;
+        TT.text(ctx, "running total: " + fmt(tot), X0 + XW, g.H - 14, { align: "right", font: "bold 13px", color: C.yellow });
+        TT.text(ctx, "from refs/build-logs/*.log (8 vCPU orb)", 20, g.H - 14, { font: "12px", color: C.muted });
+      }
+    });
+  })();
+  </script>
+
+  <h2 id="clone">Step 1: Clone and pin</h2>
+  <p>Both projects move fast; tt-metal merges dozens of commits a day. A setup guide that says "clone main" is out of date by the next afternoon. So we pin. The two hashes below are the ones every lab in this series ran against. ttsim's commit is exactly the <code>v1.15.0</code> release tag (checked with <code>git ls-remote</code>), so its source matches the published binaries of that release.</p>
+<pre><code>cd ~
+git clone https://github.com/tenstorrent/tt-metal.git
+cd tt-metal
+git checkout 7aad8aacd5bb557ee53ab7470b751cb2adadfecd
+git submodule update --init --recursive
+
+cd ~
+git clone https://github.com/tenstorrent/ttsim.git
+cd ttsim
+git checkout v1.15.0          # = b3620244b3fedaa2e5abd645fa4f5f53c5d456b1</code></pre>
+  <p>The submodule step pulls three repositories. Our log (<code>refs/build-logs/submodules.log</code>, 3.4 s) ended with:</p>
+<pre class="out"><code>Submodule path 'tt_metal/third_party/tracy': checked out 'a8a542194048195ca9c35725d7ebede33ccb028e'
+Submodule path 'tt_metal/third_party/tt-cluster-descriptors': checked out '187a384df8e0090edc8e720b8fcb9692f75b433b'
+Submodule path 'tt_metal/third_party/umd': checked out '1507ff75e000bcb923f28dbc60626be3f4283cd9'</code></pre>
+  <p>The <code>umd</code> submodule matters most for us: it contains the user-mode driver's simulator support (<code>TTSimTTDevice</code>), so the tt-metal pin and the ttsim pin have to agree. Mixing a much older tt-metal with a new ttsim, or the reverse, is the most likely way for this recipe to break. The workbench scripts assume the default locations <code>~/tt-metal</code> and <code>~/ttsim</code>; you can override both (<a href="#workbench">Step 6</a>).</p>
+
+  <h2 id="ttsim">Step 2: Build ttsim (or download it)</h2>
+  <p>ttsim is unusually easy to build: a Python build script, g++ with C++20, and no other dependencies. One command builds every flavour (release and debug, Wormhole and Blackhole, single- and multi-chip):</p>
+<pre><code>cd ~/ttsim
+time ./make.py :build</code></pre>
+  <p>Our original build (<code>refs/build-logs/ttsim-build.log</code>) logged 75 <code>Built</code> lines and <code>real 0m10.418s</code>. Re-running it for this lab on a copy of the source under <code>$LAB_HOME</code> gave:</p>
+<pre class="out"><code>g++ (Debian 12.2.0-14+deb12u1) 12.2.0
+Python 3.11.6
+...
+Built '/home/user/ttlab/b00/ttsim-src/src/_out/release_wh_x2/libttsim.so'.
+Built '/home/user/ttlab/b00/ttsim-src/src/_out/release_wh_x32/libttsim.so'.
+
+real	0m7.159s
+user	0m32.571s
+sys	0m2.549s
+
+-rwxr-xr-x 1 user user 268352 Oct 30 07:18 src/_out/release_bh/libttsim.so
+-rwxr-xr-x 1 user user 243776 Oct 30 07:18 src/_out/release_wh/libttsim.so</code></pre>
+  <p>A whole chip simulator in 244 KB. The two you need are <code>src/_out/release_wh/libttsim.so</code> (Wormhole) and <code>src/_out/release_bh/libttsim.so</code> (Blackhole). The <code>debug_*</code> flavours keep symbols for a debugger, and <code>*_x2</code>, <code>*_x8</code>, ... are multi-chip systems, which later labs use sparingly.</p>
+  <p>The build is reproducible on a given toolchain: the <code>.so</code> we built for this lab has the same SHA-256 as the one built an hour earlier and installed in <code>~/sim/wh</code>.</p>
+
+  <h3>Alternative: download release binaries</h3>
+  <p>If you'd rather not build, the ttsim README points to GitHub Releases. For the pinned version:</p>
+<pre><code>mkdir -p ~/sim/wh ~/sim/bh
+wget -O ~/sim/wh/libttsim_wh.so https://github.com/tenstorrent/ttsim/releases/download/v1.15.0/libttsim_wh.so
+wget -O ~/sim/bh/libttsim_bh.so https://github.com/tenstorrent/ttsim/releases/download/v1.15.0/libttsim_bh.so
+chmod +x ~/sim/*/libttsim_*.so</code></pre>
+  <p>We tried this too. The release <code>libttsim_wh.so</code> is 248,040 bytes and has a different hash from our 243,776-byte local build. The README explains why: the two are "functionally equivalent", and byte-identical only when built on the release CI toolchain (Ubuntu 24.04's g++). The release binary still runs on Debian 12's older glibc 2.36, because it needs no glibc symbol newer than <code>GLIBC_2.14</code>. And it is functionally identical, down to the clock count:</p>
+<pre class="out"><code>$ sha256sum libttsim_wh.so .../src/_out/release_wh/libttsim.so
+ceaf52b07bfe194787d7b42c98886b6964450bf7457a98191d5a63b5404107f9  libttsim_wh.so          (release v1.15.0)
+1977d82a6cd8b64b7bc6395ed0184759d30164ad7b4726e82d33e254fd3845a1  .../release_wh/libttsim.so  (local g++ 12.2)
+
+$ TT_METAL_SIMULATOR=$LAB_HOME/sim-release/wh/libttsim_wh.so $EX/metal_example_add_2_integers_in_riscv
+[0] 0.1 seconds (0.0 KHz)
+Success: Result is 21
+[4501] 0.2 seconds (25.7 KHz)</code></pre>
+  <p>Use whichever you like. In this series we build from source, because several labs (<a href="b02-map-and-boot.html">B02</a> onward) <em>edit</em> the simulator, and <code>build_ttsim.sh</code> needs the source anyway.</p>
+
+  <h2 id="soc">Step 3: Put each .so next to its soc_descriptor.yaml</h2>
+  <p>Now give each simulator a home directory, and copy the matching SoC descriptor next to it under the fixed name <code>soc_descriptor.yaml</code>:</p>
+<pre><code>mkdir -p ~/sim/wh ~/sim/bh
+cp ~/ttsim/src/_out/release_wh/libttsim.so ~/sim/wh/libttsim_wh.so
+cp ~/ttsim/src/_out/release_bh/libttsim.so ~/sim/bh/libttsim_bh.so
+cp ~/tt-metal/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml ~/sim/wh/soc_descriptor.yaml
+cp ~/tt-metal/tt_metal/soc_descriptors/blackhole_140_arch.yaml  ~/sim/bh/soc_descriptor.yaml</code></pre>
+  <p>The result is the layout used throughout the series (<code>env.sh</code> expects it):</p>
+<pre class="out"><code>~/sim/bh:  libttsim_bh.so  soc_descriptor.yaml
+~/sim/wh:  libttsim_wh.so  soc_descriptor.yaml</code></pre>
+  <p>Why one directory per chip? Because the YAML's <em>name</em> is fixed and its <em>location</em> is derived from the <code>.so</code> path. If you put both libraries in one directory, they would have to share one <code>soc_descriptor.yaml</code>, and one of them would get the wrong chip's descriptor.</p>
+  <p><b>Why is the file needed at all?</b> A SoC descriptor is the map of the chip you met in <a href="../chapters/a03-chip-tour.html">A03</a>: the grid size, and which (x, y) NoC coordinates are Tensix cores, DRAM, PCIe, ARC and Ethernet tiles. Silicon tells the driver which chip it is through the PCI device ID, and tt-metal then picks the map from its own <code>tt_metal/soc_descriptors/</code>. In simulator mode, tt-metal asks UMD where the simulator's descriptor lives and parses it to decide what architecture it is talking to:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/tt_cluster.cpp:56-59 @7aad8aac</div>
+<pre><code>inline std::string get_soc_description_file(
+    const tt::ARCH&amp; arch, tt::TargetDevice target_device, const tt::llrt::RunTimeOptions&amp; rtoptions) {
+    if (target_device == tt::TargetDevice::Simulator) {
+        return tt::umd::SimulationChip::get_soc_descriptor_path_from_simulator_path(rtoptions.get_simulator_path());</code></pre>
+  <p>And UMD's answer is simply "the directory of the <code>.so</code>, plus a fixed file name":</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/simulation/simulator_paths.hpp:16-22 @7aad8aac (umd 1507ff75)</div>
+<pre><code>inline std::filesystem::path get_simulator_artifacts_dir(const std::filesystem::path&amp; simulator_path) {
+    return (simulator_path.extension() == ".so") ? simulator_path.parent_path() : simulator_path;
+}
+
+inline std::string get_simulator_soc_descriptor_path(const std::filesystem::path&amp; simulator_path) {
+    return get_simulator_artifacts_dir(simulator_path) / "soc_descriptor.yaml";
+}</code></pre>
+  <div class="callout warn">A nuance in the sources. At this umd commit, UMD itself can live without the file: <code>find_simulator_soc_descriptor_path</code> returns empty when it is missing, and <code>get_simulator_arch</code> then asks the library for its PCI device ID and falls back to a built-in descriptor for Wormhole or Blackhole (<code>simulator_paths.hpp:24-29</code>, <code>simulator_paths.cpp:19-44</code>). But tt-metal builds the same path itself and parses it without checking that it exists: <code>get_platform_architecture</code> (<code>llrt/get_platform_architecture.hpp:106-109</code>, called from <code>metal_env.cpp:168</code>) reads the architecture from it before the <code>Cluster</code> is even constructed, and <code>tt_cluster.cpp</code> does the same again (lines 56-59 and 124-127). So in practice the run still dies. The ttsim README's rule ("must live in a directory also containing an SOC descriptor YAML file") is the one to follow. See <a href="#trouble">Troubleshooting</a> for what the failure looks like.</div>
+
+  <h2 id="metal">Step 4: Install dependencies and build tt-metal</h2>
+  <p class="provenance">We did not rebuild tt-metal for this lab (it takes about half an hour). The outputs in this section are excerpts of the logs saved when the series' environment was built, in <code>refs/build-logs/</code>. The logs record outputs, not the commands typed. The configure command line is printed verbatim by <code>build_metal.sh</code>; the ninja commands are reconstructed from each log's first and last lines.</p>
+  <p>tt-metal's <code>INSTALLING.md</code> lists Ubuntu 22.04 for its supported hardware configurations, and its "From source" path is: clone, <code>./build_metal.sh</code>, <code>./create_venv.sh</code>. Our orb runs Debian 12, which the dependency script recognises (<code>Detected OS: debian 12 (apt)</code>) but which needed three workarounds. On Ubuntu you may need none of them; we did not test Ubuntu or WSL2.</p>
+
+  <h3>4a. System packages, and the SFPI .deb that fails</h3>
+<pre><code>cd ~/tt-metal
+sudo ./install_dependencies.sh</code></pre>
+  <p>The script installs the build packages (git, build-essential, ninja, libhwloc, libnuma, libc++-20, ...) and CMake 4.0.2, then downloads the SFPI toolchain as a <code>.deb</code>. That is the compiler for the RISC-V cores inside each Tensix tile. On Debian 12 the install step fails:</p>
+<pre class="out"><code>2026-10-30 06:37:13 (39.0 MB/s) - '/tmp/tmp.X7XJuVqaJD/sfpi_7.92.0_x86_64_debian.deb' saved [134650388/134650388]
+...
+The following packages have unmet dependencies:
+ sfpi : Depends: libstdc++6 (&gt;= 12.3.0) but 12.2.0-14+deb12u1 is to be installed
+E: Unable to correct problems, you have held broken packages.</code></pre>
+  <p>The package was built against a newer libstdc++ than Debian 12 ships. Because the script runs with <code>set -e</code> (<code>install_dependencies.sh:6</code>), that one failure also skips everything after it in <code>install()</code>:</p>
+  <div class="filename">tt-metal/install_dependencies.sh:560-564 @7aad8aac</div>
+<pre><code>    if [ "$docker" -ne 1 ]; then
+        install_sfpi
+        install_mpi_ulfm
+    fi
+    install_llvm</code></pre>
+  <p>So two more things are now missing: <b>clang 20</b> (from <code>install_llvm</code>) and <b>OpenMPI/ULFM</b> (from <code>install_mpi_ulfm</code>). The workarounds address each of the three:</p>
+  <ol>
+    <li><b>SFPI: do nothing.</b> You don't need the system package. Unless you pass <code>--use-system-sfpi</code>, CMake downloads the SFPI tarball itself into <code>runtime/sfpi</code>, and that tarball works on Debian 12. After the build: <code>runtime/sfpi/compiler/bin/riscv-tt-elf-g++ --version</code> prints <code>riscv-tt-elf-g++ (tenstorrent/sfpi:7.92.0[1080]) 15.1.0</code>.</li>
+    <li><b>clang 20: run the LLVM script by hand</b>, exactly as <code>install_llvm()</code> would have (<code>install_dependencies.sh:405-413</code>):
+<pre><code>wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+sudo ./llvm.sh 20</code></pre>
+      Our log (<code>llvm20-install.log</code>, 26 s) ends with <code>Setting up clang-20 (1:20.1.8~++20250708063551+0c9f909b7976-1~exp1~20250708183702.136)</code>. The two <code>W: Target Packages ... is configured multiple times</code> warnings that follow are harmless: the dependency script had already added the same apt.llvm.org source.</li>
+    <li><b>MPI: build without it.</b> Pass <code>--without-distributed</code> to <code>build_metal.sh</code> ("Disable distributed compute support (OpenMPI dependency)", <code>build_metal.sh:58</code>). It sets <code>-DENABLE_DISTRIBUTED=OFF</code>. Nothing in the single-chip labs needs multi-host MPI.</li>
+  </ol>
+
+  <h3>4b. Configure</h3>
+<pre><code>cd ~/tt-metal
+./build_metal.sh --build-programming-examples --without-distributed --configure-only</code></pre>
+  <p>This printed, among other <code>INFO:</code> lines (<code>tt-metal-configure.log</code>, 2 min 53 s, most of it CPM downloading third-party sources into <code>.cpmcache/</code>):</p>
+<pre class="out"><code>INFO: Build type: Release
+INFO: Build directory: build_Release
+INFO: Enable Distributed: OFF
+INFO: With python bindings: ON
+INFO: Host march: x86-64-v3
+INFO: CMAKE_TOOLCHAIN_FILE: cmake/x86_64-linux-clang-20-libstdcpp-toolchain.cmake
+INFO: Running: cmake -B build_Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=build_Release
+  -DTT_X86_MARCH=x86-64-v3 -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF -DBUILD_PROGRAMMING_EXAMPLES=ON -DTT_UNITY_BUILDS=ON
+  -DTT_ENABLE_LIGHT_METAL_TRACE=ON -DTT_ENABLE_LIGHT_METAL_TRACE=ON -DWITH_PYTHON_BINDINGS=ON
+  -DPython3_EXECUTABLE=/usr/local/bin/python3 -DPython3_INCLUDE_DIR=/usr/local/include/python3.11
+  -DPython3_LIBRARY=/usr/local/lib/libpython3.11.so -DENABLE_DISTRIBUTED=OFF -DENABLE_FAKE_KERNELS_TARGET=OFF
+  -DCMAKE_TOOLCHAIN_FILE=cmake/x86_64-linux-clang-20-libstdcpp-toolchain.cmake
+-- The CXX compiler identification is Clang 20.1.8
+...
+-- Configuring done (171.1s)
+-- Generating done (1.5s)
+-- Build files have been written to: /home/user/workspace/refs/tt-metal/build_Release</code></pre>
+  <p>Three things in there matter later. The build directory is <code>build_Release</code>, not the <code>build</code> that the ttsim README's example uses. <code>-march=x86-64-v3</code> means the host code needs a CPU with AVX2 (roughly Haswell or newer). And the Python bindings are built against <em>whatever <code>python3</code> is on your PATH</em>, here 3.11 (<code>build_metal.sh:454-456</code>). Remember that for Step 5.</p>
+
+  <h3>4c. Build the libraries, then the examples by name</h3>
+  <p>You'd expect <code>ninja programming_examples</code> to build the examples. It builds the libraries and the profiler examples, and stops there. Our log (<code>tt-metal-build-programming_examples.log</code>, 918 steps, 6 min 23 s) ends like this, with not a single <code>metal_example_*</code> in it:</p>
+<pre class="out"><code>ninja: Entering directory `build_Release'
+[1/918] Building CXX object third_party/CMakeFiles/cadical.dir/...
+...
+[917/918] Linking CXX executable programming_examples/profiler/test_device_api_debugger
+[918/918] Linking CXX executable programming_examples/test_streaming_profiler_zones
+
+real	6m23.379s</code></pre>
+  <p>The reason is in the CMake. The umbrella target depends on a list:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/CMakeLists.txt:35-40 @7aad8aac</div>
+<pre><code>add_custom_target(
+    programming_examples
+    DEPENDS
+        profiler_examples
+        ${PROGRAMMING_EXAMPLES_TEST_TARGETS}
+)</code></pre>
+  <p>That list is only filled by the helper <code>CREATE_PGM_EXAMPLES_EXE</code> (<code>cmake/helper_functions.cmake:55-83</code>). The examples we want are declared with a plain <code>add_executable(metal_example_add_2_integers_in_riscv)</code> (<code>programming_examples/add_2_integers_in_riscv/CMakeLists.txt:4</code>), so they never join the list. The fix is to name them explicitly. Ninja can list them for you:</p>
+<pre><code>cd ~/tt-metal
+ninja -C build_Release programming_examples          # libraries (libtt_metal.so, libtt-umd.so, ...)
+ninja -C build_Release $(ninja -C build_Release -t targets all \
+      | grep -oE '^metal_example_[a-z0-9_]+' | sort -u)</code></pre>
+  <p>Run against our tree, that <code>-t targets</code> query lists 21 example targets: <code>metal_example_add_2_integers_in_compute</code>, <code>..._add_2_integers_in_riscv</code>, <code>..._custom_sfpi_add</code>, <code>..._custom_smoothstep</code>, <code>..._eltwise_binary</code>, <code>..._eltwise_sfpu</code>, the three <code>..._hello_world_*</code>, <code>..._long_matmul</code>, <code>..._loopback</code>, the four <code>..._matmul_*</code>, <code>..._noc_tile_transfer</code>, <code>..._pad_multi_core</code>, <code>..._sfpu_eltwise_chain</code>, <code>..._shard_data_rm</code>, and <code>..._vecadd_multi_core</code> and <code>..._vecadd_sharding</code>. Our build of the examples (<code>tt-metal-build-metal_examples.log</code>, 55 steps, 28 s) also built the <code>distributed_*</code> and <code>contributed/</code> examples:</p>
+<pre class="out"><code>[3/55] Linking CXX executable programming_examples/distributed/distributed_program_dispatch
+...
+[17/55] Linking CXX executable programming_examples/metal_example_add_2_integers_in_riscv
+...
+[31/55] Linking CXX executable programming_examples/metal_example_matmul_single_core
+...
+[55/55] Linking CXX executable programming_examples/metal_example_long_matmul
+
+real	0m28.075s</code></pre>
+  <p>The binaries land in <code>~/tt-metal/build_Release/programming_examples/</code>, which <code>env.sh</code> exports as <code>$EX</code>. (The <code>distributed_*</code> ones want an 8-device mesh and fail under the single-chip simulator; that's covered in a later lab.)</p>
+  <div class="callout warn">Untested shortcut: running <code>./build_metal.sh --build-programming-examples --without-distributed</code> without <code>--configure-only</code> configures and then builds the <code>install</code> target (<code>build_metal.sh:492-503</code>). That probably also builds the examples and ttnn in one go, but it is not what we ran, so we can't promise it.</div>
+
+  <h2 id="ttnn">Step 5 (optional): ttnn and python_env</h2>
+  <p>The core labs only use C++ examples. A few later pages use the Python <code>ttnn</code> library, which needs two more steps:</p>
+<pre><code>cd ~/tt-metal
+ninja -C build_Release install                # builds _ttnn.so and installs into build_Release (16 min here)
+./create_venv.sh --python-version 3.11        # must match the python3 the build used</code></pre>
+  <p>The version flag is the trap. <code>create_venv.sh</code> picks Python 3.12 on Ubuntu 24.04, 3.10 on Ubuntu 22.04, and <em>3.10 on everything else</em> (<code>create_venv.sh:231-239</code>), which includes Debian 12. But <code>_ttnn.so</code> was compiled against the system <code>python3</code>, 3.11. A 3.10 venv cannot import a 3.11 extension module. Pass the version that <code>python3 --version</code> printed when you configured. Our log (<code>create_venv.log</code>, 1 min 37 s):</p>
+<pre class="out"><code>Detected OS: debian 12 (apt)
+Creating virtual env in: /home/user/workspace/refs/tt-metal/python_env
+  Python version: 3.11
+Installing Python 3.11 via uv...
+Installed Python 3.11.16 in 1.41s
+...
+Activate with: source python_env/bin/activate</code></pre>
+  <p>To check it, we ran a 32×32 bf16 <code>ttnn.add</code> on the simulated Wormhole with the series' environment (script: <code>refs/sim-runs/ttnn/ttnn_add.py</code>, copied to <code>$LAB_HOME/run</code>):</p>
+<pre class="out"><code>$ source $TT_METAL_HOME/python_env/bin/activate
+$ python --version
+Python 3.11.16
+$ python ttnn_add.py
+[0] 2.7 seconds (0.0 KHz)
+device result[0,:4]: [0.75, 0.8515625, 0.91796875, 1.25]
+torch  result[0,:4]: [0.75, 0.8515625, 0.91796875, 1.25]
+max abs diff: 0.0078125
+elements differing from torch bf16 add: 120/1024 (bf16 rounding differences, max 1 ulp expected)
+PCC: 0.999983
+PASS
+[4881] 3.2 seconds (1.5 KHz)</code></pre>
+  <p>Notice the 120 differing elements. ttsim is bit-exact with <em>the chip</em>, not with PyTorch. The device's bf16 add rounds differently from torch's, and the simulator faithfully reproduces the device. Later chapters on number formats explain where that last bit goes.</p>
+
+  <h2 id="workbench">Step 6: The workbench scripts</h2>
+  <p>Typing a dozen <code>export</code>s before every experiment gets old, and getting one wrong produces errors that look like tt-metal bugs. The series keeps three small scripts in <code>sim-labs/workbench/</code> (with a <a href="workbench/README.md">README</a>):</p>
+  <table>
+    <tr><th>Script</th><th>What it does</th><th>Time</th></tr>
+    <tr><td><code>env.sh [wh|bh]</code></td><td><em>source</em> it: sets every variable a lab needs and <code>cd</code>s into <code>$LAB_HOME/run</code></td><td>instant</td></tr>
+    <tr><td><code>build_host.sh file.cpp</code></td><td>compiles and links one host program against <code>build_Release</code>, out of tree</td><td>about 6 s</td></tr>
+    <tr><td><code>build_ttsim.sh &lt;name&gt; [wh|bh] [release|debug]</code></td><td>makes an editable copy of ttsim, builds it, and packages it with <code>soc_descriptor.yaml</code></td><td>about 3.5 s</td></tr>
+  </table>
+
+  <p>Every command in this lab was run with <code>LAB_HOME=$HOME/ttlab/b00</code>. In the transcripts, script paths are shortened to the script name, and long tt-metal log output is trimmed (marked <code>...</code>).</p>
+
+  <h3>env.sh, line by line</h3>
+  <p>Here is every variable, who reads it, and why it has the value it has. Each one marked "override" keeps a value you exported before sourcing.</p>
+  <table>
+    <tr><th>Variable</th><th>Value</th><th>Read by, and why</th></tr>
+    <tr><td><code>ARCH</code></td><td>first argument, else <code>$ARCH</code>, else <code>wh</code></td><td>the script only: picks <code>~/sim/wh</code> or <code>~/sim/bh</code>.</td></tr>
+    <tr><td><code>TT_METAL_HOME</code></td><td>override; default <code>~/tt-metal</code> (or <code>~/workspace/refs/tt-metal</code>, this orb's layout, if <code>~/tt-metal</code> is missing); made absolute</td><td>your built checkout. tt-metal itself barely reads it (only fallbacks, such as the profiler output dir in <code>profiler_paths.hpp:28</code>). The scripts use it to find <code>build_Release</code>, headers and SoC descriptors.</td></tr>
+    <tr><td><code>TTSIM_HOME</code></td><td>override; default <code>~/ttsim</code></td><td><code>build_ttsim.sh</code> copies the source from here.</td></tr>
+    <tr><td><code>LAB_HOME</code></td><td>override; default <code>~/ttlab</code>; made absolute</td><td>scratch space for one lab: overlays, logs, run dir, simulator copies. Use a different one per lab (<code>~/ttlab/b00</code>, ...) so labs never see each other's edited kernels.</td></tr>
+    <tr><td><code>TT_METAL_SIMULATOR</code></td><td><code>$SIM</code>, default <code>~/sim/$ARCH/libttsim_$ARCH.so</code></td><td>tt-metal (<code>rtoptions.cpp:527-531</code>): its presence switches the target device to the simulator. The script warns if no <code>soc_descriptor.yaml</code> is beside it.</td></tr>
+    <tr><td><code>TT_METAL_SLOW_DISPATCH_MODE</code></td><td><code>1</code></td><td>tt-metal (<code>rtoptions.cpp:891-897</code>). The ttsim README says fast dispatch "is not sufficiently tested" and recommends slow dispatch. Chapter A17 explains the difference.</td></tr>
+    <tr><td><code>TT_METAL_DISABLE_SFPLOADMACRO</code></td><td><code>1</code></td><td>tt-metal (<code>rtoptions.cpp:922-926</code>). ttsim does not implement the <code>SFPLOADMACRO</code> instruction (README, Known Issues), so the kernels must not emit it.</td></tr>
+    <tr><td><code>TT_METAL_RUNTIME_ROOT</code></td><td><code>$TT_METAL_HOME</code></td><td>tt-metal's <em>root directory</em> (<code>rtoptions.cpp:351-353</code>): firmware sources, device headers, stock kernels. Without it, tt-metal only finds the root if the cwd contains <code>tt_metal/</code>. See <a href="#trouble">Troubleshooting</a>.</td></tr>
+    <tr><td><code>TT_METAL_KERNEL_PATH</code></td><td>override; default <code>$LAB_HOME/kernels</code> (a default set by an earlier <code>source</code> follows a new <code>LAB_HOME</code>)</td><td>tt-metal (<code>rtoptions.cpp:512-515</code>): the <b>kernel overlay</b>. A file here with the same relative path as a stock kernel replaces it (next figure).</td></tr>
+    <tr><td><code>TT_METAL_LOGS_PATH</code></td><td><code>$LAB_HOME/logs</code></td><td>tt-metal (<code>rtoptions.cpp:517-521</code>): watcher, DPRINT and inspector output. The default is the cwd.</td></tr>
+    <tr><td><code>TT_METAL_PROFILER_DIR</code></td><td><code>$LAB_HOME/profiler</code></td><td>tt-metal's profiler (<code>profiler_paths.hpp:23-26</code>); without it, reports would go into <code>$TT_METAL_HOME/generated/profiler/</code>.</td></tr>
+    <tr><td><code>EX</code></td><td><code>$TT_METAL_HOME/build_Release/programming_examples</code></td><td>you: <code>$EX/metal_example_...</code></td></tr>
+  </table>
+  <p>Finally the script runs <code>mkdir -p $LAB_HOME/{kernels,logs,run}</code> and <code>cd $LAB_HOME/run</code>. That last <code>cd</code> is not cosmetic. To see why, we need the kernel search order.</p>
+
+  <h3>Where tt-metal looks for a kernel</h3>
+  <p>Host code names a kernel by a <em>relative</em> path. The example does it like this (the prefix comes from a compile definition in <code>programming_examples/CMakeLists.txt:8</code>):</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:91-93 @7aad8aac</div>
+<pre><code>    KernelHandle kernel_id = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp",</code></pre>
+  <p>So the string tt-metal must resolve is <code>tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp</code>. It tries locations in a fixed order and takes the <em>first file that exists</em>:</p>
+  <div class="filename">tt-metal/tt_metal/impl/kernels/kernel.cpp:48-95 @7aad8aac (trimmed)</div>
+<pre><code>// Kernel path resolve:
+//
+// If the path is not an absolute path, then it must be resolved relative to:
+// 1. CWD
+// 2. TT_METAL_KERNEL_PATH
+// 3. System Kernel Directory
+// 4. TT_METAL_HOME / SetRootDir (API)
+fs::path resolve_path(const fs::path&amp; given_file_name, ContextId context_id) {
+    // Priority 0: Absolute path
+    if (given_file_name.is_absolute()) { return given_file_name; }
+    // Priority 1: Current working directory
+    {   auto current_working_dir_search_path = fs::current_path() / given_file_name;
+        if (fs::exists(current_working_dir_search_path)) { return current_working_dir_search_path; } }
+    // Priority 2: Kernel directory
+    if (rtoptions.is_kernel_dir_specified()) { ... rtoptions.get_kernel_dir() / given_file_name ... }
+    // Priority 3: System kernel directory
+    ... rtoptions.get_system_kernel_dir() / given_file_name ...
+    // Priority 4: Root directory
+    ... rtoptions.get_root_dir() / given_file_name ...
+    // Not found
+    TT_THROW("Kernel file {} doesn't exist in any of the searched paths!", given_file_name);</code></pre>
+  <p>We checked the code against the comment and found one small mismatch. The comment says "TT_METAL_HOME", but the root directory actually comes from <code>TT_METAL_RUNTIME_ROOT</code>, the <code>SetRootDir</code> API, or a cwd that contains <code>tt_metal/</code> (<code>rtoptions.cpp:351-369</code>). The system kernel directory is hard-coded to <code>/usr/share/tenstorrent/kernels/</code> (<code>rtoptions.cpp:336</code>) and only exists after a package install. Play the three scenarios below:</p>
+
+  <div class="viz" id="fig-search"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-search");
+    var g = TT.canvas(root, 880, 410), ctx = g.ctx, C = TT.C;
+    var REL = "tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp";
+    var probes = [
+      { n: "0  absolute path?", p: "(it is relative)" },
+      { n: "1  current directory", p: "$PWD/<rel>" },
+      { n: "2  TT_METAL_KERNEL_PATH", p: "$LAB_HOME/kernels/<rel>" },
+      { n: "3  system kernel dir", p: "/usr/share/tenstorrent/kernels/<rel>" },
+      { n: "4  runtime root", p: "$TT_METAL_RUNTIME_ROOT/<rel>" }
+    ];
+    // exists[k] per scenario; the first true wins. "edited" says which copy wins.
+    var SC = {
+      a: { name: "run from $LAB_HOME/run, overlay present", cwd: "$LAB_HOME/run", ex: [false, false, true, false, true], edited: [false, false, true, false, false] },
+      b: { name: "run from $LAB_HOME/run, no overlay", cwd: "$LAB_HOME/run", ex: [false, false, false, false, true], edited: [false, false, false, false, false] },
+      c: { name: "run from TT_METAL_HOME, overlay present", cwd: "$TT_METAL_HOME", ex: [false, true, true, false, true], edited: [false, false, true, false, false] }
+    };
+    var cur = "a";
+    function winner() { var e = SC[cur].ex; for (var k = 0; k < e.length; k++) if (e[k]) return k; return -1; }
+    var base = [
+      "<b>The request.</b> CreateKernel asks for the relative path shown at the top. Your edited copy (it multiplies instead of adds) lives in the overlay, <code>$LAB_HOME/kernels/&lt;rel&gt;</code>.",
+      "<b>Priority 0.</b> Absolute paths are used as-is. Ours is relative, so the search begins.",
+      "<b>Priority 1: the current directory.</b> ",
+      "<b>Priority 2: TT_METAL_KERNEL_PATH.</b> ",
+      "<b>Priority 3: /usr/share/tenstorrent/kernels/.</b> ",
+      "<b>Priority 4: the runtime root.</b> ",
+      "<b>JIT compile and cache.</b> The winning file is compiled for the core's RISC-V processors and stored under <code>~/.cache/tt-metal-cache/&lt;build key&gt;/kernels/reader_writer_add_in_riscv/&lt;hash&gt;/</code> (build.cpp:191-202, 557-558). A changed source gets a new hash directory, so you never need to clear the cache by hand.",
+      "<b>Run.</b> "
+    ];
+    function probeText(k) {
+      var w = winner();
+      if (k > w) return "Not checked: an earlier location already won.";
+      if (k === w) return SC[cur].edited[k] ? "Found: <b>your edited copy</b>. Search stops." : "Found: <b>the stock copy</b>. Search stops." + (cur === "c" ? " Your overlay is never consulted, and nothing warns you." : "");
+      if (k === 3) return "Missing: there is no package install.";
+      if (k === 1) return "Missing: " + SC[cur].cwd + " has no tt_metal/ subtree.";
+      return "Missing.";
+    }
+    var steps = base.map(function (s) { return { dur: 1.3, text: s }; });
+    function retext() {
+      for (var k = 2; k <= 5; k++) steps[k].text = base[k] + probeText(k - 1);
+      var w = winner();
+      steps[7].text = base[7] + (SC[cur].edited[w] ? "The device multiplies: <code>Error: Expected result of 21, got 98</code>. Your edit is live." : "The device adds: <code>Success: Result is 21</code>." + (cur === "c" ? " That looks like success, but it is the <em>trap</em>: you were testing the stock kernel, not your edit." : ""));
+    }
+    retext();
+    var api = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var s = SC[cur], w = winner();
+        TT.text(ctx, "cwd = " + s.cwd, 20, 22, { font: "bold 13px", mono: true, color: C.yellow });
+        TT.text(ctx, "<rel> = " + REL, 20, 46, { font: "11px", mono: true, color: C.muted });
+        for (var k = 0; k < probes.length; k++) {
+          var y = 72 + k * 58, st = k + 1;   // probe k is examined at step k+1
+          var seen = i >= st, active = i === st;
+          var col = C.border, fill = C.bg2;
+          if (seen) {
+            if (k > w) { col = C.border; }
+            else if (k === w) { col = s.edited[k] ? C.green : (cur === "c" ? C.red : C.blue); fill = col; }
+            else { col = C.muted; }
+          }
+          var a = active ? t : 1;
+          TT.box(ctx, 20, y, 470, 46, { fill: fill, alpha: k === w && seen ? 0.22 * a : 1, stroke: col, lw: active ? 2.5 : 1.5 });
+          TT.text(ctx, probes[k].n, 34, y + 15, { font: "bold 13px", color: seen ? C.fg : C.muted });
+          TT.text(ctx, probes[k].p, 34, y + 33, { font: "11px", mono: true, color: C.muted });
+          if (seen) {
+            var mark = k > w ? "skipped" : (k === w ? (s.edited[k] ? "FOUND (edited)" : "FOUND (stock)") : (k === 0 ? "no: relative" : "missing"));
+            var mc = k > w ? C.border : (k === w ? col : (k === 0 ? C.muted : C.red));
+            ctx.globalAlpha = a;
+            TT.text(ctx, mark, 480, y + 23, { align: "right", font: "bold 12px", color: mc });
+            ctx.globalAlpha = 1;
+          }
+        }
+        // right side: compile -> cache -> run
+        var RX = 540;
+        if (i >= 6) {
+          var a6 = i === 6 ? t : 1, wy = 72 + w * 58 + 23;
+          ctx.globalAlpha = a6;
+          TT.arrow(ctx, 492, wy, RX - 4, 130, { color: C.yellow, lw: 2 });
+          TT.box(ctx, RX, 95, 320, 70, { fill: C.yellow, alpha: 0.12, stroke: C.yellow });
+          TT.text(ctx, "JIT compile (SFPI riscv-tt-elf-g++)", RX + 160, 115, { align: "center", font: "bold 13px" });
+          TT.text(ctx, s.edited[w] ? "source: your overlay copy" : "source: stock copy", RX + 160, 140, { align: "center", font: "12px", color: s.edited[w] ? C.green : C.blue });
+          TT.arrow(ctx, RX + 160, 167, RX + 160, 197, { color: C.yellow, lw: 2 });
+          TT.box(ctx, RX, 200, 320, 78, { fill: C.bg3, stroke: C.border });
+          TT.text(ctx, "~/.cache/tt-metal-cache/", RX + 12, 220, { font: "12px", mono: true });
+          TT.text(ctx, "  <build key>/kernels/", RX + 12, 238, { font: "12px", mono: true });
+          TT.text(ctx, "  reader_writer_add_in_riscv/<hash>/", RX + 12, 256, { font: "12px", mono: true });
+          ctx.globalAlpha = 1;
+        }
+        if (i >= 7) {
+          var a7 = i === 7 ? t : 1, good = s.edited[w];
+          ctx.globalAlpha = a7;
+          TT.arrow(ctx, RX + 160, 280, RX + 160, 310, { color: C.yellow, lw: 2 });
+          var rc = good ? C.green : (cur === "c" ? C.red : C.blue);
+          TT.box(ctx, RX, 315, 320, 80, { fill: rc, alpha: 0.15, stroke: rc, lw: 2 });
+          TT.text(ctx, good ? "Error: Expected result of 21, got 98" : "Success: Result is 21", RX + 160, 342, { align: "center", font: "bold 13px", mono: true });
+          TT.text(ctx, good ? "your edit (a * b) ran: 14 * 7 = 98" : (cur === "c" ? "TRAP: your edit was silently ignored" : "stock kernel: 14 + 7 = 21"), RX + 160, 370, { align: "center", font: "12px", color: rc });
+          ctx.globalAlpha = 1;
+        }
+      }
+    });
+    var ctrl = root.querySelector(".controls");
+    var lab = document.createElement("label");
+    lab.textContent = "scenario";
+    var sel = document.createElement("select");
+    Object.keys(SC).forEach(function (k) { var o = document.createElement("option"); o.value = k; o.textContent = SC[k].name; sel.appendChild(o); });
+    sel.onchange = function () { cur = sel.value; retext(); api.render(); };
+    lab.appendChild(sel);
+    ctrl.insertBefore(lab, ctrl.lastChild);
+  })();
+  </script>
+
+  <p>The figure's outcomes are not hypothetical; we ran all three. The overlay case and the "no overlay" case ran in <code>$LAB_HOME/run</code>. For the trap we did <em>not</em> run inside the real <code>TT_METAL_HOME</code> (the series forbids it, because tt-metal would also drop generated files there). Instead we ran from a directory that mimics it, holding a stock copy of the kernel at the same relative path. Priority 1 behaves identically:</p>
+<pre class="out"><code>$ K=tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+$ mkdir -p $LAB_HOME/kernels/$(dirname $K) &amp;&amp; cp $TT_METAL_HOME/$K $LAB_HOME/kernels/$K
+$ sed -i 's/(\*out0) = (\*dat0) + (\*dat1);/(*out0) = (*dat0) * (*dat1);/' $LAB_HOME/kernels/$K
+
+cwd=/home/user/ttlab/b00/run                        # overlay wins (priority 2)
+Error: Expected result of 21, got 98
+... JIT cache stats: 8/9 hits (88.9%) ...           # one kernel recompiled, no rebuild of tt-metal
+
+cwd=/home/user/ttlab/b00/looks-like-tt-metal-home   # cwd copy wins (priority 1)
+Success: Result is 21</code></pre>
+  <div class="callout key">The overlay gives you an edit-and-rerun loop of under a second with zero rebuilds: copy a kernel into <code>$LAB_HOME/kernels/</code> at the same relative path, edit it, and rerun from <code>$LAB_HOME/run</code>. It only works if your cwd does <em>not</em> contain a <code>tt_metal/</code> tree. That is the whole reason <code>env.sh</code> ends with <code>cd $LAB_HOME/run</code>.</div>
+
+  <h3>build_host.sh: your own host program in 6 seconds</h3>
+  <p>Editing kernels covers most labs. When you need a different <em>host</em> program, rebuilding inside tt-metal's CMake tree would be slow and would modify the tree. <code>build_host.sh</code> instead runs <code>clang++-20</code> once with the same flags the in-tree examples use (including <code>-DOVERRIDE_KERNEL_PREFIX="tt_metal/programming_examples/"</code>, so kernel paths resolve as above), then links against the shared libraries in <code>build_Release</code> with an rpath. No install step is needed. Output lands next to the source:</p>
+<pre class="out"><code>$ mkdir -p $LAB_HOME/host &amp;&amp; cp sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/host/
+$ time build_host.sh $LAB_HOME/host/mm_fid.cpp
+compiled /home/user/ttlab/b00/host/mm_fid.o
+
+real	0m5.809s
+
+$ MM_FIDELITY=LoFi MM_SEED=42 $LAB_HOME/host/mm_fid
+math_fidelity = 0
+Output vector of size 409600
+Metalium vs Golden -- PCC = 0.9808531
+mean_abs_err = 2.216311 max_abs_err = 7.000000 result_hash = 213e53fed10c0383
+Test Passed
+[699743] 10.7 seconds (65.5 KHz)</code></pre>
+  <p>That hash and clock count are identical to the values recorded when the workbench was first tested (<code>research/06-feasibility.md</code>), which is our first taste of determinism. The flags hard-code paths into <code>.cpmcache/</code> and library versions (<code>libtt-umd.so.0.9.15</code>), so the script is tied to the pinned tt-metal commit. If you move the pin, regenerate the flags from <code>build_Release/build.ninja</code>.</p>
+
+  <h3>build_ttsim.sh: an instrumented simulator in 4 seconds</h3>
+  <p>Some labs add a <code>printf</code> inside ttsim itself. You never edit the pinned <code>~/ttsim</code>: the script copies it (minus <code>.git</code> and build outputs) to <code>$LAB_HOME/ttsim-&lt;name&gt;/</code>, builds just the flavour you asked for, packages it with the right descriptor, and prints the line to paste:</p>
+<pre class="out"><code>$ time build_ttsim.sh probe wh
+copied ttsim source to /home/user/ttlab/b00/ttsim-probe (edit files in /home/user/ttlab/b00/ttsim-probe/src/)
+export TT_METAL_SIMULATOR=/home/user/ttlab/b00/sim-probe-wh-release/libttsim.so
+
+real	0m3.473s
+
+$ ls /home/user/ttlab/b00/sim-probe-wh-release
+libttsim.so  soc_descriptor.yaml
+$ export TT_METAL_SIMULATOR=/home/user/ttlab/b00/sim-probe-wh-release/libttsim.so
+$ $EX/metal_example_add_2_integers_in_riscv
+Success: Result is 21
+[4501] 0.2 seconds (26.5 KHz)</code></pre>
+  <p>Rerun the same command after editing <code>$LAB_HOME/ttsim-probe/src/*.cpp</code>; the copy is kept and only the build reruns. Pass <code>debug</code> as the third argument for a build with symbols.</p>
+
+  <h2 id="smoke">Step 7: Smoke test</h2>
+  <p>With everything in place, the full smoke test is three lines. This is the exact output from this orb (only the date prefix is trimmed from each log line):</p>
+<pre class="out"><code>$ export LAB_HOME=$HOME/ttlab/b00
+$ source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+ttsim lab env: ARCH=wh SIM=/home/user/sim/wh/libttsim_wh.so cwd=/home/user/ttlab/b00/run
+$ $EX/metal_example_add_2_integers_in_riscv
+WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of the Data Movement kernels.
+WARNING: For example, export TT_METAL_DPRINT_CORES=0,0
+07:23:06.594 | info     |           Metal | Disabling multi-erisc mode with simulator/emule target device (rtoptions.cpp:398)
+07:23:06.596 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:252)
+07:23:06.598 | info     |             UMD | Cluster constructor started. (cluster.cpp:434)
+07:23:06.601 | info     |             UMD | Creating TopologyDiscovery for architecture: wormhole_b0 (topology_discovery.cpp:140)
+07:23:06.601 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:159)
+[0] 0.1 seconds (0.0 KHz)
+07:23:06.610 | info     | EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0x401e (tt_sim_tt_device.cpp:163)
+07:23:06.610 | info     |             UMD | Established firmware bundle version: 18.4.0 (topology_discovery.cpp:711)
+07:23:06.610 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:164)
+...
+Success: Result is 21
+07:23:06.687 | info     |    BuildKernels | JIT cache stats: 9/9 hits (100.0%) [9 cached, 0 build-once dedup, ...]
+...
+07:23:06.689 | info     | EmulationDriver | Sending exit signal to remote... (tt_sim_communicator.cpp:343)
+[4501] 0.2 seconds (27.2 KHz)</code></pre>
+  <p>How to read it:</p>
+  <ul>
+    <li><code>TTSimTTDevice ... device_id=0x401e</code>: UMD took the simulator path, and the "chip" answered the PCI config read with Wormhole's device ID. (Blackhole answers <code>0xb140</code>.)</li>
+    <li><code>[0] ...</code> and <code>[4501] ...</code> are printed by ttsim: the number in brackets is the simulated clock count, the seconds are host time, and KHz is the effective simulation rate. With DPRINT off, 4501 is the same on every run, on our build and on the release binary. See the honesty banner: it is a determinism check, not a speed.</li>
+    <li><code>JIT cache stats: 9/9 hits</code>: every kernel and firmware binary was already compiled.</li>
+  </ul>
+  <p>Now the same test the way a brand-new reader experiences it, with an empty cache. We pointed <code>TT_METAL_CACHE</code> at a fresh directory and ran twice:</p>
+<pre class="out"><code>$ export TT_METAL_CACHE=$LAB_HOME/cache
+$ for i in 1 2; do /usr/bin/time -f "wall %e s" $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 \
+    | grep -E "Success|got|JIT cache stats|^\[|wall"; done
+[0] 0.1 seconds (0.0 KHz)
+Success: Result is 21
+2026-10-30 07:21:39.524 | info     |    BuildKernels | JIT cache stats: 0/9 hits (0.0%) [0 cached, ...]
+[4501] 0.3 seconds (13.5 KHz)
+wall 3.91 s
+[0] 0.1 seconds (0.0 KHz)
+Success: Result is 21
+2026-10-30 07:21:39.892 | info     |    BuildKernels | JIT cache stats: 9/9 hits (100.0%) [9 cached, ...]
+[4501] 0.2 seconds (26.2 KHz)
+wall 0.35 s</code></pre>
+  <p>The first run spends about 3.5 seconds compiling firmware and kernels with SFPI. The second is pure simulation. The clock count is 4501 both times: compiling happens on the host, outside simulated time. Finally, Blackhole, and DPRINT, the debugging tool you'll use most:</p>
+<pre class="out"><code>$ source .../env.sh bh
+ttsim lab env: ARCH=bh SIM=/home/user/sim/bh/libttsim_bh.so cwd=/home/user/ttlab/b00/run
+$ $EX/metal_example_add_2_integers_in_riscv
+... TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0xb140 (tt_sim_tt_device.cpp:163)
+Success: Result is 21
+[6596] 0.2 seconds (27.2 KHz)
+
+$ source .../env.sh wh                                                        # back on wh
+$ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_riscv
+0:0-0:BR: Adding integers: 14 + 7
+Success: Result is 21
+[5070] 0.3 seconds (17.9 KHz)       # varies from run to run with DPRINT on</code></pre>
+  <p>Notice how the clock count moves: 4501 on Wormhole and 6596 on Blackhole, run after run. With DPRINT on it is higher, and it is <em>not</em> repeatable: this run printed 5070, and other runs in this orb gave 5056, 5062, 5944 and 6611. DPRINT starts a host thread that polls the device for print data (<code>dprint_server.cpp:998</code>), and every host read advances the simulated clock by one tick (Figure 1, step 6). How many reads that thread gets in before the program finishes depends on host thread scheduling, which is the most likely reason the count wanders. So a DPRINT-on count is not a fingerprint; compare clock counts only with DPRINT off. <a href="b01-meet-ttsim.html">B01</a> takes this apart properly.</p>
+  <p>If you want a lower-level check that skips tt-metal entirely, <code>workbench/harness/h.c</code> <code>dlopen</code>s the library and calls three of its entry points directly:</p>
+<pre class="out"><code>$ gcc -O2 -o h sim-labs/workbench/harness/h.c -ldl
+$ ./h ~/sim/wh/libttsim_wh.so
+cfg[0] = 0x401e1e52 (device&lt;&lt;16 | vendor)
+[1000] 0.0 seconds (174.9 KHz)
+$ ./h ~/sim/bh/libttsim_bh.so
+cfg[0] = 0xb1401e52 (device&lt;&lt;16 | vendor)
+[1000] 0.0 seconds (153.9 KHz)</code></pre>
+
+  <div class="callout sim">Your workbench is ready. Continue to <a href="b01-meet-ttsim.html">B01: Meet ttsim</a>, which runs every example on both chips, checks determinism, and makes your first real kernel edit.</div>
+
+  <h2 id="trouble">Troubleshooting</h2>
+  <p>Each failure below was reproduced in this orb on purpose, and the output is real.</p>
+
+  <h3><code>terminate called after throwing an instance of 'YAML::BadFile'</code></h3>
+  <p>We copied <code>libttsim_wh.so</code> alone into an empty directory and pointed <code>TT_METAL_SIMULATOR</code> at it:</p>
+<pre class="out"><code>$ TT_METAL_SIMULATOR=$LAB_HOME/nosoc/libttsim_wh.so $EX/metal_example_add_2_integers_in_riscv
+... | info     |           Metal | Disabling multi-erisc mode with simulator/emule target device (rtoptions.cpp:398)
+terminate called after throwing an instance of 'YAML::BadFile'
+  what():  bad file: /home/user/ttlab/b00/nosoc/soc_descriptor.yaml
+exit=134</code></pre>
+  <p>The message names the exact file it wanted. Copy the matching descriptor there (<a href="#soc">Step 3</a>). The updated <code>env.sh</code> warns about this as soon as you source it. A <em>wrong</em> descriptor is worse than a missing one, because the error no longer points at the YAML. We tried a Blackhole descriptor next to the Wormhole library: UMD announced <code>Creating TopologyDiscovery for architecture: blackhole</code>, the library answered with Wormhole's <code>device_id=0x401e</code>, and the run died inside the simulator with <code>[0] ERROR: UnimplementedFunctionality: pcie_bar0_rd: bar0: offset=0x1fd04100 size=4</code>. Keep one chip per directory.</p>
+
+  <h3><code>TT_FATAL: Root Directory is not set.</code></h3>
+  <p>This is what happens if you set <code>TT_METAL_HOME</code> but not <code>TT_METAL_RUNTIME_ROOT</code> and run from anywhere except a tt-metal checkout:</p>
+<pre class="out"><code>$ (unset TT_METAL_RUNTIME_ROOT; $EX/metal_example_add_2_integers_in_riscv)
+... | critical |           Metal | Failed to determine TT-Metal root directory. Root directory must be set via one of the following methods:
+1. Automatically determined when using a package install
+2. Set TT_METAL_RUNTIME_ROOT environment variable to the path containing tt_metal/
+3. Call RunTimeOptions::set_root_dir() API before creating RunTimeOptions
+4. Run from the root of the repository
+Current working directory: /home/user/ttlab/b00/run (rtoptions.cpp:379)
+... | critical |          Always | TT_FATAL: Root Directory is not set. (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  TT_FATAL @ /home/user/workspace/refs/tt-metal/tt_metal/llrt/rtoptions.cpp:382: !this-&gt;root_dir.empty()</code></pre>
+  <p><code>TT_METAL_HOME</code> was still exported during that run, which proves the point: this code path does not read it. Older guides (including the ttsim README's <code>cd $TT_METAL_HOME</code> recipe) get away with it because "run from the root of the repository" is fallback 4. Fallback 4 is exactly the stale-kernel trap below. Set <code>TT_METAL_RUNTIME_ROOT</code> (env.sh does) and run from a lab directory.</p>
+
+  <h3>The stale-kernel trap: "my edit does nothing"</h3>
+  <p>Symptom: you edited a kernel in <code>$LAB_HOME/kernels/</code>, reran, and got the old behaviour, with no error and no warning. Cause: your cwd contains a <code>tt_metal/</code> tree (usually because you <code>cd</code>'d to <code>$TT_METAL_HOME</code>, as the ttsim README's example does), so priority 1 finds the stock kernel before priority 2 ever looks at your overlay. Use the third scenario of the search-order figure to see it happen. Fix: <code>cd $LAB_HOME/run</code>, or just re-source <code>env.sh</code>. To be sure which copy ran, put a deliberate change in your overlay (such as the <code>+</code> to <code>*</code> edit above) and check the result changes.</p>
+
+  <h3>Where is the JIT cache, and should I clear it?</h3>
+  <p>Compiled firmware and kernels go to <code>$HOME/.cache/tt-metal-cache/</code>, or <code>/tmp/tt-metal-cache/</code> if <code>$HOME</code> doesn't exist (<code>build.cpp:191-198</code>). Inside it, each build configuration (architecture, debug features and so on) gets a numeric <em>build key</em> directory with <code>firmware/</code> and <code>kernels/&lt;kernel name&gt;/&lt;hash&gt;/</code> under it (<code>build.cpp:557-558</code>). In this orb it held four build-key directories and 430 MB. You normally never need to clear it: an edited kernel gets a new hash directory (our <code>8/9 hits</code> above). Clear it (<code>rm -rf ~/.cache/tt-metal-cache</code>) only if you suspect corruption or need disk space; the next run just recompiles, as the 3.9 s cold run showed.</p>
+  <div class="callout warn">One quirk if you set <code>TT_METAL_CACHE=/some/dir</code>: tt-metal appends <code>tt-metal-cache</code> without a slash (<code>rtoptions.cpp:505</code>), and the build key is then pasted straight on (<code>build.cpp:557-558</code>). The kernels end up in sibling directories such as <code>/some/dir/tt-metal-cache13101861097061555864/</code>, while the precompiled headers go to <code>/some/dir/tt-metal-cache/pch/</code>. We saw exactly that layout in <code>$LAB_HOME/cache</code>. It works; it just looks odd when you go looking.</div>
+
+  <h3>Smaller things</h3>
+  <ul>
+    <li><b><code>Failed to start Inspector RPC server ... Address already in use; toString() = 127.0.0.1:50051</code></b>: a warning we saw while another tt-metal process was running in the same orb. Each process tries to bind the same port. It is harmless; <code>TT_METAL_INSPECTOR_RPC=0</code> turns the server off (<code>rtoptions.cpp:1663-1668</code>).</li>
+    <li><b><code>clang++-20: command not found</code></b> from <code>build_host.sh</code>, or a configure error about the toolchain file: <code>llvm.sh 20</code> didn't run (Step 4a).</li>
+    <li><b><code>ImportError</code> when importing <code>ttnn</code></b>: the venv's Python minor version differs from the one <code>build_metal.sh</code> saw (Step 5).</li>
+    <li><b>An <code>UnsupportedFunctionality</code> error mentioning SFPLOADMACRO</b>: <code>TT_METAL_DISABLE_SFPLOADMACRO</code> is not set; source <code>env.sh</code>.</li>
+    <li><b>WSL2</b>: the ttsim README lists Windows via WSL2 as a supported host. We did not test it. Keep the checkouts inside the Linux filesystem (<code>~</code>), not under <code>/mnt/c</code>, or the build will be very slow.</li>
+  </ul>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>The simulator is one <code>libttsim.so</code> per chip that tt-metal's user-mode driver <code>dlopen</code>s when <code>TT_METAL_SIMULATOR</code> is set. Everything above UMD is the same binary you would run on silicon.</li>
+    <li>Pin <b>tt-metal 7aad8aac</b> and <b>ttsim v1.15.0 (b3620244)</b>. ttsim builds in about 10 s with <code>./make.py :build</code>; the release binaries work too and give identical results.</li>
+    <li>Each <code>.so</code> lives in its own directory next to <code>soc_descriptor.yaml</code>, because tt-metal derives that path from the library path and parses it to learn the architecture.</li>
+    <li>On Debian 12: ignore the failed SFPI <code>.deb</code> (CMake fetches a working tarball), run <code>llvm.sh 20</code> yourself, build with <code>--without-distributed</code>, and name the <code>metal_example_*</code> ninja targets explicitly.</li>
+    <li>For ttnn, match the venv's Python to the <code>python3</code> used at configure time (<code>--python-version 3.11</code> here).</li>
+    <li><code>env.sh</code> sets the runtime root, the kernel overlay and the log paths, then <code>cd</code>s to <code>$LAB_HOME/run</code>, because the cwd is searched <em>first</em> for kernels.</li>
+    <li>Smoke test: <code>Success: Result is 21</code> at <code>[4501]</code> clocks on Wormhole, every time (with DPRINT off; DPRINT's polling thread makes the count vary). That number is a fingerprint, not a speed.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>You set TT_METAL_SIMULATOR=~/sim/libttsim_wh.so and also put libttsim_bh.so in ~/sim. What goes wrong, and why?</summary><p>Both libraries would have to share <code>~/sim/soc_descriptor.yaml</code>, because the descriptor's location is "the directory of the .so" plus a fixed name (<code>simulator_paths.hpp:16-22</code>). Whichever chip's descriptor you copy there is wrong for the other library. tt-metal parses the file to decide the architecture and the core map, so it would mis-describe the simulated chip. Giving each chip its own directory avoids the clash.</p></details>
+  <details class="quiz"><summary>You edit your overlay kernel, rerun, and still get "Success: Result is 21". Name two different possible causes and how to tell them apart.</summary><p>(1) <b>The cwd shadows the overlay</b>: you're in a directory with a <code>tt_metal/</code> tree, so priority 1 wins. Check with <code>pwd</code>, and fix it with <code>cd $LAB_HOME/run</code>. (2) <b>The overlay path is wrong</b>: it must mirror the full relative string the host passes, <code>tt_metal/programming_examples/add_2_integers_in_riscv/kernels/...</code>. If it doesn't, priority 2 misses and priority 4 finds the stock file. Check with <code>ls $TT_METAL_KERNEL_PATH/&lt;rel&gt;</code>. Not a cause: the JIT cache. The edit got its own hash directory, and the run reported a cache miss for it.</p></details>
+  <details class="quiz"><summary>Why does the series set TT_METAL_RUNTIME_ROOT instead of relying on TT_METAL_HOME?</summary><p>Because <code>RunTimeOptions</code> resolves its root from <code>TT_METAL_RUNTIME_ROOT</code>, the <code>set_root_dir</code> API, a package install, or a cwd that contains <code>tt_metal/</code> (<code>rtoptions.cpp:340-382</code>). It does not consult <code>TT_METAL_HOME</code>, as our failing run with <code>TT_METAL_HOME</code> still exported showed. The only fallback that would work without it is "run from the repository root", and that is exactly the location that causes the stale-kernel trap.</p></details>
+  <details class="quiz"><summary>The release libttsim_wh.so and your locally built one have different SHA-256 hashes. Should you worry that results will differ?</summary><p>No. The README says local builds are functionally equivalent to the releases and byte-identical only on the release CI toolchain (Ubuntu 24.04's g++). Different compilers produce different machine code for the same C++. We checked: both gave <code>Success: Result is 21</code> at exactly <code>[4501]</code> clocks. And a rebuild with the <em>same</em> toolchain reproduced the earlier binary bit for bit.</p></details>
+  <details class="quiz"><summary>On Debian 12, install_dependencies.sh fails at the SFPI package. Why did that also leave you without clang 20, and why is SFPI itself not actually a problem?</summary><p>The script runs under <code>set -e</code>, and <code>install()</code> calls <code>install_sfpi</code>, then <code>install_mpi_ulfm</code>, then <code>install_llvm</code>. The first failure aborts the rest, so neither MPI nor clang 20 gets installed. Hence <code>llvm.sh 20</code> by hand and <code>--without-distributed</code>. SFPI is fine because, unless you pass <code>--use-system-sfpi</code>, the CMake build downloads its own SFPI tarball into <code>runtime/sfpi</code>, and that one runs on Debian 12 (it reports 7.92.0).</p></details>
+  <details class="quiz"><summary>A cold run took 3.9 s and a warm run 0.35 s, but both reported [4501] clocks. What does that tell you about the clock count?</summary><p>The extra time was JIT compilation on the host, which happens outside the simulation, so it doesn't add simulated clocks. The clock count only advances when UMD calls <code>libttsim_clock</code>, mostly one tick per device read. It measures how much the host drove the simulation, not wall time, and not how long silicon would take.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/ttsim">tenstorrent/ttsim</a>: the simulator's README. Read Getting Started, Known Issues, and the numerical-accuracy contract.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/releases/tag/v1.15.0">ttsim v1.15.0 release</a>: prebuilt <code>libttsim_*.so</code> for x86_64 and aarch64, including Quasar.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/libttsim_api.md">libttsim API and ABI</a>: the flat C interface UMD calls, and the library's guarantees (no threads, no env vars, no dlopen).</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/docs/sim_error_handling.md">ttsim: Simulator Error Handling</a>: what UndefinedBehavior, UnsupportedFunctionality and friends mean when you hit them.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md">tt-metal INSTALLING.md</a>: the official install paths (source, Docker, wheel) and supported OS versions.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/commit/7aad8aacd5bb557ee53ab7470b751cb2adadfecd">tt-metal commit 7aad8aac</a>: the exact tree this series pins.</li>
+    <li><a href="https://github.com/tenstorrent/tt-umd">tenstorrent/tt-umd</a>: the user-mode driver, home of <code>TTSimTTDevice</code> and the soc_descriptor lookup.</li>
+    <li><a href="https://github.com/tenstorrent/tt-kmd">tenstorrent/tt-kmd</a>: the kernel driver behind <code>/dev/tenstorrent/N</code> on real hardware, the layer ttsim replaces.</li>
+    <li><a href="https://github.com/tenstorrent/sfpi">tenstorrent/sfpi</a>: the RISC-V cross toolchain and SFPU programming interface that compiles every kernel.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/index.html">TT-Metalium programming examples</a>: official walkthroughs of the examples you just built.</li>
+    <li><a href="https://apt.llvm.org/">apt.llvm.org</a>: source of <code>llvm.sh</code> and the clang 20 packages.</li>
+    <li><a href="https://learn.microsoft.com/en-us/windows/wsl/install">Install WSL</a>: Microsoft's guide, if you are on Windows.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a03-chip-tour.html">&larr; A03 A tour of the chip</a><a class="next" href="b01-meet-ttsim.html">B01 Meet ttsim &rarr;</a></div>
+</main>
+</body>
+</html>
