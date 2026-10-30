@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A10 · Your first TT-Metalium program · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a09-memory.html">&larr; Prev</a>
+  <a href="a11-dataflow-and-cbs.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 10</span><span class="tag">Prerequisites: A04, A08, A09</span>
+  <h1><span class="num">10.</span> Your first TT-Metalium program</h1>
+  <p class="subtitle">By the end you will be able to read every line of a complete host program and kernel, say where each byte lives at each moment, and explain why the first run is ten times slower than the second.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#shape">The shape of every Metalium program</a></li>
+      <li><a href="#timeline">The host&harr;device timeline</a></li>
+      <li><a href="#host">The host program, line by line</a></li>
+      <li><a href="#args">Runtime args vs compile-time args</a></li>
+      <li><a href="#kernel">The kernel, line by line</a></li>
+      <li><a href="#journey">Where each value lives</a></li>
+      <li><a href="#ordering">The store that has not landed yet</a></li>
+      <li><a href="#dprint">DPRINT: your first tool</a></li>
+      <li><a href="#sim">Run it in the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p><b>What is the least code that makes the chip compute 14 + 7?</b></p>
+  <p>On a CPU the answer is one line. On a GPU it is about a dozen: allocate device memory, copy the inputs over, launch a kernel, copy the result back. On a Tenstorrent chip the official answer is the <code>add_2_integers_in_riscv</code> programming example: a 135-line host file and a 57-line kernel. That sounds like a lot for one addition, but most of those lines are comments. Each remaining line answers a question the chip forces on you, because (as <a href="a09-memory.html">A09</a> showed) the chip has <em>no caches and no shared address space</em>. Nothing moves unless somebody moves it.</p>
+  <p>So before reading any code, list the questions a program must answer to add two numbers on a machine like that:</p>
+  <ol>
+    <li><b>Which chip?</b> A host can see several.</li>
+    <li><b>How does the host talk to it?</b> Through a queue of commands, not by function calls.</li>
+    <li><b>Where do the inputs live on the device?</b> In DRAM, at addresses an allocator chooses.</li>
+    <li><b>Where can a core actually touch them?</b> Only in its own L1. A Tensix core cannot load from DRAM; it has to ask the NoC to copy the data into L1 first.</li>
+    <li><b>What code runs, on which of the five RISC-V CPUs in the core?</b></li>
+    <li><b>How does that code learn the addresses?</b></li>
+    <li><b>How does the result get back?</b></li>
+  </ol>
+  <p>Every line of the example answers one of these seven questions. The chapter goes through them in order, then runs the program, edits it, and breaks it in the simulator.</p>
+
+  <h2 id="shape">The shape of every Metalium program</h2>
+  <p>Strip away the comments and the host side of any TT-Metalium program has the same five-beat rhythm:</p>
+  <ol>
+    <li><b>Open</b> a device and get its command queue.</li>
+    <li><b>Allocate</b> buffers on the device.</li>
+    <li><b>Describe</b> a <em>Program</em>: which kernel source files run on which cores, with which arguments.</li>
+    <li><b>Enqueue</b> writes, the program, and reads onto the queue.</li>
+    <li><b>Wait</b> for the queue to drain, then close.</li>
+  </ol>
+  <p>The kernel side is a C++ function called <code>kernel_main()</code>. It is compiled for one of the baby RISC-V cores from <a href="a04-inside-tensix.html">A04</a> and runs bare-metal: no OS, no <code>malloc</code>, no <code>printf</code>. It reads its arguments from a fixed spot in L1, moves data with the NoC, computes, and returns.</p>
+
+  <div class="callout gpu">If you know CUDA, the mapping is close: <code>MeshBuffer::create</code> ≈ <code>cudaMalloc</code>, <code>EnqueueWriteMeshBuffer</code> ≈ <code>cudaMemcpyAsync</code> host→device, <code>EnqueueMeshWorkload</code> ≈ a kernel launch on a stream, <code>Finish</code> ≈ <code>cudaStreamSynchronize</code>. There are three differences. First, the kernel cannot dereference a DRAM pointer: it must copy the data into on-core SRAM itself. Second, you choose <em>which</em> core and <em>which</em> CPU inside that core runs your code, rather than launching a grid of anonymous threads. Third, kernels are compiled from source by a JIT on first use, like NVRTC, not ahead of time by <code>nvcc</code>.</div>
+
+  <h2 id="timeline">The host&harr;device timeline</h2>
+  <p>Before the line-by-line tour, look at what happens in time when you run the program. The figure uses wall-clock times I measured in this orb on the Wormhole simulator. Pick a scenario and press Play. The bars are drawn to scale against the 4-second axis.</p>
+
+  <div class="viz" id="fig-timeline">
+    <div class="controls" id="tl-modes">
+      <button class="tt on" data-m="0">1. Empty cache (first run ever)</button>
+      <button class="tt" data-m="1">2. Kernel edited, rest cached</button>
+      <button class="tt" data-m="2">3. Warm rerun</button>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-timeline");
+    var g = TT.canvas(root, 860, 400), ctx = g.ctx, C = TT.C;
+    // Measured wall times (s): empty cache 3.75-3.92 (avg ~3.84), kernel-only cold 0.74-0.76, warm 0.36.
+    var MODES = [
+      { name: "empty cache", total: 3.84, fw: 3.09, jit: 0.39, hits: "0/9" },
+      { name: "kernel edited", total: 0.75, fw: 0, jit: 0.39, hits: "8/9" },
+      { name: "warm rerun", total: 0.36, fw: 0, jit: 0, hits: "9/9" }
+    ];
+    var mode = 0, rest = 0.06; // the remaining 0.36 s spread evenly over 6 stages (not individually timed)
+    var rows = [
+      { label: "create_unit_mesh (open)", side: "dev", dur: function () { return rest; }, col: C.blue },
+      { label: "firmware + PCH JIT build", side: "host", dur: function (m) { return m.fw; }, col: C.red, jit: 1 },
+      { label: "EnqueueWriteMeshBuffer ×2", side: "dev", dur: function () { return rest; }, col: C.green },
+      { label: "kernel JIT build", side: "host", dur: function (m) { return m.jit; }, col: C.orange, jit: 1 },
+      { label: "launch: binary + args", side: "dev", dur: function () { return rest; }, col: C.purple },
+      { label: "BRISC runs kernel_main", side: "dev", dur: function () { return rest; }, col: C.yellow },
+      { label: "EnqueueReadMeshBuffer", side: "dev", dur: function () { return rest; }, col: C.teal },
+      { label: "close", side: "dev", dur: function () { return rest; }, col: C.muted }
+    ];
+    function txt(i, m) {
+      var T = [
+        "<b>Open.</b> <code>MeshDevice::create_unit_mesh(0)</code> opens chip 0 as a 1×1 mesh and initialises it.",
+        m.fw ? "<b>Firmware build, " + m.fw.toFixed(2) + " s.</b> On an empty cache, device init first JIT-compiles firmware for every RISC-V (brisc, ncrisc, trisc0-2, erisc…) and a precompiled header. This bar is most of the run." : "<b>Firmware build: 0 s.</b> The firmware ELFs are already in the cache, so this bar has vanished.",
+        "<b>Write inputs.</b> Two 4-byte writes, host vector → DRAM. In slow-dispatch mode the host does each write itself.",
+        m.jit ? "<b>Kernel JIT, ~" + m.jit.toFixed(2) + " s.</b> The first enqueue of a program compiles <code>reader_writer_add_in_riscv.cpp</code> with riscv-tt-elf-g++ into a BRISC ELF. The cache is keyed on the source, so an edited kernel misses here (JIT cache " + m.hits + ")." : "<b>Kernel JIT: 0 s.</b> Same source, same args, same defines, so it is a cache hit (JIT cache 9/9). The compile bar is gone.",
+        "<b>Launch.</b> The kernel binary and the six runtime args are written into the core's L1, and BRISC is told to go.",
+        "<b>Run.</b> The kernel itself: two NoC reads, one add, one NoC write. In ttsim this is <b>[4501] simulated clocks in all three scenarios</b>: the device work is identical; only host-side compilation changes.",
+        "<b>Read back.</b> A blocking read of the 4-byte result. Commands run in FIFO order, so it cannot overtake the kernel.",
+        "<b>Close.</b> Total wall time ≈ <b>" + m.total.toFixed(2) + " s</b> (" + m.name + "). The six thin bars share the measured 0.36 s floor; their split was not individually timed, so they are drawn equal."
+      ];
+      return T[i];
+    }
+    var steps = rows.map(function (r, i) { return { dur: r.jit ? 1.6 : 0.6, text: "" }; });
+    function setTexts() { steps.forEach(function (s, i) { s.text = txt(i, MODES[mode]); }); }
+    setTexts();
+    var X0 = 222, PX = 150; // 150 px per second
+    function draw(i, t) {
+      var m = MODES[mode];
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "wall time (s) →", X0, 18, { color: C.muted, font: "12px" });
+      TT.box(ctx, 14, 12, 10, 10, { fill: C.blue, r: 2 }); TT.text(ctx, "host only", 30, 17, { color: C.muted, font: "11px" });
+      TT.box(ctx, 100, 12, 10, 10, { fill: C.green, r: 2 }); TT.text(ctx, "touches device", 116, 17, { color: C.muted, font: "11px" });
+      for (var s = 0; s <= 4; s++) {
+        var x = X0 + s * PX;
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, 30); ctx.lineTo(x, 330); ctx.stroke();
+        TT.text(ctx, s + " s", x, 342, { color: C.muted, align: "center", font: "12px" });
+      }
+      var tcur = 0, y0 = 40, rh = 34;
+      for (var k = 0; k < rows.length; k++) {
+        var r = rows[k], d = r.dur(m), y = y0 + k * rh;
+        TT.text(ctx, r.label, X0 - 10, y + 12, { align: "right", font: "12px", mono: true, color: k <= i ? C.fg : C.muted });
+        TT.box(ctx, 14, y + 7, 10, 10, { fill: r.side === "host" ? C.blue : C.green, r: 2 });
+        var frac = k < i ? 1 : (k === i ? t : 0);
+        if (frac > 0) {
+          var w = Math.max(d > 0 ? 3 : 0, d * PX * frac);
+          if (d > 0) TT.box(ctx, X0 + tcur * PX, y + 2, w, 20, { fill: r.col, alpha: 0.8, r: 3 });
+          else TT.text(ctx, "cached: 0 s", X0 + tcur * PX + 4, y + 12, { color: C.green, font: "12px" });
+          if (d >= 0.3) TT.text(ctx, d.toFixed(2) + " s", X0 + tcur * PX + w + 6, y + 12, { font: "12px", color: r.col });
+        }
+        tcur += d;
+      }
+      // total marker
+      if (i === rows.length - 1 && t > 0.9) {
+        var xe = X0 + m.total * PX;
+        TT.arrow(ctx, xe, 360, xe, 334, { color: C.yellow, head: 7 });
+        TT.text(ctx, "≈ " + m.total.toFixed(2) + " s total · [4501] device clocks", Math.min(xe, 620), 378, { color: C.yellow, font: "13px", align: "center" });
+      }
+      // reference ticks for the other scenarios
+      MODES.forEach(function (mm, j) {
+        if (j === mode) return;
+        var xr = X0 + mm.total * PX;
+        ctx.strokeStyle = C.muted; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(xr, 30); ctx.lineTo(xr, 330); ctx.stroke(); ctx.setLineDash([]);
+        var right = xr > 760;
+        TT.text(ctx, mm.name, right ? xr - 4 : xr + 4, 306 + 12 * j, { font: "10px", color: C.muted, align: right ? "right" : "left" });
+      });
+    }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    document.querySelectorAll("#tl-modes button").forEach(function (b) {
+      b.onclick = function () {
+        mode = +b.dataset.m;
+        document.querySelectorAll("#tl-modes button").forEach(function (o) { o.classList.toggle("on", o === b); });
+        setTexts(); api.render();
+      };
+    });
+  })();
+  </script>
+
+  <p>The <a href="#sim">simulator section</a> shows the measurements behind the figure. Three things to take from it:</p>
+  <ul>
+    <li><b>The device work is tiny and constant.</b> ttsim reports <code>[4501]</code> simulated clocks for this program in every scenario. (ttsim is a functional model, so those clocks are not a performance measure. They are steady because the device does exactly the same work each time.)</li>
+    <li><b>The first run is dominated by compilation on the host.</b> With an empty cache, tt-metal compiles firmware for every RISC-V type plus a precompiled header (about 3 s here), then compiles your kernel (about 0.4 s). That is 3.8 s for a 4-byte add.</li>
+    <li><b>The cache makes the compile bars disappear.</b> The second run hits 9/9 JIT cache entries and takes 0.36 s. Edit the kernel source and only your kernel's entry misses (8/9 hits, 0.75 s).</li>
+  </ul>
+  <div class="callout key">Kernels are compiled from source when the program is first enqueued, and the result is cached. A slow first run is the JIT, not your kernel.</div>
+  <p>The research notes (<code>research/06-feasibility.md</code>) recorded "1.08 s cold / 0.36 s warm" for this example. My kernel-only-cold runs took 0.74–0.76 s and my fully empty-cache runs took 3.75–3.92 s. The two sources disagree on the cold figure. The likely cause is that the earlier "cold" run had the firmware cached and only the kernel cold, but I could not confirm how that run was set up. The warm figures agree exactly. This chapter's JIT is a black box until <a href="a13-llk-mops-jit.html">A13</a>, which opens up the build steps, the cache key and the kernel path search.</p>
+
+  <h2 id="host">The host program, line by line</h2>
+  <h3>1. Which chip? <code>create_unit_mesh</code></h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:29-34 @7aad8aac</div>
+<pre><code>std::shared_ptr&lt;distributed::MeshDevice&gt; mesh_device = distributed::MeshDevice::create_unit_mesh(0);
+...
+distributed::MeshCommandQueue&amp; cq = mesh_device-&gt;mesh_command_queue();</code></pre>
+  <p>The current API has only one kind of device handle, the <code>MeshDevice</code>: a 2D grid of chips that you address as a single object. A single chip is a <b>1×1 mesh</b>, which is what <code>create_unit_mesh(device_id)</code> builds. The older <code>CreateDevice</code>/<code>EnqueueProgram</code> API you may see in old blog posts has gone. Because one chip is just the smallest mesh, the same five-beat program scales to many chips (<a href="a21-many-chips.html">A21</a>) without changing its shape.</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/mesh_device.hpp:327-334 @7aad8aac</div>
+<pre><code>static std::shared_ptr&lt;MeshDevice&gt; create_unit_mesh(
+    int device_id,
+    size_t l1_small_size = DEFAULT_L1_SMALL_SIZE,
+    size_t trace_region_size = DEFAULT_TRACE_REGION_SIZE,
+    size_t num_command_queues = 1,
+    const DispatchCoreConfig&amp; dispatch_core_config = DispatchCoreConfig{},
+    ttsl::Span&lt;const std::uint32_t&gt; l1_bank_remap = {},
+    size_t worker_l1_size = DEFAULT_WORKER_L1_SIZE);</code></pre>
+  <p>The defaulted parameters show what "opening a device" decides: how much L1 to reserve for special regions, how many command queues to create (one by default), and which cores run the dispatch firmware. You can ignore all of them for now. Opening the device is also when firmware is built and loaded onto every core: <code>RiscFirmwareInitializer::run_async_build_phase</code> is profiled as <code>"FW builds and Device Inits"</code> (<code>tt_metal/impl/device/firmware/risc_firmware_initializer.cpp:109-110</code>). That is the big red bar in the timeline.</p>
+
+  <h3>2. How does the host talk to it? The command queue</h3>
+  <p><code>mesh_command_queue()</code> returns the device's command queue. Every interaction with the device after this point (writing a buffer, running a program, reading a buffer) is a command pushed onto this queue, and <b>commands execute in FIFO order</b>. The example relies on that ordering: the comment at line 119 says "a read will not run before the prior kernel finishes". On real hardware in the default <em>fast dispatch</em> mode, the queue is a ring buffer that dispatch firmware running on reserved cores consumes. Under ttsim the workbench sets <code>TT_METAL_SLOW_DISPATCH_MODE=1</code>, and the host performs each command itself, synchronously. The program is written the same way in both modes. <a href="a17-dispatch-host.html">A17</a> explains what sits between "enqueue" and "a kernel starts".</p>
+
+  <h3>3. Where do the inputs live? <code>MeshBuffer</code> and page size</h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:46-72 @7aad8aac</div>
+<pre><code>constexpr uint32_t buffer_size = sizeof(uint32_t);
+...
+distributed::DeviceLocalBufferConfig dram_config{
+    .page_size = buffer_size,
+    .buffer_type = BufferType::DRAM};
+distributed::DeviceLocalBufferConfig l1_config{
+    .page_size = buffer_size,
+    .buffer_type = BufferType::L1};
+distributed::ReplicatedBufferConfig buffer_config{
+    .size = buffer_size,
+};
+auto src0_dram_buffer = distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+auto src1_dram_buffer = distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+auto dst_dram_buffer = distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+auto src0_l1_buffer = distributed::MeshBuffer::create(buffer_config, l1_config, mesh_device.get());
+auto src1_l1_buffer = distributed::MeshBuffer::create(buffer_config, l1_config, mesh_device.get());
+auto dst_l1_buffer = distributed::MeshBuffer::create(buffer_config, l1_config, mesh_device.get());</code></pre>
+  <p>A buffer is described by two small configs:</p>
+  <ul>
+    <li><b><code>DeviceLocalBufferConfig</code></b> says what the buffer looks like on <em>each</em> chip: where it lives (<code>BufferType::DRAM</code> or <code>BufferType::L1</code>) and its <b>page size</b>.</li>
+    <li><b><code>ReplicatedBufferConfig</code></b> says how big it is. "Replicated" means every chip in the mesh gets a full copy. With a 1×1 mesh that is just one copy.</li>
+  </ul>
+  <p>The <b>page</b> is the interleaving unit from <a href="a09-memory.html">A09</a>. An interleaved buffer is cut into pages, and the pages are dealt round-robin across the banks: page 0 to bank 0, page 1 to bank 1, and so on. Real programs use one tile per page (32×32 bf16 = 2048 B). Here the whole buffer is one 4-byte integer, so it is a single page, and page 0 always lands in bank 0. The kernel's address generator computes <code>bank_index = id − (id / NUM_DRAM_BANKS) · NUM_DRAM_BANKS</code>, which is 0 for id 0 (<code>tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:20-43</code>).</p>
+  <p>The program creates <em>six</em> buffers: three in DRAM (two inputs and one output) and three in L1 (scratch space on core (0,0)). The L1 buffers are needed because, as the comment at lines 48-50 says, "the Tensix core does not have direct access to DRAM". The host does not choose any addresses; the allocator does. I printed them from the kernel in the simulator (see <a href="#sim">below</a>):</p>
+  <table>
+    <tr><th>Buffer</th><th>Type</th><th>Address chosen by the allocator (WH sim)</th></tr>
+    <tr><td>src0_dram</td><td>DRAM</td><td><code>0x2d4c40</code></td></tr>
+    <tr><td>src1_dram</td><td>DRAM</td><td><code>0x2d4c60</code></td></tr>
+    <tr><td>dst_dram</td><td>DRAM</td><td><code>0x2d4c80</code></td></tr>
+    <tr><td>src0_l1</td><td>L1</td><td><code>0x16dfe0</code></td></tr>
+    <tr><td>src1_l1</td><td>L1</td><td><code>0x16dfc0</code></td></tr>
+    <tr><td>dst_l1</td><td>L1</td><td><code>0x16dfa0</code></td></tr>
+  </table>
+  <p>Two patterns are worth noticing. Each 4-byte buffer takes a 0x20 = 32-byte slot, because the allocator rounds sizes up to its alignment. And the L1 addresses count <em>down</em> from near the top of the 1.5 MB L1, while the DRAM ones count up. The allocator internals are a sidebar in A09. What matters here is that <b>the kernel knows none of these addresses at compile time</b>; somebody has to tell it.</p>
+
+  <h3>4. Getting the inputs onto the device: <code>EnqueueWriteMeshBuffer</code></h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:75-83 @7aad8aac</div>
+<pre><code>std::vector&lt;uint32_t&gt; src0_vec = {14};
+std::vector&lt;uint32_t&gt; src1_vec = {7};
+...
+EnqueueWriteMeshBuffer(cq, src0_dram_buffer, src0_vec, /*blocking=*/false);
+EnqueueWriteMeshBuffer(cq, src1_dram_buffer, src1_vec, /*blocking=*/false);</code></pre>
+  <p>The host vectors hold 14 and 7. <code>EnqueueWriteMeshBuffer</code> is a thin template (<code>distributed.hpp:72-85</code>) that checks the vector is at least as large as the buffer (a <code>TT_FATAL</code> otherwise) and calls <code>mesh_cq.enqueue_write_mesh_buffer</code>. <code>blocking=false</code> lets the host carry on while the copy is queued. That is safe because the queue is in order: the program that reads these buffers is enqueued later.</p>
+
+  <h3>5. Describing the work: <code>CreateProgram</code> and <code>CreateKernel</code></h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:37-43 @7aad8aac</div>
+<pre><code>distributed::MeshWorkload workload;
+distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device-&gt;shape());
+Program program = CreateProgram();
+...
+constexpr CoreCoord core = {0, 0};</code></pre>
+  <p>A <b>Program</b> is a container: "the main container that bundles kernels, circular buffers, and/or semaphores for execution on device" (<code>host_api.hpp:101-111</code>). Creating one does nothing on the device. It is a description that you fill in, then submit. <code>CoreCoord{0,0}</code> is a <em>logical</em> coordinate: the first Tensix worker, not NoC position (0,0). (A08 explained why logical and NoC coordinates differ.)</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:91-95 @7aad8aac</div>
+<pre><code>KernelHandle kernel_id = CreateKernel(
+    program,
+    OVERRIDE_KERNEL_PREFIX "add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp",
+    core,
+    DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});</code></pre>
+  <p><code>CreateKernel</code> takes four things:</p>
+  <ul>
+    <li><b>A source path, not a binary.</b> Nothing is compiled yet. <code>OVERRIDE_KERNEL_PREFIX</code> is set by <code>tt_metal/programming_examples/CMakeLists.txt:8</code> to <code>"tt_metal/programming_examples/"</code>, so the path the runtime actually searches for is <code>tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp</code>. This matters when you overlay your own copy in the simulator section.</li>
+    <li><b>Where it runs.</b> A <code>CoreCoord</code>, a <code>CoreRange</code> or a <code>CoreRangeSet</code>. One core here.</li>
+    <li><b>Which CPU inside the core</b>, which is the job of the config type. <code>DataMovementConfig</code> means "one of the two data-movement RISC-Vs", and <code>ComputeConfig</code> means "the three TRISCs together" (<a href="a12-compute-kernels.html">A12</a>).</li>
+    <li><b>Which NoC</b> that CPU issues its transfers on.</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/kernel_types.hpp:23-39 @7aad8aac</div>
+<pre><code>enum class DataMovementProcessor {
+    RISCV_0 = 0,  // BRISC; Core DM0 on Quasar
+    RISCV_1 = 1,  // NCRISC; Core DM1 on Quasar
+    ...
+};
+
+enum NOC : uint8_t {
+    RISCV_0_default = 0,
+    RISCV_1_default = 1,
+    NOC_0 = 0,
+    NOC_1 = 1,
+};</code></pre>
+  <p><code>RISCV_0</code> is <b>BRISC</b> and <code>RISCV_1</code> is <b>NCRISC</b>, the two data-movement cores from A04. <code>NOC::RISCV_0_default</code> is just another name for NoC 0. The processor and the NoC are independent choices. By convention a reader kernel runs on RISCV_0/NoC0 and a writer on RISCV_1/NoC1, so the two traffic streams use the two opposite tori from <a href="a08-noc.html">A08</a>. This example does both reading and writing from one kernel on BRISC/NoC0, which is fine for 12 bytes of traffic.</p>
+  <p>The rest of <code>DataMovementConfig</code> (<code>kernel_types.hpp:65-85</code>) holds <code>compile_args</code>, <code>named_compile_args</code>, <code>defines</code> and <code>opt_level</code> (default <code>O2</code>). All of these change the generated binary, which leads to the next question.</p>
+
+  <h2 id="args">Runtime args vs compile-time args</h2>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:98-109 @7aad8aac</div>
+<pre><code>SetRuntimeArgs(
+    program,
+    kernel_id,
+    core,
+    {
+        static_cast&lt;uint32_t&gt;(src0_dram_buffer-&gt;address()),
+        static_cast&lt;uint32_t&gt;(src1_dram_buffer-&gt;address()),
+        static_cast&lt;uint32_t&gt;(dst_dram_buffer-&gt;address()),
+        static_cast&lt;uint32_t&gt;(src0_l1_buffer-&gt;address()),
+        static_cast&lt;uint32_t&gt;(src1_l1_buffer-&gt;address()),
+        static_cast&lt;uint32_t&gt;(dst_l1_buffer-&gt;address()),
+    });</code></pre>
+  <p>The kernel learns the six allocator-chosen addresses through <b>runtime arguments</b>: a list of 32-bit words per (kernel, core) pair. At launch they are written into the kernel-config region of that core's L1. The kernel reads word <i>i</i> with <code>get_arg_val&lt;uint32_t&gt;(i)</code>, which is literally a load from a fixed L1 address (shown below). The number of args is bounded by that L1 space; <code>get_arg_val</code>'s doc gives the valid index range as 0 to 341 (<code>dataflow_api.h:135-146</code>). There is also <code>SetCommonRuntimeArgs</code>/<code>get_common_arg_val</code> for words shared by every core running the kernel (<code>host_api.hpp:416</code>).</p>
+  <p>The alternative is <b>compile-time arguments</b>: <code>DataMovementConfig{.compile_args = {...}}</code>, read in the kernel with <code>get_compile_time_arg_val(i)</code> (<code>tt_metal/hw/inc/api/compile_time_args.h:64</code>). These are baked into the binary: the JIT passes them as <code>-DKERNEL_COMPILE_TIME_ARGS=…</code> (<code>tt_metal/jit_build/build.cpp:1229</code>), so the compiler can constant-fold them, unroll loops by them, and size arrays with them. The price is that a new value means a new binary. The header comment on <code>defines</code> says it directly: "Each unique combination of defines will produce a unique compiled instantiation" (<code>kernel_types.hpp:70-72</code>), and compile args behave the same way.</p>
+  <table>
+    <tr><th></th><th>Runtime args</th><th>Compile-time args</th></tr>
+    <tr><td>Host API</td><td><code>SetRuntimeArgs</code>, <code>SetCommonRuntimeArgs</code></td><td><code>.compile_args</code>, <code>.named_compile_args</code>, <code>.defines</code></td></tr>
+    <tr><td>Kernel API</td><td><code>get_arg_val&lt;T&gt;(i)</code></td><td><code>get_compile_time_arg_val(i)</code> (a <code>constexpr</code>)</td></tr>
+    <tr><td>Lives in</td><td>L1, written at each launch</td><td>The instruction stream itself</td></tr>
+    <tr><td>Changing it costs</td><td>A few words of L1 write</td><td>A JIT compile (the orange bar), then a cache entry</td></tr>
+    <tr><td>Typical contents</td><td>Buffer addresses, tile counts, start offsets per core</td><td>Page sizes, tile formats, loop bounds, CB indices, booleans that select code paths</td></tr>
+  </table>
+  <div class="callout key"><b>Rule of thumb:</b> things that change between runs or between cores (<em>addresses and counts</em>) are runtime args. Things that shape the code (<em>layouts, sizes, formats, flags</em>) are compile-time args. Buffer addresses are the canonical runtime arg, because the allocator may give a different address on every run.</div>
+  <div class="callout warn">Putting a buffer address in a compile-time arg works on the first run and then silently recompiles every time the allocator moves the buffer. Worse, if the address happens to stay the same, a stale assumption can survive for weeks. Addresses go in runtime args.</div>
+
+  <h3>6. Submitting: <code>MeshWorkload</code>, <code>EnqueueMeshWorkload</code>, <code>Finish</code></h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:113-114 @7aad8aac</div>
+<pre><code>workload.add_program(device_range, std::move(program));
+distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);</code></pre>
+  <p>A <b>MeshWorkload</b> maps programs onto regions of the mesh. <code>device_range</code> covers the whole mesh (<code>MeshCoordinateRange(mesh_device-&gt;shape())</code>), which here is the single chip at (0,0). On a bigger mesh you could put different programs on different chips in one workload. The program is <em>moved</em> in, because the workload now owns it.</p>
+  <p><code>EnqueueMeshWorkload</code> is where the orange JIT bar happens. In fast-dispatch mode it compiles the workload, loads the binaries and generates dispatch commands before enqueueing. In slow-dispatch mode the comment says it "normally JIT-compiles inside LaunchProgram":</p>
+  <div class="filename">tt-metal/tt_metal/distributed/distributed.cpp:127-138 @7aad8aac</div>
+<pre><code>if (env.get_rtoptions().get_fast_dispatch() &amp;&amp; !emulated) {
+    mesh_workload.impl().compile(mesh_cq.device());
+    mesh_workload.impl().load_binaries(mesh_cq);
+    mesh_workload.impl().generate_dispatch_commands(mesh_cq);
+} else if (...Mock) {
+    // Slow dispatch normally JIT-compiles inside LaunchProgram, ...
+    mesh_workload.impl().compile(mesh_cq.device());
+}
+mesh_cq.enqueue_mesh_workload(mesh_workload, blocking);</code></pre>
+  <p>Either way, the first time a given kernel source and config is enqueued, it is compiled. <code>Finish(cq)</code> (<code>distributed.hpp:128</code>) blocks until everything on the queue has completed. This example does not call <code>Finish</code>, because its next step is a <em>blocking</em> read, which waits for everything ahead of it in FIFO order. The hello-world examples have no read, so they call <code>Finish</code> explicitly.</p>
+
+  <h3>7. Getting the answer back: <code>EnqueueReadMeshBuffer</code></h3>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/add_2_integers_in_riscv.cpp:120-133 @7aad8aac</div>
+<pre><code>std::vector&lt;uint32_t&gt; result_vec;
+distributed::EnqueueReadMeshBuffer(cq, result_vec, dst_dram_buffer, /*blocking=*/true);
+...
+if (result_vec[0] != 21) {
+    std::cout &lt;&lt; "Error: Expected result of 21, got " &lt;&lt; result_vec[0] &lt;&lt; std::endl;
+...
+std::cout &lt;&lt; "Success: Result is " &lt;&lt; result_vec[0] &lt;&lt; std::endl;</code></pre>
+  <p>Note the argument order flips compared with the write: <em>(queue, destination vector, source buffer)</em>. The template resizes <code>result_vec</code> to <code>buffer-&gt;size() / sizeof(DType)</code> = 1 for you (<code>distributed.hpp:87-100</code>). With <code>blocking=true</code>, the call returns only after the data is in <code>result_vec</code>, and FIFO order guarantees the kernel has finished first. Then <code>mesh_device-&gt;close()</code>.</p>
+
+  <h2 id="kernel">The kernel, line by line</h2>
+  <p>Now switch to the device side. This file is compiled for BRISC and runs exactly once, on core (0,0).</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:5-20 @7aad8aac</div>
+<pre><code>#include "ckernel.h"
+
+void kernel_main() {
+    uint32_t src0_dram = get_arg_val&lt;uint32_t&gt;(0);
+    uint32_t src1_dram = get_arg_val&lt;uint32_t&gt;(1);
+    uint32_t dst_dram = get_arg_val&lt;uint32_t&gt;(2);
+    uint32_t src0_l1 = get_arg_val&lt;uint32_t&gt;(3);
+    uint32_t src1_l1 = get_arg_val&lt;uint32_t&gt;(4);
+    uint32_t dst_l1 = get_arg_val&lt;uint32_t&gt;(5);
+    ...
+    InterleavedAddrGen&lt;true&gt; src0 = {.bank_base_address = src0_dram, .page_size = sizeof(uint32_t)};
+    InterleavedAddrGen&lt;true&gt; src1 = {.bank_base_address = src1_dram, .page_size = sizeof(uint32_t)};
+    InterleavedAddrGen&lt;true&gt; dst = {.bank_base_address = dst_dram, .page_size = sizeof(uint32_t)};</code></pre>
+  <p><b><code>kernel_main()</code></b> is the entry point for every kind of kernel (data movement and compute alike). The firmware already running on BRISC calls it when the launch message arrives and goes back to waiting when it returns.</p>
+  <p><b><code>get_arg_val</code></b> is all there is to argument passing:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:147-152 @7aad8aac</div>
+<pre><code>template &lt;typename T&gt;
+FORCE_INLINE T get_arg_val(int arg_idx) {
+    // only 4B args are supported (eg int32, uint32)
+    static_assert("Error: only 4B args are supported" &amp;&amp; sizeof(T) == 4);
+    return *((tt_l1_ptr T*)(get_arg_addr(arg_idx)));
+}</code></pre>
+  <p>It is one load from L1. There is no marshalling and no type information: argument 3 is "the L1 address of src0" only because the host put that word in position 3. Get the order wrong and the kernel happily reads from the wrong place.</p>
+  <p><b><code>InterleavedAddrGen&lt;true&gt;</code></b> (<code>true</code> = DRAM) is a tiny struct that turns "page <i>id</i> of this interleaved buffer" into a <b>64-bit NoC address</b>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:281-304 @7aad8aac</div>
+<pre><code>struct InterleavedAddrGen {
+    static constexpr bool is_dram = DRAM;
+    uint32_t bank_base_address;  // Base address for the whole tensor.
+    const uint32_t page_size;    // Num bytes in page.
+    ...
+    std::uint64_t get_noc_addr(const uint32_t id, const uintptr_t offset = 0, uint8_t noc = noc_index) const {
+        uint32_t bank_offset_index = interleaved_addr_gen::get_bank_offset_index&lt;DRAM&gt;(id);
+        uint32_t bank_index = interleaved_addr_gen::get_bank_index&lt;DRAM&gt;(id, bank_offset_index);
+        uint32_t addr = this-&gt;get_addr(id, bank_offset_index, bank_index, offset);
+        return noc_address_backend::bank_address&lt;DRAM&gt;(bank_index, addr, noc);
+    }
+};</code></pre>
+  <p>This is A09's interleaving written as code. Page <i>id</i> goes to bank <code>id mod N</code>, at row <code>id / N</code> within that bank. The 32-bit buffer address becomes the low part of the NoC address, and the high bits name <em>which DRAM endpoint</em> to talk to. For src0 the simulator printed <code>noc addr src0=0x2c00002d4c40</code>: the low bits are the buffer address <code>0x2d4c40</code>, and the high bits <code>0x2c0…</code> encode the NoC coordinates of the DRAM endpoint that serves bank 0. (A11 decodes the format.) As the source comment warns, "the parameters here must match the parameters used in the host code": if the page size here differs from the host's <code>page_size</code>, every page after the first is read from the wrong offset within its bank. This is the older address-generator style. Modern kernels use <code>TensorAccessor</code>, which gets these parameters from compile-time args so they cannot drift. <a href="a11-dataflow-and-cbs.html">A11</a> covers it.</p>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:30-43 @7aad8aac</div>
+<pre><code>uint64_t src0_dram_noc_addr = src0.get_noc_addr(0);
+uint64_t src1_dram_noc_addr = src1.get_noc_addr(0);
+noc_async_read(src0_dram_noc_addr, src0_l1, sizeof(uint32_t));
+noc_async_read(src1_dram_noc_addr, src1_l1, sizeof(uint32_t));
+noc_async_read_barrier();
+
+// Do simple add in RiscV core
+uint32_t* dat0 = (uint32_t*)src0_l1;
+uint32_t* dat1 = (uint32_t*)src1_l1;
+uint32_t* out0 = (uint32_t*)dst_l1;
+
+DPRINT("Adding integers: {} + {}\n", *dat0, *dat1);
+
+(*out0) = (*dat0) + (*dat1);</code></pre>
+  <p><b><code>noc_async_read(src_noc_addr, dst_l1_addr, size)</code></b> asks this core's NoC interface to fetch <code>size</code> bytes from a remote NoC address into local L1. It is <em>asynchronous</em>: the call programs a command into the NoC hardware and returns immediately, before any byte has moved. That is why both reads can be in flight at once. <b><code>noc_async_read_barrier()</code></b> spins until every read this core has issued has completed. Only after the barrier may you touch <code>src0_l1</code> and <code>src1_l1</code>.</p>
+  <p>Treat both calls as a black box for now: "start a copy" and "wait for all my copies". <a href="a11-dataflow-and-cbs.html">A11</a> opens it up: how the barrier knows the reads are done (a counter of acknowledged transactions), the write-side variants, and alignment rules. One alignment rule already applies here: the low bits of the source and destination addresses must match. Reading into <code>src0_l1 + 4</code> makes ttsim stop with <code>UndefinedBehavior: … alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match</code> (recorded in <code>research/06-feasibility.md</code>). Lab B05 reproduces it.</p>
+  <p>After the barrier, the add is ordinary C on ordinary pointers. L1 is plain memory to the RISC-V, so <code>*dat0</code> is an <code>lw</code> instruction. This is the core's only "compute" in the whole program, and it runs on a data-movement CPU, not on the matrix or vector engines. The host comment says why: "Data Movement cores are … still fully capable of performing simple arithmetic operations like addition. Just slower." <a href="a12-compute-kernels.html">A12</a> does it properly on the FPU.</p>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:45-56 @7aad8aac</div>
+<pre><code>// Force the store above to land in L1 before the noc_async_write below reads dst_l1 as its source.
+// A baby-RISCV store can retire before it lands, and the RISCV and NoC are independent L1 clients with
+// no ordering between them (MemoryOrdering.md), so the NoC could otherwise read a stale value.
+// load_blocking stalls the pipeline until the store is processed.
+(void)ckernel::load_blocking(reinterpret_cast&lt;volatile tt_l1_ptr uint32_t*&gt;(dst_l1));
+...
+uint64_t dst_dram_noc_addr = dst.get_noc_addr(0);
+noc_async_write(dst_l1, dst_dram_noc_addr, sizeof(uint32_t));
+noc_async_write_barrier();</code></pre>
+  <p>The last three lines mirror the reads: compute the NoC address of page 0 of the output buffer, issue an asynchronous write from L1 to DRAM, and wait for it. The line before them is the most interesting in the file, and it gets its own section after the next figure.</p>
+
+  <h2 id="journey">Where each value lives</h2>
+  <p>Here is the whole program as a sequence of places. Step through it and watch the three numbers. The addresses are the ones the allocator actually chose in the simulator run.</p>
+  <div class="viz" id="fig-journey"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-journey");
+    var g = TT.canvas(root, 860, 420), ctx = g.ctx, C = TT.C;
+    // Fixed layout
+    var HOST = { x: 15, y: 50, w: 170, h: 300 };
+    var DRAM = { x: 225, y: 50, w: 190, h: 300 };
+    var CORE = { x: 455, y: 50, w: 390, h: 300 };
+    var P = {
+      h0: [35, 110], h1: [35, 160], hr: [35, 260],
+      d0: [245, 110], d1: [245, 160], dd: [245, 260],
+      l0: [475, 110], l1: [475, 160], ld: [475, 260], args: [475, 210],
+      r0: [680, 130], r1: [680, 180], rs: [680, 240], sq: [680, 300]
+    };
+    var CW = 130, CH = 30;
+    var steps = [
+      { dur: 1, text: "<b>Allocate.</b> Host vectors hold 14 and 7. <code>MeshBuffer::create</code> reserves three 4-byte DRAM buffers and three 4-byte L1 buffers on core (0,0). Nothing is in them yet." },
+      { dur: 1.5, text: "<b>EnqueueWriteMeshBuffer ×2.</b> 14 → DRAM <code>0x2d4c40</code>, 7 → DRAM <code>0x2d4c60</code>. Each is page 0 of its buffer, so both land in DRAM bank 0." },
+      { dur: 1.5, text: "<b>Launch.</b> The six runtime args (three DRAM and three L1 addresses) are written into the core's L1 kernel-config area. BRISC starts <code>kernel_main</code> and reads them with <code>get_arg_val</code>." },
+      { dur: 1.6, text: "<b>noc_async_read ×2.</b> BRISC asks the NoC to copy DRAM → L1. Both copies are in flight at once; the calls have already returned." },
+      { dur: 0.8, text: "<b>noc_async_read_barrier.</b> BRISC spins until both reads have completed. Now L1 <code>0x16dfe0</code> = 14 and <code>0x16dfc0</code> = 7." },
+      { dur: 1.2, text: "<b>Loads.</b> <code>*dat0</code> and <code>*dat1</code> are <code>lw</code> instructions: L1 → BRISC registers." },
+      { dur: 1.2, text: "<b>Add and store.</b> <code>add</code> gives 21 in a register. <code>sw</code> puts 21 in the <b>store queue</b>. The instruction has retired, but L1 <code>0x16dfa0</code> may still hold the old value." },
+      { dur: 1.2, text: "<b>load_blocking(dst_l1).</b> A load from the same address, plus an instruction that uses its result, forces the queued store to be processed first. Now L1 really holds 21." },
+      { dur: 1.5, text: "<b>noc_async_write + barrier.</b> The NoC reads 21 from L1 and writes it to DRAM <code>0x2d4c80</code>. The kernel returns." },
+      { dur: 1.5, text: "<b>EnqueueReadMeshBuffer (blocking).</b> DRAM → host vector. The host prints <code>Success: Result is 21</code>." }
+    ];
+    function cell(p, label, val, col, on) {
+      TT.box(ctx, p[0], p[1], CW, CH, { fill: on ? col : C.bg3, alpha: on ? 0.25 : 1, stroke: on ? col : C.border });
+      TT.text(ctx, label, p[0] + 6, p[1] + CH / 2, { font: "11px", mono: true, color: C.muted });
+      if (val !== "") TT.text(ctx, val, p[0] + CW - 8, p[1] + CH / 2, { font: "bold 15px", mono: true, align: "right", color: col });
+    }
+    function token(a, b, t, val, col) {
+      var x = TT.lerp(a[0] + CW - 30, b[0] + CW - 30, t), y = TT.lerp(a[1], b[1], t) + 3;
+      TT.box(ctx, x, y, 28, 24, { fill: col, alpha: 0.9, label: val, color: "#000", font: "bold 13px", mono: true });
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      TT.box(ctx, HOST.x, HOST.y, HOST.w, HOST.h, { stroke: C.blue, fill: C.bg2 });
+      TT.text(ctx, "Host (x86)", HOST.x + 10, HOST.y + 18, { color: C.blue, font: "bold 13px" });
+      TT.box(ctx, DRAM.x, DRAM.y, DRAM.w, DRAM.h, { stroke: C.orange, fill: C.bg2 });
+      TT.text(ctx, "DRAM bank 0", DRAM.x + 10, DRAM.y + 18, { color: C.orange, font: "bold 13px" });
+      TT.box(ctx, CORE.x, CORE.y, CORE.w, CORE.h, { stroke: C.green, fill: C.bg2 });
+      TT.text(ctx, "Tensix core (0,0)", CORE.x + 10, CORE.y + 18, { color: C.green, font: "bold 13px" });
+      TT.text(ctx, "L1 (SRAM)", 475, 92, { color: C.muted, font: "11px" });
+      TT.box(ctx, 660, 85, 170, 255, { stroke: C.yellow, r: 4 });
+      TT.text(ctx, "BRISC (RISCV_0)", 668, 100, { color: C.yellow, font: "bold 12px" });
+      // NoC link
+      ctx.strokeStyle = C.purple; ctx.lineWidth = 3; ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(DRAM.x + DRAM.w, 200); ctx.lineTo(CORE.x, 200); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "NoC 0", 435, 188, { color: C.purple, font: "11px", align: "center" });
+      TT.text(ctx, "PCIe", 205, 375, { color: C.muted, font: "11px", align: "center" });
+      // State after step k
+      var done = function (k) { return i > k || (i === k && t >= 1); };
+      cell(P.h0, "src0_vec", "14", C.blue, true);
+      cell(P.h1, "src1_vec", "7", C.blue, true);
+      cell(P.hr, "result_vec", done(9) ? "21" : "", C.blue, done(9));
+      cell(P.d0, "0x2d4c40", done(1) ? "14" : "", C.orange, done(1));
+      cell(P.d1, "0x2d4c60", done(1) ? "7" : "", C.orange, done(1));
+      cell(P.dd, "0x2d4c80", done(8) ? "21" : "", C.orange, done(8));
+      cell(P.args, "rt args ×6", done(2) ? "addrs" : "", C.purple, done(2));
+      cell(P.l0, "0x16dfe0", done(3) ? "14" : "", C.green, done(3));
+      cell(P.l1, "0x16dfc0", done(3) ? "7" : "", C.green, done(3));
+      cell(P.ld, "0x16dfa0", done(7) ? "21" : (done(6) ? "old" : ""), C.green, done(7));
+      cell(P.r0, "reg a", done(5) ? "14" : "", C.yellow, done(5));
+      cell(P.r1, "reg b", done(5) ? "7" : "", C.yellow, done(5));
+      cell(P.rs, "reg a+b", done(6) ? "21" : "", C.yellow, done(6));
+      var sqv = (done(6) && !done(7)) ? "21" : "";
+      cell(P.sq, "store queue", sqv, C.red, sqv !== "");
+      // barrier tick
+      if (done(4)) TT.text(ctx, "✓ barrier", 610, 75, { color: C.green, font: "12px" });
+      // Moving tokens during the current step
+      if (t < 1) {
+        if (i === 1) { token(P.h0, P.d0, t, "14", C.orange); token(P.h1, P.d1, t, "7", C.orange); }
+        if (i === 2) { token([P.hr[0], 210], P.args, t, "@", C.purple); }
+        if (i === 3) { token(P.d0, P.l0, t, "14", C.green); token(P.d1, P.l1, TT.smooth(t * 0.85), "7", C.green); }
+        if (i === 5) { token(P.l0, P.r0, t, "14", C.yellow); token(P.l1, P.r1, t, "7", C.yellow); }
+        if (i === 6) { token(P.rs, P.sq, t, "21", C.red); }
+        if (i === 7) { token(P.sq, P.ld, t, "21", C.green); }
+        if (i === 8) { token(P.ld, P.dd, t, "21", C.orange); }
+        if (i === 9) { token(P.dd, P.hr, t, "21", C.blue); }
+      }
+      if (done(9)) TT.text(ctx, "Success: Result is 21", 430, 400, { color: C.green, font: "bold 14px", mono: true, align: "center" });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+  <p>Count the hops: each input crosses three memories (host RAM → DRAM → L1 → register) and the output crosses three on the way back. On a CPU the caches would do this for you, invisibly. Here, every arrow in the figure is a line of code someone wrote. That is the price of having no caches, and also the source of control: A15 and A16 are about choosing these arrows carefully enough that the compute engines never wait for them.</p>
+  <div class="callout gpu">A GPU kernel would write <code>c[0] = a[0] + b[0]</code> on global-memory pointers. The DRAM→register path still exists there, but the load/store unit and the cache hierarchy run it. On Tensix the DRAM→L1 step is an explicit DMA that you issue and wait on. A GPU's closest equivalent is <code>cp.async</code> into shared memory followed by a wait, which you only reach for when you are tuning.</div>
+
+  <h2 id="ordering">The store that has not landed yet</h2>
+  <p>Why does the kernel load from <code>dst_l1</code> and throw the value away? Because of two facts about the baby RISC-V cores, both from the ISA documentation:</p>
+  <ol>
+    <li><b>A store can retire before it reaches memory.</b> The load/store unit has "a four-entry store queue and an eight-entry retire-order queue", and "stores can retire <em>before</em> their write-request makes it into the memory subsystem" (<code>tt-isa-documentation/WormholeB0/TensixTile/BabyRISCV/MemoryOrdering.md @be83310</code>).</li>
+    <li><b><code>fence</code> does nothing.</b> "The RISCV <code>fence</code> instruction is treated as a no-op by the baby RISCV cores, so it <b>cannot</b> be used to enforce stronger ordering" (same file).</li>
+  </ol>
+  <p>Meanwhile, <code>noc_async_write</code> works by <em>storing</em> a command into the NoC's registers, after which the NoC reads <code>dst_l1</code> by itself. The RISC-V and the NoC are separate clients of L1. So the danger is that the NoC command reaches the NoC and the NoC reads L1 <em>before</em> the <code>sw</code> of 21 has been processed. The NoC would then ship the stale old value to DRAM. Step through both versions:</p>
+  <div class="viz" id="fig-order">
+    <div class="controls" id="ord-modes">
+      <button class="tt on" data-m="0">without load_blocking (possible on silicon)</button>
+      <button class="tt" data-m="1">with load_blocking</button>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-order");
+    var g = TT.canvas(root, 860, 300), ctx = g.ctx, C = TT.C, mode = 0;
+    var lanes = [
+      { y: 60, name: "BRISC pipeline", col: C.yellow },
+      { y: 120, name: "store queue", col: C.red },
+      { y: 180, name: "L1 @0x16dfa0", col: C.green },
+      { y: 240, name: "NoC engine", col: C.purple }
+    ];
+    var T = [
+      ["<b>sw 21 → dst_l1.</b> The store enters the store queue and retires. BRISC moves on.",
+       "<b>sw 21 → dst_l1.</b> The store enters the store queue and retires."],
+      ["<b>Issue noc_async_write.</b> Stores to the NoC command registers go to a <em>different</em> memory region, so they may be processed before the queued L1 store.",
+       "<b>lw dst_l1; and r,r,r.</b> A load from the <em>same</em> address is ordered after the store, and the <code>and</code> needs the load's result, so the pipeline stalls until the load returns. By then the store has been processed: L1 = 21."],
+      ["<b>NoC reads L1 first.</b> It reads <code>dst_l1</code> while 21 is still in the store queue, and ships the stale value.",
+       "<b>Issue noc_async_write.</b> Only now does BRISC program the NoC command."],
+      ["<b>Store lands too late.</b> L1 becomes 21, but DRAM already holds the old value. The host would print an error.",
+       "<b>NoC reads 21.</b> The correct value goes to DRAM. This is the order the kernel relies on."]
+    ];
+    var steps = T.map(function () { return { dur: 1.3, text: "" }; });
+    function setT() { steps.forEach(function (s, k) { s.text = T[k][mode]; }); }
+    setT();
+    function ev(x, lane, label, col) { TT.box(ctx, x, lanes[lane].y - 14, 140, 28, { fill: col, alpha: 0.3, stroke: col, label: label, font: "12px", mono: true }); }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      lanes.forEach(function (l) {
+        TT.text(ctx, l.name, 10, l.y, { color: l.col, font: "12px" });
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(130, l.y); ctx.lineTo(850, l.y); ctx.stroke();
+      });
+      TT.text(ctx, "time →", 800, 20, { color: C.muted, font: "12px" });
+      var X = [140, 320, 500, 680];
+      var show = function (k) { return i > k || (i === k && t > 0.3); };
+      // step 0: sw into queue
+      if (show(0)) { ev(X[0], 0, "sw 21", C.yellow); ev(X[0], 1, "21 queued", C.red); TT.text(ctx, "old", X[0] + 70, lanes[2].y, { color: C.muted, align: "center", mono: true }); }
+      if (mode === 0) {
+        if (show(1)) ev(X[1], 0, "store NoC cmd", C.yellow);
+        if (show(2)) { ev(X[2], 3, "read L1 → old", C.red); TT.arrow(ctx, X[2] + 70, lanes[2].y + 4, X[2] + 70, lanes[3].y - 16, { color: C.red }); TT.text(ctx, "old", X[2] + 70, lanes[2].y - 8, { color: C.red, align: "center", mono: true }); }
+        if (show(3)) { ev(X[3], 2, "L1 = 21 (late)", C.green); TT.arrow(ctx, X[3] + 70, lanes[1].y + 14, X[3] + 70, lanes[2].y - 16, { color: C.green }); TT.text(ctx, "✗ DRAM gets the stale value", 500, 285, { color: C.red, font: "bold 13px", align: "center" }); }
+      } else {
+        if (show(1)) { ev(X[1], 0, "lw + and (stall)", C.yellow); ev(X[1], 2, "L1 = 21", C.green); TT.arrow(ctx, X[1] + 70, lanes[1].y + 14, X[1] + 70, lanes[2].y - 16, { color: C.green }); }
+        if (show(2)) ev(X[2], 0, "store NoC cmd", C.yellow);
+        if (show(3)) { ev(X[3], 3, "read L1 → 21", C.green); TT.arrow(ctx, X[3] + 70, lanes[2].y + 4, X[3] + 70, lanes[3].y - 16, { color: C.green }); TT.text(ctx, "✓ DRAM gets 21", 500, 285, { color: C.green, font: "bold 13px", align: "center" }); }
+      }
+    }
+    var api = TT.stepper({ root: root, steps: steps, draw: draw });
+    document.querySelectorAll("#ord-modes button").forEach(function (b) {
+      b.onclick = function () { mode = +b.dataset.m; document.querySelectorAll("#ord-modes button").forEach(function (o) { o.classList.toggle("on", o === b); }); setT(); api.render(); };
+    });
+  })();
+  </script>
+  <p>Here is how <code>load_blocking</code> achieves the right-hand ordering:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel.h:155-183 @7aad8aac</div>
+<pre><code>// important note: FENCE on Wormhole is a NOP
+//
+// this code provides a blocking load by doing the following:
+// - issue a LOAD transaction to the address
+// - issue an instruction that requires the data from the LOAD transaction
+//     - block the pipeline until the LOAD transaction completes
+// - memory clobber
+...
+asm volatile(
+    "lw %[raw], (%[ptr])\n\t"
+    "and %[raw], %[raw], %[raw]"
+    : [raw] "=r"(raw)
+    : [ptr] "r"(ptr)
+    : "memory");</code></pre>
+  <p>This is a recipe straight out of MemoryOrdering.md. A store followed by a load from <em>exactly the same address</em> is emitted and processed in order, and an instruction that consumes the loaded register cannot enter the integer unit until the load's response arrives. So by the time the next instruction (the store that programs the NoC) issues, the store of 21 has been processed. The <code>"memory"</code> clobber stops the <em>compiler</em> from moving memory operations across it.</p>
+  <div class="callout warn"><b>The simulator will not catch you here.</b> I commented out the <code>load_blocking</code> line in an overlay copy and ran it three times on ttsim: each time <code>Success: Result is 21</code>, at <code>[4497]</code> clocks. ttsim is a functional model and does not reproduce the store-queue timing that makes this race real on silicon. Passing in the simulator is not proof that a kernel's memory ordering is correct. <a href="../sim-labs/b05-noc-and-dram.html">B05</a> covers which bugs hide in ttsim. The general rule: <b>whenever a RISC-V writes data with ordinary stores and then hands that data to another agent (the NoC, or by pushing a CB), make the store land first.</b></div>
+
+  <h2 id="dprint">DPRINT: your first tool</h2>
+  <p>You may have noticed a line in the kernel that the walkthrough skipped: <code>DPRINT("Adding integers: {} + {}\n", *dat0, *dat1);</code>. A kernel has no terminal. DPRINT gives it one. Each RISC-V writes formatted records into a small buffer in its own L1, and a host-side print server polls those buffers and prints the records with a prefix that says where they came from.</p>
+  <p>The two hello-world examples are the cleanest demonstration. The data-movement one creates the <em>same</em> kernel source twice on core (0,0), once on each data-movement CPU:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/hello_world_datamovement_kernel/hello_world_datamovement_kernel.cpp:40-50 @7aad8aac</div>
+<pre><code>KernelHandle data_movement_kernel_0 = CreateKernel(
+    program,
+    OVERRIDE_KERNEL_PREFIX "hello_world_datamovement_kernel/kernels/dataflow/void_dataflow_kernel.cpp",
+    core,
+    DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
+
+KernelHandle data_movement_kernel_1 = CreateKernel(
+    program,
+    OVERRIDE_KERNEL_PREFIX "hello_world_datamovement_kernel/kernels/dataflow/void_dataflow_kernel.cpp",
+    core,
+    DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});</code></pre>
+  <div class="filename">tt-metal/tt_metal/programming_examples/hello_world_datamovement_kernel/kernels/dataflow/void_dataflow_kernel.cpp:5-16 @7aad8aac</div>
+<pre><code>#include "api/debug/dprint.h"  // required in all kernels using DPRINT
+#include "api/dataflow/dataflow_api.h"
+
+void kernel_main() {
+    // Simply print a message to show that the Data Movement kernel is running.
+    // Make sure to export TT_METAL_DPRINT_CORES=0,0 before runtime.
+    DPRINT("My logical coordinates are {},{}\n", get_absolute_logical_x(), get_absolute_logical_y());
+    // The DPRINT_DATA0 and DPRINT_DATA1 macros are used to print messages selectively on Data Movement
+    // cores 0 and 1 respectively. Otherwise by default DPRINT will print on all cores.
+    DPRINT_DATA0("Hello, host, I am running a void data movement kernel on Data Movement core 0.\n");
+    DPRINT_DATA1("Hello, host, I am running a void data movement kernel on Data Movement core 1.\n");
+}</code></pre>
+  <p>Plain <code>DPRINT</code> runs on whichever CPU executes the kernel. <code>DPRINT_DATA0</code> only prints on RISCV_0 (BRISC) and <code>DPRINT_DATA1</code> only on RISCV_1 (NCRISC). So one source file prints different lines depending on which CPU it was compiled for. Here is the output from the simulator (trimmed of log lines):</p>
+<pre><code>Hello, Core {0, 0} on Device 0, Please start execution. I will standby for your communication.
+0:0-0:BR: My logical coordinates are 0,0
+0:0-0:NC: My logical coordinates are 0,0
+0:0-0:BR: Hello, host, I am running a void data movement kernel on Data Movement core 0.
+0:0-0:NC: Hello, host, I am running a void data movement kernel on Data Movement core 1.
+Thank you, Core {0, 0} on Device 0, for the completed task.</code></pre>
+  <p>The prefix is <code>&lt;device&gt;:&lt;x&gt;-&lt;y&gt;:&lt;RISC&gt;:</code>. <b>BR</b> is BRISC and <b>NC</b> is NCRISC. The comment in the example's host file predicts the prefix as <code>0:(x=0,y=0):NC:</code> (<code>hello_world_datamovement_kernel.cpp:64-67</code>), but the tt-metal build in this orb prints <code>0:0-0:NC:</code>. The format has changed since the comment was written, so trust the output, not the comment.</p>
+  <p>The compute hello-world is stranger, and it previews <a href="a12-compute-kernels.html">A12</a>. A compute kernel is created with <code>ComputeConfig{}</code>, and the JIT compiles it <em>three times</em>, once for each TRISC:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/hello_world_compute_kernel/kernels/compute/void_compute_kernel.cpp:5-15 @7aad8aac</div>
+<pre><code>#include "api/debug/dprint.h"  // required in all kernels using DPRINT
+#include "api/compute/compute_kernel_api.h"
+
+void kernel_main() {
+    // Nothing to compute. Print respond message.
+    // Make sure to export TT_METAL_DPRINT_CORES=0,0 before runtime.
+
+    DPRINT_MATH("Hello, I am the MATH core running the compute kernel.\n");
+    DPRINT_UNPACK("Hello, I am the UNPACK core running the compute kernel.\n");
+    DPRINT_PACK("Hello, I am the PACK core running the compute kernel.\n");
+}</code></pre>
+<pre><code>Hello, Core (0, 0) on Device 0, I am sending you a compute kernel. Standby awaiting communication.
+0:0-0:TR1: Hello, I am the MATH core running the compute kernel.
+0:0-0:TR0: Hello, I am the UNPACK core running the compute kernel.
+0:0-0:TR2: Hello, I am the PACK core running the compute kernel.
+Thank you, Core {0, 0} on Device 0, for the completed task.</code></pre>
+  <p><b>TR0</b> is TRISC0 (UNPACK), <b>TR1</b> is TRISC1 (MATH) and <b>TR2</b> is TRISC2 (PACK). Each line only exists in one of the three binaries, so one source produced three programs. The JIT cache stats are consistent with this: the add example (one BRISC binary), the data-movement hello-world (BRISC and NCRISC) and the compute hello-world (three TRISCs) reported 9, 10 and 11 cache entries respectively.</p>
+  <div class="callout warn"><b>Print order is not execution order.</b> On a second run the same compute example printed TR1, TR2, TR0 instead of TR1, TR0, TR2, even though ttsim is deterministic and the device ran the same instructions. The host print server polls each RISC's buffer in turn, so lines from different RISCs interleave in whatever order it happens to drain them. Within one RISC, order is preserved. To reason about cross-core ordering, print a counter or a value, not the line order.</div>
+  <p>Rules from <code>docs/source/tt-metalium/tools/device_print.rst</code> that you will hit in practice:</p>
+  <ul>
+    <li><b>Enable with <code>TT_METAL_DPRINT_CORES</code></b> (lines 17-24): <code>0,0</code>, a list <code>(x1,y1),(x2,y2)</code>, a range, <code>all</code>, <code>worker</code> or <code>dispatch</code>. The coordinates are logical. The doc says that whether this variable is defined "determines whether printing is enabled during kernel compilation", so DPRINT changes how kernels are built, not just what the host shows. <code>TT_METAL_DPRINT_RISCVS=BR</code> restricts printing to some RISCs (line 29), and <code>TT_METAL_DPRINT_FILE</code> sends output to a file (line 30).</li>
+    <li><b>Every format string must end in <code>\n</code></b> (lines 37-45). The server flushes a RISC's buffer only on a newline, and "any tail still buffered at device detach is dropped". If your print never appears, this is the most common cause.</li>
+    <li><b>fmt-style formatting</b> (lines 64-68): <code>{}</code>, <code>{:x}</code>, <code>{:.5f}</code>, and bf16 values via <code>bf16_t</code>.</li>
+    <li><b>Tiles</b> can be printed from circular buffers with <code>TSLICE</code>/<code>TileSlice</code> (lines 130-192). That is useful from <a href="a11-dataflow-and-cbs.html">A11</a> onwards, and lab B06 uses it to watch CB pointers.</li>
+  </ul>
+  <div class="callout warn">DPRINT is not free. Under ttsim the add example rose from <code>[4501]</code> to between <code>[5944]</code> and <code>[6115]</code> simulated clocks with DPRINT on, varying from run to run (the research notes recorded 6611 on another run; the count depends on host polling). On silicon it adds real time and L1 traffic. Leave it off when measuring.</div>
+
+  <h2 id="sim">Run it in the simulator</h2>
+  <div class="callout sim">Set up the workbench first: <a href="../sim-labs/b00-workbench.html">B00</a>. The hands-on version of this section, with more experiments, is <a href="../sim-labs/b01-meet-ttsim.html">B01 · Meet ttsim</a>.</div>
+  <p>All runs below are on the Wormhole build of ttsim in this orb, using the prebuilt example binaries. I gave the JIT cache a private directory (<code>TT_METAL_CACHE</code>, <code>tt_metal/llrt/rtoptions.cpp:499-506</code>) so that "cold" really meant cold.</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/a10
+source tenstorrent-from-zero/sim-labs/workbench/env.sh wh   # cds into $LAB_HOME/run
+export TT_METAL_CACHE=$LAB_HOME/cache
+rm -rf $LAB_HOME/cache                                       # truly cold
+/usr/bin/time -f "WALL %e s" $EX/metal_example_add_2_integers_in_riscv</code></pre>
+  <p>Output, trimmed to the interesting lines:</p>
+<pre><code>Success: Result is 21
+... BuildKernels | JIT cache stats: 0/9 hits (0.0%) [0 cached, ...]
+[4501] 0.3 seconds (13.4 KHz)
+WALL 3.90 s</code></pre>
+  <p>Then the same command again without deleting anything:</p>
+<pre><code>... BuildKernels | JIT cache stats: 9/9 hits (100.0%) [9 cached, ...]
+[4501] 0.2 seconds (27.9 KHz)
+WALL 0.35 s</code></pre>
+  <p>The bracketed number is ttsim's simulated clock count. It is identical in both runs because the device did the same work. Across repeated runs I measured:</p>
+  <table>
+    <tr><th>Scenario</th><th>JIT cache hits</th><th>Wall time</th><th>Simulated clocks</th></tr>
+    <tr><td>Empty cache (firmware, PCH and kernel all built)</td><td>0/9</td><td>3.75, 3.90, 3.92 s</td><td>4501</td></tr>
+    <tr><td>Only the kernel's cache directory deleted</td><td>8/9</td><td>0.74, 0.76, 0.76 s</td><td>4501</td></tr>
+    <tr><td>Warm</td><td>9/9</td><td>0.35, 0.36, 0.36, 0.36 s</td><td>4501</td></tr>
+  </table>
+  <p>The cache directory shows most of what gets built: firmware for seven RISC-V types (<code>firmware/{brisc, ncrisc, trisc0, trisc1, trisc2, erisc, idle_erisc}</code>), precompiled headers under <code>pch/</code>, and one directory for our kernel, <code>kernels/reader_writer_add_in_riscv/&lt;hash&gt;/brisc/brisc.elf</code>. (I did not map each of the nine telemetry entries to a directory.) Only a <code>brisc</code> ELF is built for the kernel, because it was created for RISCV_0 only. Deleting just the <code>kernels/</code> directory gives the 8/9 case: one miss.</p>
+
+  <h3>Edit the kernel: + becomes *</h3>
+  <p>No rebuild of tt-metal is needed. The runtime looks for kernel sources in this order: absolute path, then the current directory, then <code>TT_METAL_KERNEL_PATH</code>, then the system kernel directory, then the root directory (<code>tt_metal/impl/kernels/kernel.cpp:50-95</code>). The workbench points <code>TT_METAL_KERNEL_PATH</code> at <code>$LAB_HOME/kernels</code>. So put an edited copy there under the <em>exact relative path the example asks for</em>, which includes the <code>tt_metal/programming_examples/</code> prefix from <code>OVERRIDE_KERNEL_PREFIX</code>:</p>
+<pre><code>P=tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
+mkdir -p $LAB_HOME/kernels/$(dirname $P)
+cp $TT_METAL_HOME/$P $LAB_HOME/kernels/$P
+sed -i 's/(\*out0) = (\*dat0) + (\*dat1);/(*out0) = (*dat0) * (*dat1);/' $LAB_HOME/kernels/$P
+diff $TT_METAL_HOME/$P $LAB_HOME/kernels/$P
+/usr/bin/time -f "WALL %e s" $EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code>43c43
+&lt;     (*out0) = (*dat0) + (*dat1);
+---
+&gt;     (*out0) = (*dat0) * (*dat1);
+Error: Expected result of 21, got 98
+... BuildKernels | JIT cache stats: 8/9 hits (88.9%) [8 cached, ...]
+[4501] 0.2 seconds (26.0 KHz)
+WALL 0.76 s</code></pre>
+  <p>14 × 7 = 98. The host's check fails as it should. The JIT noticed the new source: one miss, firmware still cached, 0.76 s. With DPRINT on, the kernel's own print line confirms that the inputs arrived intact:</p>
+<pre><code>$ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_riscv
+0:0-0:BR: Adding integers: 14 + 7
+Error: Expected result of 21, got 98
+[5944] 0.4 seconds (15.9 KHz)</code></pre>
+  <p>Delete the overlay file and the stock kernel is used again (<code>0:0-0:BR: Adding integers: 14 + 7</code>, <code>Success: Result is 21</code>).</p>
+  <div class="callout warn">Never run the examples with the current directory set to <code>TT_METAL_HOME</code>. The current directory is searched <em>before</em> <code>TT_METAL_KERNEL_PATH</code>, so from there the stock kernel always wins and your edit is silently ignored. <code>env.sh</code> moves you into <code>$LAB_HOME/run</code> for this reason.</div>
+
+  <h3>Print the addresses</h3>
+  <p>The address table earlier came from a second overlay that adds three DPRINT lines after the NoC addresses are computed:</p>
+<pre><code>DPRINT("dram src0={:#x} src1={:#x} dst={:#x}\n", src0_dram, src1_dram, dst_dram);
+DPRINT("l1 src0={:#x} src1={:#x} dst={:#x}\n", src0_l1, src1_l1, dst_l1);
+DPRINT("noc addr src0={:#x}\n", src0_dram_noc_addr);</code></pre>
+<pre><code>0:0-0:BR: dram src0=0x2d4c40 src1=0x2d4c60 dst=0x2d4c80
+0:0-0:BR: l1 src0=0x16dfe0 src1=0x16dfc0 dst=0x16dfa0
+0:0-0:BR: noc addr src0=0x2c00002d4c40
+0:0-0:BR: Adding integers: 14 + 7
+Success: Result is 21</code></pre>
+
+  <h3>The hello-world kernels</h3>
+<pre><code>TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_datamovement_kernel
+TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_compute_kernel</code></pre>
+  <p>The outputs are shown in the DPRINT section above. Without <code>TT_METAL_DPRINT_CORES</code>, the compute example prints its <code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES…</code> lines, no TR lines at all, and finishes at <code>[4385]</code> clocks instead of roughly 5100–6600 (<code>[6520]</code> on one run; with DPRINT on the count varies with host polling). With DPRINT on and a warm cache (10/10 and 11/11 hits), each took about 1.0–1.1 s of wall time. I did not break down why that is longer than the add example's 0.36 s.</p>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>Every Metalium host program has five beats: <b>open</b> (<code>MeshDevice::create_unit_mesh</code>, where one chip is a 1×1 mesh), <b>allocate</b> (<code>MeshBuffer::create</code> with a DRAM or L1 <code>DeviceLocalBufferConfig</code> and a page size), <b>describe</b> (<code>CreateProgram</code>, <code>CreateKernel</code>, <code>SetRuntimeArgs</code>), <b>enqueue</b> (writes, <code>EnqueueMeshWorkload</code>, reads) on an in-order command queue, and <b>wait</b> (<code>Finish</code> or a blocking read).</li>
+    <li><code>CreateKernel</code> takes a <em>source path</em>, a set of cores and a config. <code>DataMovementConfig{RISCV_0, NOC_0}</code> picks BRISC on NoC 0. The processor and the NoC are independent choices.</li>
+    <li>Runtime args are 32-bit words in L1, read with <code>get_arg_val</code>. Compile-time args are baked into the binary. Addresses and counts go at runtime; layouts and sizes go at compile time.</li>
+    <li>A kernel cannot touch DRAM. It asks the NoC to copy pages into L1 (<code>noc_async_read</code>), waits (<code>noc_async_read_barrier</code>), computes, and copies back. <code>InterleavedAddrGen</code> turns a page index into a bank plus a 64-bit NoC address.</li>
+    <li>Baby RISC-V stores can retire before they land, and <code>fence</code> is a no-op. Before handing data the CPU stored to the NoC, force it into L1 with <code>load_blocking</code>. ttsim will not catch you if you forget.</li>
+    <li>Kernels are JIT-compiled on first enqueue and cached by content. The first run (3.8 s) is almost all compilation; a warm rerun takes 0.36 s, and the device work (4501 sim clocks) never changes.</li>
+    <li>DPRINT, enabled with <code>TT_METAL_DPRINT_CORES</code>, prints per-RISC with prefixes BR, NC, TR0, TR1 and TR2. Each line must end in <code>\n</code>, and lines from different RISCs can interleave in any order.</li>
+  </ul>
+  <p>Next, <a href="a11-dataflow-and-cbs.html">A11</a> opens the <code>noc_async_*</code> black box and replaces the six hand-placed L1 buffers with <em>circular buffers</em>, the mechanism that lets a reader core and a compute core agree that a tile is ready without sharing a single variable.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>The example allocates three L1 buffers in addition to the three DRAM buffers. Why can't the kernel add the DRAM values directly?</summary><p>A Tensix RISC-V has no load path to DRAM. Its loads and stores reach only its own L1 (and some local registers). DRAM is reachable only through the NoC, as an asynchronous copy into L1. So each input must first be copied to an L1 buffer, and the result must be stored in L1 before the NoC can copy it out. That is why there is one L1 buffer for each DRAM buffer.</p></details>
+  <details class="quiz"><summary>You grow the DRAM buffers to 2048 bytes and set page_size = 2048 on the host, but leave the kernel's InterleavedAddrGen at sizeof(uint32_t). Does anything break for this example? When would it?</summary><p>(You do have to grow the buffer too: a 4-byte buffer with a 2048-byte page fails at creation with <code>TT_FATAL</code>, because an interleaved buffer's size must be divisible by its page size, <code>tt_metal/impl/buffers/buffer.cpp:285-290</code>.) For this example, probably not: the kernel only reads page 0, which lands in bank 0 at the buffer's base address whatever the page size. It breaks as soon as the kernel reads more than one page. The kernel computes bank and offset from its own <code>page_size</code>, so page 1 and later would be fetched from the wrong offsets. This is why the source comment says the parameters "must match", and why <code>TensorAccessor</code> (A11) derives them from the buffer through compile-time args.</p></details>
+  <details class="quiz"><summary>You want to run the same kernel on 64 cores, each processing a different slice of a tensor. Which values go in compile-time args and which in runtime args?</summary><p>Each core's start tile index and tile count differ per core, and the buffer addresses can change between runs, so those are runtime args (<code>SetRuntimeArgs</code> per core, or <code>SetCommonRuntimeArgs</code> for the addresses if they are shared). The page/tile size, the data format and any flags that select code paths are the same everywhere and shape the code, so they are compile-time args. Then all 64 cores share a single compiled binary.</p></details>
+  <details class="quiz"><summary>Why is the second run of the example about ten times faster than the first, when the simulated clock count is identical?</summary><p>The clock count measures the device work, which is the same: write, launch, run, read. The difference is on the host. The first run JIT-compiles firmware for every RISC-V type plus a precompiled header at device open (about 3 s here), then compiles the kernel on first enqueue (about 0.4 s). Both results go into the JIT cache keyed by content, so the second run gets 9/9 hits and skips compilation entirely.</p></details>
+  <details class="quiz"><summary>A colleague removes the load_blocking line, runs on ttsim, sees "Success: Result is 21", and concludes the line is unnecessary. What is wrong with that reasoning?</summary><p>ttsim is a functional model. It does not reproduce the baby RISC-V store queue, where a store can retire before its write reaches L1, or the timing between the RISC-V and the NoC as separate L1 clients. On silicon, <code>noc_async_write</code> programs the NoC with stores to a different memory region, and these can overtake the pending L1 store, so the NoC can read the stale value. And because <code>fence</code> is a no-op, there is no cheaper fix. The test passing in a model without the hazard says nothing about hardware that has it.</p></details>
+  <details class="quiz"><summary>The compute hello-world prints three lines with TR0, TR1 and TR2, but the source contains a single kernel_main. How?</summary><p>A compute kernel is compiled three times, once for each TRISC (UNPACK, MATH and PACK), with a different define each time. <code>DPRINT_UNPACK</code>, <code>DPRINT_MATH</code> and <code>DPRINT_PACK</code> each expand to a real print on only one of those builds and to nothing on the other two. So each TRISC runs its own binary and prints its own line. A12 builds on this "one source, three CPUs" idea.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/index.html">TT-Metalium programming examples</a>: the official walkthroughs of the examples used here and the ones that follow.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tt_metal/programming_examples/add_2_integers_in_riscv">add_2_integers_in_riscv on GitHub</a>: the host file, kernel and markdown walkthrough this chapter reads.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/dram_loopback.html">DRAM loopback example</a>: the next step up, with tile-sized pages and the modern TensorAccessor.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: Tenstorrent's architecture overview and programming-model guide, linked from the hello-world example.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/api/tt-metalium/host_api.hpp">host_api.hpp</a>: the reference docs for CreateProgram, CreateKernel, SetRuntimeArgs and friends, in their doc comments.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_print.html">Device Debug Print (DPRINT) docs</a>: every environment variable and print helper, including TileSlice.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">Watcher docs</a>: the next debugging tool, which catches bad NoC addresses and records waypoints (used in A11 and B05).</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/MemoryOrdering.md">Baby RISC-V memory ordering</a>: the authoritative description of the store queue and the recipes behind load_blocking.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab1/lab1.html">TT-Metalium matmul lab 1</a>: an official hands-on lab that starts from the same host-program skeleton.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator used for every run in this chapter.</li>
+  </ul>
+
+  <div class="pager"><a href="a09-memory.html">&larr; 09 Memory: L1, DRAM, interleaving and sharding</a><a class="next" href="a11-dataflow-and-cbs.html">11 Data movement kernels and circular buffers &rarr;</a></div>
+</main>
+</body>
+</html>
