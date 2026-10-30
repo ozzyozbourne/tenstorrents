@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B02 · Map the chip and watch it boot · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .modebar { display:flex; gap:.5rem; flex-wrap:wrap; padding:.6rem .8rem; background:var(--bg2); border-top:1px solid var(--border); font-size:14px; align-items:center; }
+  .modebar button { background:var(--bg3); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:.3rem .8rem; cursor:pointer; font:inherit; font-size:14px; }
+  .modebar button.on { background:var(--blue); color:#000; }
+  .modebar span { color:var(--muted); }
+  .modebar input[type=range] { flex:1; min-width:200px; }
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  td.num, th.num { text-align:right; font-family:var(--mono); font-size:14px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="b01-meet-ttsim.html">&larr; Prev</a>
+  <a href="../chapters/a04-inside-tensix.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B02</span><span class="tag">Prerequisites: A03, B00, B01</span>
+  <h1><span class="num">B02.</span> Map the chip and watch it boot</h1>
+  <p class="subtitle">Add three small patches to ttsim, then watch a simulated Wormhole being built, explored and woken up: which tiles the host and kernels actually touch, and which of the 400 RISC-V cores leave reset, in what order, and at which PCs.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. Every <code>[1234]</code> clock stamp in this lab is ttsim's <code>g_clock</code>, which in slow dispatch counts host polls (see <a href="b01-meet-ttsim.html">B01</a>). We use clocks only to put events <em>in order</em>. A gap of 1,872 clocks says nothing about how long the same step takes on silicon.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">Set up an instrumented simulator</a></li>
+      <li><a href="#inventory">Step 1: Print the chip inventory</a></li>
+      <li><a href="#map">Step 2: Which coordinates get touched?</a></li>
+      <li><a href="#dram">The DRAM aliases: three doors to one room</a></li>
+      <li><a href="#reset">Step 3: Watch SOFT_RESET_0</a></li>
+      <li><a href="#firmware">Checking the boot against the firmware source</a></li>
+      <li><a href="#exercises">Step 4: Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="../chapters/a03-chip-tour.html">A03</a> you read a map of a Wormhole: a 10 × 12 grid with 80 Tensix tiles, 18 DRAM tiles, 16 Ethernet tiles, one PCIe tile and one ARC tile. In <a href="b01-meet-ttsim.html">B01</a> you ran <code>add_2_integers_in_riscv</code>, which adds 14 and 7 on one RISC-V core and prints 21. Put the two together and two questions come up.</p>
+  <p>First: of those 120 grid positions, which ones does a program that adds two integers actually touch? One Tensix tile and one DRAM tile, perhaps? Second: each Tensix tile has five RISC-V cores, so the chip has 400 of them. When the program starts they are all held in reset. Who lets them go, in what order, and where does each one start executing? The ISA documentation says BRISC always wakes up at address <code>0x00000</code>. But tt-metal's firmware for BRISC is not at address 0. So how does it get there?</p>
+  <p>In this lab you answer both questions by measurement. You patch ttsim to print three things: what <code>ttsim_init</code> built, every distinct NoC coordinate that is read or written, and every write to the soft-reset register. Then you check what you saw against the SoC descriptor and the firmware source. All output below was captured in this orb, trimmed where marked with <code>…</code>.</p>
+
+  <h2 id="setup">Set up an instrumented simulator</h2>
+  <p>Use the workbench from <a href="b00-workbench.html">B00</a> with a scratch directory of your own. <code>build_ttsim.sh</code> copies ttsim's source to <code>$LAB_HOME/ttsim-boot/</code> on first use and builds it in about 4 seconds:</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/b02
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # env.sh cds away, so use absolute paths
+P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+source $W/env.sh wh
+$W/build_ttsim.sh boot wh                     # first call: copy the source, build the stock simulator
+cd $LAB_HOME/ttsim-boot
+patch -p1 &lt; $P/b02-1-inventory.patch
+patch -p1 &lt; $P/b02-2-noc-map.patch
+patch -p1 &lt; $P/b02-3-soft-reset.patch
+$W/build_ttsim.sh boot wh                     # rebuild with the patches
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-boot-wh-release/libttsim.so
+cd $LAB_HOME/run</code></pre>
+  <p>Each patch was made with <code>diff -ru</code> against the pristine ttsim source at <code>b3620244</code>, so each one also applies on its own. Applied together, <code>patch</code> reports a few hunks at an offset, which is harmless. Every print is behind an environment variable, so the patched simulator is silent until you ask:</p>
+  <table>
+    <tr><th>Variable</th><th>Patch</th><th>What it prints</th></tr>
+    <tr><td><code>B02_INVENTORY=1</code></td><td><a href="patches/b02-1-inventory.patch">b02-1-inventory.patch</a></td><td>What <code>ttsim_init</code> built: tile counts, coordinates, harvesting, reset state</td></tr>
+    <tr><td><code>B02_MAP=1</code></td><td><a href="patches/b02-2-noc-map.patch">b02-2-noc-map.patch</a></td><td>The first access to each NoC coordinate by each initiator, and a per-coordinate count at exit</td></tr>
+    <tr><td><code>B02_RESET=1</code> or <code>2</code>, <code>B02_TILE=n</code></td><td><a href="patches/b02-3-soft-reset.patch">b02-3-soft-reset.patch</a></td><td>Writes to <code>SOFT_RESET_0</code> that start or stop a core (1), or every write (2); changes to the reset-PC registers; <code>B02_TILE</code> keeps one Tensix tile</td></tr>
+  </table>
+  <p>The patched library is still the same simulator. <code>add_2_integers_in_riscv</code> prints <code>Success: Result is 21</code> and ends at <code>[4501]</code>, exactly as in B01, with all three variables set. The prints call <code>ttsim_printf</code>, which only writes to stdout. It makes no host reads, so it cannot change the clock count.</p>
+
+  <h2 id="inventory">Step 1: Print the chip inventory</h2>
+  <p>B01 showed that <code>ttsim_init</code> (<code>sim.cpp:23-46</code>) loops over chips and calls <code>p_tile_init</code>, <code>t_tile_init</code> for each of the 80 Tensix tiles, <code>e_tile_init</code> for the 16 Ethernet tiles, <code>a_tile_init</code>, and then <code>mmap</code>s DRAM. It prints nothing. The first patch adds a function that runs at the end of <code>ttsim_init</code> and reports what was built. Most of the patch is formatting. These are the lines that matter:</p>
+  <div class="filename">sim-labs/patches/b02-1-inventory.patch (excerpt, against ttsim/src/sim.cpp @b3620244)</div>
+<pre><code>+// B02 lab: print what ttsim_init just built. Enable with B02_INVENTORY=1.
++uint32_t b02_tile_to_coord(char tile_type, uint32_t tile_id); // tile.cpp
++uint32_t tensix_harvested_row_mask();                          // tile.cpp
++uint32_t tensix_harvested_column_mask();                       // tile.cpp
++static void b02_print_inventory() {
+ …
++        const BaseTile *b = &amp;g_t_tiles[0].base;
++        ttsim_printf("B02 chip %u: no-broadcast cols=0x%x rows=0x%x (harvested Tensix cols=0x%x rows=0x%x)\n", chip_id,
++            b-&gt;router_cfg_1[0], b-&gt;router_cfg_3[0], tensix_harvested_column_mask(), tensix_harvested_row_mask());
+ …
++            ttsim_printf("B02   row y=%2u: T%u..T%u, translated y=%u%s\n", y, first, last,
++                g_t_tiles[first].base.noc_id_logical[0] &gt;&gt; 6, ((tensix_harvested_row_mask() &gt;&gt; y) &amp; 1) ? "  (harvested)" : "");
+ …
++            for (uint32_t r = 0; r &lt; RV32_CORES_PER_T_TILE; r++) active += ttsim_rv32_get_core_active('T', id, r);
+ …
+@@ -42,6 +94,9 @@
+         }
+     }
++    if (getenv("B02_INVENTORY")) { // B02
++        b02_print_inventory();
++    }
+     ttsim_select_chip(0);
+ }</code></pre>
+  <p>It reads state that <code>base_tile_init</code> and <code>t_tile_init</code> have just written: the broadcast opt-out masks (<code>router_cfg_1</code>, <code>router_cfg_3</code>), each tile's translated NoC ID (<code>noc_id_logical</code>), and whether each hart is active. <code>tile_to_coord</code> is <code>static</code> in <code>tile.cpp</code>, so the patch adds a two-line wrapper there. Run it:</p>
+<pre><code>B02_INVENTORY=1 $EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code>[0] B02 ttsim_init: Wormhole (TT_ARCH_VERSION 0), 1 chip(s), NoC grid 10x12
+[0] B02   Tensix tiles: 80, each 5 RV32 harts + 1 Tensix unit, 1464 KiB L1
+[0] B02   Eth tiles: 16, each 1 RV32 hart(s), 256 KiB L1
+[0] B02   DRAM: 6 channels x 2048 MiB, mmap'd lazily
+[0] B02   PCIe tile at (0,3), ARC tile at (0,10)
+[0] B02 chip 0: no-broadcast cols=0x21 rows=0x141 (harvested Tensix cols=0x0 rows=0x100)
+[0] B02   Tensix columns, physical x -&gt; translated x: 1-&gt;18 2-&gt;19 3-&gt;20 4-&gt;21 6-&gt;22 7-&gt;23 8-&gt;24 9-&gt;25
+[0] B02   row y= 1: T0..T7, translated y=18
+[0] B02   row y= 2: T8..T15, translated y=19
+[0] B02   row y= 3: T16..T23, translated y=20
+[0] B02   row y= 4: T24..T31, translated y=21
+[0] B02   row y= 5: T32..T39, translated y=22
+[0] B02   row y= 7: T40..T47, translated y=23
+[0] B02   row y= 8: T48..T55, translated y=27  (harvested)
+[0] B02   row y= 9: T56..T63, translated y=24
+[0] B02   row y=10: T64..T71, translated y=25
+[0] B02   row y=11: T72..T79, translated y=26
+[0] B02   Eth tiles: E0(9,0) E1(1,0) E2(8,0) E3(2,0) E4(7,0) E5(3,0) E6(6,0) E7(4,0) E8(9,6) E9(1,6) E10(8,6) E11(2,6) E12(7,6) E13(3,6) E14(6,6) E15(4,6)
+[0] B02   soft_reset_0 = 0x47800 on 80 of 80 Tensix tiles; Tensix harts running: 0 of 400
+[0] 0.1 seconds (0.0 KHz)
+[0] B02 ttsim_init: Wormhole (TT_ARCH_VERSION 0), 1 chip(s), NoC grid 10x12
+…the same 19 lines again…
+Success: Result is 21
+[4501] 0.2 seconds (26.6 KHz)</code></pre>
+  <p>The block appears twice. The first copy comes from UMD's short-lived probe instance, which <code>dlopen</code>s the simulator just to learn which chip it is and then exits at clock 0 (B01, section 2). The second copy is the device that runs your program. Line by line:</p>
+  <ul>
+    <li><b>The sizes</b> come from <code>config.h:13-35</code>: <code>NUM_T_TILES 80</code>, <code>RV32_CORES_PER_T_TILE 5</code>, <code>TENSIX_SRAM_SIZE (1464 * 1024)</code>, <code>NUM_E_TILES 16</code>, <code>ETH_SRAM_SIZE (256 * 1024)</code>, and <code>NUM_DRAM_CHANNELS 6</code> × <code>DRAM_CHANNEL_SIZE 0x80000000</code>. The comment on the channel count admits that the hardware really has 12 channels, two per group, "but doesn't matter". We will see in step 2 why it doesn't.</li>
+    <li><b>Tensix IDs are row-major over the holes.</b> T0..T7 is physical row 1, skipping column 5 (DRAM). Row 6 (Ethernet) is skipped, so row 7 starts at T40. This is <code>tile_to_coord</code> (<code>tile.cpp:660-668</code>): <code>x += (x &gt;= 4) ? 2 : 1</code>, <code>y += (y &gt;= 5) ? 2 : 1</code>.</li>
+    <li><b>Physical row 8 is harvested.</b> ttsim hard-codes the single-chip harvesting mask <code>N150[] = {0x40}</code> (<code>tile.cpp:30</code>). Bit 6 indexes <code>TENSIX_ROWS = {1,2,3,4,5,7,8,9,10,11}</code> (<code>tile.cpp:63</code>), and entry 6 is physical row 8. The broadcast opt-out row mask <code>0x141</code> is bits 0, 6 and 8: the two Ethernet rows plus the harvested row. Translated row numbers skip row 8 and give it 27, the last slot, as A03 described.</li>
+    <li><b>The Ethernet IDs alternate from the outside in</b>, E0 at (9,0) and E1 at (1,0). This matches the order of the <code>eth:</code> list in <code>wormhole_b0_80_arch.yaml</code>.</li>
+    <li><b>Every core starts in reset.</b> <code>t_tile_init</code> ends with <code>p_tile-&gt;soft_reset_0 = RISCV_DEBUG_REGS_SOFT_RESET_0_RESET_VALUE</code> (<code>tile.cpp:267</code>), which the generated register header defines as <code>0x47800</code>. No hart is active, so <code>libttsim_clock</code> would execute nothing at all. Something must write that register before any code runs. Step 3 finds out who.</li>
+  </ul>
+  <div class="callout key">After <code>ttsim_init</code> the simulated chip is fully built and completely asleep. All 400 Tensix harts are held in reset by <code>SOFT_RESET_0 = 0x47800</code>, and L1 is all zeros. Everything that happens after that is caused by the host.</div>
+
+  <h2 id="map">Step 2: Which coordinates get touched?</h2>
+  <p>Every access in ttsim that goes to a NoC coordinate ends up in one of two functions, <code>tile_rd_bytes</code> or <code>tile_wr_bytes</code> (<code>tile.cpp:2769-2898</code>). Both start by calling <code>coord_to_tile</code>, which turns a raw coordinate into a tile type and index. Their callers are the host's PCIe BAR path (<code>pcie.cpp:340-359</code>, through TLB windows) and the device's own NoC commands (<code>noc_cmd_ctrl</code>, <code>tile.cpp:1397-1623</code>). So instrumenting the two functions sees everything. Here is the inverse map they use, for the special tiles:</p>
+  <div class="filename">ttsim/src/tile.cpp:723-753 @b3620244</div>
+<pre><code>static std::pair&lt;char, uint32_t&gt; coord_to_tile(uint32_t coord) {
+    switch (coord) {
+#if TT_ARCH_VERSION == 0
+        case 0 | (0 &lt;&lt; 6):
+        case 0 | (1 &lt;&lt; 6):
+        case 0 | (11 &lt;&lt; 6):
+            return {'D', 0}; // DRAM channel 0
+        case 0 | (5 &lt;&lt; 6):
+        case 0 | (6 &lt;&lt; 6):
+        case 0 | (7 &lt;&lt; 6):
+            return {'D', 1}; // DRAM channel 1
+        …                    // channels 2–5 in column 5
+        case 0 | (3 &lt;&lt; 6):
+            return {'P', 0}; // PCIE tile (just one)
+        case 0 | (10 &lt;&lt; 6):
+            return {'A', 0}; // ARC tile (just one)</code></pre>
+  <p>A coordinate is packed as <code>x | (y &lt;&lt; 6)</code>. Three different coordinates return <code>{'D', 0}</code>: the simulator sends all three to the same array, <code>g_dram[0]</code>. Keep that in mind. Anything not in the switch falls through to the Tensix and Ethernet arithmetic, and a router-only position such as (0,2) hits <code>TTSIM_ERROR(UnimplementedFunctionality, …)</code>.</p>
+  <p>Printing every access would flood the terminal: add_2 alone makes 4,539 host reads and 7,710 host writes. So the second patch prints only the <em>first</em> access to each coordinate by each initiator, counts the rest, and prints a table at exit. To tell host from device, <code>libttsim.cpp</code> sets a flag while it serves a BAR access, and <code>noc_cmd_ctrl</code> records which tile issued the command:</p>
+  <div class="filename">sim-labs/patches/b02-2-noc-map.patch (excerpt)</div>
+<pre><code>--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
++    g_b02_host = true; // B02
+     pcie_mem_rd_bytes(paddr, p, size);
++    g_b02_host = false; // B02
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
+     auto *p_tile = get_tile&lt;tile_type&gt;(tile_id);
++    s_b02_initiator = tile_to_coord(tile_type, tile_id); // B02
+ …
++static void b02_touch(uint32_t coord, char tile_type, uint32_t tile_id, bool write, uint64_t addr) {
++    static const bool on = getenv("B02_MAP") != nullptr;
++    if (!on) {
++        return;
++    }
++    bool host = g_b02_host;
++    s_b02_counts[coord &amp; 0xFFF][(host ? 0 : 2) + write]++;
++    uint32_t who = host ? 0xFFFFFFFF : s_b02_initiator;
++    if (!s_b02_seen.insert((uint64_t(coord) &lt;&lt; 32) | who).second) {
++        return;   // this (coordinate, initiator) pair was already printed
++    }
+ …
+ void tile_rd_bytes(uint32_t coord, uint64_t addr, void *p, uint32_t size) {
+     auto [tile_type, tile_id] = coord_to_tile(coord);
++    b02_touch(coord, tile_type, tile_id, false, addr); // B02</code></pre>
+  <p>The patch also remembers the last call to <code>remap_virtual_coordinate</code> (<code>tile.cpp:1147-1187</code>), so a line can show the translated coordinate the host used ("via"). Run it:</p>
+<pre><code>B02_MAP=1 $EX/metal_example_add_2_integers_in_riscv</code></pre>
+<pre><code>[0] B02 touch A0 (0,10) by host rd 0x880030060
+[22] B02 touch E0 (9,0) by host rd 0x1efc via (25,16)
+[24] B02 touch E1 (1,0) by host rd 0x1efc via (18,16)
+…14 more Ethernet tiles, 2 clocks apart…
+[123] B02 touch T0 (1,1) by host wr 0xffb121b0 via (18,18)
+[123] B02 touch T1 (2,1) by host wr 0xffb121b0 via (19,18)
+…70 more Tensix tiles, all at clock 123…
+[123] B02 touch T79 (9,11) by host wr 0xffb121b0 via (25,26)
+[4091] B02 touch D0 (0,11) by host wr 0x2d4c40 via (0,11)
+[4342] B02 touch D0 (0,11) by (1,1) rd 0x2d4c40
+Success: Result is 21
+[4501] B02 map E1  (1,0): host rd 12 wr 82, device rd 0 wr 0
+…
+[4501] B02 map T0  (1,1): host rd 376 wr 127, device rd 0 wr 0
+[4501] B02 map T1  (2,1): host rd 55 wr 88, device rd 0 wr 0
+…
+[4501] B02 map A0  (0,10): host rd 65 wr 21, device rd 0 wr 0
+[4501] B02 map D0  (0,11): host rd 1 wr 2, device rd 2 wr 1
+[4501] B02 map total: host rd 4539 wr 7710, device rd 2 wr 1</code></pre>
+  <p>The answer to the first question surprises most people. A program that adds two integers touches <b>90 coordinates</b>: all 72 usable Tensix tiles, all 16 Ethernet tiles, the ARC tile and one DRAM endpoint. Only one of those accesses (well, three: two reads and one write) is made by the device itself. Everything else is the host setting the chip up.</p>
+  <ul>
+    <li><b>Ethernet tiles first.</b> The host reads <code>0x1EFC</code> and <code>0x1104</code> on each. UMD names them <code>ETH_RETRAIN_ADDR</code> and <code>ETH_TRAIN_STATUS_ADDR</code> (<code>tt-umd/api/tt-umd/types/wormhole_eth.hpp:15-16</code>), so this is topology discovery asking whether any Ethernet link is up. ttsim seeded <code>0x1104</code> with 3, "NOT_CONNECTED", for a single chip (<code>tile.cpp:300</code>).</li>
+    <li><b>Then every Tensix tile, at address <code>0xFFB121B0</code>.</b> That is <code>TENSIX_SOFT_RESET_ADDR</code> in UMD (<code>wormhole_implementation.hpp:285</code>): the reset register again. Step 3 decodes these writes.</li>
+    <li><b>"via (18,18)".</b> The host addresses Tensix tiles in translated coordinates, and the PCIe tile's translation table turns (18,18) into physical (1,1). It addresses DRAM with raw coordinates, (0,11) "via (0,11)", because translated values 0 to 15 are the identity.</li>
+    <li><b>T0 (1,1) gets 376 reads; the others get 55.</b> The kernel runs on logical core (0,0), which is translated (18,18), which is physical (1,1). The extra 321 reads are the host polling that core until the kernel reports done.</li>
+    <li><b>What is never touched.</b> The 8 tiles of harvested row 8, the 4 router-only positions, the PCIe tile itself, and 17 of the 18 DRAM endpoints. (The host's BAR traffic enters through the PCIe tile, but ttsim models that as a direct jump to the target coordinate, so <code>tile_rd_bytes</code> only sees the PCIe tile when a device core does DMA to host memory. None does here.)</li>
+  </ul>
+  <p>The kernel's single DRAM endpoint is not a surprise, since add_2 uses one small buffer per input. To see the aliases you need a program whose buffers are spread over every bank. <code>eltwise_binary</code> uses interleaved buffers:</p>
+<pre><code>B02_MAP=1 $EX/metal_example_eltwise_binary 2&gt;&amp;1 | grep "B02 touch D\|B02 map D\|B02 map total"</code></pre>
+<pre><code>[4091] B02 touch D0 (0,11) by host wr 0x2d4c40 via (0,11)
+[4091] B02 touch D0 (0,1) by host wr 0x402d4c40 via (0,1)
+[4091] B02 touch D1 (0,5) by host wr 0x2d4c40 via (0,5)
+[4091] B02 touch D1 (0,7) by host wr 0x402d4c40 via (0,7)
+[4091] B02 touch D2 (5,1) by host wr 0x2d4c40 via (5,1)
+[4091] B02 touch D2 (5,11) by host wr 0x402d4c40 via (5,11)
+[4091] B02 touch D3 (5,2) by host wr 0x2d4c40 via (5,2)
+[4091] B02 touch D3 (5,9) by host wr 0x402d4c40 via (5,9)
+[4091] B02 touch D4 (5,8) by host wr 0x2d4c40 via (5,8)
+[4091] B02 touch D4 (5,3) by host wr 0x402d4c40 via (5,3)
+[4091] B02 touch D5 (5,5) by host wr 0x2d4c40 via (5,5)
+[4091] B02 touch D5 (5,7) by host wr 0x402d4c40 via (5,7)
+[4482] B02 touch D0 (0,11) by (1,1) rd 0x2d4c40
+[4523] B02 touch D0 (0,1) by (1,1) rd 0x402d4c40
+…the same 12 endpoints, read in the same order…
+[7959] B02 map D0  (0,1): host rd 6 wr 12, device rd 12 wr 6
+[7959] B02 map D2  (5,1): host rd 5 wr 10, device rd 10 wr 5
+…
+[7959] B02 map D0  (0,11): host rd 6 wr 12, device rd 12 wr 6
+[7959] B02 map D2  (5,11): host rd 5 wr 10, device rd 10 wr 5
+[7959] B02 map total: host rd 7997 wr 7843, device rd 128 wr 64</code></pre>
+  <p>Twelve endpoints, two per channel, and in each pair one address is the other plus <code>0x40000000</code> (1 GiB). Six DRAM tiles are never touched: (0,0), (0,6), (5,0), (5,10), (5,4) and (5,6). Before explaining why, watch the whole add_2 run (or vecadd_multi_core, which uses 64 cores) replayed on the chip map. The events in this figure are the real <code>B02 touch</code> and <code>B02 reset</code> lines from our logs, embedded in the page: 339 events for add_2 and 1,117 for vecadd.</p>
+
+  <div class="viz" id="fig-map"></div>
+
+  <h3 id="dram">The DRAM aliases: three doors to one room</h3>
+  <p>The ISA overview says Wormhole has "18x DRAM tile, collectively exposing 12 GiB of GDDR6 (each 2 GiB is exposed identically on 3 tiles)" (<code>tt-isa-documentation/WormholeB0/README.md</code>). The SoC descriptor lists the groups, and then picks, for each 1 GiB half, which door to use:</p>
+  <div class="filename">tt-metal/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml:11-37 @7aad8aac (trimmed)</div>
+<pre><code>dram:
+  [
+    [0-0, 0-1, 0-11],
+    [0-5, 0-6, 0-7],
+    [5-0, 5-1, 5-11],
+    [5-2, 5-9, 5-10],
+    [5-3, 5-4, 5-8],
+    [5-5, 5-6, 5-7]
+  ]
+
+# Dram view parameters are used by tt-metal and are not recognized by UMD.
+# Eth and worker dram endpoints represent subchannel id from dram array for each noc.
+…
+dram_views:
+  [
+    { channel: 0, eth_endpoint: [0, 0], worker_endpoint: [2, 2], address_offset: 0 },
+    { channel: 0, eth_endpoint: [0, 0], worker_endpoint: [1, 1], address_offset: 1073741824 },
+    …</code></pre>
+  <p>(The real file writes each view over five lines; we joined them.) The descriptor's list of channels is exactly ttsim's <code>coord_to_tile</code> table. A <em>view</em> is half a channel, 1 GiB at <code>address_offset</code> 0 or 1 GiB, and there are 12 of them. Each view names a <code>worker_endpoint</code>: an index into the channel's list of three, one for NoC 0 and one for NoC 1. Channel 0's first view uses index 2, which is (0,11), and its second view uses index 1, which is (0,1). That is exactly what the log shows: <code>0x2d4c40</code> at (0,11) and <code>0x402d4c40</code> at (0,1). Check all six channels in the figure below. Every touched endpoint is a <code>worker_endpoint</code>, and every untouched one is the channel's <code>eth_endpoint</code>, reserved for kernels on Ethernet cores, which these examples do not run.</p>
+  <p>The interleaving explains the order of the touches too. An interleaved buffer puts page 0 in bank 0, page 1 in bank 1, and so on. The log visits channel 0's two halves, then channel 1's, and so on, at the same offset <code>0x2d4c40</code> within each view. That is consistent with tt-metal using the 12 views, in file order, as its 12 DRAM banks (A03's gridinfo printed <code>dram_grid_size = 12x1</code>).</p>
+
+  <div class="viz" id="fig-dram"></div>
+
+  <p>Why three doors? A03 gave the hardware reason: they spread NoC traffic over three routers instead of piling it onto one. The simulator has no routers and no congestion (B01, section 5). It just maps the three coordinates to <code>g_dram[c]</code> and does a <code>memcpy</code> (<code>tile.cpp:2786</code>, <code>:2833</code>). So in ttsim the choice of door changes nothing measurable, which is why <code>config.h</code> can say the 12-versus-6 channel split "doesn't matter". On silicon the choice matters for bandwidth, which is why tt-metal makes it in the descriptor rather than in your kernel.</p>
+  <div class="callout warn"><b>Aliases are the same memory.</b> If you write to (0,0) and then read the same address from (0,11), you get what you wrote, on silicon and in ttsim. But do not pick doors yourself: tt-metal's worker kernels reach the upper 1 GiB of channel 0 only through (0,1), and you will get a different bank than you think if you guess. If you hand-build a NoC address, take the endpoint from the bank tables (<code>get_noc_addr_from_bank_id</code>), not from your own reading of the YAML.</div>
+
+  <h2 id="reset">Step 3: Watch SOFT_RESET_0</h2>
+  <h3>What the register does</h3>
+  <p>The ISA spec describes <code>RISCV_DEBUG_REG_SOFT_RESET_0</code> bit by bit (<code>WormholeB0/TensixTile/SoftReset.md:19-26</code>). Five of its bits hold the five RISC-V cores:</p>
+  <table>
+    <tr><th>Bit</th><th>Mask</th><th>Core</th><th>UMD name (<code>wormhole_implementation.hpp:365-369</code>)</th></tr>
+    <tr><td class="num">11</td><td class="num">0x00800</td><td>RISCV B (BRISC)</td><td><code>SOFT_RESET_BRISC</code></td></tr>
+    <tr><td class="num">12</td><td class="num">0x01000</td><td>RISCV T0 (TRISC0)</td><td><code>SOFT_RESET_TRISC0</code></td></tr>
+    <tr><td class="num">13</td><td class="num">0x02000</td><td>RISCV T1 (TRISC1)</td><td><code>SOFT_RESET_TRISC1</code></td></tr>
+    <tr><td class="num">14</td><td class="num">0x04000</td><td>RISCV T2 (TRISC2)</td><td><code>SOFT_RESET_TRISC2</code></td></tr>
+    <tr><td class="num">18</td><td class="num">0x40000</td><td>RISCV NC (NCRISC)</td><td><code>SOFT_RESET_NCRISC</code></td></tr>
+  </table>
+  <p>Add them up and you get <code>0x47800</code>, the reset value from step 1: all five held. A 1 means "held in reset". Coming out of reset, says the spec, "<code>pc</code> will be set according to the below table" (<code>SoftReset.md:41-48</code>): BRISC always starts at <code>0x00000</code>, and each other core starts either at a fixed default (<code>0x06000</code>, <code>0x0A000</code>, <code>0x0E000</code>, <code>0x12000</code>) or, if an override bit is set, at a PC held in a configuration register. ttsim implements that table directly:</p>
+  <div class="filename">ttsim/src/tile.cpp:1096-1127 @b3620244 (trimmed)</div>
+<pre><code>        case RISCV_DEBUG_REGS_SOFT_RESET_0: {
+            data &amp;= 0x7FFFFFFF; // ignore bit 31 written by UMD
+            TTSIM_VERIFY(!(data &amp; ~0x47800), UnimplementedFunctionality, "SOFT_RESET_0=0x%x", data);
+            static const uint32_t soft_reset_bits[] = {0x800, 0x1000, 0x2000, 0x4000, 0x40000};
+            for (uint32_t rv32_id = 0; rv32_id &lt; RV32_CORES_PER_T_TILE; rv32_id++) {
+                if (data &amp; soft_reset_bits[rv32_id]) { // put core into reset
+                    ttsim_rv32_set_core_active('T', tile_id, rv32_id, false);
+                } else if (!ttsim_rv32_get_core_active('T', tile_id, rv32_id)) { // take core out of reset
+                    ttsim_rv32_set_core_active('T', tile_id, rv32_id, true);
+                    uint32_t reset_pc;
+                    switch (rv32_id) {
+                        case RV32_ID_BRISC: reset_pc = 0; break; // reset PC for brisc is always zero
+                        case RV32_ID_TRISC0:
+                            reset_pc = (p_tile-&gt;trisc_reset_pc_override &amp; 1) ? p_tile-&gt;trisc0_reset_pc : 0x6000;
+                            break;
+                        …   // TRISC1 0xA000, TRISC2 0xE000, NCRISC 0x12000, same pattern
+                    }
+                    p_tile-&gt;rv32[rv32_id].pc = reset_pc;
+                }
+            }
+            p_tile-&gt;soft_reset_0 = data;</code></pre>
+  <p>Three details matter. A core only "comes out of reset" on a 1-to-0 transition; writing 0 to a core that is already running changes nothing, so its PC is not reset. Bit 31 is masked off because UMD sets it for "staggered start" (<code>SOFT_RESET_STAGGERED_START = 1 &lt;&lt; 31</code>), which ttsim does not model. And any bit outside the five, such as the Tensix-unit resets in bits 0 to 10, is rejected as unimplemented: a program that relies on them will stop with an error rather than run wrongly. On Wormhole the reset-PC registers are Tensix <em>configuration</em> registers 158–163 (<code>tensix.cpp:519-524</code>), written through the config space, not the debug-register page.</p>
+
+  <h3>The patch</h3>
+  <p>The third patch logs each write in that case block: who wrote it, the old and new value, and which cores started or stopped at which PCs. For a core that starts, it also prints the 32-bit word at its new PC, the first instruction it will fetch. It also logs changes to the six reset-PC registers, and Ethernet tiles' own soft-reset register. The writer is known because <code>t_tile_mmio_wr32</code> receives a <code>riscv_id</code>: a hart number when a core on the tile does the write, and <code>0xFFFFFFFF</code> when it arrives from the host or the NoC.</p>
+  <div class="filename">sim-labs/patches/b02-3-soft-reset.patch (excerpt)</div>
+<pre><code>+int b02_reset_level(uint32_t tile_id) {
++    static const char *level = getenv("B02_RESET");
++    static const char *tile = getenv("B02_TILE");
++    if (!level || (tile &amp;&amp; uint32_t(atoi(tile)) != tile_id)) {
++        return 0;
++    }
++    return atoi(level);
++}
+ …
+                     p_tile-&gt;rv32[rv32_id].pc = reset_pc;
++                    b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, " start %s@0x%x", b02_names[rv32_id], reset_pc); // B02
++                    if (reset_pc &lt; sizeof(p_tile-&gt;sram)) { // B02: show the first instruction it will fetch
++                        b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, " [0x%08x]", mem_rd&lt;uint32_t&gt;(&amp;p_tile-&gt;sram[reset_pc]));
++                    }
+ …
++            if (int level = b02_reset_level(tile_id); (level &gt;= 2) || ((level == 1) &amp;&amp; b02_n)) { // B02
++                ttsim_printf("B02 reset T%u (%u,%u) by %s: 0x%05x -&gt; 0x%05x%s\n", tile_id, coord &amp; 63, coord &gt;&gt; 6,
++                    s_b02_writer &lt; RV32_CORES_PER_T_TILE ? b02_writers[s_b02_writer] : "host/NoC", p_tile-&gt;soft_reset_0, data,
++                    b02_n ? b02_msg : " no change");
++            }
+ …
+         case RISCV_DEBUG_REGS_BASE ... RISCV_DEBUG_REGS_LIMIT:
++            s_b02_writer = riscv_id; // B02
+             return riscv_debug_regs_wr32(tile_id, 0, addr - RISCV_DEBUG_REGS_BASE, data);</code></pre>
+
+  <h3>Filter the noise</h3>
+  <p>tt-metal writes this register a lot. Start with level 2, which prints every write, and count:</p>
+<pre><code>B02_RESET=2 $EX/metal_example_add_2_integers_in_riscv &gt; r2.log 2&gt;&amp;1
+grep -c 'B02 reset T[0-9]* (' r2.log                    # 432 writes to Tensix SOFT_RESET_0
+grep 'B02 reset T[0-9]* (' r2.log | grep -c 'no change'   # 216 of them change nothing
+grep -c 'B02 reset E' r2.log                            # 80 to Ethernet tiles
+grep "B02 reset T5 (" r2.log</code></pre>
+<pre><code>[123] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
+[123] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
+[129] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
+[271] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47000 start BRISC@0x0;
+[2143] B02 reset T5 (7,1) by BRISC: 0x47000 -&gt; 0x00000 start TRISC0@0x6140; start TRISC1@0x6740; start TRISC2@0x6d40; start NCRISC@0x5940;
+[4419] B02 reset T5 (7,1) by host/NoC: 0x00000 -&gt; 0x47800 stop BRISC@0x3fac; stop TRISC0@0x6318; stop TRISC1@0x68f4; stop TRISC2@0x6f00; stop NCRISC@0x5af8;</code></pre>
+  <p>Six writes per tile, three of them redundant. The two at clock 123 arrive in the same clock on all 72 tiles at once, so they are broadcasts. UMD's <code>Cluster::assert_risc_reset()</code> broadcasts <code>ALL_TENSIX</code> to address <code>0xFFB121B0</code> over every Tensix row and column (<code>tt-umd-workload/src/cluster.cpp:1042-1060, 1411-1448</code>), and tt-metal calls it once when it creates its cluster (<code>tt_cluster.cpp:264-266</code>) and UMD calls it again in <code>deassert_resets_and_set_clock_state</code> (<code>cluster.cpp:1464-1467</code>). We did not trace which broadcast is which. The third, one tile per clock, is tt-metal's <code>assert_tensix_workers_impl</code> (<code>risc_firmware_initializer.cpp:412-422</code>), which asserts <code>RiscType::ALL</code> on each core through UMD's read-modify-write. The read is why each tile costs one clock.</p>
+  <p>So the useful filter is level 1, which keeps only writes that start or stop something, plus <code>B02_TILE</code> to follow one tile. That brings 432 lines down to 9:</p>
+<pre><code>B02_RESET=1 B02_TILE=0 $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep "B02 reset"</code></pre>
+<pre><code>[249] B02 reset T0 (1,1) by host/NoC: 0x47800 -&gt; 0x47000 start BRISC@0x0 [0x3210306f];
+[1839] B02 reset T0 cfg NCRISC_RESET_PC = 0x5940
+[1841] B02 reset T0 cfg TRISC0_RESET_PC = 0x6140
+[1844] B02 reset T0 cfg TRISC1_RESET_PC = 0x6740
+[1846] B02 reset T0 cfg TRISC2_RESET_PC = 0x6d40
+[1848] B02 reset T0 cfg TRISC_RESET_PC_OVERRIDE = 0x7
+[1851] B02 reset T0 cfg NCRISC_RESET_PC_OVERRIDE = 0x1
+[2121] B02 reset T0 (1,1) by BRISC: 0x47000 -&gt; 0x00000 start TRISC0@0x6140 [0xffb001b7]; start TRISC1@0x6740 [0xffb001b7]; start TRISC2@0x6d40 [0xffb001b7]; start NCRISC@0x5940 [0xffb001b7];
+[4414] B02 reset T0 (1,1) by host/NoC: 0x00000 -&gt; 0x47800 stop BRISC@0x3f48; stop TRISC0@0x6304; stop TRISC1@0x68e4; stop TRISC2@0x6f0c; stop NCRISC@0x5b0c;</code></pre>
+  <p>That is the whole life of one Tensix tile. Read it as a story:</p>
+  <ol>
+    <li><b>Clock 249: the host releases BRISC alone.</b> <code>0x47800 → 0x47000</code> clears bit 11 only. BRISC starts at PC 0, as the spec promised, and the word it finds there is <code>0x3210306f</code>.</li>
+    <li><b>Clocks 1839–1851: BRISC writes the reset PCs</b> for its four siblings, then sets both override registers (<code>0x7</code> for the three TRISCs, <code>0x1</code> for NCRISC). The hardware defaults <code>0x6000</code>…<code>0x12000</code> are never used.</li>
+    <li><b>Clock 2121: BRISC releases the other four</b> by writing 0 to the register. Note the writer: <code>by BRISC</code>, not the host. All four begin with the same instruction word, <code>0xffb001b7</code>.</li>
+    <li><b>Clock 4414: the host puts all five back into reset</b> during teardown, wherever they happen to be.</li>
+  </ol>
+  <p>Over the whole chip, level 1 without <code>B02_TILE</code> prints the same three transitions on each of the 72 usable tiles (216 lines, plus 432 config-register lines and 32 Ethernet lines). Summarised:</p>
+<pre><code>B02_RESET=1 $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep "B02 reset T" | grep -v " cfg " |
+  sed -E 's/^\[[0-9]+\] B02 reset T[0-9]+ \([0-9,]+\) //; s/@0x[0-9a-f]+( \[0x[0-9a-f]+\])?//g' | sort | uniq -c</code></pre>
+<pre><code>     72 by BRISC: 0x47000 -&gt; 0x00000 start TRISC0; start TRISC1; start TRISC2; start NCRISC;
+     72 by host/NoC: 0x00000 -&gt; 0x47800 stop BRISC; stop TRISC0; stop TRISC1; stop TRISC2; stop NCRISC;
+     72 by host/NoC: 0x47800 -&gt; 0x47000 start BRISC;</code></pre>
+  <p>The host releases BRISCs one tile per clock, from clock 237 to 315, in the order (8,11), (7,11), (4,11), (8,10), (6,10), (2,11)… That is not a geometric order. It is the iteration order of the <code>std::unordered_set&lt;CoreCoord&gt; not_done_cores</code> that tt-metal loops over (<code>risc_firmware_initializer.cpp:1406, 1569-1583</code>). On every one of the 72 tiles, BRISC releases its siblings exactly <b>1,872 clocks</b> after it was itself released. Each tile runs identical firmware, and in ttsim each hart executes one instruction per clock, so the gap is the same everywhere (on silicon it would not be exact).</p>
+  <p>The Ethernet tiles follow a simpler path. Between clocks 228 and 291 the host takes each ERISC out of reset (<code>0x00800 → 0x00000</code>, "ERISC0 running at 0x0"), and at the end, clocks 4486–4501, puts it back. Step through one Tensix tile's boot:</p>
+
+  <div class="viz" id="fig-boot"></div>
+
+  <h2 id="firmware">Checking the boot against the firmware source</h2>
+  <p>The log made three claims. Each should be visible in tt-metal's source.</p>
+  <h3>1. Firmware is placed in L1 before anything runs</h3>
+  <p>The Wormhole memory map fixes where each core's firmware lives:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/wormhole/dev_mem_map.h:84-102 @7aad8aac (trimmed)</div>
+<pre><code>#define MEM_BOOT_CODE_BASE 0
+#define MEM_NOC_ATOMIC_RET_VAL_ADDR 4
+#define MEM_L1_BARRIER 12
+#define MEM_MAILBOX_BASE 16
+#define MEM_MAILBOX_SIZE 13568
+…
+#define MEM_ZEROS_BASE ((MEM_MAILBOX_END + 31) &amp; ~31)
+#define MEM_LLK_DEBUG_BASE (MEM_ZEROS_BASE + MEM_ZEROS_SIZE)
+#define MEM_BRISC_FIRMWARE_BASE (MEM_LLK_DEBUG_BASE + MEM_LLK_DEBUG_SIZE)
+#define MEM_NCRISC_FIRMWARE_BASE (MEM_BRISC_FIRMWARE_BASE + MEM_BRISC_FIRMWARE_SIZE)
+#define MEM_TRISC0_FIRMWARE_BASE (MEM_NCRISC_FIRMWARE_BASE + MEM_NCRISC_FIRMWARE_SIZE)
+#define MEM_TRISC1_FIRMWARE_BASE (MEM_TRISC0_FIRMWARE_BASE + MEM_TRISC0_FIRMWARE_SIZE)
+#define MEM_TRISC2_FIRMWARE_BASE (MEM_TRISC1_FIRMWARE_BASE + MEM_TRISC1_FIRMWARE_SIZE)</code></pre>
+  <p>Do the arithmetic. The mailbox ends at 16 + 13,568 = 13,584, which rounds up to <code>0x3520</code>. Add the 512-byte zeros area and the 1,024-byte LLK debug area and BRISC's firmware starts at <b><code>0x3B20</code></b>. BRISC's firmware is 6 × 1024 + 1568 bytes (line 58), so NCRISC's starts at <b><code>0x5940</code></b>. NCRISC gets 2,048 bytes and each TRISC 1,536 (lines 60-63), giving <b><code>0x6140</code></b>, <b><code>0x6740</code></b> and <b><code>0x6D40</code></b>. Those are exactly the PCs in the log. The host loaded the five images at clock 211 (a scratch print of every access to T0 showed writes to <code>0x3b20</code>, <code>0x5940</code>, <code>0x6140</code>, <code>0x6740</code>, <code>0x6d40</code>, the mailboxes, and address <code>0x0</code>, all at clock 211). The loader is <code>initialize_firmware</code>, which multicasts each binary to the whole worker grid (<code>risc_firmware_initializer.cpp:1093-1240</code>, the <code>test_load_multicast_write_risc_binary</code> call at 1197).</p>
+
+  <h3>2. A jump at address 0, because BRISC has no reset-PC register</h3>
+  <p>BRISC always starts at 0, but its firmware is at <code>0x3B20</code>. tt-metal's answer is in a comment:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/hal.cpp:214-236 @7aad8aac (trimmed)</div>
+<pre><code>uint32_t generate_risc_startup_addr(uint32_t firmware_base) {
+    // Options for handling brisc fw not starting at mem[0]:
+    // 1) Program the register for the start address out of reset - no reset PC register on GS/WH/BH
+    // 2) Encode a jump in crt0 for mem[0]
+    // 3) Write the jump to mem[0] here
+    // This does #3.  …
+    constexpr uint32_t jal_opcode = 0x6f;
+    …
+    uint32_t jal_offset_bits_10_to_1 = (firmware_base &amp; 0x7fe) &lt;&lt; 20;
+    uint32_t jal_offset_bit_11 = (firmware_base &amp; 0x800) &lt;&lt; 9;
+    uint32_t jal_offset_bits_19_to_12 = (firmware_base &amp; 0xff000) &lt;&lt; 0;
+    …
+    return jal_offset | opcode;
+}</code></pre>
+  <p>The Wormhole HAL passes <code>MEM_BRISC_FIRMWARE_BASE</code> and stores the result at address 0: <code>.fw_launch_addr = 0x0, // BRISC is hardcoded to have reset PC of 0</code> (<code>wh_hal_tensix.cpp:105-106</code>). Encode <code>0x3B20</code> by hand: bits 10..1 are <code>0x320</code>, shifted to <code>0x32000000</code>; bit 11 is set, giving <code>0x00100000</code>; bits 19..12 are <code>0x3000</code>. Add the opcode <code>0x6f</code> and you get <b><code>0x3210306f</code></b>, the word our patch read at BRISC's reset PC. It is <code>jal x0, 0x3b20</code>: "jump to the firmware, don't save a return address".</p>
+  <p>The other four cores need no trampoline, because they do have reset-PC registers. Their first word, <code>0xffb001b7</code>, is <code>lui gp, 0xffb00</code>, the first instruction of the firmware's <code>_start</code> (setting the global pointer into core-local memory). You can confirm it with the toolchain shipped with tt-metal: <code>riscv-tt-elf-objdump -d ~/.cache/tt-metal-cache/*/firmware/ncrisc/ncrisc.elf</code> shows <code>00005940 &lt;_start&gt;: ffb001b7 lui gp,0xffb00</code>, and the BRISC ELF shows the same instruction at <code>00003b20 &lt;_start&gt;</code>.</p>
+
+  <h3>3. The host releases BRISC; BRISC releases the rest</h3>
+  <p>The host side, after loading firmware and writing each core's launch and go messages:</p>
+  <div class="filename">tt-metal/tt_metal/impl/device/firmware/risc_firmware_initializer.cpp:1569-1583 @7aad8aac (trimmed)</div>
+<pre><code>    for (const auto&amp; worker_core : not_done_cores) {
+        …
+        tt::umd::RiscType reset_val;
+        if (cluster_.arch() == ARCH::QUASAR) {
+            reset_val = tt::umd::RiscType::ALL;
+        } else {
+            reset_val = tt::umd::RiscType::BRISC;
+            …
+        }
+        cluster_.deassert_risc_reset_at_core(tt_cxy_pair(device_id, worker_core), reset_val);
+    }</code></pre>
+  <p>Only <code>BRISC</code>. On the simulator, UMD's <code>TTSimTTDevice::deassert_risc_reset</code> turns that into a read-modify-write: read <code>0xFFB121B0</code>, clear the BRISC bit, write it back (<code>tt_sim_tt_device.cpp:397-416</code>). That is the <code>0x47800 → 0x47000</code> we logged, one tile per clock because each read clocks the chip once.</p>
+  <p>Then BRISC's <code>main()</code> takes over:</p>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisc.cc:359-382 @7aad8aac (trimmed)</div>
+<pre><code>int main() {
+    configure_csr();
+    WAYPOINT("I");
+    do_crt1((uint32_t*)MEM_BRISC_INIT_LOCAL_L1_BASE_SCRATCH);
+    noc_bank_table_init(MEM_BANK_TO_NOC_SCRATCH);
+    …
+    risc_init();
+    device_setup();                 // calls set_deassert_addresses() at line 240
+    …
+    mailboxes-&gt;ncrisc_halt.resume_addr = 0;
+    deassert_ncrisc_trisc();        // writes SOFT_RESET_0 = 0
+    // Wait for all cores to be finished initializing before reporting initialization done.
+    wait_ncrisc_trisc();</code></pre>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisc.cc:186-204 @7aad8aac (trimmed)</div>
+<pre><code>void set_deassert_addresses() {
+#ifdef ARCH_BLACKHOLE
+    WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC, MEM_NCRISC_FIRMWARE_BASE);
+    …
+#else
+    volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
+
+    cfg_regs[NCRISC_RESET_PC_PC_ADDR32] = MEM_NCRISC_FIRMWARE_BASE;
+    cfg_regs[TRISC_RESET_PC_SEC0_PC_ADDR32] = MEM_TRISC0_FIRMWARE_BASE;
+    cfg_regs[TRISC_RESET_PC_SEC1_PC_ADDR32] = MEM_TRISC1_FIRMWARE_BASE;
+    cfg_regs[TRISC_RESET_PC_SEC2_PC_ADDR32] = MEM_TRISC2_FIRMWARE_BASE;
+    cfg_regs[TRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en_ADDR32] = 0b111;
+    cfg_regs[NCRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en_ADDR32] = 0x1;
+#endif
+}</code></pre>
+  <p>Same six writes, in the same order as our log: NCRISC PC, TRISC0, TRISC1, TRISC2, then the two overrides. On Wormhole they go through <code>cfg_regs</code>, which is why ttsim catches them in <code>tensix.cpp</code> rather than in the debug-register block. And <code>deassert_ncrisc_trisc()</code> (<code>brisc.cc:274-280</code>) calls <code>deassert_all_reset()</code>, which is one line:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/tt-1xx/risc_common.h:128-130 @7aad8aac</div>
+<pre><code>inline void deassert_all_reset() { WRITE_REG(RISCV_DEBUG_REG_SOFT_RESET_0, RISCV_SOFT_RESET_0_NONE); }
+
+inline void assert_just_ncrisc_reset() { WRITE_REG(RISCV_DEBUG_REG_SOFT_RESET_0, RISCV_SOFT_RESET_0_NCRISC); }</code></pre>
+  <p><code>RISCV_SOFT_RESET_0_NONE</code> is <code>0x00000</code>. Writing it also "releases" BRISC, but BRISC is already running, so ttsim's 1-to-0 rule leaves its PC alone. Our log's <code>by BRISC: 0x47000 -&gt; 0x00000</code> is that line executing. After this BRISC waits in <code>wait_ncrisc_trisc()</code> until all four siblings report done, and the host polls the go message until each BRISC reports that initialisation finished (<code>wait_until_cores_done(… RUN_MSG_INIT …)</code>, <code>risc_firmware_initializer.cpp:1595-1596</code>). In our scratch trace of T0, the host read the same L1 word, <code>0x4a0</code>, every 70 to 90 clocks from 336 until the launch at 4091.</p>
+  <div class="callout gpu"><b>Compared with a GPU.</b> CUDA programmers never see an SM come out of reset. The driver and the GPU's own firmware bring the chip up before your process exists, and a kernel launch only hands work to cores that are already running a scheduler. On Tenstorrent, with tt-metal, the boot is part of opening the device: the runtime library writes the firmware into every core's L1 and flips each core's reset bit itself, every time you open the device. That is more work, but it means the whole boot is ordinary, readable code, and a simulator can show you every step.</div>
+
+  <h3>One more twist: NCRISC's IRAM dance</h3>
+  <p>Run <code>eltwise_binary</code> on tile 0, whose reader kernel runs on NCRISC:</p>
+<pre><code>B02_RESET=1 B02_TILE=0 $EX/metal_example_eltwise_binary 2&gt;&amp;1 | grep "B02 reset" | tail -4</code></pre>
+<pre><code>[4390] B02 reset T0 cfg NCRISC_RESET_PC = 0xffc00000
+[4391] B02 reset T0 (1,1) by BRISC: 0x00000 -&gt; 0x40000 stop NCRISC@0x5ecc;
+[4400] B02 reset T0 (1,1) by BRISC: 0x40000 -&gt; 0x00000 start NCRISC@0xffc00000;
+[7872] B02 reset T0 (1,1) by host/NoC: 0x00000 -&gt; 0x47800 stop BRISC@0x3fe0; stop TRISC0@0x652c; stop TRISC1@0x68f4; stop TRISC2@0x6f08; stop NCRISC@0x5af8;</code></pre>
+  <p>Mid-program, BRISC points NCRISC's reset PC at <code>0xFFC00000</code>, puts NCRISC <em>back into reset</em>, and releases it 9 clocks later. <code>0xFFC00000</code> is <code>MEM_NCRISC_IRAM_BASE</code>, NCRISC's private 16 KiB instruction RAM, where Wormhole runs NCRISC kernels. tt-metal's own comment gives the reason only as "Jumping to IRAM causes bizarre behavior" (<code>ncrisc.cc:177-178</code>). The ISA spec describes the underlying hazard: IRAM is written by the mover, and if NCRISC's frontend fetches from IRAM (for example because its branch predictor guesses a jump there) while the mover is writing, the contents can be corrupted. Reset helps because it erases branch-predictor history (<code>WormholeB0/TensixTile/BabyRISCV/InstructionRAM.md:7-16</code>). The firmware does not follow the spec's "reset during the copy" recipe literally: NCRISC itself has the mover copy its kernel into IRAM and waits for the copy (<code>ncrisc.cc:141</code>, <code>:164</code>), and only then gets reset into IRAM, so it starts there with a clean predictor. After the kernel it deliberately pollutes its branch predictor (<code>ncrisc.cc:193-199</code>), the last option in the spec's list, to protect the next copy. The handoff: NCRISC parks itself in <code>wh_iram_trampoline</code> with status <code>RUN_SYNC_MSG_WAITING_FOR_RESET</code> (<code>ncrisc.cc:180-181</code>), and BRISC's <code>start_ncrisc_kernel_run</code> writes the resume address, calls <code>assert_just_ncrisc_reset()</code>, waits with <code>riscv_wait(5)</code>, and calls <code>deassert_all_reset()</code> (<code>brisc.cc:306-323</code>). In <code>vecadd_multi_core</code> all 64 worker tiles do the dance, between clocks 4302 and 4386, with gaps of 9 or 10 clocks. This only happens on Wormhole (<code>#if defined(ARCH_WORMHOLE)</code>); on Blackhole NCRISC jumps straight to its kernel in L1.</p>
+  <div class="callout warn"><b>"Released once" is wrong.</b> If you instrument reset expecting one release per core, Wormhole's NCRISC will confuse you: it is reset and released again for every program whose NCRISC kernel runs from IRAM. The first release starts it at its firmware (<code>0x5940</code>); later ones start it at <code>0xFFC00000</code>, and the reset clears its registers, so the firmware saved them on the stack first.</div>
+
+  <h2 id="exercises">Step 4: Exercises, with answers</h2>
+  <details class="quiz"><summary>Exercise 1. Run the same tile-0 trace on Blackhole (<code>source $W/env.sh bh</code>, <code>$W/build_ttsim.sh boot bh</code>). Predict the PCs before you look. What changes?</summary>
+  <p>Our run: <code>[340] … start BRISC@0x0 [0x3e10306f]</code>, reset PCs <code>NCRISC 0x5de0</code>, <code>TRISC0 0x67e0</code>, <code>TRISC1 0x71e0</code>, <code>TRISC2 0x7be0</code>, and the siblings released at clock 3124 by BRISC. The sequence is identical; the addresses moved because Blackhole's memory map has different sizes. Decode the JAL: <code>0x3e1…</code> has bits 10..1 = <code>0x3e0</code>, bit 11 set and bits 19..12 = 3, so it jumps to <code>0x3be0</code>. On Blackhole the reset-PC writes go to debug registers (<code>WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC, …)</code>), which ttsim handles in <code>tile.cpp:1130-1135</code> instead of <code>tensix.cpp</code>; the patch logs both. The inventory also shows column harvesting instead of row harvesting: <code>harvested Tensix cols=0x480</code>, which is columns 7 and 10, and Tensix column 7 is translated to 16 and column 10 to 15, the end of the range. There is no NCRISC IRAM dance.</p></details>
+  <details class="quiz"><summary>Exercise 2. Why is the gap between "start BRISC" and "start TRISC0" exactly 1,872 clocks on every one of the 72 tiles, even though they were released at different clocks?</summary>
+  <p>Every tile runs the same BRISC firmware, with the same data apart from its coordinates, and in ttsim each active hart executes exactly one instruction per clock (B01). The path from <code>_start</code> to the <code>SOFT_RESET_0</code> write in <code>deassert_ncrisc_trisc</code> doesn't depend on which tile it is on, so it takes the same number of clocks everywhere. (We checked: the set of differences across all 72 tiles is {1872}, in both add_2 and vecadd.) On silicon, L1 contention and cache behaviour would make the gaps differ slightly.</p></details>
+  <details class="quiz"><summary>Exercise 3. A colleague's kernel hand-builds a NoC address for DRAM bank 1 using coordinate (0,0) and offset 0x2d4c40. Will it read the same data as tt-metal's reader?</summary>
+  <p>No. Bank 1 is channel 0's <em>upper</em> 1 GiB (<code>address_offset: 1073741824</code>), which tt-metal reaches as (0,1) at <code>0x402d4c40</code>. (0,0) is the same physical channel, so the colleague needs offset <code>0x402d4c40</code> to see the same bytes. At <code>0x2d4c40</code> they are reading bank 0's page through a different door. In ttsim both doors land in <code>g_dram[0]</code>, so the bug shows up as wrong data, not as an error.</p></details>
+  <details class="quiz"><summary>Exercise 4. With <code>B02_RESET=2</code>, add_2 makes 80 writes to Ethernet soft-reset registers, but only 32 change anything. Without reading tt-metal, what does that tell you about who writes them?</summary>
+  <p>The 48 no-op writes (16 × <code>0x800 → 0x800</code> twice and 16 × <code>0 → 0</code>) are the same pattern as on Tensix tiles: broadcasts or read-modify-writes that set a bit already set, or clear one already clear. In our log the first 16 writes come at clocks 196–211, one per clock, which is the per-core read-modify-write signature; the releases follow at 228–291, at irregular intervals (nine in consecutive clocks, then seven spread over 258–291). Whoever writes them uses the same assert/deassert helpers, applied to every core regardless of its current state. That is cheap on silicon and harmless, because a reset bit that is already set has no effect.</p></details>
+  <details class="quiz"><summary>Exercise 5. In the chip-map replay for add_2, which grid positions never light up, and for each, why?</summary>
+  <p>Row y = 8 (T48–T55): harvested, so tt-metal has no logical core there and never addresses it. Router-only (0,2), (0,4), (0,8), (0,9): nothing to talk to, and ttsim would raise <code>UnimplementedFunctionality</code> if anything tried. PCIe (0,3): host accesses enter through it but ttsim routes them straight to the target, and nothing on the device does DMA to the host in this example. 17 DRAM endpoints: add_2's buffers are small and live in bank 0 only, whose worker door is (0,11).</p></details>
+  <details class="quiz"><summary>Exercise 6. Change one line in your patched ttsim so that TRISC1 ignores the override and always starts at its hardware default <code>0xA000</code>. Predict what happens to add_2.</summary>
+  <p>This is a prediction we did not run, so treat it as a hypothesis to test. With the override ignored, TRISC1 would start at <code>0xA000</code>, which is outside every firmware image (TRISC2's ends at <code>0x6D40 + 1536 = 0x7340</code>) and holds whatever the host put there, possibly zeros. A zero word is not a valid RISC-V instruction, so ttsim would most likely stop with an error on TRISC1 before init completes, and tt-metal would never see TRISC1 report done. Try it and check the error message; whatever you see, you will have learned that the override write at clock 1848 is load-bearing.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><code>ttsim_init</code> builds every tile of the chip with all 400 Tensix harts held in reset (<code>SOFT_RESET_0 = 0x47800</code>) and L1 empty. Single-chip Wormhole harvests physical row 8, translated to row 27.</li>
+    <li>All NoC traffic, host or device, passes through <code>tile_rd_bytes</code>/<code>tile_wr_bytes</code> and <code>coord_to_tile</code>, so two hooks see everything. Gate prints and count the rest, or one run prints tens of thousands of lines.</li>
+    <li>add_2 touches 90 coordinates, almost all of them by the host during setup. The kernel's only NoC traffic is to one DRAM door, (0,11).</li>
+    <li>Each Wormhole DRAM channel has three doors. tt-metal splits it into two 1 GiB views (its banks), each with a fixed <code>worker_endpoint</code>; the third door is the <code>eth_endpoint</code>. ttsim maps all three to the same array.</li>
+    <li>Boot order on every Tensix tile: the host loads five firmware images and a <code>jal 0x3b20</code> at address 0, then clears only BRISC's reset bit. BRISC sets the four reset PCs (override on), then writes 0 to release TRISC0–2 and NCRISC at <code>0x6140/0x6740/0x6d40/0x5940</code>.</li>
+    <li>On Wormhole, NCRISC is reset again per program to start its kernel in IRAM (<code>0xFFC00000</code>), because tt-metal found that jumping from L1 into IRAM misbehaves (the ISA docs describe the related IRAM/branch-predictor hazard).</li>
+    <li>Clock stamps order these events; they don't time them.</li>
+  </ul>
+  <div class="callout sim">Next, <a href="../chapters/a04-inside-tensix.html">A04</a> opens up one of these Tensix tiles and explains what the five cores you just watched wake up are each for. Then <a href="b03-riscv-interpreter.html">B03</a> follows a single hart instruction by instruction inside ttsim's RISC-V interpreter.</div>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Why does tt-metal write a <code>jal</code> instruction to L1 address 0 instead of programming a reset PC for BRISC, as it does for the other four cores?</summary>
+  <p>Because BRISC has no reset-PC register on Wormhole or Blackhole. The spec gives its reset PC as a constant <code>0x00000</code> (<code>SoftReset.md:44</code>), ttsim hard-codes <code>reset_pc = 0</code> for it (<code>tile.cpp:1108</code>), and tt-metal's own comment says "no reset PC register on GS/WH/BH". So the only way to start firmware at <code>0x3B20</code> is to put a jump at 0.</p></details>
+  <details class="quiz"><summary><code>SOFT_RESET_0</code> reads <code>0x47000</code>. Which cores are running?</summary>
+  <p>Only BRISC. <code>0x47000</code> is <code>0x47800</code> with bit 11 cleared, so TRISC0–2 (bits 12–14) and NCRISC (bit 18) are still held. This is the state between the host's release of BRISC and BRISC's own write of 0, clocks 249 to 2121 on tile 0.</p></details>
+  <details class="quiz"><summary>You write <code>0x00000</code> to <code>SOFT_RESET_0</code> on a tile where all five cores are already running. In ttsim, what happens to their PCs?</summary>
+  <p>Nothing. ttsim only sets a PC on a 1-to-0 transition: <code>else if (!ttsim_rv32_get_core_active(…))</code>. Cores that are already active keep running where they were. This is why BRISC can write 0 to release its siblings without restarting itself.</p></details>
+  <details class="quiz"><summary>Why do the host's BRISC releases arrive one per clock, while its first two reset writes reach all 72 tiles in clock 123?</summary>
+  <p>The first two are broadcast writes (UMD's <code>broadcast_tensix_risc_reset_to_cluster</code>), which make no read, so no clock passes. The per-core release is a read-modify-write in <code>TTSimTTDevice::deassert_risc_reset</code>, and every host read clocks the simulator once (<code>after_read()</code>, B01). So one tile costs one clock.</p></details>
+  <details class="quiz"><summary>Wormhole's SoC descriptor lists 18 DRAM tiles, but <code>eltwise_binary</code> only ever touches 12. Is that a bug?</summary>
+  <p>No. The 12 touched tiles are the <code>worker_endpoint</code>s of the 12 views, two per channel. The other six are the <code>eth_endpoint</code>s, which tt-metal would use from kernels running on Ethernet cores, and this example runs none. All 18 are live: any of a channel's three tiles reaches the same 2 GiB.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/SoftReset.md">tt-isa-documentation: SOFT_RESET_0</a>, the bit map and reset-PC table this lab instruments.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/InstructionRAM.md">tt-isa-documentation: NCRISC instruction RAM</a>, the branch-predictor hazard behind NCRISC's reset-and-restart.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/README.md">tt-isa-documentation: Baby RISC-V cores</a>, the five cores of a Tensix tile and their memory maps.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/NoC/Coordinates.md">tt-isa-documentation: NoC coordinates</a>, physical and translated coordinates and harvesting.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/DRAMTile/README.md">tt-isa-documentation: DRAM tile</a>, what a DRAM tile contains and why it only answers requests.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml">wormhole_b0_80_arch.yaml</a>, the SoC descriptor with the DRAM groups and views.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/firmware/src/tt-1xx/brisc.cc">brisc.cc</a>, BRISC's firmware: the boot you watched, then the dispatch loop.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/impl/device/firmware/risc_firmware_initializer.cpp">risc_firmware_initializer.cpp</a>, the host side: assert, load, release BRISC, wait for init.</li>
+    <li><a href="https://github.com/tenstorrent/tt-umd">tt-umd</a>, the user-mode driver whose reset helpers and broadcasts show up in the log.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">tenstorrent/ttsim</a>, the simulator source you patched.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">Watcher documentation</a>, tt-metal's tool for seeing where firmware is on live cores (the <code>WAYPOINT("I")</code>, <code>"GW"</code> markers in <code>brisc.cc</code>).</li>
+    <li><a href="https://www.corsix.org/content/tt-wh-part1">corsix: Tenstorrent Wormhole series, part 1</a>, a bottom-up blog that also starts by poking reset and L1 by hand.</li>
+  </ul>
+
+  <div class="pager"><a href="b01-meet-ttsim.html">&larr; B01 Meet ttsim</a><a class="next" href="../chapters/a04-inside-tensix.html">A04 Inside a Tensix core &rarr;</a></div>
+</main>
+
+<script>
+/* Wormhole NoC grid, parsed from tt-metal@7aad8aac tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml
+   (same data as A03). Each tile: [x, y, type, id]. */
+var WH_TILES = [[0,0,"D",0],[1,0,"E",1],[2,0,"E",3],[3,0,"E",5],[4,0,"E",7],[5,0,"D",2],[6,0,"E",6],[7,0,"E",4],[8,0,"E",2],[9,0,"E",0],[0,1,"D",0],[1,1,"T",0],[2,1,"T",1],[3,1,"T",2],[4,1,"T",3],[5,1,"D",2],[6,1,"T",4],[7,1,"T",5],[8,1,"T",6],[9,1,"T",7],[0,2,"R",0],[1,2,"T",8],[2,2,"T",9],[3,2,"T",10],[4,2,"T",11],[5,2,"D",3],[6,2,"T",12],[7,2,"T",13],[8,2,"T",14],[9,2,"T",15],[0,3,"P",0],[1,3,"T",16],[2,3,"T",17],[3,3,"T",18],[4,3,"T",19],[5,3,"D",4],[6,3,"T",20],[7,3,"T",21],[8,3,"T",22],[9,3,"T",23],[0,4,"R",1],[1,4,"T",24],[2,4,"T",25],[3,4,"T",26],[4,4,"T",27],[5,4,"D",4],[6,4,"T",28],[7,4,"T",29],[8,4,"T",30],[9,4,"T",31],[0,5,"D",1],[1,5,"T",32],[2,5,"T",33],[3,5,"T",34],[4,5,"T",35],[5,5,"D",5],[6,5,"T",36],[7,5,"T",37],[8,5,"T",38],[9,5,"T",39],[0,6,"D",1],[1,6,"E",9],[2,6,"E",11],[3,6,"E",13],[4,6,"E",15],[5,6,"D",5],[6,6,"E",14],[7,6,"E",12],[8,6,"E",10],[9,6,"E",8],[0,7,"D",1],[1,7,"T",40],[2,7,"T",41],[3,7,"T",42],[4,7,"T",43],[5,7,"D",5],[6,7,"T",44],[7,7,"T",45],[8,7,"T",46],[9,7,"T",47],[0,8,"R",2],[1,8,"T",48],[2,8,"T",49],[3,8,"T",50],[4,8,"T",51],[5,8,"D",4],[6,8,"T",52],[7,8,"T",53],[8,8,"T",54],[9,8,"T",55],[0,9,"R",3],[1,9,"T",56],[2,9,"T",57],[3,9,"T",58],[4,9,"T",59],[5,9,"D",3],[6,9,"T",60],[7,9,"T",61],[8,9,"T",62],[9,9,"T",63],[0,10,"A",0],[1,10,"T",64],[2,10,"T",65],[3,10,"T",66],[4,10,"T",67],[5,10,"D",3],[6,10,"T",68],[7,10,"T",69],[8,10,"T",70],[9,10,"T",71],[0,11,"D",0],[1,11,"T",72],[2,11,"T",73],[3,11,"T",74],[4,11,"T",75],[5,11,"D",2],[6,11,"T",76],[7,11,"T",77],[8,11,"T",78],[9,11,"T",79]];
+/* Real events from this lab's logs (ttsim b3620244 + b02 patches, WH, slow dispatch).
+   Each event: [clock, kind, x, y, (reader x, reader y)].
+   H = first host access to a coordinate; D = first read of a DRAM endpoint by a given Tensix tile;
+   B = host released BRISC; R = BRISC released TRISC0-2 + NCRISC; n/N = NCRISC put into / out of reset (IRAM);
+   S = host put all five into reset (teardown); e/E = Ethernet ERISC0 released / reset. */
+var REPLAY = {"add2":{"end":4501,"ev":[[0,"H",0,10],[22,"H",9,0],[24,"H",1,0],[26,"H",8,0],[28,"H",2,0],[30,"H",7,0],[32,"H",3,0],[34,"H",6,0],[36,"H",4,0],[38,"H",9,6],[40,"H",1,6],[42,"H",8,6],[44,"H",2,6],[46,"H",7,6],[48,"H",3,6],[50,"H",6,6],[52,"H",4,6],[123,"H",1,1],[123,"H",2,1],[123,"H",3,1],[123,"H",4,1],[123,"H",6,1],[123,"H",7,1],[123,"H",8,1],[123,"H",9,1],[123,"H",1,2],[123,"H",2,2],[123,"H",3,2],[123,"H",4,2],[123,"H",6,2],[123,"H",7,2],[123,"H",8,2],[123,"H",9,2],[123,"H",1,3],[123,"H",2,3],[123,"H",3,3],[123,"H",4,3],[123,"H",6,3],[123,"H",7,3],[123,"H",8,3],[123,"H",9,3],[123,"H",1,4],[123,"H",2,4],[123,"H",3,4],[123,"H",4,4],[123,"H",6,4],[123,"H",7,4],[123,"H",8,4],[123,"H",9,4],[123,"H",1,5],[123,"H",2,5],[123,"H",3,5],[123,"H",4,5],[123,"H",6,5],[123,"H",7,5],[123,"H",8,5],[123,"H",9,5],[123,"H",1,7],[123,"H",2,7],[123,"H",3,7],[123,"H",4,7],[123,"H",6,7],[123,"H",7,7],[123,"H",8,7],[123,"H",9,7],[123,"H",1,9],[123,"H",2,9],[123,"H",3,9],[123,"H",4,9],[123,"H",6,9],[123,"H",7,9],[123,"H",8,9],[123,"H",9,9],[123,"H",1,10],[123,"H",2,10],[123,"H",3,10],[123,"H",4,10],[123,"H",6,10],[123,"H",7,10],[123,"H",8,10],[123,"H",9,10],[123,"H",1,11],[123,"H",2,11],[123,"H",3,11],[123,"H",4,11],[123,"H",6,11],[123,"H",7,11],[123,"H",8,11],[123,"H",9,11],[228,"e",1,6],[229,"e",2,6],[230,"e",9,6],[231,"e",4,0],[232,"e",7,6],[233,"e",9,0],[234,"e",3,0],[235,"e",1,0],[236,"e",6,6],[237,"B",8,11],[238,"B",7,11],[239,"B",4,11],[240,"B",8,10],[241,"B",6,10],[242,"B",2,11],[243,"B",4,10],[244,"B",6,4],[245,"B",9,10],[246,"B",7,5],[247,"B",6,11],[248,"B",1,10],[249,"B",1,1],[250,"B",8,9],[251,"B",1,4],[252,"B",3,4],[253,"B",9,4],[254,"B",8,3],[255,"B",6,3],[256,"B",9,11],[257,"B",7,7],[258,"e",8,6],[259,"B",1,3],[260,"B",2,3],[261,"B",4,7],[262,"B",3,10],[263,"B",3,7],[264,"B",8,2],[265,"B",8,7],[266,"B",6,9],[267,"B",4,1],[268,"B",3,1],[269,"e",3,6],[270,"B",6,1],[271,"B",7,1],[272,"B",9,2],[273,"B",7,3],[274,"B",6,7],[275,"B",2,4],[276,"B",4,3],[277,"B",1,2],[278,"B",1,9],[279,"B",3,9],[280,"B",8,1],[281,"e",4,6],[282,"B",2,1],[283,"B",9,1],[284,"e",7,0],[285,"B",2,2],[286,"B",1,11],[287,"B",3,5],[288,"e",6,0],[289,"e",8,0],[290,"B",3,2],[291,"e",2,0],[292,"B",4,2],[293,"B",3,3],[294,"B",7,2],[295,"B",9,5],[296,"B",2,9],[297,"B",6,2],[298,"B",9,3],[299,"B",7,4],[300,"B",6,5],[301,"B",8,4],[302,"B",3,11],[303,"B",1,5],[304,"B",2,7],[305,"B",4,4],[306,"B",2,5],[307,"B",8,5],[308,"B",1,7],[309,"B",7,10],[310,"B",9,9],[311,"B",4,5],[312,"B",2,10],[313,"B",4,9],[314,"B",9,7],[315,"B",7,9],[2109,"R",8,11],[2110,"R",7,11],[2111,"R",4,11],[2112,"R",8,10],[2113,"R",6,10],[2114,"R",2,11],[2115,"R",4,10],[2116,"R",6,4],[2117,"R",9,10],[2118,"R",7,5],[2119,"R",6,11],[2120,"R",1,10],[2121,"R",1,1],[2122,"R",8,9],[2123,"R",1,4],[2124,"R",3,4],[2125,"R",9,4],[2126,"R",8,3],[2127,"R",6,3],[2128,"R",9,11],[2129,"R",7,7],[2131,"R",1,3],[2132,"R",2,3],[2133,"R",4,7],[2134,"R",3,10],[2135,"R",3,7],[2136,"R",8,2],[2137,"R",8,7],[2138,"R",6,9],[2139,"R",4,1],[2140,"R",3,1],[2142,"R",6,1],[2143,"R",7,1],[2144,"R",9,2],[2145,"R",7,3],[2146,"R",6,7],[2147,"R",2,4],[2148,"R",4,3],[2149,"R",1,2],[2150,"R",1,9],[2151,"R",3,9],[2152,"R",8,1],[2154,"R",2,1],[2155,"R",9,1],[2157,"R",2,2],[2158,"R",1,11],[2159,"R",3,5],[2162,"R",3,2],[2164,"R",4,2],[2165,"R",3,3],[2166,"R",7,2],[2167,"R",9,5],[2168,"R",2,9],[2169,"R",6,2],[2170,"R",9,3],[2171,"R",7,4],[2172,"R",6,5],[2173,"R",8,4],[2174,"R",3,11],[2175,"R",1,5],[2176,"R",2,7],[2177,"R",4,4],[2178,"R",2,5],[2179,"R",8,5],[2180,"R",1,7],[2181,"R",7,10],[2182,"R",9,9],[2183,"R",4,5],[2184,"R",2,10],[2185,"R",4,9],[2186,"R",9,7],[2187,"R",7,9],[4091,"H",0,11],[4342,"D",0,11,1,1],[4414,"S",1,1],[4415,"S",2,1],[4416,"S",3,1],[4417,"S",4,1],[4418,"S",6,1],[4419,"S",7,1],[4420,"S",8,1],[4421,"S",9,1],[4422,"S",1,2],[4423,"S",2,2],[4424,"S",3,2],[4425,"S",4,2],[4426,"S",6,2],[4427,"S",7,2],[4428,"S",8,2],[4429,"S",9,2],[4430,"S",1,3],[4431,"S",2,3],[4432,"S",3,3],[4433,"S",4,3],[4434,"S",6,3],[4435,"S",7,3],[4436,"S",8,3],[4437,"S",9,3],[4438,"S",1,4],[4439,"S",2,4],[4440,"S",3,4],[4441,"S",4,4],[4442,"S",6,4],[4443,"S",7,4],[4444,"S",8,4],[4445,"S",9,4],[4446,"S",1,5],[4447,"S",2,5],[4448,"S",3,5],[4449,"S",4,5],[4450,"S",6,5],[4451,"S",7,5],[4452,"S",8,5],[4453,"S",9,5],[4454,"S",1,7],[4455,"S",2,7],[4456,"S",3,7],[4457,"S",4,7],[4458,"S",6,7],[4459,"S",7,7],[4460,"S",8,7],[4461,"S",9,7],[4462,"S",1,9],[4463,"S",2,9],[4464,"S",3,9],[4465,"S",4,9],[4466,"S",6,9],[4467,"S",7,9],[4468,"S",8,9],[4469,"S",9,9],[4470,"S",1,10],[4471,"S",2,10],[4472,"S",3,10],[4473,"S",4,10],[4474,"S",6,10],[4475,"S",7,10],[4476,"S",8,10],[4477,"S",9,10],[4478,"S",1,11],[4479,"S",2,11],[4480,"S",3,11],[4481,"S",4,11],[4482,"S",6,11],[4483,"S",7,11],[4484,"S",8,11],[4485,"S",9,11],[4486,"E",4,6],[4487,"E",6,6],[4488,"E",3,6],[4489,"E",9,0],[4490,"E",1,0],[4491,"E",8,0],[4492,"E",2,0],[4493,"E",7,0],[4494,"E",3,0],[4495,"E",8,6],[4496,"E",6,0],[4497,"E",4,0],[4498,"E",7,6],[4499,"E",9,6],[4500,"E",1,6],[4501,"E",2,6]]},"vecadd":{"end":5980,"ev":[[0,"H",0,10],[22,"H",9,0],[24,"H",1,0],[26,"H",8,0],[28,"H",2,0],[30,"H",7,0],[32,"H",3,0],[34,"H",6,0],[36,"H",4,0],[38,"H",9,6],[40,"H",1,6],[42,"H",8,6],[44,"H",2,6],[46,"H",7,6],[48,"H",3,6],[50,"H",6,6],[52,"H",4,6],[123,"H",1,1],[123,"H",2,1],[123,"H",3,1],[123,"H",4,1],[123,"H",6,1],[123,"H",7,1],[123,"H",8,1],[123,"H",9,1],[123,"H",1,2],[123,"H",2,2],[123,"H",3,2],[123,"H",4,2],[123,"H",6,2],[123,"H",7,2],[123,"H",8,2],[123,"H",9,2],[123,"H",1,3],[123,"H",2,3],[123,"H",3,3],[123,"H",4,3],[123,"H",6,3],[123,"H",7,3],[123,"H",8,3],[123,"H",9,3],[123,"H",1,4],[123,"H",2,4],[123,"H",3,4],[123,"H",4,4],[123,"H",6,4],[123,"H",7,4],[123,"H",8,4],[123,"H",9,4],[123,"H",1,5],[123,"H",2,5],[123,"H",3,5],[123,"H",4,5],[123,"H",6,5],[123,"H",7,5],[123,"H",8,5],[123,"H",9,5],[123,"H",1,7],[123,"H",2,7],[123,"H",3,7],[123,"H",4,7],[123,"H",6,7],[123,"H",7,7],[123,"H",8,7],[123,"H",9,7],[123,"H",1,9],[123,"H",2,9],[123,"H",3,9],[123,"H",4,9],[123,"H",6,9],[123,"H",7,9],[123,"H",8,9],[123,"H",9,9],[123,"H",1,10],[123,"H",2,10],[123,"H",3,10],[123,"H",4,10],[123,"H",6,10],[123,"H",7,10],[123,"H",8,10],[123,"H",9,10],[123,"H",1,11],[123,"H",2,11],[123,"H",3,11],[123,"H",4,11],[123,"H",6,11],[123,"H",7,11],[123,"H",8,11],[123,"H",9,11],[228,"e",1,6],[229,"e",2,6],[230,"e",9,6],[231,"e",4,0],[232,"e",7,6],[233,"e",9,0],[234,"e",3,0],[235,"e",1,0],[236,"e",6,6],[237,"B",8,11],[238,"B",7,11],[239,"B",4,11],[240,"B",8,10],[241,"B",6,10],[242,"B",2,11],[243,"B",4,10],[244,"B",6,4],[245,"B",9,10],[246,"B",7,5],[247,"B",6,11],[248,"B",1,10],[249,"B",1,1],[250,"B",8,9],[251,"B",1,4],[252,"B",3,4],[253,"B",9,4],[254,"B",8,3],[255,"B",6,3],[256,"B",9,11],[257,"B",7,7],[258,"e",8,6],[259,"B",1,3],[260,"B",2,3],[261,"B",4,7],[262,"B",3,10],[263,"B",3,7],[264,"B",8,2],[265,"B",8,7],[266,"B",6,9],[267,"B",4,1],[268,"B",3,1],[269,"e",3,6],[270,"B",6,1],[271,"B",7,1],[272,"B",9,2],[273,"B",7,3],[274,"B",6,7],[275,"B",2,4],[276,"B",4,3],[277,"B",1,2],[278,"B",1,9],[279,"B",3,9],[280,"B",8,1],[281,"e",4,6],[282,"B",2,1],[283,"B",9,1],[284,"e",7,0],[285,"B",2,2],[286,"B",1,11],[287,"B",3,5],[288,"e",6,0],[289,"e",8,0],[290,"B",3,2],[291,"e",2,0],[292,"B",4,2],[293,"B",3,3],[294,"B",7,2],[295,"B",9,5],[296,"B",2,9],[297,"B",6,2],[298,"B",9,3],[299,"B",7,4],[300,"B",6,5],[301,"B",8,4],[302,"B",3,11],[303,"B",1,5],[304,"B",2,7],[305,"B",4,4],[306,"B",2,5],[307,"B",8,5],[308,"B",1,7],[309,"B",7,10],[310,"B",9,9],[311,"B",4,5],[312,"B",2,10],[313,"B",4,9],[314,"B",9,7],[315,"B",7,9],[2109,"R",8,11],[2110,"R",7,11],[2111,"R",4,11],[2112,"R",8,10],[2113,"R",6,10],[2114,"R",2,11],[2115,"R",4,10],[2116,"R",6,4],[2117,"R",9,10],[2118,"R",7,5],[2119,"R",6,11],[2120,"R",1,10],[2121,"R",1,1],[2122,"R",8,9],[2123,"R",1,4],[2124,"R",3,4],[2125,"R",9,4],[2126,"R",8,3],[2127,"R",6,3],[2128,"R",9,11],[2129,"R",7,7],[2131,"R",1,3],[2132,"R",2,3],[2133,"R",4,7],[2134,"R",3,10],[2135,"R",3,7],[2136,"R",8,2],[2137,"R",8,7],[2138,"R",6,9],[2139,"R",4,1],[2140,"R",3,1],[2142,"R",6,1],[2143,"R",7,1],[2144,"R",9,2],[2145,"R",7,3],[2146,"R",6,7],[2147,"R",2,4],[2148,"R",4,3],[2149,"R",1,2],[2150,"R",1,9],[2151,"R",3,9],[2152,"R",8,1],[2154,"R",2,1],[2155,"R",9,1],[2157,"R",2,2],[2158,"R",1,11],[2159,"R",3,5],[2162,"R",3,2],[2164,"R",4,2],[2165,"R",3,3],[2166,"R",7,2],[2167,"R",9,5],[2168,"R",2,9],[2169,"R",6,2],[2170,"R",9,3],[2171,"R",7,4],[2172,"R",6,5],[2173,"R",8,4],[2174,"R",3,11],[2175,"R",1,5],[2176,"R",2,7],[2177,"R",4,4],[2178,"R",2,5],[2179,"R",8,5],[2180,"R",1,7],[2181,"R",7,10],[2182,"R",9,9],[2183,"R",4,5],[2184,"R",2,10],[2185,"R",4,9],[2186,"R",9,7],[2187,"R",7,9],[4091,"H",0,11],[4091,"H",0,1],[4091,"H",0,5],[4091,"H",0,7],[4091,"H",5,1],[4091,"H",5,11],[4091,"H",5,2],[4091,"H",5,9],[4091,"H",5,8],[4091,"H",5,3],[4091,"H",5,5],[4091,"H",5,7],[4302,"n",8,10],[4303,"n",6,10],[4305,"n",4,10],[4306,"n",6,4],[4307,"n",9,10],[4308,"n",7,5],[4310,"n",1,10],[4311,"n",1,1],[4311,"N",8,10],[4312,"n",8,9],[4312,"N",6,10],[4313,"n",1,4],[4314,"n",3,4],[4315,"n",9,4],[4315,"N",4,10],[4316,"n",8,3],[4316,"N",6,4],[4317,"n",6,3],[4317,"N",9,10],[4318,"N",7,5],[4319,"n",7,7],[4320,"N",1,10],[4321,"N",1,1],[4321,"n",1,3],[4322,"n",2,3],[4322,"N",8,9],[4323,"N",1,4],[4323,"n",4,7],[4324,"N",3,4],[4324,"n",3,10],[4325,"N",9,4],[4325,"n",3,7],[4326,"n",8,2],[4326,"N",8,3],[4327,"N",6,3],[4327,"n",8,7],[4328,"n",6,9],[4329,"n",4,1],[4329,"N",7,7],[4330,"n",3,1],[4331,"N",1,3],[4332,"n",6,1],[4332,"N",2,3],[4333,"n",7,1],[4333,"N",4,7],[4334,"n",9,2],[4334,"N",3,10],[4335,"n",7,3],[4335,"N",3,7],[4336,"N",8,2],[4336,"n",6,7],[4337,"n",2,4],[4337,"N",8,7],[4338,"N",4,1],[4338,"n",4,3],[4338,"N",6,9],[4339,"N",3,1],[4339,"n",1,2],[4340,"n",1,9],[4341,"N",6,1],[4341,"n",3,9],[4342,"N",7,1],[4342,"n",8,1],[4343,"N",9,2],[4344,"n",2,1],[4344,"N",7,3],[4345,"n",9,1],[4345,"N",6,7],[4346,"N",2,4],[4347,"n",2,2],[4347,"N",4,3],[4348,"N",1,2],[4349,"n",3,5],[4349,"N",1,9],[4350,"N",3,9],[4351,"N",8,1],[4352,"n",3,2],[4353,"N",2,1],[4354,"N",9,1],[4354,"n",4,2],[4355,"n",3,3],[4356,"N",2,2],[4356,"n",7,2],[4357,"n",9,5],[4358,"N",3,5],[4358,"n",2,9],[4359,"n",6,2],[4360,"n",9,3],[4361,"N",3,2],[4361,"n",7,4],[4362,"n",6,5],[4363,"N",4,2],[4363,"n",8,4],[4364,"N",3,3],[4365,"N",7,2],[4365,"n",1,5],[4366,"N",9,5],[4366,"n",2,7],[4367,"n",4,4],[4367,"N",2,9],[4368,"N",6,2],[4368,"n",2,5],[4369,"N",9,3],[4369,"n",8,5],[4370,"N",7,4],[4370,"n",1,7],[4371,"N",6,5],[4371,"n",7,10],[4372,"N",8,4],[4372,"n",9,9],[4373,"n",4,5],[4374,"N",1,5],[4374,"n",2,10],[4375,"N",2,7],[4375,"n",4,9],[4376,"N",4,4],[4376,"n",9,7],[4377,"N",2,5],[4377,"n",7,9],[4378,"N",8,5],[4379,"N",1,7],[4380,"N",7,10],[4381,"N",9,9],[4382,"N",4,5],[4383,"N",2,10],[4384,"N",4,9],[4385,"N",9,7],[4386,"N",7,9],[4396,"D",5,8,8,10],[4397,"D",0,11,6,10],[4405,"D",0,5,4,10],[4406,"D",5,1,6,4],[4407,"D",5,2,9,10],[4408,"D",5,5,7,5],[4410,"D",5,8,1,10],[4411,"D",0,11,1,1],[4412,"D",0,11,8,9],[4413,"D",0,11,1,4],[4414,"D",5,8,3,4],[4415,"D",5,5,9,4],[4416,"D",5,1,8,3],[4417,"D",5,8,6,3],[4419,"D",5,2,7,7],[4421,"D",5,1,1,3],[4422,"D",0,5,2,3],[4423,"D",5,2,4,1],[4423,"D",5,5,4,7],[4424,"D",5,8,3,1],[4424,"D",5,1,3,10],[4425,"D",0,11,3,7],[4426,"D",5,1,6,1],[4426,"D",5,8,8,2],[4427,"D",0,5,7,1],[4427,"D",5,1,8,7],[4428,"D",5,2,9,2],[4428,"D",5,1,6,9],[4429,"D",5,2,7,3],[4430,"D",5,8,6,7],[4431,"D",5,5,2,4],[4432,"D",5,5,4,3],[4433,"D",5,8,1,2],[4434,"D",0,11,1,9],[4435,"D",5,8,3,9],[4436,"D",0,11,8,1],[4438,"D",5,5,2,1],[4439,"D",5,5,9,1],[4441,"D",5,2,2,2],[4443,"D",5,1,3,5],[4446,"D",5,1,3,2],[4448,"D",0,5,4,2],[4449,"D",0,11,3,3],[4450,"D",5,5,7,2],[4451,"D",5,2,9,5],[4452,"D",5,5,2,9],[4453,"D",0,11,6,2],[4454,"D",0,5,9,3],[4455,"D",0,5,7,4],[4456,"D",0,11,6,5],[4457,"D",0,11,8,4],[4459,"D",5,8,1,5],[4460,"D",0,5,2,7],[4461,"D",5,2,4,4],[4462,"D",5,2,2,5],[4462,"D",5,3,8,10],[4463,"D",5,8,8,5],[4463,"D",0,1,6,10],[4464,"D",5,1,1,7],[4465,"D",5,5,7,10],[4466,"D",5,5,9,9],[4467,"D",0,5,4,5],[4468,"D",5,2,2,10],[4469,"D",5,2,4,9],[4470,"D",0,5,9,7],[4471,"D",0,5,7,9],[4471,"D",0,7,4,10],[4472,"D",5,11,6,4],[4473,"D",5,9,9,10],[4474,"D",5,7,7,5],[4476,"D",5,3,1,10],[4477,"D",0,1,1,1],[4478,"D",0,1,8,9],[4479,"D",0,1,1,4],[4480,"D",5,3,3,4],[4481,"D",5,7,9,4],[4482,"D",5,11,8,3],[4483,"D",5,3,6,3],[4485,"D",5,9,7,7],[4487,"D",5,11,1,3],[4488,"D",0,7,2,3],[4489,"D",5,9,4,1],[4489,"D",5,7,4,7],[4490,"D",5,3,3,1],[4490,"D",5,11,3,10],[4491,"D",0,1,3,7],[4492,"D",5,11,6,1],[4492,"D",5,3,8,2],[4493,"D",0,7,7,1],[4493,"D",5,11,8,7],[4494,"D",5,9,9,2],[4494,"D",5,11,6,9],[4495,"D",5,9,7,3],[4496,"D",5,3,6,7],[4497,"D",5,7,2,4],[4498,"D",5,7,4,3],[4499,"D",5,3,1,2],[4500,"D",0,1,1,9],[4501,"D",5,3,3,9],[4502,"D",0,1,8,1],[4504,"D",5,7,2,1],[4505,"D",5,7,9,1],[4507,"D",5,9,2,2],[4509,"D",5,11,3,5],[4512,"D",5,11,3,2],[4514,"D",0,7,4,2],[4515,"D",0,1,3,3],[4516,"D",5,7,7,2],[4517,"D",5,9,9,5],[4518,"D",5,7,2,9],[4519,"D",0,1,6,2],[4520,"D",0,7,9,3],[4521,"D",0,7,7,4],[4522,"D",0,1,6,5],[4523,"D",0,1,8,4],[4525,"D",5,3,1,5],[4526,"D",0,7,2,7],[4527,"D",5,9,4,4],[4528,"D",5,9,2,5],[4528,"D",5,5,8,10],[4529,"D",5,3,8,5],[4529,"D",0,5,6,10],[4530,"D",5,11,1,7],[4531,"D",5,7,7,10],[4532,"D",5,7,9,9],[4533,"D",0,7,4,5],[4534,"D",5,9,2,10],[4535,"D",5,9,4,9],[4536,"D",0,7,9,7],[4537,"D",0,7,7,9],[4537,"D",5,1,4,10],[4538,"D",5,2,6,4],[4539,"D",5,8,9,10],[4540,"D",0,11,7,5],[4542,"D",5,5,1,10],[4543,"D",0,5,1,1],[4544,"D",0,5,8,9],[4545,"D",0,5,1,4],[4546,"D",5,5,3,4],[4547,"D",0,11,9,4],[4548,"D",5,2,8,3],[4549,"D",5,5,6,3],[4551,"D",5,8,7,7],[4553,"D",5,2,1,3],[4554,"D",5,1,2,3],[4555,"D",5,8,4,1],[4555,"D",0,11,4,7],[4556,"D",5,5,3,1],[4556,"D",5,2,3,10],[4557,"D",0,5,3,7],[4558,"D",5,2,6,1],[4558,"D",5,5,8,2],[4559,"D",5,1,7,1],[4559,"D",5,2,8,7],[4560,"D",5,8,9,2],[4560,"D",5,2,6,9],[4561,"D",5,8,7,3],[4562,"D",5,5,6,7],[4563,"D",0,11,2,4],[4564,"D",0,11,4,3],[4565,"D",5,5,1,2],[4566,"D",0,5,1,9],[4567,"D",5,5,3,9],[4568,"D",0,5,8,1],[4570,"D",0,11,2,1],[4571,"D",0,11,9,1],[4573,"D",5,8,2,2],[4575,"D",5,2,3,5],[4578,"D",5,2,3,2],[4580,"D",5,1,4,2],[4581,"D",0,5,3,3],[4582,"D",0,11,7,2],[4583,"D",5,8,9,5],[4584,"D",0,11,2,9],[4585,"D",0,5,6,2],[4586,"D",5,1,9,3],[4587,"D",5,1,7,4],[4588,"D",0,5,6,5],[4589,"D",0,5,8,4],[4591,"D",5,5,1,5],[4592,"D",5,1,2,7],[4593,"D",5,8,4,4],[4594,"D",5,8,2,5],[4594,"D",5,7,8,10],[4595,"D",5,5,8,5],[4595,"D",0,7,6,10],[4596,"D",5,2,1,7],[4597,"D",0,11,7,10],[4598,"D",0,11,9,9],[4599,"D",5,1,4,5],[4600,"D",5,8,2,10],[4601,"D",5,8,4,9],[4602,"D",5,1,9,7],[4603,"D",5,1,7,9],[4603,"D",5,11,4,10],[4604,"D",5,9,6,4],[4605,"D",5,3,9,10],[4606,"D",0,1,7,5],[4608,"D",5,7,1,10],[4609,"D",0,7,1,1],[4610,"D",0,7,8,9],[4611,"D",0,7,1,4],[4612,"D",5,7,3,4],[4613,"D",0,1,9,4],[4614,"D",5,9,8,3],[4615,"D",5,7,6,3],[4617,"D",5,3,7,7],[4619,"D",5,9,1,3],[4620,"D",5,11,2,3],[4621,"D",5,3,4,1],[4621,"D",0,1,4,7],[4622,"D",5,7,3,1],[4622,"D",5,9,3,10],[4623,"D",0,7,3,7],[4624,"D",5,9,6,1],[4624,"D",5,7,8,2],[4625,"D",5,11,7,1],[4625,"D",5,9,8,7],[4626,"D",5,3,9,2],[4626,"D",5,9,6,9],[4627,"D",5,3,7,3],[4628,"D",5,7,6,7],[4629,"D",0,1,2,4],[4630,"D",0,1,4,3],[4631,"D",5,7,1,2],[4632,"D",0,7,1,9],[4633,"D",5,7,3,9],[4634,"D",0,7,8,1],[4636,"D",0,1,2,1],[4637,"D",0,1,9,1],[4639,"D",5,3,2,2],[4641,"D",5,9,3,5],[4644,"D",5,9,3,2],[4646,"D",5,11,4,2],[4647,"D",0,7,3,3],[4648,"D",0,1,7,2],[4649,"D",5,3,9,5],[4650,"D",0,1,2,9],[4651,"D",0,7,6,2],[4652,"D",5,11,9,3],[4653,"D",5,11,7,4],[4654,"D",0,7,6,5],[4655,"D",0,7,8,4],[4657,"D",5,7,1,5],[4658,"D",5,11,2,7],[4659,"D",5,3,4,4],[4660,"D",5,3,2,5],[4661,"D",5,7,8,5],[4662,"D",5,9,1,7],[4663,"D",0,1,7,10],[4664,"D",0,1,9,9],[4665,"D",5,11,4,5],[4666,"D",5,3,2,10],[4666,"D",0,11,8,10],[4667,"D",5,3,4,9],[4667,"D",5,1,6,10],[4668,"D",5,11,9,7],[4669,"D",5,11,7,9],[4675,"D",5,2,4,10],[4676,"D",5,8,6,4],[4677,"D",5,5,9,10],[4678,"D",0,5,7,5],[4680,"D",0,11,1,10],[4681,"D",5,1,1,1],[4682,"D",5,1,8,9],[4683,"D",5,1,1,4],[4684,"D",0,11,3,4],[4685,"D",0,5,9,4],[4686,"D",5,8,8,3],[4687,"D",0,11,6,3],[4689,"D",5,5,7,7],[4691,"D",5,8,1,3],[4692,"D",5,2,2,3],[4693,"D",5,5,4,1],[4693,"D",0,5,4,7],[4694,"D",0,11,3,1],[4694,"D",5,8,3,10],[4695,"D",5,1,3,7],[4696,"D",5,8,6,1],[4696,"D",0,11,8,2],[4697,"D",5,2,7,1],[4697,"D",5,8,8,7],[4698,"D",5,5,9,2],[4698,"D",5,8,6,9],[4699,"D",5,5,7,3],[4700,"D",0,11,6,7],[4701,"D",0,5,2,4],[4702,"D",0,5,4,3],[4703,"D",0,11,1,2],[4704,"D",5,1,1,9],[4705,"D",0,11,3,9],[4706,"D",5,1,8,1],[4708,"D",0,5,2,1],[4709,"D",0,5,9,1],[4711,"D",5,5,2,2],[4713,"D",5,8,3,5],[4716,"D",5,8,3,2],[4718,"D",5,2,4,2],[4719,"D",5,1,3,3],[4720,"D",0,5,7,2],[4721,"D",5,5,9,5],[4722,"D",0,5,2,9],[4723,"D",5,1,6,2],[4724,"D",5,2,9,3],[4725,"D",5,2,7,4],[4726,"D",5,1,6,5],[4727,"D",5,1,8,4],[4729,"D",0,11,1,5],[4730,"D",5,2,2,7],[4731,"D",5,5,4,4],[4732,"D",5,5,2,5],[4732,"D",0,1,8,10],[4733,"D",0,11,8,5],[4733,"D",5,11,6,10],[4734,"D",5,8,1,7],[4735,"D",0,5,7,10],[4736,"D",0,5,9,9],[4737,"D",5,2,4,5],[4738,"D",5,5,2,10],[4739,"D",5,5,4,9],[4740,"D",5,2,9,7],[4741,"D",5,2,7,9],[4741,"D",5,9,4,10],[4742,"D",5,3,6,4],[4743,"D",5,7,9,10],[4744,"D",0,7,7,5],[4746,"D",0,1,1,10],[4747,"D",5,11,1,1],[4748,"D",5,11,8,9],[4749,"D",5,11,1,4],[4750,"D",0,1,3,4],[4751,"D",0,7,9,4],[4752,"D",5,3,8,3],[4753,"D",0,1,6,3],[4755,"D",5,7,7,7],[4757,"D",5,3,1,3],[4758,"D",5,9,2,3],[4759,"D",5,7,4,1],[4759,"D",0,7,4,7],[4760,"D",0,1,3,1],[4760,"D",5,3,3,10],[4761,"D",5,11,3,7],[4762,"D",5,3,6,1],[4762,"D",0,1,8,2],[4763,"D",5,9,7,1],[4763,"D",5,3,8,7],[4764,"D",5,7,9,2],[4764,"D",5,3,6,9],[4765,"D",5,7,7,3],[4766,"D",0,1,6,7],[4767,"D",0,7,2,4],[4768,"D",0,7,4,3],[4769,"D",0,1,1,2],[4770,"D",5,11,1,9],[4771,"D",0,1,3,9],[4772,"D",5,11,8,1],[4774,"D",0,7,2,1],[4775,"D",0,7,9,1],[4777,"D",5,7,2,2],[4779,"D",5,3,3,5],[4782,"D",5,3,3,2],[4784,"D",5,9,4,2],[4785,"D",5,11,3,3],[4786,"D",0,7,7,2],[4787,"D",5,7,9,5],[4788,"D",0,7,2,9],[4789,"D",5,11,6,2],[4790,"D",5,9,9,3],[4791,"D",5,9,7,4],[4792,"D",5,11,6,5],[4793,"D",5,11,8,4],[4795,"D",0,1,1,5],[4796,"D",5,9,2,7],[4797,"D",5,7,4,4],[4798,"D",5,7,2,5],[4798,"D",0,5,8,10],[4799,"D",0,1,8,5],[4799,"D",5,2,6,10],[4800,"D",5,3,1,7],[4801,"D",0,7,7,10],[4802,"D",0,7,9,9],[4803,"D",5,9,4,5],[4804,"D",5,7,2,10],[4805,"D",5,7,4,9],[4806,"D",5,9,9,7],[4807,"D",5,9,7,9],[4807,"D",5,8,4,10],[4808,"D",5,5,6,4],[4809,"D",0,11,9,10],[4810,"D",5,1,7,5],[4812,"D",0,5,1,10],[4813,"D",5,2,1,1],[4814,"D",5,2,8,9],[4815,"D",5,2,1,4],[4816,"D",0,5,3,4],[4817,"D",5,1,9,4],[4818,"D",5,5,8,3],[4819,"D",0,5,6,3],[4821,"D",0,11,7,7],[4823,"D",5,5,1,3],[4824,"D",5,8,2,3],[4825,"D",0,11,4,1],[4825,"D",5,1,4,7],[4826,"D",0,5,3,1],[4826,"D",5,5,3,10],[4827,"D",5,2,3,7],[4828,"D",5,5,6,1],[4828,"D",0,5,8,2],[4829,"D",5,8,7,1],[4829,"D",5,5,8,7],[4830,"D",0,11,9,2],[4830,"D",5,5,6,9],[4831,"D",0,11,7,3],[4832,"D",0,5,6,7],[4833,"D",5,1,2,4],[4834,"D",5,1,4,3],[4835,"D",0,5,1,2],[4836,"D",5,2,1,9],[4837,"D",0,5,3,9],[4838,"D",5,2,8,1],[4840,"D",5,1,2,1],[4841,"D",5,1,9,1],[4843,"D",0,11,2,2],[4845,"D",5,5,3,5],[4848,"D",5,5,3,2],[4850,"D",5,8,4,2],[4851,"D",5,2,3,3],[4852,"D",5,1,7,2],[4853,"D",0,11,9,5],[4854,"D",5,1,2,9],[4855,"D",5,2,6,2],[4856,"D",5,8,9,3],[4857,"D",5,8,7,4],[4858,"D",5,2,6,5],[4859,"D",5,2,8,4],[4861,"D",0,5,1,5],[4862,"D",5,8,2,7],[4863,"D",0,11,4,4],[4864,"D",0,11,2,5],[4864,"D",0,7,8,10],[4865,"D",0,5,8,5],[4865,"D",5,9,6,10],[4866,"D",5,5,1,7],[4867,"D",5,1,7,10],[4868,"D",5,1,9,9],[4869,"D",5,8,4,5],[4870,"D",0,11,2,10],[4871,"D",0,11,4,9],[4872,"D",5,8,9,7],[4873,"D",5,8,7,9],[4873,"D",5,3,4,10],[4874,"D",5,7,6,4],[4875,"D",0,1,9,10],[4876,"D",5,11,7,5],[4878,"D",0,7,1,10],[4879,"D",5,9,1,1],[4880,"D",5,9,8,9],[4881,"D",5,9,1,4],[4882,"D",0,7,3,4],[4883,"D",5,11,9,4],[4884,"D",5,7,8,3],[4885,"D",0,7,6,3],[4887,"D",0,1,7,7],[4889,"D",5,7,1,3],[4890,"D",5,3,2,3],[4891,"D",0,1,4,1],[4891,"D",5,11,4,7],[4892,"D",0,7,3,1],[4892,"D",5,7,3,10],[4893,"D",5,9,3,7],[4894,"D",5,7,6,1],[4894,"D",0,7,8,2],[4895,"D",5,3,7,1],[4895,"D",5,7,8,7],[4896,"D",0,1,9,2],[4896,"D",5,7,6,9],[4897,"D",0,1,7,3],[4898,"D",0,7,6,7],[4899,"D",5,11,2,4],[4900,"D",5,11,4,3],[4901,"D",0,7,1,2],[4902,"D",5,9,1,9],[4903,"D",0,7,3,9],[4904,"D",5,9,8,1],[4906,"D",5,11,2,1],[4907,"D",5,11,9,1],[4909,"D",0,1,2,2],[4911,"D",5,7,3,5],[4914,"D",5,7,3,2],[4916,"D",5,3,4,2],[4917,"D",5,9,3,3],[4918,"D",5,11,7,2],[4919,"D",0,1,9,5],[4920,"D",5,11,2,9],[4921,"D",5,9,6,2],[4922,"D",5,3,9,3],[4923,"D",5,3,7,4],[4924,"D",5,9,6,5],[4925,"D",5,9,8,4],[4927,"D",0,7,1,5],[4928,"D",5,3,2,7],[4929,"D",0,1,4,4],[4930,"D",0,1,2,5],[4931,"D",0,7,8,5],[4932,"D",5,7,1,7],[4933,"D",5,11,7,10],[4934,"D",5,11,9,9],[4935,"D",5,3,4,5],[4936,"D",0,1,2,10],[4936,"D",5,1,8,10],[4937,"D",0,1,4,9],[4937,"D",5,8,6,10],[4938,"D",5,3,9,7],[4939,"D",5,3,7,9],[4945,"D",5,5,4,10],[4946,"D",0,11,6,4],[4947,"D",0,5,9,10],[4948,"D",5,2,7,5],[4950,"D",5,1,1,10],[4951,"D",5,8,1,1],[4952,"D",5,8,8,9],[4953,"D",5,8,1,4],[4954,"D",5,1,3,4],[4955,"D",5,2,9,4],[4956,"D",0,11,8,3],[4957,"D",5,1,6,3],[4959,"D",0,5,7,7],[4961,"D",0,11,1,3],[4962,"D",5,5,2,3],[4963,"D",0,5,4,1],[4963,"D",5,2,4,7],[4964,"D",5,1,3,1],[4964,"D",0,11,3,10],[4965,"D",5,8,3,7],[4966,"D",0,11,6,1],[4966,"D",5,1,8,2],[4967,"D",5,5,7,1],[4967,"D",0,11,8,7],[4968,"D",0,5,9,2],[4968,"D",0,11,6,9],[4969,"D",0,5,7,3],[4970,"D",5,1,6,7],[4971,"D",5,2,2,4],[4972,"D",5,2,4,3],[4973,"D",5,1,1,2],[4974,"D",5,8,1,9],[4975,"D",5,1,3,9],[4976,"D",5,8,8,1],[4978,"D",5,2,2,1],[4979,"D",5,2,9,1],[4981,"D",0,5,2,2],[4983,"D",0,11,3,5],[4986,"D",0,11,3,2],[4988,"D",5,5,4,2],[4989,"D",5,8,3,3],[4990,"D",5,2,7,2],[4991,"D",0,5,9,5],[4992,"D",5,2,2,9],[4993,"D",5,8,6,2],[4994,"D",5,5,9,3],[4995,"D",5,5,7,4],[4996,"D",5,8,6,5],[4997,"D",5,8,8,4],[4999,"D",5,1,1,5],[5000,"D",5,5,2,7],[5001,"D",0,5,4,4],[5002,"D",0,5,2,5],[5002,"D",5,11,8,10],[5003,"D",5,1,8,5],[5003,"D",5,3,6,10],[5004,"D",0,11,1,7],[5005,"D",5,2,7,10],[5006,"D",5,2,9,9],[5007,"D",5,5,4,5],[5008,"D",0,5,2,10],[5009,"D",0,5,4,9],[5010,"D",5,5,9,7],[5011,"D",5,5,7,9],[5011,"D",5,7,4,10],[5012,"D",0,1,6,4],[5013,"D",0,7,9,10],[5014,"D",5,9,7,5],[5016,"D",5,11,1,10],[5017,"D",5,3,1,1],[5018,"D",5,3,8,9],[5019,"D",5,3,1,4],[5020,"D",5,11,3,4],[5021,"D",5,9,9,4],[5022,"D",0,1,8,3],[5023,"D",5,11,6,3],[5025,"D",0,7,7,7],[5027,"D",0,1,1,3],[5028,"D",5,7,2,3],[5029,"D",0,7,4,1],[5029,"D",5,9,4,7],[5030,"D",5,11,3,1],[5030,"D",0,1,3,10],[5031,"D",5,3,3,7],[5032,"D",0,1,6,1],[5032,"D",5,11,8,2],[5033,"D",5,7,7,1],[5033,"D",0,1,8,7],[5034,"D",0,7,9,2],[5034,"D",0,1,6,9],[5035,"D",0,7,7,3],[5036,"D",5,11,6,7],[5037,"D",5,9,2,4],[5038,"D",5,9,4,3],[5039,"D",5,11,1,2],[5040,"D",5,3,1,9],[5041,"D",5,11,3,9],[5042,"D",5,3,8,1],[5044,"D",5,9,2,1],[5045,"D",5,9,9,1],[5047,"D",0,7,2,2],[5049,"D",0,1,3,5],[5052,"D",0,1,3,2],[5054,"D",5,7,4,2],[5055,"D",5,3,3,3],[5056,"D",5,9,7,2],[5057,"D",0,7,9,5],[5058,"D",5,9,2,9],[5059,"D",5,3,6,2],[5060,"D",5,7,9,3],[5061,"D",5,7,7,4],[5062,"D",5,3,6,5],[5063,"D",5,3,8,4],[5065,"D",5,11,1,5],[5066,"D",5,7,2,7],[5067,"D",0,7,4,4],[5068,"D",0,7,2,5],[5069,"D",5,11,8,5],[5070,"D",0,1,1,7],[5071,"D",5,9,7,10],[5072,"D",5,9,9,9],[5073,"D",5,7,4,5],[5074,"D",0,7,2,10],[5075,"D",0,7,4,9],[5076,"D",5,7,9,7],[5077,"D",5,7,7,9],[5893,"S",1,1],[5894,"S",2,1],[5895,"S",3,1],[5896,"S",4,1],[5897,"S",6,1],[5898,"S",7,1],[5899,"S",8,1],[5900,"S",9,1],[5901,"S",1,2],[5902,"S",2,2],[5903,"S",3,2],[5904,"S",4,2],[5905,"S",6,2],[5906,"S",7,2],[5907,"S",8,2],[5908,"S",9,2],[5909,"S",1,3],[5910,"S",2,3],[5911,"S",3,3],[5912,"S",4,3],[5913,"S",6,3],[5914,"S",7,3],[5915,"S",8,3],[5916,"S",9,3],[5917,"S",1,4],[5918,"S",2,4],[5919,"S",3,4],[5920,"S",4,4],[5921,"S",6,4],[5922,"S",7,4],[5923,"S",8,4],[5924,"S",9,4],[5925,"S",1,5],[5926,"S",2,5],[5927,"S",3,5],[5928,"S",4,5],[5929,"S",6,5],[5930,"S",7,5],[5931,"S",8,5],[5932,"S",9,5],[5933,"S",1,7],[5934,"S",2,7],[5935,"S",3,7],[5936,"S",4,7],[5937,"S",6,7],[5938,"S",7,7],[5939,"S",8,7],[5940,"S",9,7],[5941,"S",1,9],[5942,"S",2,9],[5943,"S",3,9],[5944,"S",4,9],[5945,"S",6,9],[5946,"S",7,9],[5947,"S",8,9],[5948,"S",9,9],[5949,"S",1,10],[5950,"S",2,10],[5951,"S",3,10],[5952,"S",4,10],[5953,"S",6,10],[5954,"S",7,10],[5955,"S",8,10],[5956,"S",9,10],[5957,"S",1,11],[5958,"S",2,11],[5959,"S",3,11],[5960,"S",4,11],[5961,"S",6,11],[5962,"S",7,11],[5963,"S",8,11],[5964,"S",9,11],[5965,"E",4,6],[5966,"E",6,6],[5967,"E",3,6],[5968,"E",9,0],[5969,"E",1,0],[5970,"E",8,0],[5971,"E",2,0],[5972,"E",7,0],[5973,"E",3,0],[5974,"E",8,6],[5975,"E",6,0],[5976,"E",4,0],[5977,"E",7,6],[5978,"E",9,6],[5979,"E",1,6],[5980,"E",2,6]]}};
+</script>
+
+<script>
+(function () {
+  var root = document.getElementById("fig-map");
+  var g = TT.canvas(root, 880, 560), ctx = g.ctx, C = TT.C;
+  var mode = "add2";
+  var CW = 52, CH = 40, X0 = 46, Y0 = 50;
+  var PH = {
+    common: [[0, 122], [123, 236], [237, 315], [316, 2108], [2109, 2187], [2188, 4090]],
+    add2: [[4091, 4341], [4342, 4413], [4414, 4501]],
+    vecadd: [[4091, 4395], [4396, 5892], [5893, 5980]]
+  };
+  var TXT = {
+    common: [
+      "<b>Clocks 0–122: topology discovery.</b> UMD reads the ARC tile (0,10) and two link-training words (<code>0x1EFC</code>, <code>0x1104</code>) on each of the 16 Ethernet tiles. Every Tensix core is still in reset (grey). Blue dot = touched by the host at least once.",
+      "<b>123–236: assert and load.</b> At clock 123 the host writes <code>SOFT_RESET_0</code> on all 72 usable Tensix tiles at once (broadcast), then once more per tile. Every core was already in reset, so nothing changes. At clock 211 it writes the five firmware images into each L1. Row y = 8 is harvested: it is never touched.",
+      "<b>237–315: BRISC released.</b> One tile per clock, the host clears bit 11. Yellow = BRISC running alone, from PC 0. The order follows an <code>std::unordered_set</code>, not the grid. The 16 Ethernet ERISCs were released at 228–291 (green).",
+      "<b>316–2108: BRISC boots alone.</b> crt0, <code>main()</code>, <code>device_setup()</code>: all inside the tile, so the NoC map is quiet. Each BRISC also writes its siblings' reset PCs here.",
+      "<b>2109–2187: BRISC releases its siblings.</b> Each tile turns green when its BRISC writes 0 to <code>SOFT_RESET_0</code>: all five cores running. Every tile does this exactly 1,872 clocks after its own BRISC was released.",
+      "<b>2188–4090: init done, host waits.</b> 360 cores run their init code and settle into wait loops. The host polls each tile's go message until every BRISC reports that initialisation finished."
+    ],
+    add2: [
+      "<b>4091–4341: launch.</b> The host writes the two inputs into DRAM channel 0 through the door at (0,11), then the kernel and its go message into the worker at (1,1), which is logical core (0,0).",
+      "<b>4342–4413: the only device traffic.</b> The kernel on (1,1) reads DRAM through (0,11) (orange line) and writes the sum back. That is the whole program's own NoC traffic: two reads and one write.",
+      "<b>4414–4501: teardown.</b> The host puts every core back into reset (red border: stopped). The Ethernet cores follow at 4486–4501. Final count: 90 coordinates touched, almost all of them by the host during setup."
+    ],
+    vecadd: [
+      "<b>4091–4395: launch.</b> The host writes the inputs into all 12 DRAM views (two doors per channel). On the 64 worker tiles, BRISC parks NCRISC in reset (orange) and restarts it in IRAM at <code>0xFFC00000</code> 9–10 clocks later: Wormhole's IRAM workaround.",
+      "<b>4396–5892: 64 cores read DRAM.</b> Each line is the first read of one DRAM door by one core. Only 12 of the 18 DRAM tiles light up: the <code>worker_endpoint</code>s. The six <code>eth_endpoint</code>s stay dark.",
+      "<b>5893–5980: teardown.</b> The host stops every core, then the Ethernet cores."
+    ]
+  };
+  var steps = [];
+  for (var s = 0; s < 9; s++) steps.push({ dur: s === 3 || s === 5 ? 1.2 : 2.2, text: "" });
+  function ranges() { return PH.common.concat(PH[mode]); }
+  function setTexts() { var t = TXT.common.concat(TXT[mode]); for (var k = 0; k < 9; k++) steps[k].text = t[k]; }
+  setTexts();
+  var TYPECOL = { T: C.blue, D: C.purple, E: C.green, P: C.yellow, A: C.red, R: "#4a525e" };
+  function cell(x, y) { return [X0 + x * CW, Y0 + y * CH]; }
+  function draw(i, t) {
+    var rg = ranges()[i], clk = Math.round(TT.lerp(rg[0], rg[1], t));
+    var R = REPLAY[mode], ev = R.ev;
+    var Ts = {}, Es = {}, host = {}, dcount = {}, recent = [], win = Math.max(6, (rg[1] - rg[0]) / 6);
+    for (var k = 0; k < ev.length; k++) {
+      var e = ev[k]; if (e[0] > clk) break;
+      var key = e[2] + "," + e[3];
+      switch (e[1]) {
+        case "H": host[key] = 1; break;
+        case "D": dcount[key] = (dcount[key] || 0) + 1; break;
+        case "B": Ts[key] = "B"; break;
+        case "R": case "N": Ts[key] = "A"; break;
+        case "n": Ts[key] = "n"; break;
+        case "S": Ts[key] = "S"; break;
+        case "e": Es[key] = "run"; break;
+        case "E": Es[key] = "stop"; break;
+      }
+      if (e[0] > clk - win) recent.push(e);
+    }
+    TT.clear(ctx, g.W, g.H);
+    for (var x = 0; x < 10; x++) TT.text(ctx, String(x), X0 + x * CW + CW / 2, Y0 - 12, { color: C.muted, font: "11px", align: "center" });
+    for (var y = 0; y < 12; y++) TT.text(ctx, String(y), X0 - 14, Y0 + y * CH + CH / 2, { color: C.muted, font: "11px", align: "center" });
+    TT.text(ctx, "x →", X0 + 10 * CW + 4, Y0 - 12, { color: C.muted, font: "11px" });
+    var nB = 0, nA = 0, nS = 0, nE = 0, nD = 0;
+    WH_TILES.forEach(function (tl) {
+      var p = cell(tl[0], tl[1]), key = tl[0] + "," + tl[1], tp = tl[2];
+      var fill = C.bg3, alpha = 1, stroke = C.border, lw = 1, label = tp + tl[3], lc = C.muted;
+      if (tp === "T") {
+        var st = Ts[key];
+        if (tl[1] === 8) { fill = "#15181d"; label = "harv."; lc = "#59606b"; }
+        else if (st === "B") { fill = C.yellow; lc = "#000"; nB++; }
+        else if (st === "A") { fill = C.green; lc = "#000"; nA++; }
+        else if (st === "n") { fill = C.orange; lc = "#000"; nA++; }
+        else if (st === "S") { fill = "#3a1f1f"; stroke = C.red; lw = 1.5; nS++; }
+      } else if (tp === "E") {
+        if (Es[key] === "run") { fill = C.green; alpha = 0.55; lc = "#000"; nE++; }
+        else if (Es[key] === "stop") { stroke = C.red; lw = 1.5; }
+        else { fill = "#1d2a1d"; }
+      } else if (tp === "D") {
+        fill = dcount[key] || host[key] ? C.purple : "#2a2233"; alpha = dcount[key] || host[key] ? 0.85 : 1; lc = dcount[key] || host[key] ? "#000" : C.muted;
+        if (dcount[key] || host[key]) nD++;
+      } else if (tp === "A") { fill = C.red; alpha = host[key] ? 0.8 : 0.3; lc = "#000"; }
+      else if (tp === "P") { fill = C.yellow; alpha = 0.25; label = "PCIe"; }
+      else if (tp === "R") { fill = "#1a1d22"; label = "rtr"; lc = "#4a525e"; }
+      TT.box(ctx, p[0] + 2, p[1] + 2, CW - 4, CH - 4, { fill: fill, alpha: alpha, stroke: stroke, lw: lw, r: 4 });
+      TT.text(ctx, label, p[0] + CW / 2, p[1] + CH / 2 + 1, { color: lc, font: "11px", align: "center", mono: true });
+      if (host[key]) { ctx.fillStyle = C.blue; ctx.beginPath(); ctx.arc(p[0] + 8, p[1] + 8, 3, 0, 7); ctx.fill(); }
+      if (dcount[key]) TT.text(ctx, String(dcount[key]), p[0] + CW - 6, p[1] + 9, { color: "#000", font: "bold 9px", align: "right" });
+    });
+    recent.forEach(function (e) {
+      var p = cell(e[2], e[3]);
+      if (e[1] === "D") {
+        var q = cell(e[4], e[5]);
+        ctx.globalAlpha = 0.55; TT.arrow(ctx, q[0] + CW / 2, q[1] + CH / 2, p[0] + CW / 2, p[1] + CH / 2, { color: C.orange, lw: 1.5, head: 6 }); ctx.globalAlpha = 1;
+      } else {
+        TT.box(ctx, p[0] + 1, p[1] + 1, CW - 2, CH - 2, { stroke: e[1] === "H" ? C.blue : C.fg, lw: 2.5, r: 5 });
+      }
+    });
+    var px = 590;
+    TT.text(ctx, (mode === "add2" ? "add_2_integers_in_riscv" : "vecadd_multi_core") + " (WH)", px, 60, { color: C.muted, font: "13px" });
+    TT.text(ctx, "g_clock = " + clk, px, 92, { color: C.fg, font: "bold 22px", mono: true });
+    TT.text(ctx, "phase " + (i + 1) + ": clocks " + rg[0] + "–" + rg[1], px, 120, { color: C.muted, font: "12px" });
+    var rows = [["Tensix: BRISC only", nB, C.yellow], ["Tensix: all 5 running", nA, C.green], ["Tensix: stopped", nS, C.red], ["ERISC running", nE, C.green], ["DRAM doors touched", nD, C.purple], ["coords touched by host", Object.keys(host).length, C.blue]];
+    rows.forEach(function (r, k) {
+      TT.box(ctx, px, 146 + k * 28, 14, 14, { fill: r[2], alpha: 0.85, r: 3 });
+      TT.text(ctx, r[0], px + 22, 153 + k * 28, { color: C.fg, font: "13px" });
+      TT.text(ctx, String(r[1]), 868, 153 + k * 28, { color: C.fg, font: "bold 13px", align: "right", mono: true });
+    });
+    TT.text(ctx, "legend", px, 330, { color: C.muted, font: "12px" });
+    var leg = [["grey Tensix: held in reset", C.bg3], ["orange: NCRISC parked in reset", C.orange], ["blue dot: host touched it", C.blue], ["white/blue flash: touched now", C.fg], ["orange line: device DRAM read", C.orange], ["number on DRAM: readers so far", C.purple]];
+    leg.forEach(function (l, k) { TT.box(ctx, px, 344 + k * 22, 12, 12, { fill: l[1], alpha: 0.8, r: 3 }); TT.text(ctx, l[0], px + 20, 350 + k * 22, { color: C.muted, font: "12px" }); });
+    TT.text(ctx, "Replayed from real B02_MAP + B02_RESET logs.", px, 500, { color: C.muted, font: "11px" });
+    TT.text(ctx, "Map events are first touches only.", px, 516, { color: C.muted, font: "11px" });
+  }
+  var bar = document.createElement("div"); bar.className = "modebar";
+  var lab = document.createElement("span"); lab.textContent = "Program:"; bar.appendChild(lab);
+  var btns = {};
+  [["add2", "add_2_integers_in_riscv"], ["vecadd", "vecadd_multi_core (64 cores)"]].forEach(function (m) {
+    var b = document.createElement("button"); b.textContent = m[1]; btns[m[0]] = b;
+    b.onclick = function () { mode = m[0]; setTexts(); for (var k in btns) btns[k].className = (k === mode ? "on" : ""); st.render(); };
+    bar.appendChild(b);
+  });
+  btns.add2.className = "on";
+  root.appendChild(bar);
+  var st = TT.stepper({ root: root, steps: steps, draw: draw });
+})();
+</script>
+
+<script>
+(function () {
+  var root = document.getElementById("fig-dram");
+  var g = TT.canvas(root, 880, 380), ctx = g.ctx, C = TT.C;
+  // From wormhole_b0_80_arch.yaml: dram groups, and per channel the NoC0 index of
+  // worker_endpoint for the 0 GiB view, the 1 GiB view, and the eth_endpoint.
+  var CH = [[[0, 0], [0, 1], [0, 11]], [[0, 5], [0, 6], [0, 7]], [[5, 0], [5, 1], [5, 11]], [[5, 2], [5, 9], [5, 10]], [[5, 3], [5, 4], [5, 8]], [[5, 5], [5, 6], [5, 7]]];
+  var W0 = [2, 0, 1, 0, 2, 0], W1 = [1, 2, 2, 1, 0, 2], ETH = [0, 1, 0, 2, 1, 1];
+  // eltwise_binary B02_MAP totals: host wr / device rd per worker door (both doors of a channel are equal)
+  var HW = [12, 12, 10, 10, 10, 10], DR = [12, 12, 10, 10, 10, 10];
+  var COL = [C.purple, C.teal, C.orange, C.pink, C.yellow, C.blue];
+  var steps = [{ dur: 1.5, text: "<b>Overview.</b> 18 DRAM tiles in columns 0 and 5, in six channels of three (colour = channel). In <code>eltwise_binary</code> 12 of them were touched (bright) and 6 never (hatched)." }];
+  for (var c = 0; c < 6; c++) steps.push({ dur: 1.5, text: "" });
+  steps.push({ dur: 1.5, text: "<b>Inside ttsim.</b> <code>coord_to_tile</code> maps all three doors of channel c to <code>{'D', c}</code>, and <code>tile_rd_bytes</code> does <code>memcpy(p, &amp;g_dram[c].p_mem[addr], size)</code>. Six arrays of 2 GiB, eighteen names. The door chosen only matters on silicon, for spreading traffic." });
+  function nm(p) { return "(" + p[0] + "," + p[1] + ")"; }
+  for (var k = 0; k < 6; k++) {
+    var ch = CH[k];
+    steps[k + 1].text = "<b>Channel " + k + "</b> = tt-metal banks " + (2 * k) + " and " + (2 * k + 1) + ". Lower 1 GiB: worker door " + nm(ch[W0[k]]) + " (index " + W0[k] + "). Upper 1 GiB: worker door " + nm(ch[W1[k]]) + " (index " + W1[k] + "), addresses + <code>0x40000000</code>. Ethernet door " + nm(ch[ETH[k]]) + " (index " + ETH[k] + ") was never touched. Log: both worker doors saw host wr " + HW[k] + ", device rd " + DR[k] + ".";
+  }
+  var cw = 40, chh = 26, x0 = 40, y0 = 30;
+  function draw(i, t) {
+    TT.clear(ctx, g.W, g.H);
+    var sel = (i >= 1 && i <= 6) ? i - 1 : -1;
+    for (var y = 0; y < 12; y++) for (var x = 0; x < 10; x++) {
+      TT.box(ctx, x0 + x * cw + 1, y0 + y * chh + 1, cw - 2, chh - 2, { fill: "#161b22", stroke: C.border, lw: 0.5, r: 2 });
+    }
+    for (var c = 0; c < 6; c++) {
+      CH[c].forEach(function (p, idx) {
+        var bx = x0 + p[0] * cw + 1, by = y0 + p[1] * chh + 1;
+        var used = idx === W0[c] || idx === W1[c];
+        var dim = sel >= 0 && sel !== c;
+        var a = dim ? 0.12 : (used ? 0.9 : 0.25);
+        if (i === 7) a = 0.75;
+        TT.box(ctx, bx, by, cw - 2, chh - 2, { fill: COL[c], alpha: a, stroke: sel === c ? C.fg : COL[c], lw: sel === c ? 2 : 1, r: 3 });
+        if (!used && i !== 7 && !dim) {
+          ctx.strokeStyle = COL[c]; ctx.lineWidth = 1; ctx.beginPath();
+          for (var h = -20; h < 40; h += 7) { ctx.moveTo(bx + h, by + chh - 2); ctx.lineTo(bx + h + chh - 2, by); }
+          ctx.save(); ctx.rect(bx, by, cw - 2, chh - 2); ctx.clip(); ctx.stroke(); ctx.restore();
+        }
+        TT.text(ctx, "D" + c, bx + (cw - 2) / 2, by + (chh - 2) / 2, { color: dim ? C.muted : "#000", font: "bold 11px", align: "center" });
+      });
+    }
+    TT.text(ctx, "column 0", x0 + cw / 2, y0 + 12 * chh + 14, { color: C.muted, font: "11px", align: "center" });
+    TT.text(ctx, "column 5", x0 + 5 * cw + cw / 2, y0 + 12 * chh + 14, { color: C.muted, font: "11px", align: "center" });
+    var px = 470;
+    if (sel >= 0) {
+      var ch = CH[sel];
+      TT.text(ctx, "Channel " + sel + " (one 2 GiB GDDR6 group)", px, 50, { color: C.fg, font: "bold 15px" });
+      ch.forEach(function (p, idx) {
+        var role = idx === W0[sel] ? "worker door, view 0 GiB  (bank " + (2 * sel) + ")" : idx === W1[sel] ? "worker door, view 1 GiB  (bank " + (2 * sel + 1) + ")" : "eth door (unused here)";
+        var used = idx !== ETH[sel];
+        TT.box(ctx, px, 72 + idx * 44, 80, 32, { fill: COL[sel], alpha: used ? 0.9 : 0.25, r: 4, label: "[" + idx + "] " + nm(p), color: used ? "#000" : C.fg, font: "12px", mono: true });
+        TT.text(ctx, role, px + 92, 88 + idx * 44, { color: used ? C.fg : C.muted, font: "13px" });
+      });
+      var yy = 220;
+      TT.arrow(ctx, px + 40, 208, px + 40, yy + 4, { color: C.muted, lw: 1.5, head: 6 });
+      TT.box(ctx, px, yy + 8, 380, 40, { fill: COL[sel], alpha: 0.2, stroke: COL[sel], r: 6, label: "ttsim: g_dram[" + sel + "]  (0 … 2 GiB, one mmap)", color: C.fg, font: "13px", mono: true });
+      TT.text(ctx, "page at 0x2d4c40 → door " + nm(ch[W0[sel]]) + " @ 0x2d4c40", px, yy + 76, { color: C.fg, font: "12px", mono: true });
+      TT.text(ctx, "page at 1 GiB+0x2d4c40 → door " + nm(ch[W1[sel]]) + " @ 0x402d4c40", px, yy + 96, { color: C.fg, font: "12px", mono: true });
+    } else if (i === 0) {
+      TT.text(ctx, "6 channels × 3 doors = 18 DRAM tiles", px, 60, { color: C.fg, font: "bold 15px" });
+      TT.text(ctx, "bright: a worker_endpoint (touched)", px, 92, { color: C.fg, font: "13px" });
+      TT.text(ctx, "hatched: the eth_endpoint (never touched)", px, 114, { color: C.muted, font: "13px" });
+      TT.text(ctx, "12 views of 1 GiB = tt-metal's 12 DRAM banks", px, 146, { color: C.fg, font: "13px" });
+      TT.text(ctx, "Press Step to visit each channel.", px, 178, { color: C.muted, font: "12px" });
+    } else {
+      TT.text(ctx, "coord_to_tile (tile.cpp:726-749)", px, 50, { color: C.fg, font: "bold 15px" });
+      for (var c2 = 0; c2 < 6; c2++) {
+        TT.text(ctx, CH[c2].map(nm).join(" ") + "  →  {'D', " + c2 + "}", px, 84 + c2 * 24, { color: C.fg, font: "12px", mono: true });
+      }
+      TT.text(ctx, "tile_rd_bytes: memcpy(p, &g_dram[id].p_mem[addr], size)", px, 248, { color: C.teal, font: "12px", mono: true });
+      TT.text(ctx, "No routers, no queues: every door is equally fast here.", px, 276, { color: C.muted, font: "12px" });
+    }
+  }
+  TT.stepper({ root: root, steps: steps, draw: draw });
+})();
+</script>
+
+<script>
+(function () {
+  var root = document.getElementById("fig-boot");
+  var g = TT.canvas(root, 880, 470), ctx = g.ctx, C = TT.C;
+  var CORES = ["BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2"];
+  var BITS = [[18, "NC", 4], [14, "T2", 3], [13, "T1", 2], [12, "T0", 1], [11, "B", 0]]; // bit, label, core index (BRISC=0, NC=4 in our CORES order -> map)
+  var CIDX = { 0: 0, 1: 2, 2: 3, 3: 4, 4: 1 }; // rv32 id -> row in CORES
+  var FW = [["JAL", 0x0, 0x10, C.red], ["mailboxes", 0x10, 0x3520, "#4a525e"], ["BRISC fw", 0x3b20, 0x5940, C.yellow], ["NCRISC fw", 0x5940, 0x6140, C.teal], ["TRISC0", 0x6140, 0x6740, C.green], ["TRISC1", 0x6740, 0x6d40, C.green], ["TRISC2", 0x6d40, 0x7340, C.green]];
+  // per step: clock, reg, run[5] (rv32 id order B,T0,T1,T2,NC), pc[5], pcregs [nc,t0,t1,t2,ovT,ovN], loaded, note
+  var Z = [0, 0, 0, 0, 0, 0];
+  var PCR = [0x5940, 0x6140, 0x6740, 0x6d40, 7, 1];
+  var S = [
+    { clk: "0", reg: 0x47800, run: [0, 0, 0, 0, 0], pc: [null, null, null, null, null], pcr: Z, load: 0, writer: "", text: "<b>Clock 0: <code>ttsim_init</code>.</b> <code>t_tile_init</code> sets <code>soft_reset_0 = 0x47800</code>: all five bits set, all five cores held. L1 is all zeros. Nothing on this tile can execute." },
+    { clk: "123–195", reg: 0x47800, run: [0, 0, 0, 0, 0], pc: [null, null, null, null, null], pcr: Z, load: 0, writer: "host", text: "<b>Clocks 123–195: the host asserts reset.</b> Two broadcasts and one read-modify-write per tile, all writing <code>0x47800</code>. Nothing changes: this is tt-metal making sure, not changing state." },
+    { clk: "211", reg: 0x47800, run: [0, 0, 0, 0, 0], pc: [null, null, null, null, null], pcr: Z, load: 1, writer: "host", text: "<b>Clock 211: firmware into L1.</b> The host multicasts five images to the worker grid: BRISC at <code>0x3B20</code>, NCRISC <code>0x5940</code>, TRISC0–2 <code>0x6140/0x6740/0x6D40</code>, plus mailboxes, and at address 0 the word <code>0x3210306f</code>." },
+    { clk: "249", reg: 0x47000, run: [1, 0, 0, 0, 0], pc: [0x0, null, null, null, null], pcr: Z, load: 1, writer: "host", text: "<b>Clock 249: the host clears bit 11.</b> <code>0x47800 → 0x47000</code>. BRISC leaves reset at PC <code>0x0</code>, the only PC it can have, and fetches <code>0x3210306f</code> = <code>jal x0, 0x3b20</code>." },
+    { clk: "250–1838", reg: 0x47000, run: [1, 0, 0, 0, 0], pc: [0x3b20, null, null, null, null], pcr: Z, load: 1, writer: "", text: "<b>BRISC runs alone.</b> It jumps to <code>_start</code> at <code>0x3B20</code>, sets up gp and sp, and enters <code>main()</code>: <code>do_crt1</code>, bank tables, <code>risc_init</code>, <code>device_setup</code>." },
+    { clk: "1839–1851", reg: 0x47000, run: [1, 0, 0, 0, 0], pc: [0x3b20, null, null, null, null], pcr: PCR, load: 1, writer: "BRISC", text: "<b>Clocks 1839–1851: <code>set_deassert_addresses()</code>.</b> BRISC writes NCRISC, TRISC0, TRISC1, TRISC2 reset PCs, then the overrides <code>0b111</code> and <code>0x1</code> (Tensix config registers 158–163 on Wormhole)." },
+    { clk: "2121", reg: 0x00000, run: [1, 1, 1, 1, 1], pc: [0x3b20, 0x6140, 0x6740, 0x6d40, 0x5940], pcr: PCR, load: 1, writer: "BRISC", text: "<b>Clock 2121: <code>deassert_all_reset()</code>.</b> BRISC writes <code>0x00000</code>. The four held cores start at the override PCs; each fetches <code>0xffb001b7</code> = <code>lui gp,0xffb00</code>, the first instruction of its <code>_start</code>. BRISC was already running, so its PC is untouched." },
+    { clk: "2122–4090", reg: 0x00000, run: [1, 1, 1, 1, 1], pc: ["wait", "wait", "wait", "wait", "wait"], pcr: PCR, load: 1, writer: "", text: "<b>Init, then wait.</b> The four run their init and report done; BRISC's <code>wait_ncrisc_trisc()</code> sees them, and BRISC reports done to the host, which has been polling. All five sit in wait loops until a program arrives." },
+    { clk: "4390–4400", reg: 0x00000, run: [1, 1, 1, 1, 1], pc: ["kernel", "kernel", "kernel", "kernel", 0xffc00000], pcr: [0xffc00000, 0x6140, 0x6740, 0x6d40, 7, 1], load: 1, writer: "BRISC", text: "<b>eltwise_binary only, clocks 4390–4400.</b> BRISC sets NCRISC's reset PC to <code>0xFFC00000</code> (IRAM), writes <code>0x40000</code> (NCRISC alone into reset), then <code>0x00000</code> 9 clocks later. NCRISC restarts in IRAM to run its kernel. add_2 skips this: its kernel is on BRISC." },
+    { clk: "4414 (add_2)", reg: 0x47800, run: [0, 0, 0, 0, 0], pc: [null, null, null, null, null], pcr: PCR, load: 1, writer: "host", text: "<b>Teardown.</b> The host writes <code>0x47800</code>: all five stop wherever they are (in add_2: BRISC at <code>0x3f48</code>, NCRISC at <code>0x5b0c</code>, …). L1 keeps its contents; the next open reloads anyway." }
+  ];
+  var steps = S.map(function (s) { return { dur: 1.6, text: s.text }; });
+  function hex(v) { return "0x" + v.toString(16).padStart(5, "0"); }
+  function draw(i, t) {
+    var s = S[i], prev = S[Math.max(0, i - 1)];
+    TT.clear(ctx, g.W, g.H);
+    TT.text(ctx, "Tensix tile T0 at (1,1), Wormhole   ·   clock " + s.clk, 16, 20, { color: C.muted, font: "13px" });
+    // register
+    TT.text(ctx, "SOFT_RESET_0  (0xFFB121B0)", 16, 52, { color: C.fg, font: "bold 13px" });
+    BITS.forEach(function (b, k) {
+      var set = (s.reg >> b[0]) & 1, was = (prev.reg >> b[0]) & 1, changed = set !== was && i > 0;
+      var x = 16 + k * 54;
+      TT.box(ctx, x, 64, 48, 40, { fill: set ? C.red : C.green, alpha: changed ? TT.lerp(0.3, 0.9, t) : 0.75, stroke: changed ? C.fg : null, lw: 2, r: 5, label: String(set), color: "#000", font: "bold 16px", mono: true });
+      TT.text(ctx, "bit " + b[0], x + 24, 116, { color: C.muted, font: "11px", align: "center" });
+      TT.text(ctx, b[1], x + 24, 130, { color: C.fg, font: "11px", align: "center" });
+    });
+    TT.text(ctx, "= " + hex(s.reg), 290, 84, { color: C.fg, font: "bold 16px", mono: true });
+    TT.text(ctx, "1 = held in reset", 290, 106, { color: C.muted, font: "11px" });
+    if (s.writer) TT.text(ctx, "this step: writes by " + s.writer, 290, 124, { color: s.writer === "host" ? C.blue : C.yellow, font: "bold 12px" });
+    // reset-PC registers
+    TT.text(ctx, "reset-PC config registers", 16, 162, { color: C.fg, font: "bold 13px" });
+    var names = ["NCRISC_RESET_PC", "TRISC0_RESET_PC", "TRISC1_RESET_PC", "TRISC2_RESET_PC", "TRISC_..._OVERRIDE", "NCRISC_..._OVERRIDE"];
+    names.forEach(function (n, k) {
+      var v = s.pcr[k], ch = v !== prev.pcr[k] && i > 0;
+      TT.text(ctx, n, 16, 186 + k * 20, { color: C.muted, font: "12px", mono: true });
+      TT.text(ctx, v ? "0x" + v.toString(16) : "0", 260, 186 + k * 20, { color: ch ? C.yellow : C.fg, font: (ch ? "bold " : "") + "12px", mono: true, align: "right" });
+    });
+    TT.text(ctx, "defaults if the override is off:", 16, 312, { color: C.muted, font: "11px" });
+    TT.text(ctx, "0x6000 / 0xA000 / 0xE000 / 0x12000", 16, 328, { color: C.muted, font: "11px", mono: true });
+    // cores
+    TT.text(ctx, "cores", 330, 162, { color: C.fg, font: "bold 13px" });
+    var order = [0, 4, 1, 2, 3]; // rv32 ids in display order: BRISC, NCRISC, T0, T1, T2
+    order.forEach(function (rid, k) {
+      var y = 176 + k * 38, run = s.run[rid], pc = s.pc[rid];
+      TT.box(ctx, 330, y, 76, 28, { fill: run ? C.green : C.bg3, alpha: run ? 0.85 : 1, stroke: run ? null : C.border, r: 5, label: CORES[k], color: run ? "#000" : C.muted, font: "bold 12px" });
+      var lbl = run ? (typeof pc === "number" ? "pc = 0x" + pc.toString(16) : pc === "wait" ? "in a wait loop" : "running its kernel") : "in reset";
+      TT.text(ctx, lbl, 416, y + 14, { color: run ? C.fg : C.muted, font: "12px", mono: true });
+    });
+    // L1 strip
+    var lx = 600, ly = 50, lw = 70, lh = 380, top = 0, bot = 0x7400;
+    TT.text(ctx, "L1 (low 29 KiB)", lx, 36, { color: C.fg, font: "bold 13px" });
+    TT.box(ctx, lx, ly, lw, lh, { fill: "#11151a", stroke: C.border, r: 3 });
+    function ya(a) { return ly + (a - top) / (bot - top) * lh; }
+    FW.forEach(function (f) {
+      if (!s.load) return;
+      var y1 = ya(f[1]), y2 = Math.max(ya(f[2]), y1 + 6);
+      TT.box(ctx, lx + 1, y1, lw - 2, y2 - y1, { fill: f[3], alpha: i === 2 ? TT.lerp(0.1, 0.7, t) : 0.6, r: 1 });
+      TT.text(ctx, f[0] + (f[1] >= 0x3b20 ? "  0x" + f[1].toString(16) : f[1] === 0 ? "  @0x0" : ""), lx + lw + 8, (y1 + y2) / 2, { color: C.fg, font: "11px" });
+    });
+    // arrows from cores to their PCs
+    order.forEach(function (rid, k) {
+      var pc = s.pc[rid]; if (!s.run[rid] || typeof pc !== "number") return;
+      var y = 176 + k * 38 + 14;
+      if (pc >= 0xffc00000) { TT.text(ctx, "→ IRAM 0xFFC00000 (off this strip)", lx + lw + 8, 420, { color: C.orange, font: "bold 11px" }); TT.arrow(ctx, 560, y, lx + lw + 4, 414, { color: C.orange, lw: 1.5, head: 6 }); return; }
+      TT.arrow(ctx, 560, y, lx - 2, ya(pc) + (pc === 0 ? 3 : 2), { color: rid === 0 ? C.yellow : C.green, lw: 1.5, head: 6 });
+    });
+    if (i === 3 || i === 4) {
+      var y0 = ya(0) + 3, y1 = ya(0x3b20) + 2;
+      ctx.strokeStyle = C.red; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(lx + lw + 2, y0); ctx.bezierCurveTo(lx + lw + 110, y0, lx + lw + 110, y1, lx + lw + 4, y1); ctx.stroke();
+      TT.text(ctx, "jal 0x3b20", lx + lw + 62, (y0 + y1) / 2, { color: C.red, font: "bold 11px" });
+    }
+  }
+  TT.stepper({ root: root, steps: steps, draw: draw });
+})();
+</script>
+</body>
+</html>

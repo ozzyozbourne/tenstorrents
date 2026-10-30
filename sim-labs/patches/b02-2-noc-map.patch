@@ -1,0 +1,168 @@
+diff -ru -x _out -x __pycache__ a/src/libttsim.cpp b/src/libttsim.cpp
+--- a/src/libttsim.cpp	2026-10-30 06:33:42.283526883 +0000
++++ b/src/libttsim.cpp	2026-10-30 07:46:48.759526883 +0000
+@@ -157,6 +157,8 @@
+ 
+ // Route a host physical access to the owning MMIO device's chip, then translate within
+ // that device's BAR windows.
++extern bool g_b02_host; // B02: tile.cpp
++
+ extern "C" API_EXPORT void libttsim_pci_mem_rd_bytes(uint64_t paddr, void *p, uint32_t size) {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+@@ -164,7 +166,9 @@
+     uint32_t device = pcie_device_from_paddr(paddr, size);
+     uint32_t saved_chip_id = g_current_chip_id;
+     ttsim_select_chip(device);
++    g_b02_host = true; // B02
+     pcie_mem_rd_bytes(paddr, p, size);
++    g_b02_host = false; // B02
+     ttsim_select_chip(saved_chip_id);
+ }
+ 
+@@ -175,7 +179,9 @@
+     uint32_t device = pcie_device_from_paddr(paddr, size);
+     uint32_t saved_chip_id = g_current_chip_id;
+     ttsim_select_chip(device);
++    g_b02_host = true; // B02
+     pcie_mem_wr_bytes(paddr, p, size);
++    g_b02_host = false; // B02
+     ttsim_select_chip(saved_chip_id);
+ }
+ 
+diff -ru -x _out -x __pycache__ a/src/sim.cpp b/src/sim.cpp
+--- a/src/sim.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/sim.cpp	2026-10-30 07:46:48.759526883 +0000
+@@ -51,7 +51,10 @@
+     g_chip = &g_chips[chip_id];
+ }
+ 
++void b02_map_summary(); // B02: tile.cpp
++
+ void ttsim_exit() {
++    b02_map_summary(); // B02
+     ttsim_heartbeat();
+     for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+         ttsim_select_chip(chip_id);
+diff -ru -x _out -x __pycache__ a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tile.cpp	2026-10-30 07:46:48.759526883 +0000
+@@ -5,6 +5,7 @@
+ #include "sim.h"
+ #include "topology.h"
+ #include "eth_fw_blob.h" // generated
++#include <set> // B02
+ 
+ #if TT_ARCH_VERSION == 0
+ static constexpr uint64_t PCIE_HOST_WINDOW_BASE = 0x800000000ull;
+@@ -14,6 +15,11 @@
+ static std::pair<char, uint32_t> coord_to_tile(uint32_t coord);
+ static uint32_t tile_to_coord(char tile_type, uint32_t tile_id);
+ 
++// B02 lab: which NoC coordinates get touched, and by whom. Enable with B02_MAP=1.
++bool g_b02_host;                                     // set by libttsim.cpp while it serves a host BAR access
++static uint32_t s_b02_initiator;                     // tile whose NoC command is executing (noc_cmd_ctrl)
++static uint32_t s_b02_virt = ~0u, s_b02_phys = ~0u;  // last translation done by remap_virtual_coordinate
++
+ template<char tile_type>
+ static inline auto get_tile(uint32_t tile_id) {
+     static_assert((tile_type == 'T') || (tile_type == 'E'));
+@@ -1145,6 +1151,7 @@
+ }
+ 
+ uint32_t remap_virtual_coordinate(const BaseTile *base_tile, uint32_t noc_instance, uint32_t coord) {
++    s_b02_virt = coord; // B02
+     uint32_t coord_x = coord & 63;
+     uint32_t coord_y = coord >> 6;
+ #if TT_ARCH_VERSION == 0
+@@ -1161,7 +1168,7 @@
+         coord_x = 9 - coord_x;
+         coord_y = 11 - coord_y;
+     }
+-    return coord_x | (coord_y << 6);
++    return s_b02_phys = coord_x | (coord_y << 6); // B02: remember the result
+ #elif TT_ARCH_VERSION == 1
+     TTSIM_VERIFY(coord <= 0xFFF, AssertionFailure, "coord=0x%x", coord);
+     TTSIM_VERIFY((coord_x < 32) && (coord_y < 32), UnimplementedFunctionality, "invalid virtual coordinate %d,%d", coord_x, coord_y);
+@@ -1183,7 +1190,7 @@
+     }
+     TTSIM_VERIFY((coord_x <= 16) && (coord_y <= 11), UnimplementedFunctionality, "invalid coordinate after virtualization %d,%d", coord_x, coord_y);
+ #endif
+-    return coord_x | (coord_y << 6);
++    return s_b02_phys = coord_x | (coord_y << 6); // B02: remember the result
+ }
+ 
+ static uint32_t noc_node_id(uint32_t noc_instance, uint32_t coord) {
+@@ -1397,6 +1404,7 @@
+ template<char tile_type>
+ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
+     auto *p_tile = get_tile<tile_type>(tile_id);
++    s_b02_initiator = tile_to_coord(tile_type, tile_id); // B02
+     uint32_t noc_at_len_be = p_tile->noc_at_len_be[noc_instance][cmd_buf];
+     uint32_t txn_id = bits<13,10>(p_tile->noc_packet_tag[noc_instance][cmd_buf]);
+     uint32_t noc_ctrl = p_tile->noc_ctrl[noc_instance][cmd_buf];
+@@ -2766,8 +2774,56 @@
+     }
+ }
+ 
++// B02: count accesses per (coordinate, host or device), print the first one of each, summarize at exit
++static uint64_t s_b02_counts[4096][4]; // host rd, host wr, device rd, device wr
++static std::set<uint64_t> s_b02_seen;  // (coordinate, initiator) pairs already printed
++static void b02_touch(uint32_t coord, char tile_type, uint32_t tile_id, bool write, uint64_t addr) {
++    static const bool on = getenv("B02_MAP") != nullptr;
++    if (!on) {
++        return;
++    }
++    bool host = g_b02_host;
++    s_b02_counts[coord & 0xFFF][(host ? 0 : 2) + write]++;
++    uint32_t who = host ? 0xFFFFFFFF : s_b02_initiator;
++    if (!s_b02_seen.insert((uint64_t(coord) << 32) | who).second) {
++        return;
++    }
++    char by[32], via[32] = "";
++    if (host) {
++        snprintf(by, sizeof(by), "host");
++    } else {
++        snprintf(by, sizeof(by), "(%u,%u)", who & 63, who >> 6);
++    }
++    if (s_b02_phys == coord) {
++        snprintf(via, sizeof(via), " via (%u,%u)", s_b02_virt & 63, (s_b02_virt >> 6) & 63);
++    }
++    ttsim_printf("B02 touch %c%u (%u,%u) by %s %s 0x%llx%s\n", tile_type, tile_id, coord & 63, coord >> 6, by,
++        write ? "wr" : "rd", (unsigned long long)addr, via);
++}
++
++void b02_map_summary() {
++    uint64_t total[4] = {};
++    for (uint32_t coord = 0; coord < 4096; coord++) {
++        const uint64_t *n = s_b02_counts[coord];
++        if (!(n[0] | n[1] | n[2] | n[3])) {
++            continue;
++        }
++        auto [tile_type, tile_id] = coord_to_tile(coord);
++        ttsim_printf("B02 map %c%-2u (%u,%u): host rd %llu wr %llu, device rd %llu wr %llu\n", tile_type, tile_id,
++            coord & 63, coord >> 6, (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2], (unsigned long long)n[3]);
++        for (int k = 0; k < 4; k++) {
++            total[k] += n[k];
++        }
++    }
++    if (total[0] | total[1] | total[2] | total[3]) {
++        ttsim_printf("B02 map total: host rd %llu wr %llu, device rd %llu wr %llu\n", (unsigned long long)total[0],
++            (unsigned long long)total[1], (unsigned long long)total[2], (unsigned long long)total[3]);
++    }
++}
++
+ void tile_rd_bytes(uint32_t coord, uint64_t addr, void *p, uint32_t size) {
+     auto [tile_type, tile_id] = coord_to_tile(coord);
++    b02_touch(coord, tile_type, tile_id, false, addr); // B02
+     if (tile_type == 'D') {
+ #if TT_ARCH_VERSION == 0
+         if ((addr >= DRAM_APB_BASE) && (addr <= DRAM_APB_LIMIT)) {
+@@ -2828,6 +2884,7 @@
+ 
+ void tile_wr_bytes(uint32_t coord, uint64_t addr, const void *p, uint32_t size) {
+     auto [tile_type, tile_id] = coord_to_tile(coord);
++    b02_touch(coord, tile_type, tile_id, true, addr); // B02
+     if (tile_type == 'D') {
+         TTSIM_VERIFY(addr + size <= DRAM_CHANNEL_SIZE, UndefinedBehavior, "DRAM write overrun");
+         memcpy(&g_dram[tile_id].p_mem[addr], p, size);

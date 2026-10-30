@@ -1,0 +1,94 @@
+diff -ru -x _out -x __pycache__ a/src/sim.cpp b/src/sim.cpp
+--- a/src/sim.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/sim.cpp	2026-10-30 07:46:10.543526883 +0000
+@@ -4,6 +4,7 @@
+ // Definitions of the central global simulator state and shared runtime utilities (logging, etc.).
+ #include <time.h>
+ #include <sys/mman.h>
++#include <stdlib.h> // B02: getenv
+ #include "sim.h"
+ 
+ const uint32_t g_num_chips = NUM_CHIPS;
+@@ -20,6 +21,57 @@
+     return g_clock;
+ }
+ 
++// B02 lab: print what ttsim_init just built. Enable with B02_INVENTORY=1.
++uint32_t b02_tile_to_coord(char tile_type, uint32_t tile_id); // tile.cpp
++uint32_t tensix_harvested_row_mask();                          // tile.cpp
++uint32_t tensix_harvested_column_mask();                       // tile.cpp
++static void b02_print_inventory() {
++    ttsim_printf("B02 ttsim_init: %s (TT_ARCH_VERSION %d), %u chip(s), NoC grid %ux%u\n",
++        TT_ARCH_VERSION ? "Blackhole" : "Wormhole", TT_ARCH_VERSION, g_num_chips, NUM_TILE_COLS, NUM_TILE_ROWS);
++    ttsim_printf("B02   Tensix tiles: %u, each %u RV32 harts + %u Tensix unit, %u KiB L1\n",
++        NUM_T_TILES, RV32_CORES_PER_T_TILE, TENSIX_CORES_PER_T_TILE, TENSIX_SRAM_SIZE / 1024);
++    ttsim_printf("B02   Eth tiles: %u, each %u RV32 hart(s), %u KiB L1\n", NUM_E_TILES, RV32_CORES_PER_E_TILE, ETH_SRAM_SIZE / 1024);
++    ttsim_printf("B02   DRAM: %u channels x %llu MiB, mmap'd lazily\n", NUM_DRAM_CHANNELS, DRAM_CHANNEL_SIZE >> 20);
++    uint32_t p = b02_tile_to_coord('P', 0), a = b02_tile_to_coord('A', 0);
++    ttsim_printf("B02   PCIe tile at (%u,%u), ARC tile at (%u,%u)\n", p & 63, p >> 6, a & 63, a >> 6);
++    for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
++        ttsim_select_chip(chip_id);
++        const BaseTile *b = &g_t_tiles[0].base;
++        ttsim_printf("B02 chip %u: no-broadcast cols=0x%x rows=0x%x (harvested Tensix cols=0x%x rows=0x%x)\n", chip_id,
++            b->router_cfg_1[0], b->router_cfg_3[0], tensix_harvested_column_mask(), tensix_harvested_row_mask());
++        char line[512];
++        int n = 0;
++        for (uint32_t id = 0; id < NUM_T_TILES; id++) { // the first row gives the column map
++            uint32_t c = b02_tile_to_coord('T', id), v = g_t_tiles[id].base.noc_id_logical[0];
++            if ((c >> 6) != (b02_tile_to_coord('T', 0) >> 6)) break;
++            n += snprintf(line + n, sizeof(line) - n, " %u->%u", c & 63, v & 63);
++        }
++        ttsim_printf("B02   Tensix columns, physical x -> translated x:%s\n", line);
++        for (uint32_t y = 0; y < NUM_TILE_ROWS; y++) {
++            uint32_t first = NUM_T_TILES, last = 0;
++            for (uint32_t id = 0; id < NUM_T_TILES; id++) {
++                if ((b02_tile_to_coord('T', id) >> 6) == y) { first = std::min(first, id); last = id; }
++            }
++            if (first == NUM_T_TILES) continue;
++            ttsim_printf("B02   row y=%2u: T%u..T%u, translated y=%u%s\n", y, first, last,
++                g_t_tiles[first].base.noc_id_logical[0] >> 6, ((tensix_harvested_row_mask() >> y) & 1) ? "  (harvested)" : "");
++        }
++        n = 0;
++        for (uint32_t id = 0; id < NUM_E_TILES; id++) {
++            uint32_t c = b02_tile_to_coord('E', id);
++            n += snprintf(line + n, sizeof(line) - n, " E%u(%u,%u)", id, c & 63, c >> 6);
++        }
++        ttsim_printf("B02   Eth tiles:%s\n", line);
++        uint32_t active = 0, same = 0;
++        for (uint32_t id = 0; id < NUM_T_TILES; id++) {
++            same += g_t_tiles[id].soft_reset_0 == g_t_tiles[0].soft_reset_0;
++            for (uint32_t r = 0; r < RV32_CORES_PER_T_TILE; r++) active += ttsim_rv32_get_core_active('T', id, r);
++        }
++        ttsim_printf("B02   soft_reset_0 = 0x%x on %u of %u Tensix tiles; Tensix harts running: %u of %u\n",
++            g_t_tiles[0].soft_reset_0, same, NUM_T_TILES, active, NUM_T_TILES * RV32_CORES_PER_T_TILE);
++    }
++}
++
+ void ttsim_init() {
+     for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+         ttsim_select_chip(chip_id);
+@@ -42,6 +94,9 @@
+             // XXX It might be interesting to use MADV_DONTNEED or MADV_FREE in the future to release DRAM pages if we see them cleared with all zero
+         }
+     }
++    if (getenv("B02_INVENTORY")) { // B02
++        b02_print_inventory();
++    }
+     ttsim_select_chip(0);
+ }
+ 
+diff -ru -x _out -x __pycache__ a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tile.cpp	2026-10-30 07:45:59.131526883 +0000
+@@ -720,6 +720,11 @@
+     }
+ }
+ 
++// B02 lab: let sim.cpp's inventory print use tile_to_coord
++uint32_t b02_tile_to_coord(char tile_type, uint32_t tile_id) {
++    return tile_to_coord(tile_type, tile_id);
++}
++
+ static std::pair<char, uint32_t> coord_to_tile(uint32_t coord) {
+     switch (coord) {
+ #if TT_ARCH_VERSION == 0

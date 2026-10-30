@@ -1,0 +1,133 @@
+diff -ru -x _out a/src/tensix.cpp b/src/tensix.cpp
+--- a/src/tensix.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tensix.cpp	2026-10-30 07:55:52.111526883 +0000
+@@ -7,6 +7,9 @@
+ // https://github.com/tenstorrent/tt-llk/blob/main/tt_llk_blackhole/instructions/assembly.yaml
+ 
+ #include "sim.h"
++
++void b02_reset_pc_wr(uint32_t tile_id, const char *name, uint32_t old_value, uint32_t value); // B02: tile.cpp
++
+ #include "tensix_decode.h" // generated
+ #include <algorithm>
+ 
+@@ -516,12 +519,12 @@
+                 }
+             }
+             break;
+-        case 158: p_tile->trisc0_reset_pc = data; break; // TRISC_RESET_PC_SEC0_PC
+-        case 159: p_tile->trisc1_reset_pc = data; break; // TRISC_RESET_PC_SEC1_PC
+-        case 160: p_tile->trisc2_reset_pc = data; break; // TRISC_RESET_PC_SEC2_PC
+-        case 161: p_tile->trisc_reset_pc_override = data; break; // TRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en
+-        case 162: p_tile->ncrisc_reset_pc = data; break; // NCRISC_RESET_PC_PC
+-        case 163: p_tile->ncrisc_reset_pc_override = data; break; // NCRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en
++        case 158: b02_reset_pc_wr(p_tensix->tile_id, "TRISC0_RESET_PC", p_tile->trisc0_reset_pc, data); p_tile->trisc0_reset_pc = data; break; // TRISC_RESET_PC_SEC0_PC
++        case 159: b02_reset_pc_wr(p_tensix->tile_id, "TRISC1_RESET_PC", p_tile->trisc1_reset_pc, data); p_tile->trisc1_reset_pc = data; break; // TRISC_RESET_PC_SEC1_PC
++        case 160: b02_reset_pc_wr(p_tensix->tile_id, "TRISC2_RESET_PC", p_tile->trisc2_reset_pc, data); p_tile->trisc2_reset_pc = data; break; // TRISC_RESET_PC_SEC2_PC
++        case 161: b02_reset_pc_wr(p_tensix->tile_id, "TRISC_RESET_PC_OVERRIDE", p_tile->trisc_reset_pc_override, data); p_tile->trisc_reset_pc_override = data; break; // TRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en
++        case 162: b02_reset_pc_wr(p_tensix->tile_id, "NCRISC_RESET_PC", p_tile->ncrisc_reset_pc, data); p_tile->ncrisc_reset_pc = data; break; // NCRISC_RESET_PC_PC
++        case 163: b02_reset_pc_wr(p_tensix->tile_id, "NCRISC_RESET_PC_OVERRIDE", p_tile->ncrisc_reset_pc_override, data); p_tile->ncrisc_reset_pc_override = data; break; // NCRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en
+         case 164: seed_prng(p_tensix, data); break; // PRNG_SEED_Seed_Val
+ #elif TT_ARCH_VERSION == 1
+         CFG_REG_BANKED_WR(12)
+diff -ru -x _out a/src/tile.cpp b/src/tile.cpp
+--- a/src/tile.cpp	2026-10-30 06:33:42.287526883 +0000
++++ b/src/tile.cpp	2026-10-30 07:55:03.107526883 +0000
+@@ -1061,6 +1061,25 @@
+     }
+ }
+ 
++// B02 lab: watch SOFT_RESET_0 and the reset PCs. B02_RESET=1 prints writes that start or stop a core,
++// B02_RESET=2 prints every write; B02_TILE=<id> keeps only one Tensix tile.
++static uint32_t s_b02_writer = 0xFFFFFFFF; // hart id doing the MMIO write, or 0xFFFFFFFF for host/NoC
++int b02_reset_level(uint32_t tile_id) {
++    static const char *level = getenv("B02_RESET");
++    static const char *tile = getenv("B02_TILE");
++    if (!level || (tile && uint32_t(atoi(tile)) != tile_id)) {
++        return 0;
++    }
++    return atoi(level);
++}
++
++// B02: log changes to the reset-PC registers (WH: Tensix config registers, BH: debug registers)
++void b02_reset_pc_wr(uint32_t tile_id, const char *name, uint32_t old_value, uint32_t value) {
++    if ((value != old_value) && b02_reset_level(tile_id)) {
++        ttsim_printf("B02 reset T%u cfg %s = 0x%x\n", tile_id, name, value);
++    }
++}
++
+ [[nodiscard]] static bool riscv_debug_regs_wr32(uint32_t tile_id, uint32_t tensix_id, uint32_t offset, uint32_t data) {
+     TensixTile *p_tile = &g_t_tiles[tile_id];
+     switch (offset) {
+@@ -1098,8 +1117,14 @@
+             TTSIM_VERIFY(!(data & ~0x47800), UnimplementedFunctionality, "SOFT_RESET_0=0x%x", data);
+             static const uint32_t soft_reset_bits[] = {0x800, 0x1000, 0x2000, 0x4000, 0x40000};
+             static_assert(std::size(soft_reset_bits) == RV32_CORES_PER_T_TILE);
++            static const char *const b02_names[] = {"BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"}; // B02
++            char b02_msg[256] = ""; // B02: what changed
++            int b02_n = 0;
+             for (uint32_t rv32_id = 0; rv32_id < RV32_CORES_PER_T_TILE; rv32_id++) {
+                 if (data & soft_reset_bits[rv32_id]) { // put core into reset
++                    if (ttsim_rv32_get_core_active('T', tile_id, rv32_id)) { // B02
++                        b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, " stop %s@0x%x;", b02_names[rv32_id], p_tile->rv32[rv32_id].pc);
++                    }
+                     ttsim_rv32_set_core_active('T', tile_id, rv32_id, false);
+                 } else if (!ttsim_rv32_get_core_active('T', tile_id, rv32_id)) { // take core out of reset
+                     ttsim_rv32_set_core_active('T', tile_id, rv32_id, true);
+@@ -1121,18 +1146,30 @@
+                         default: TTSIM_ERROR(AssertionFailure, "rv32_id=%d", rv32_id);
+                     }
+                     p_tile->rv32[rv32_id].pc = reset_pc;
++                    b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, " start %s@0x%x", b02_names[rv32_id], reset_pc); // B02
++                    if (reset_pc < sizeof(p_tile->sram)) { // B02: show the first instruction it will fetch
++                        b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, " [0x%08x]", mem_rd<uint32_t>(&p_tile->sram[reset_pc]));
++                    }
++                    b02_n += snprintf(b02_msg + b02_n, sizeof(b02_msg) - b02_n, ";");
+                 }
+             }
++            if (int level = b02_reset_level(tile_id); (level >= 2) || ((level == 1) && b02_n)) { // B02
++                static const char *const b02_writers[] = {"BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"};
++                uint32_t coord = tile_to_coord('T', tile_id);
++                ttsim_printf("B02 reset T%u (%u,%u) by %s: 0x%05x -> 0x%05x%s\n", tile_id, coord & 63, coord >> 6,
++                    s_b02_writer < RV32_CORES_PER_T_TILE ? b02_writers[s_b02_writer] : "host/NoC", p_tile->soft_reset_0, data,
++                    b02_n ? b02_msg : " no change");
++            }
+             p_tile->soft_reset_0 = data;
+             break;
+         }
+ #if TT_ARCH_VERSION == 1
+-        case RISCV_DEBUG_REGS_TRISC0_RESET_PC: p_tile->trisc0_reset_pc = data; break;
+-        case RISCV_DEBUG_REGS_TRISC1_RESET_PC: p_tile->trisc1_reset_pc = data; break;
+-        case RISCV_DEBUG_REGS_TRISC2_RESET_PC: p_tile->trisc2_reset_pc = data; break;
+-        case RISCV_DEBUG_REGS_TRISC_RESET_PC_OVERRIDE: p_tile->trisc_reset_pc_override = data; break;
+-        case RISCV_DEBUG_REGS_NCRISC_RESET_PC: p_tile->ncrisc_reset_pc = data; break;
+-        case RISCV_DEBUG_REGS_NCRISC_RESET_PC_OVERRIDE: p_tile->ncrisc_reset_pc_override = data; break;
++        case RISCV_DEBUG_REGS_TRISC0_RESET_PC: b02_reset_pc_wr(tile_id, "TRISC0_RESET_PC", p_tile->trisc0_reset_pc, data); p_tile->trisc0_reset_pc = data; break;
++        case RISCV_DEBUG_REGS_TRISC1_RESET_PC: b02_reset_pc_wr(tile_id, "TRISC1_RESET_PC", p_tile->trisc1_reset_pc, data); p_tile->trisc1_reset_pc = data; break;
++        case RISCV_DEBUG_REGS_TRISC2_RESET_PC: b02_reset_pc_wr(tile_id, "TRISC2_RESET_PC", p_tile->trisc2_reset_pc, data); p_tile->trisc2_reset_pc = data; break;
++        case RISCV_DEBUG_REGS_TRISC_RESET_PC_OVERRIDE: b02_reset_pc_wr(tile_id, "TRISC_RESET_PC_OVERRIDE", p_tile->trisc_reset_pc_override, data); p_tile->trisc_reset_pc_override = data; break;
++        case RISCV_DEBUG_REGS_NCRISC_RESET_PC: b02_reset_pc_wr(tile_id, "NCRISC_RESET_PC", p_tile->ncrisc_reset_pc, data); p_tile->ncrisc_reset_pc = data; break;
++        case RISCV_DEBUG_REGS_NCRISC_RESET_PC_OVERRIDE: b02_reset_pc_wr(tile_id, "NCRISC_RESET_PC_OVERRIDE", p_tile->ncrisc_reset_pc_override, data); p_tile->ncrisc_reset_pc_override = data; break;
+         case RISCV_DEBUG_REGS_DEST_CG_CTRL: break;
+         case RISCV_DEBUG_REGS_CG_CTRL_EN:
+             TTSIM_VERIFY(!(data & ~0x1FFFF), UnsupportedFunctionality, "cg_ctrl_en=0x%x", data);
+@@ -2243,6 +2280,7 @@
+             riscv_tdma_regs_wr32(tile_id, addr - RISCV_TDMA_REGS_BASE, data);
+             return true;
+         case RISCV_DEBUG_REGS_BASE ... RISCV_DEBUG_REGS_LIMIT:
++            s_b02_writer = riscv_id; // B02
+             return riscv_debug_regs_wr32(tile_id, 0, addr - RISCV_DEBUG_REGS_BASE, data);
+         case NOC0_REGS_BASE ... NOC0_REGS_LIMIT:
+             noc_regs_wr32<'T'>(tile_id, 0, addr - NOC0_REGS_BASE, data);
+@@ -2368,6 +2406,11 @@
+                 ttsim_rv32_set_core_active('E', tile_id, 0, true);
+             }
+ #endif
++            if (static const char *b02 = getenv("B02_RESET"); b02 && !getenv("B02_TILE") && ((data != p_tile->soft_reset_0) || (atoi(b02) >= 2))) { // B02
++                uint32_t coord = tile_to_coord('E', tile_id);
++                ttsim_printf("B02 reset E%u (%u,%u): 0x%05x -> 0x%05x, ERISC0 %s at 0x%x\n", tile_id, coord & 63, coord >> 6, p_tile->soft_reset_0,
++                    data, ttsim_rv32_get_core_active('E', tile_id, 0) ? "running" : "in reset", p_tile->rv32[0].pc);
++            }
+             p_tile->soft_reset_0 = data;
+             return true;
+ #if TT_ARCH_VERSION == 1
