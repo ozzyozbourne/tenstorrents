@@ -30,7 +30,7 @@ Unseeded errors by fidelity: HiFi2 1.511, HiFi3 1.505, HiFi4 1.505 (mean_abs_err
   - Without Watcher, ttsim reports `[4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match`.
   - With Watcher, tt-metal catches it first: "Watcher detected NOC error ... (invalid address alignment in NOC transaction)".
 - **Instrumented ttsim:** a `ttsim_printf` in `noc_cmd_ctrl` printed 100 NoC commands for loopback.
-- **Device profiler:** `TT_METAL_DEVICE_PROFILER=1` produces a CSV with only the header. No data, cause unknown.
+- **Device profiler:** `TT_METAL_DEVICE_PROFILER=1` gives a header-only CSV for a one-program metal example, but rows for TT-NN runs with several ops (3 `ttnn.add` calls: 3,760 rows). Likely cause (B11, more host polling after the last op recovers more rows): the firmware pushes its zones to DRAM only after signalling done, and ttsim advances only while the host polls, so the last program's zones are partly or wholly lost. Timestamps are ttsim's host-driven clock and `CHIP_FREQ[MHz]` is 0: ordering only, not time.
 - **Debugger:** gdb is not installed. `lldb-20` on the debug `.so` with `breakpoint set -n ttsim_error` gives a backtrace into `noc_cmd_ctrl<'T'>` at tile.cpp:1610. `sudo apt install gdb` is possible.
 - **Raw dlopen harness** (`workbench/harness/h.c`): reading PCI config returns 0x401e1e52 on WH and 0xb1401e52 on BH; `libttsim_clock(1000)` works.
 - **Multichip:**

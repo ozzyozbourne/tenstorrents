@@ -129,12 +129,15 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
   under ttsim, restarting pytest after each simulator abort and reporting pass/fail/skip/abort counts; sweep one op over
   shapes, dtypes, layouts and memory configs with PCC and the JIT-compiled kernel list per case (private
   `TT_METAL_CACHE` per case); and run one matmul per memory config for NoC counting under `../patches/a20-counters.patch`.
+  `b11_s0_add.py` is the 32×32 smoke test, `b11_s1_probe.py <add_fp32|sum_fp32|mm_fp32acc|trace>` runs one setup probe
+  per process, and `b11_s3_hifi.py` compares HiFi2/3/4 with FP32 accumulation (`B11_SAVE=<file>.pt` saves the outputs).
   `../patches/b11-ten3868.patch` makes ttsim skip the dummy unpack Wormhole's LLK issues after unpack-to-Dst, which
-  otherwise aborts most Wormhole ops on FP32 tensors or with `fp32_dest_acc_en`.
+  otherwise aborts many Wormhole ops on FP32 tensors or with `fp32_dest_acc_en`. It is a modelling workaround, not a ttsim
+  bug fix: ttsim's check follows the ISA. `../patches/b11-api-count.patch` counts the host's PCIe reads, writes and clock calls.
 - `py/a22_decoder_layer.py`, `py/a22_tt_transformers_block.py`, `py/a22_trace_decode_mlp.py` (chapter A22): a tiny
   Llama decoder layer from TT-NN ops (prefill + paged-KV decode, `--precision perf|bf16`, PCC vs PyTorch); the real
   `tt_transformers` `TransformerBlock` (Llama-3.2-1B config, dummy weights, one decode step; needs `PYTHONPATH=$TT_METAL_HOME`
-  and `A22_FP16_DST=1`, because Wormhole ttsim stops on kernels built with `fp32_dest_acc_en=True`, at an LLK
+  and `A22_FP16_DST=1`, because Wormhole ttsim stops on many kernels built with `fp32_dest_acc_en=True` (which ones depends on the program config; see B11), at an LLK
   hardware-workaround unpack it rejects as undefined; B08 explains it); and a traced decode MLP
   (run with `TT_METAL_SLOW_DISPATCH_MODE` unset, since trace needs fast dispatch).
 

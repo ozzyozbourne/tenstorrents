@@ -1,0 +1,48 @@
+--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
+@@ -70,6 +70,13 @@
+ static void (*s_pfn_libttsim_pci_dma_mem_rd_bytes)(uint64_t paddr, void *p, uint32_t size);
+ static void (*s_pfn_libttsim_pci_dma_mem_wr_bytes)(uint64_t paddr, const void *p, uint32_t size);
+ 
++// B11: count the host's calls into libttsim, printed at exit.
++static uint64_t b11_rd, b11_rd_bytes, b11_wr, b11_wr_bytes, b11_clk_calls, b11_clks;
++static void b11_dump() {
++    printf("B11API pci_mem_rd calls=%llu bytes=%llu  pci_mem_wr calls=%llu bytes=%llu  clock calls=%llu clocks=%llu\n",
++        (unsigned long long)b11_rd, (unsigned long long)b11_rd_bytes, (unsigned long long)b11_wr, (unsigned long long)b11_wr_bytes,
++        (unsigned long long)b11_clk_calls, (unsigned long long)b11_clks);
++}
+ extern "C" API_EXPORT void libttsim_init() {
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(!s_ttsim_running, ConfigurationError, "sim is already running");
+@@ -79,6 +86,7 @@
+ }
+ 
+ extern "C" API_EXPORT void libttsim_exit() {
++    b11_dump();
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+     ttsim_exit();
+@@ -158,6 +166,7 @@
+ // Route a host physical access to the owning MMIO device's chip, then translate within
+ // that device's BAR windows.
+ extern "C" API_EXPORT void libttsim_pci_mem_rd_bytes(uint64_t paddr, void *p, uint32_t size) {
++    b11_rd++; b11_rd_bytes += size;
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+     TTSIM_VERIFY(size, UndefinedBehavior, "size=%d", size);
+@@ -169,6 +178,7 @@
+ }
+ 
+ extern "C" API_EXPORT void libttsim_pci_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size) {
++    b11_wr++; b11_wr_bytes += size;
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+     TTSIM_VERIFY(size, UndefinedBehavior, "size=%d", size);
+@@ -300,6 +310,7 @@
+ }
+ 
+ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
++    b11_clk_calls++; b11_clks += n_clocks;
+     FpEnvGuard fpenv_guard;
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+     uint32_t saved_chip_id = g_current_chip_id;

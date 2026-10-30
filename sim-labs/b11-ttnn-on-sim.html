@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B11 · TT-NN on the simulator · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border: 1px solid var(--orange); background: var(--bg2); border-radius: 8px; padding: .7rem 1rem; margin: 1rem 0 1.5rem; }
+  .honesty b { color: var(--orange); }
+  .out { border-color: #3a4a2a; }
+  .modebar { display: flex; flex-wrap: wrap; gap: .5rem; padding: .6rem .8rem; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .modebar span { color: var(--muted); align-self: center; margin-right: .3rem; }
+  .modebar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: .3rem .7rem; cursor: pointer; font: inherit; }
+  .modebar button.on { background: var(--blue); color: #000; border-color: var(--blue); }
+  .readout { padding: .5rem .9rem; font-family: ui-monospace, monospace; font-size: 13px; color: var(--muted); background: var(--bg2); border-top: 1px solid var(--border); min-height: 3.2em; white-space: pre-wrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a19-op-anatomy-compilers.html">&larr; Prev</a>
+  <a href="../index.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B11</span><span class="tag">Prerequisites: A09, A18, A19, B00 (B05 and A20 help)</span>
+  <h1><span class="num">B11.</span> TT-NN on the simulator</h1>
+  <p class="subtitle">Use ttsim as a test bench for an operator library: run tt-metal's own TT-NN pytest suite on it, sweep an op over every dtype, layout and memory config, count the NoC bytes each memory config costs, and track one failure down to a single instruction.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <em>functional, bit-exact</em> simulator. It is <em>not a timing model</em>. Nothing on this page measures speed: bracketed clock counts and wall times describe the simulator on this orb's CPU, not a Tenstorrent chip. What this lab measures is <em>whether</em> an op runs, <em>what values</em> it produces, <em>which kernels</em> it compiles and <em>how many bytes</em> its kernels move. "Passes on ttsim" means "passes on ttsim". ttsim's authors aim to match silicon; I have no silicon in this orb, and section 5 shows two places where the documents say silicon behaves differently. Everything below ran in this orb with tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code> (v1.15.0), on the Wormhole build unless the text says Blackhole.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">Setup: what has to be true for <code>import ttnn</code> to reach the simulator</a></li>
+      <li><a href="#pytest">Step 1: Run tt-metal's own TT-NN tests</a></li>
+      <li><a href="#abort">Step 2: One abort, down to the instruction</a></li>
+      <li><a href="#explore">Step 3: An op explorer</a></li>
+      <li><a href="#traffic">Step 4: Count the bytes of each memory config</a></li>
+      <li><a href="#differs">Step 5: Where ttsim and the documents disagree</a></li>
+      <li><a href="#exercises">Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="../chapters/a18-ttnn-user.html">A18</a> you used TT-NN as a user and in <a href="../chapters/a19-op-anatomy-compilers.html">A19</a> you took one op apart. Both chapters ran their scripts on ttsim, one script at a time. This last lab turns the question around. Suppose you change a kernel, or write a new op, or just want to know whether a configuration is legal. You have no Tenstorrent card. Tt-metal ships thousands of TT-NN tests. So:</p>
+  <p><b>Can a simulator be your test bench? If 117 matmul tests run on it and 20 of them crash the process, what have you learned about your code, about the simulator, and about the chip?</b></p>
+  <p>The answer, worked out over five steps, is "a lot, if you read the failures". By the end you will have a pytest driver that survives simulator crashes, an explorer that tells you which kernels each configuration compiles, exact NoC byte counts for four memory configs of one matmul, and an eight-line simulator patch. That patch turns every Wormhole FP32 crash in our slice of tests into a pass (or a failure the test itself expects). Why it works is the most interesting part.</p>
+
+  <h2 id="setup">Setup: what has to be true for <code>import ttnn</code> to reach the simulator</h2>
+  <p>Nothing about TT-NN is simulator-specific. The Python package is the one built with tt-metal, and the switch is one environment variable read deep in the runtime:</p>
+  <div class="filename">tt-metal/tt_metal/llrt/rtoptions.cpp:523-531 @7aad8aac (trimmed)</div>
+<pre><code>// TT_METAL_SIMULATOR
+// Path to simulator executable. When set, overrides mock cluster mode if both are set.
+case EnvVarID::TT_METAL_SIMULATOR:
+    this-&gt;simulator_path = std::string(value);
+    // Simulator takes precedence over Mock (will be set even if Mock was set first)
+    this-&gt;runtime_target_device_ = tt::TargetDevice::Simulator;
+    break;</code></pre>
+  <p>So the setup is the workbench from <a href="b00-workbench.html">B00</a> plus tt-metal's Python environment:</p>
+<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+P=$W/../patches                                      # the series' ttsim patches
+export LAB_HOME=$HOME/ttlab/b11
+source $W/env.sh wh                                  # or bh
+source $TT_METAL_HOME/python_env/bin/activate        # Python 3.11, ttnn, torch, pytest
+export TT_METAL_INSPECTOR=0                          # several runs share the orb: avoid the inspector's port clash
+export TT_METAL_CACHE=$LAB_HOME/jit                  # a private JIT cache you can list (section 3)</code></pre>
+  <table>
+    <tr><th>Variable</th><th>Why it is needed for TT-NN</th></tr>
+    <tr><td><code>TT_METAL_SIMULATOR</code></td><td>Path to <code>libttsim.so</code>. A <code>soc_descriptor.yaml</code> must sit next to it (B00), or the run aborts with <code>YAML::BadFile</code>.</td></tr>
+    <tr><td><code>TT_METAL_SLOW_DISPATCH_MODE=1</code></td><td>ttsim's recommended mode. It also changes which tests run: tests marked <code>skip_for_slow_dispatch</code> skip, and trace is refused (below).</td></tr>
+    <tr><td><code>TT_METAL_DISABLE_SFPLOADMACRO=1</code></td><td>SFPLOADMACRO is <code>UnsupportedFunctionality</code> in ttsim; this makes the SFPU kernels avoid it.</td></tr>
+    <tr><td><code>TT_METAL_RUNTIME_ROOT</code></td><td>Firmware and stock kernels. Without it: <code>TT_FATAL: Root Directory is not set.</code></td></tr>
+    <tr><td>cwd = <code>$LAB_HOME/run</code></td><td>Kernels are looked up in the cwd first, so never run from <code>$TT_METAL_HOME</code>. Pytest is no exception: give it absolute test paths from <code>$LAB_HOME/run</code>, and it still finds tt-metal's <code>pytest.ini</code> and <code>conftest.py</code> from those paths.</td></tr>
+  </table>
+  <p>A 32×32 add is the smoke test:</p>
+<pre><code>python $W/py/b11_s0_add.py        # open_device, two from_torch, ttnn.add, to_torch, close</code></pre>
+<pre class="out"><code>grid 8-8 arch Arch.WORMHOLE_B0
+max abs diff vs torch: 0.015625
+... BuildKernels | JIT cache stats: 13/13 hits (100.0%) ...
+[4881] 3.1 seconds (1.6 KHz)</code></pre>
+  <p>Two details are worth noticing. The worker grid is 8×8 = 64 cores, the compute grid tt-metal's core descriptor gives this simulated chip (A18 used the same grid). And the run ends at clock 4,881 every time. The whole run took 2.5 s of wall time with a warm cache and 7.2 s with an empty private cache.</p>
+
+  <h3>What happens under <code>ttnn.add</code></h3>
+  <p>To see what "the simulator runs TT-NN" means, I added call counters to ttsim's exported API (<code>patches/b11-api-count.patch</code>, 11 added lines in <code>src/libttsim.cpp</code>) and ran the same script. Its first line is an all-zero <code>B11API</code> line at clock 0, from a short-lived simulator instance that tt-metal opens and closes during start-up; I omit it:</p>
+<pre class="out"><code>B11API pci_mem_rd calls=4919 bytes=21824  pci_mem_wr calls=23551 bytes=722884  clock calls=4881 clocks=4881
+[4881] 3.4 seconds (1.4 KHz)</code></pre>
+  <p>The run is identical on a second run. Every byte of tensor data, kernel binary and runtime argument reached the chip as one of 23,551 PCIe writes into the simulated BAR windows. And the simulated chip advanced exactly 4,881 clocks, one per call. Those clocks come from the host, not from a clock of ttsim's own. UMD's simulator device ticks the chip after every read:</p>
+  <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/tt_device/tt_sim_tt_device.cpp:334-338 @7aad8aac</div>
+<pre><code>void TTSimTTDevice::after_read() {
+    // Ideally we would not auto-clock on reads at all, but some clocking is required to avoid hangs
+    // in the absence of an API reliably called from all spin loops polling the device.
+    communicator_-&gt;advance_clock(1);
+}</code></pre>
+  <p>So the chip only moves while the host polls it. That is why the clock count is not performance: it counts how often the host looked. The figure follows one call down the stack.</p>
+
+  <div class="viz" id="fig-stack"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-stack");
+    var g = TT.canvas(root, 860, 440), ctx = g.ctx, C = TT.C;
+    var L = [
+      { n: "Python", d: "ttnn.add(ta, tb)", c: C.yellow },
+      { n: "TT-NN (C++)", d: "device op, program factory, program cache, JIT", c: C.orange },
+      { n: "TT-Metalium", d: "slow dispatch: write binaries + args into L1, poll", c: C.blue },
+      { n: "UMD", d: "TTSimTTDevice: core/addr \u2192 TLB window \u2192 PCIe address", c: C.purple },
+      { n: "libttsim.so", d: "libttsim_pci_mem_wr/rd_bytes, libttsim_clock", c: C.teal },
+      { n: "simulated chip", d: "64 Tensix cores, DRAM, NoC: run when clocked", c: C.green }
+    ];
+    var X = 30, Wd = 470, Y0 = 22, H = 52, G = 14;
+    function ly(i) { return Y0 + i * (H + G); }
+    var steps = [
+      { dur: 1.2, text: "<b>1. Python.</b> <code>ttnn.add(ta, tb)</code> is an ordinary call into the <code>ttnn</code> extension module. Nothing in it knows about the simulator." },
+      { dur: 1.4, text: "<b>2. TT-NN.</b> The op validates its inputs, picks a program factory (here binary_ng) and looks in the program cache. On a miss, the three kernels are JIT-compiled with the RISC-V compiler and written to <code>TT_METAL_CACHE</code> (A19)." },
+      { dur: 1.4, text: "<b>3. TT-Metalium, slow dispatch.</b> No command queue and no dispatch firmware: the host writes kernel binaries, runtime arguments, CB configuration and the go message directly into each core's L1 (A17)." },
+      { dur: 1.8, text: "<b>4. UMD.</b> Each write to (core, address) goes through a TLB window and becomes a host physical address. For ttsim the 'PCIe' is a function call: <code>libttsim_pci_mem_wr_bytes</code>. This run made <b>23,551</b> such writes, 722,884 bytes." },
+      { dur: 1.6, text: "<b>5. libttsim.so.</b> The simulator decodes the address, finds the tile and writes its L1 (or DRAM). Kernels, data and the go signal are now in place, but nothing has executed yet." },
+      { dur: 2.4, text: "<b>6. Polling.</b> The host waits for 'done' by reading a mailbox. After each device read, UMD calls <code>libttsim_clock(1)</code>, and only then do the cores execute one clock. This run made 4,919 PCIe reads and <b>4,881</b> one-clock calls; 4,881 is the clock printed at exit." },
+      { dur: 1.4, text: "<b>7. Back up.</b> The result is read back over the same path and <code>to_torch</code> returns. Same inputs, same 4,881 clocks, every run." },
+      { dur: 1.8, text: "<b>8. The failure path.</b> If a core executes something ttsim does not support, <code>ttsim_error</code> prints <code>[clock] ERROR: ...</code> and calls <code>_Exit(1)</code> inside the call in step 4 or 6. There is no exception to catch: Python, and pytest with it, simply stop. Section 1 has to deal with that." }
+    ];
+    var token = [0, 1, 2, 3, 4, 5, 5, 0];
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      for (var k = 0; k < L.length; k++) {
+        var on = (k === token[i]) || (i === 5 && k >= 3) || (i === 7 && k >= 4);
+        TT.box(ctx, X, ly(k), Wd, H, { fill: L[k].c, alpha: on ? 0.32 : 0.10, stroke: L[k].c, lw: on ? 2.5 : 1 });
+        TT.text(ctx, L[k].n, X + 14, ly(k) + 18, { font: "bold 14px", color: L[k].c });
+        TT.text(ctx, L[k].d, X + 14, ly(k) + 37, { font: "12px", color: C.fg, mono: true });
+      }
+      // token
+      var from = i > 0 ? token[i - 1] : 0, to = token[i];
+      var yy = TT.lerp(ly(from) + H / 2, ly(to) + H / 2, t);
+      if (i === 7) yy = TT.lerp(ly(4) + H / 2, ly(0) + H / 2, t);
+      ctx.beginPath(); ctx.arc(X + Wd - 26, yy, 9, 0, 7);
+      ctx.fillStyle = i === 7 ? C.red : C.yellow; ctx.fill();
+      // counters panel
+      var px = 530, pw = 310;
+      TT.box(ctx, px, ly(0), pw, ly(5) + H - ly(0), { stroke: C.border, fill: C.bg2, alpha: 1 });
+      TT.text(ctx, "measured: one 32\u00d732 add", px + 12, ly(0) + 20, { font: "bold 13px", color: C.muted });
+      var wr = i < 3 ? 0 : (i === 3 ? Math.round(TT.lerp(0, 23551, t)) : 23551);
+      var rd = i < 5 ? 0 : (i === 5 ? Math.round(TT.lerp(0, 4919, t)) : 4919);
+      var ck = i < 5 ? 0 : (i === 5 ? Math.round(TT.lerp(0, 4881, t)) : 4881);
+      var rows = [["pci_mem_wr calls", wr, C.purple], ["pci_mem_rd calls", rd, C.purple], ["libttsim_clock(1) calls", ck, C.teal]];
+      for (var r = 0; r < rows.length; r++) {
+        var yr = ly(0) + 56 + r * 46;
+        TT.text(ctx, rows[r][0], px + 12, yr, { font: "13px", mono: true });
+        TT.text(ctx, rows[r][1].toLocaleString("en-US"), px + pw - 14, yr, { font: "bold 16px", mono: true, color: rows[r][2], align: "right" });
+        ctx.fillStyle = rows[r][2]; ctx.globalAlpha = 0.5;
+        ctx.fillRect(px + 12, yr + 12, (pw - 24) * rows[r][1] / 23551, 6); ctx.globalAlpha = 1;
+      }
+      // chip grid
+      var gx = px + 40, gy = ly(4) - 4, s = 13;
+      for (var cy = 0; cy < 8; cy++) for (var cx = 0; cx < 8; cx++) {
+        var lit = (i >= 4 && i <= 6) ? (i === 5 ? ((cx + cy * 8 + Math.floor(t * 40)) % 7 === 0 ? 0.9 : 0.35) : 0.35) : 0.12;
+        if (i === 7 && cx === 3 && cy === 2) { ctx.fillStyle = C.red; ctx.globalAlpha = 1; }
+        else { ctx.fillStyle = C.green; ctx.globalAlpha = lit; }
+        ctx.fillRect(gx + cx * (s + 3), gy + cy * (s + 3) - 40, s, s);
+      }
+      ctx.globalAlpha = 1;
+      TT.text(ctx, "8\u00d78 worker grid", gx + 140, gy + 20, { font: "12px", color: C.muted });
+      if (i === 7) TT.text(ctx, "_Exit(1)", gx + 140, gy - 10, { font: "bold 15px", mono: true, color: C.red });
+    } });
+  })();
+  </script>
+
+  <h3>What works and what does not</h3>
+  <p>A18 listed what worked for its scripts. Here are the claims I needed for this lab, each checked with a one-case probe script (<code>workbench/py/b11_s1_probe.py</code>; one case per process, because a ttsim error ends the process):</p>
+  <table>
+    <tr><th>Feature (Wormhole, stock ttsim)</th><th>Result in this orb</th></tr>
+    <tr><td>bf16 / bfp8 add, matmul, sharded and interleaved, TILE and ROW_MAJOR</td><td>works (section 3)</td></tr>
+    <tr><td><code>ttnn.add</code> on two <code>float32</code> tensors</td><td><b>aborts</b>: <code>[4716] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></td></tr>
+    <tr><td><code>ttnn.sum</code> of a <code>float32</code> tensor</td><td><b>aborts</b>: same message, at clock 4767</td></tr>
+    <tr><td>matmul with <code>fp32_dest_acc_en=True</code> (A18's finding)</td><td><b>aborts</b>: <code>[4634] ERROR: UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code></td></tr>
+    <tr><td>All three FP32 cases on the <b>Blackhole</b> build</td><td>work; the FP32 add is bit-identical to torch</td></tr>
+    <tr><td>Trace, slow dispatch</td><td>refused: <code>TT_THROW: Not supported for slow dispatch</code> from <code>sd_mesh_command_queue.cpp:488</code></td></tr>
+    <tr><td>Trace, fast dispatch (<code>env -u TT_METAL_SLOW_DISPATCH_MODE</code>)</td><td>works: capture + replay of a relu, PCC 0.999998, 5.5 s</td></tr>
+    <tr><td>Device profiler, <code>TT_METAL_DEVICE_PROFILER=1</code></td><td>writes zones for every program except the last, which is partly or wholly lost (so a one-program run gives only the header); timestamps are simulated clocks; see section 5</td></tr>
+  </table>
+  <div class="callout warn">The FP32 rows matter more than they look. TT-NN routes FP32 tensors and <code>fp32_dest_acc_en</code> through one particular unpacker path. On Wormhole, that path crashes stock ttsim in many ops, as section 1 shows. The cause (section 2) is not a bug in the op you are testing.</div>
+
+  <h2 id="pytest">Step 1: Run tt-metal's own TT-NN tests</h2>
+  <p>The TT-NN unit tests live in <code>tests/ttnn/unit_tests/</code> and use a <code>device</code> fixture from tt-metal's root <code>conftest.py</code>, which calls <code>ttnn.CreateDevice</code> (<code>conftest.py:432-479</code>). Nothing in the fixture checks for hardware, so with the environment above they run on ttsim unchanged. Collection is cheap and shows the scale:</p>
+<pre><code>T=$TT_METAL_HOME/tests/ttnn/unit_tests/operations
+pytest -p no:cacheprovider -o addopts= --import-mode=importlib --collect-only -q $T/matmul/test_matmul.py | tail -1</code></pre>
+  <table>
+    <tr><th>File</th><th class="num">tests collected</th></tr>
+    <tr><td><code>eltwise/test_add.py</code></td><td class="num">102</td></tr>
+    <tr><td><code>eltwise/test_activation.py</code></td><td class="num">39</td></tr>
+    <tr><td><code>reduce/test_sum.py</code></td><td class="num">408</td></tr>
+    <tr><td><code>data_movement/test_concat.py</code></td><td class="num">498</td></tr>
+    <tr><td><code>eltwise/test_unary.py</code></td><td class="num">763</td></tr>
+    <tr><td><code>matmul/test_matmul.py</code></td><td class="num">1,260</td></tr>
+  </table>
+  <p>The flags matter. <code>-o addopts=</code> drops the repository's <code>pytest.ini</code> defaults (<code>-vvs</code>, a JUnit file under <code>generated/</code> in the cwd, and <code>--durations</code>). <code>-p no:cacheprovider</code> keeps pytest from writing <code>.pytest_cache</code> into the tt-metal tree.</p>
+  <p>The first file, whole:</p>
+<pre><code>pytest -p no:cacheprovider -o addopts= --import-mode=importlib -q -rfEs --durations=5 $T/eltwise/test_add.py</code></pre>
+<pre class="out"><code>........................................................................ [ 70%]
+.........ssssssssssssssss.....                                           [100%]
+============================= slowest 5 durations ==============================
+3.44s call     .../test_add.py::test_add_dram_and_l1_tensor[shape_b=(1, 4096)-shape_a=(4096, 4096)]
+2.60s call     .../test_add.py::test_add_attention_scores_to_scalar[scalar=0.125-shape=(8, 16, 384, 384)]
+1.81s call     .../test_add.py::test_non_4D_channel_bcast[shapes=[[13600, 1, 4], [1, 9, 4]]]
+...
+SKIPPED [16] .../eltwise/test_add.py:341: Skipping unsupported case: not working for slow dispatch
+86 passed, 16 skipped in 44.14s</code></pre>
+  <p>86 passed in 44 s, including a 4096×4096 add (16 M elements) in 3.4 s. The 16 skips are <code>test_add_with_sub_devices</code>, marked <code>@skip_for_slow_dispatch()</code>. That decorator only reads <code>TT_METAL_SLOW_DISPATCH_MODE == "1"</code> (<code>tt_py_test_utils_common/utility_functions.py:878-879, 928-929</code>), so unset the variable and they run, on ttsim, in fast dispatch:</p>
+<pre><code>env -u TT_METAL_SLOW_DISPATCH_MODE pytest ... $T/eltwise/test_add.py -k "sub_devices"</code></pre>
+<pre class="out"><code>16 passed, 86 deselected in 26.93s
+[1797441] 28.6 seconds (62.8 KHz)</code></pre>
+
+  <h3>Selecting tests</h3>
+  <p><code>-k</code> takes a boolean expression over substrings of the test names: <code>-k "sub_devices"</code>, <code>-k "test_sum_global and not FLOAT32"</code>, <code>-k "matched_width_height or transpose_a_or_b"</code>. It does not accept arbitrary parameter ids. My first try failed in pytest's expression parser before any test ran:</p>
+<pre class="out"><code>ERROR: Wrong expression passed to '-k': sub_devices and ROW_MAJOR and out_sharded=True-input_b_sharded=True-input_a_sharded=True: at column 42: expected end of input; got =</code></pre>
+  <p>For one exact case, pass its node id (<code>"path::test_name[param-id]"</code>) as an argument, or use <code>--deselect</code> with the node id to drop one. Use <code>--collect-only -q</code> first to see the ids. Then count the cost. The ops themselves are cheap: about 0.4 s per bf16 add test above, and 92 s for 117 matmul tests. At that rate the full 1,260-test matmul file is a matter of tens of minutes, not hours. What is genuinely expensive is a crash, because of how ttsim reports errors:</p>
+  <div class="filename">ttsim/src/common.cpp:33-45 @b3620244 (trimmed)</div>
+<pre><code>void ttsim_error(TTSimErrorCategory category, const char *func, const char *fmt, ...) {
+    uint64_t clock = ttsim_get_clock();
+    printf("[%" PRId64 "] ERROR: %s: %s%s", clock, category_str, func, fmt ? ": " : "\n");
+    ...
+    fflush(stdout);
+    _Exit(1);
+}</code></pre>
+  <p><code>_Exit(1)</code> skips every handler. Pytest gets no chance to record a failure or to write its summary. Running <code>reduce/test_sum.py -k test_sum_global</code> plainly gives one line of progress, then <code>[4767] ERROR: UndefinedBehavior: tensix_unpacr: ...</code> and exit code 1, after the first of 96 tests. So I wrote a driver, <code>workbench/py/b11_pytest.py</code>. It collects the node ids, runs pytest with <code>-v -s</code> so that each test's id is printed before it starts, and records each outcome. When pytest dies, the test that was running is the one that killed it. The driver records it with the last ttsim <code>ERROR</code> line, then restarts pytest with every passed and aborted test deselected:</p>
+<pre><code>python -I $W/py/b11_pytest.py $T/eltwise/test_activation.py</code></pre>
+<pre class="out"><code>collected 39 tests
+ABORT tests/ttnn/unit_tests/operations/eltwise/test_activation.py::test_scalarB_celu[torch_dtype=torch.float32-ttnn_dtype=DataType.FLOAT32-w=128-h=64-alpha=1]
+      UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0
+...
+pytest runs: 17
+counts: PASSED=21 SKIPPED=2 ABORTED=16
+  SKIPPED [2] tests/ttnn/unit_tests/operations/eltwise/test_activation.py:167: alpha=0 is not supported
+   16 x ABORT UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
+  <p>Seventeen pytest processes for 39 tests: each abort costs a full restart. Here is the slice I ran, on stock Wormhole ttsim, and again on the patched ttsim of section 2:</p>
+  <table>
+    <tr><th>Selection</th><th class="num">tests</th><th>stock ttsim (WH)</th><th>ttsim + <code>b11-ten3868.patch</code> (WH)</th></tr>
+    <tr><td><code>eltwise/test_add.py</code></td><td class="num">102</td><td>86 pass, 16 skip (slow dispatch); 1 run</td><td>86 pass, 16 skip; 1 run</td></tr>
+    <tr><td><code>eltwise/test_activation.py</code></td><td class="num">39</td><td>21 pass, 2 skip, <b>16 abort</b>; 17 runs, 62–71 s</td><td>37 pass, 2 skip; 1 run, 10 s</td></tr>
+    <tr><td><code>matmul/test_matmul.py -k "matched_width_height or transpose_a_or_b or test_matmul_padding or test_sharded_matmul or fp32_crossblock or tiny_tiles_bfloat"</code></td><td class="num">117</td><td>81 pass, 16 skip, <b>20 abort</b> (12 × <code>cfg_context_id=1</code>, 8 × <code>unpack_to_dst=0 ...</code>); 21 runs, 3 min 54 s</td><td>99 pass, 16 skip, 2 xfail; 1 run, 1 min 32 s</td></tr>
+    <tr><td><code>reduce/test_sum.py -k test_sum_global</code></td><td class="num">96</td><td>34 pass, <b>62 abort</b>; 63 runs, 5 min 8 s</td><td>96 pass; 1 run, 35 s</td></tr>
+    <tr><td>same, Blackhole build, stock</td><td class="num">96</td><td colspan="2">96 pass; 1 run, 1 min 38 s</td></tr>
+  </table>
+  <p>Zero ordinary failures. Every non-pass on stock ttsim was a simulator abort, and each abort message was one of two strings. The skip reasons were the slow-dispatch one, <code>alpha=0 is not supported</code> (a test-level skip), and, for 16 matmul tiny-tile cases, <code>transpose tile does not support tile height less than 16</code> (<code>test_matmul.py:120</code>). The aborted tests were not random. In <code>test_activation.py</code> all 16 were the <code>float32</code> parametrizations. In <code>test_sum_global</code> the 62 were all 32 FLOAT32 cases plus 30 of the 32 BFLOAT16 cases; only the single-tile bf16 cases (h = 32, w = 32 or 31, batch 1) and all 32 BFLOAT8_B cases passed. In the matmul slice they were <code>test_matmul_padding</code> and <code>test_matmul_fp32_crossblock_reload_*</code>. Blackhole passed everything. The pattern points at FP32 data on Wormhole, so that is where we dig.</p>
+  <div class="callout key">On a simulator, a red test can mean three different things: your op is wrong (a FAILED with a PCC message), the test does not apply here (a SKIP), or the simulator refused an instruction (an abort with a ttsim category). Only the first is about your code. Always read the category before you read the test.</div>
+
+  <h2 id="abort">Step 2: One abort, down to the instruction</h2>
+  <p>The two messages name the same instruction, <code>UNPACR</code>, the unpacker's "move datums from L1 into SrcA, SrcB or Dst" (A04, A12). Here are the two checks in ttsim:</p>
+  <div class="filename">ttsim/src/tensix.cpp:3153, 3165, 3455-3459 @b3620244</div>
+<pre><code>TENSIX_EXECUTE_UNPACR() {
+    ...
+    TTSIM_VERIFY(!cfg_context_id, UnsupportedFunctionality, "cfg_context_id=%d", cfg_context_id);
+    ...
+        } else if (in_data_format == 0) { // fp32
+            if (out_data_format == 0) { // fp32
+                TTSIM_VERIFY(unpack_to_dst, UndefinedBehavior, "unpack_to_dst=%d in_data_format=%d out_data_format=%d",
+                    unpack_to_dst, in_data_format, out_data_format);
+                value = dst_encode_fp32(value);</code></pre>
+  <p>The first message is an UNPACR that names configuration context 1 in its <code>CfgContextId</code> field. The second is an FP32 → FP32 unpack that is <em>not</em> going to Dst, so it is going to SrcA. That second one is exactly what the ISA leaves undefined. SrcA cells are 19 bits wide, so FP32 can reach SrcA only as TF32, BF16 or FP16 (<code>Unpackers/FormatConversion.md:29</code>). The functional model makes it explicit:</p>
+  <div class="filename">tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/UNPACR_Regular.md:641-647 @be83310 (trimmed)</div>
+<pre><code>  // FP32/INT32 with !UnpackToDst is intentionally UndefinedBehavior. SrcA/SrcB datum slots are 19 bits;
+  // storing a 32-bit datum requires lossy conversion to a 16-bit or 19-bit storage format (TF32, FP16,
+  // BF16, etc.). Software wanting full-precision FP32/INT32 should use UnpackToDst instead. Silicon
+  // behavior in this case is not merely an UnpredictableValue(); the exact behavior has not been
+  // validated and must not be relied upon by software.
+  case FP32:  return UnpackToDst ? DstEncodeFP32(DatumBits) : UndefinedBehavior();</code></pre>
+  <p>So ttsim is following the spec. The question becomes: who issues this UNPACR? The JIT descriptor of the aborted FP32 add (in the private cache, <code>kernels/eltwise_binary_sfpu_no_bcast/*/chlkc_descriptors.h</code>) shows that the operands do not go to SrcA. <code>unpack_src_format = {0,0,...}</code> and <code>DST_ACCUM_MODE = true</code>: both inputs are FP32 and are unpacked straight into a 32-bit Dst, because the SFPU does the add. Something else is unpacking to SrcA.</p>
+  <p>To find out what, I made ttsim say more. An editable copy (<code>build_ttsim.sh why wh</code>, with a few extra arguments added by hand to the two messages; this edit is not shipped as a patch) prints the unpacker, the context, both <code>Unpack_if_sel</code> bits, and how many unpack-to-Dst UNPACRs came first:</p>
+<pre class="out"><code>[4716] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0 unpacker=0 (B11: 0=SrcA/Dst, 1=SrcB) context=0 if_sel_cntx0=0 if_sel_cntx1=0 earlier_to_dst_unpacrs=4
+[4634] ERROR: UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1 (B11: unpacker=0 zero_write2=1 set_dat_valid=0)</code></pre>
+  <p>The bad UNPACR comes after four unpack-to-Dst UNPACRs had already run, and after <code>Unpack_if_sel</code> has been switched back to "not Dst". It has <code>zero_write2=1</code> (the ISA's <code>AllDatumsAreZero</code>) and no dvalid. That is a deliberate dummy, and the Wormhole LLK says why:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cunpack_common.h:963, 969-985 @7aad8aac (trimmed)</div>
+<pre><code>inline void unpack_to_dest_tile_done(std::uint32_t &amp;context_id, const std::uint32_t unpack_dst_format)
+{
+    ...
+    if (context_id == 0)
+    {
+        cfg_reg_rmw_tensix&lt;THCON_SEC0_REG2_Unpack_if_sel_cntx0_RMW&gt;(0);
+        ...
+    // Due to a hardware bug (TEN-3868), we need to have one unpack-to-srcA instruction after the last unpack-to-dest instruction.
+    TTI_SETADCXX(p_setadc::UNP_A, FACE_C_DIM - 1, 0x0);
+    TT_UNPACR(SrcA, 0, 0, context_id, 0, 1 /* Set OvrdThreadId*/, 0 /*Set Dvalid*/, p_unpacr::RAREFYB_DISABLE, 1, 0, 0, 0, 1);
+    TTI_SETADCXX(p_setadc::UNP_A, FACE_R_DIM * FACE_C_DIM - 1, 0x0);
+}</code></pre>
+  <p>Read the <code>TT_UNPACR</code> arguments against the macro in <code>ckernel_ops.h:833-851</code>: unpacker A, address mode 0, <code>CfgContextId = context_id</code>, OvrdThreadId 1, SetDatValid 0, <b>ZeroWrite2 = 1</b>. That one instruction explains both messages:</p>
+  <ul>
+    <li>In context 0 the instruction still sees the tile's FP32 formats, with unpack-to-Dst now switched off: FP32 → FP32 into SrcA, <b>UndefinedBehavior</b>.</li>
+    <li>In context 1 (the unpacker LLK uses two configuration contexts) it carries <code>CfgContextId = 1</code>, which ttsim does not support at all: <b>cfg_context_id=1</b>. That is A18's matmul crash.</li>
+  </ul>
+  <p>Blackhole's version of <code>unpack_to_dest_tile_done</code> (<code>tt_llk_blackhole/common/inc/cunpack_common.h:976-993</code>) has no dummy unpack. That is why the Blackhole build passed every FP32 case.</p>
+  <h3>The patch</h3>
+  <p>On silicon this instruction exists to work around a hardware bug, and nothing reads what it writes: it sets no dvalid, so the FPU never consumes SrcA. I first tried to "execute it properly". That took three rounds: tolerate FP32 into SrcA, then implement <code>zero_write2</code> (ttsim reports it as <code>UntestedFunctionality</code>), then drop its writes past SrcA's 64 rows (<code>UnsupportedFunctionality: tensix_unpacr: src_a row=64</code>). Each round only uncovered the next unmodelled corner, so in the end I treated the dummy as the no-op it is meant to be:</p>
+  <div class="filename">sim-labs/patches/b11-ten3868.patch (against ttsim/src/tensix.cpp @b3620244)</div>
+<pre><code> TENSIX_EXECUTE_UNPACR() {
++#if TT_ARCH_VERSION == 0
++    // B11: Wormhole's LLK follows every unpack-to-Dst tile with one dummy UNPACR to SrcA (hardware bug
++    // TEN-3868): all-zero datums, no dvalid, no address increment, in the tile's config context.
++    // Nothing reads what it writes, so treat it as a no-op instead of checking its (FP32) formats.
++    if (zero_write2 &amp;&amp; !set_dat_valid &amp;&amp; !unpack_block_selection &amp;&amp; !addr_mode) {
++        return true;
++    }
++#endif</code></pre>
+<pre><code>$W/build_ttsim.sh ten3868 wh &amp;&amp; (cd $LAB_HOME/ttsim-ten3868 &amp;&amp; patch -p1 &lt; $P/b11-ten3868.patch) &amp;&amp; $W/build_ttsim.sh ten3868 wh
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-ten3868-wh-release/libttsim.so
+for c in add_fp32 sum_fp32 mm_fp32acc; do python $W/py/b11_s1_probe.py $c; done</code></pre>
+<pre class="out"><code>add_fp32 max|err| 0.0 bit-identical True
+sum 32.93839645385742 torch 32.93839645385742
+PCC 0.9999958038338154</code></pre>
+  <p>The table in section 1 has the effect: every one of the 98 aborts in the slice became a pass (or, for two matmul cases, an expected failure the test itself marks <code>xfail</code>). Two controls show the patch changed nothing else. <code>test_add.py</code> gave the same 86/16, and in the 54-case explorer of the next section, all 46 cases that did not abort had the same status, PCC and max error, to the last digit, with and without the patch.</p>
+  <div class="callout warn">This patch is a modelling decision, not a fix you can upstream as-is. It assumes the dummy unpack's side effects are invisible. That is what the LLK comment implies, but nothing here verifies it. A ttsim that executed the instruction exactly would need the TEN-3868 hardware behaviour itself, which is not public. Use the patched simulator to test your FP32 op's <em>values</em>. Do not use it to argue about the unpacker.</div>
+
+  <h2 id="explore">Step 3: An op explorer</h2>
+  <p>A pytest file tells you whether someone else's chosen cases pass. When you are designing, you want the whole space: every dtype × layout × memory config of one op, with an accuracy number for each, and for each one, which kernels actually ran. <code>workbench/py/b11_explore.py</code> does that. Each case runs in its own process (aborts again). Each process gets a private <code>TT_METAL_CACHE</code>. That cache starts with only firmware and precompiled headers, hard-linked from a seed cache, so afterwards its <code>kernels/</code> directory lists exactly the kernels this case compiled. A JIT cache entry is a directory per kernel name and hash:</p>
+<pre class="out"><code>$LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/eltwise_binary_no_bcast/10083976056017848008/trisc0
+$LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/reader_interleaved_no_bcast/10456270060302663221/ncrisc
+$LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/writer_interleaved_no_bcast/2689147808996234265/brisc</code></pre>
+  <p>This listing is from the 32×32 smoke test. The reader runs on NCRISC, the writer on BRISC, and the compute kernel on the three TRISCs. The cache was 93 MB, 92 MB of it precompiled headers, which is why the explorer links them instead of rebuilding.</p>
+  <div class="filename">sim-labs/workbench/py/b11_explore.py (the core of one case)</div>
+<pre><code>tx = ttnn.from_torch(x, dtype=dt, layout=lay, device=dev, memory_config=mc)
+if case["op"] == "add":
+    ty = ttnn.from_torch(y, dtype=dt, layout=lay, device=dev, memory_config=mc)
+    out, ref = ttnn.add(tx, ty, memory_config=mc), x + y
+...
+elif case["op"] == "matmul":
+    wt = torch.randn(w, w) / w ** 0.5
+    tw = ttnn.from_torch(wt, dtype=dt, layout=ttnn.TILE_LAYOUT, device=dev)
+    out, ref = ttnn.matmul(tx, tw, memory_config=mc), x @ wt
+got = ttnn.to_torch(out).float().reshape(ref.shape)
+pcc = torch.corrcoef(torch.stack([got.flatten().double(), ref.flatten().double()]))[0, 1].item()</code></pre>
+  <p>The reference is torch in FP32 on the <em>original</em> FP32 inputs, so the PCC includes the cost of quantizing to the tensor dtype. "height" means height-sharded over <code>min(8, h/32)</code> cores. The output uses the input's memory config.</p>
+<pre><code>python -I $W/py/b11_explore.py --op add --shapes 64x128 --dtypes bf16,bfp8,fp32 --layouts tile,rm \
+                               --mems dram,l1,height --jobs 4 --out $LAB_HOME/explore_add.json</code></pre>
+<pre class="out"><code>shape      dtype lay  mem    status   PCC       max|err|  kernels / reason
+64x128     bf16  tile dram   ok       0.999997  0.0205    eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast
+64x128     bf16  tile height ok       0.999997  0.0205    eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast
+64x128     bf16  rm   dram   ok       0.999997  0.0205    eltwise_binary_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast
+64x128     bf16  rm   height ok       0.999997  0.0205    eltwise_binary_no_bcast reader_interleaved_no_bcast reader_unary_sharded_metal2 tilize_metal2 untilize_metal2 writer_interleaved_no_bcast writer_unary_sharded_metal2
+64x128     bfp8  tile height ok       0.999953  0.0577    eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast
+64x128     bfp8  rm   dram   rejected                     Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:104)
+64x128     fp32  tile dram   abort                        UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0
+...
+real	0m16.971s</code></pre>
+  <p>18 cases in 17 s with 4 jobs. The matmul sweep (36 cases, two shapes) took 34 s. The matrix has all 54 cases, for both simulators. Click a cell for its numbers and kernel list.</p>
+
+  <div class="viz" id="fig-matrix"><div class="modebar" id="mx-modes"><span>Simulator:</span></div><div class="readout" id="mx-read">Click a cell. Green = ran (brighter = higher PCC), grey = rejected by TT-NN on the host, red = ttsim abort.</div></div>
+  <script>
+  (function () {
+    var D = [["add","64x128","bf16","tile","dram",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bf16","tile","l1",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bf16","tile","height",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bf16","rm","dram",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"],0],["add","64x128","bf16","rm","l1",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"],0],["add","64x128","bf16","rm","height",["o",0.999997,0.0205,"","eltwise_binary_no_bcast reader_interleaved_no_bcast reader_unary_sharded_metal2 tilize_metal2 untilize_metal2 writer_interleaved_no_bcast writer_unary_sharded_metal2"],0],["add","64x128","bfp8","tile","dram",["o",0.999954,0.0595,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bfp8","tile","l1",["o",0.999954,0.0595,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bfp8","tile","height",["o",0.999953,0.0577,"","eltwise_binary_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],0],["add","64x128","bfp8","rm","dram",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["add","64x128","bfp8","rm","l1",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["add","64x128","bfp8","rm","height",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["add","64x128","fp32","tile","dram",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"]],["add","64x128","fp32","tile","l1",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"]],["add","64x128","fp32","tile","height",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast writer_interleaved_no_bcast"]],["add","64x128","fp32","rm","dram",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","eltwise_binary_sfpu_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"]],["add","64x128","fp32","rm","l1",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","eltwise_binary_sfpu_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_rm_no_bcast writer_interleaved_rm_no_bcast"]],["add","64x128","fp32","rm","height",["a",null,null,"UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out","reader_unary_sharded_metal2 tilize_metal2 writer_unary_sharded_metal2"],["o",1.0,0.0,"","eltwise_binary_sfpu_no_bcast reader_interleaved_no_bcast reader_unary_sharded_metal2 tilize_metal2 untilize_metal2 writer_interleaved_no_bcast writer_unary_sharded_metal2"]],["matmul","64x128","bf16","tile","dram",["o",0.999982,0.0367,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","64x128","bf16","tile","l1",["o",0.999979,0.0402,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","64x128","bf16","tile","height",["o",0.999979,0.0402,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","64x128","bf16","rm","dram",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","64x128","bf16","rm","l1",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","64x128","bf16","rm","height",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","64x128","bfp8","tile","dram",["o",0.999832,0.0837,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","64x128","bfp8","tile","l1",["o",0.99983,0.0816,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","64x128","bfp8","tile","height",["o",0.999829,0.0978,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","64x128","bfp8","rm","dram",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","64x128","bfp8","rm","l1",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","64x128","bfp8","rm","height",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","64x128","fp32","tile","dram",["a",null,null,"UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],["o",1.0,0.0059,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"]],["matmul","64x128","fp32","tile","l1",["o",1.0,0.0059,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","64x128","fp32","tile","height",["o",1.0,0.0059,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","64x128","fp32","rm","dram",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","64x128","fp32","rm","l1",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","64x128","fp32","rm","height",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","bf16","tile","dram",["o",0.999978,0.0424,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","256x256","bf16","tile","l1",["o",0.999964,0.0604,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","256x256","bf16","tile","height",["o",0.999964,0.0604,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","256x256","bf16","rm","dram",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","bf16","rm","l1",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","bf16","rm","height",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","bfp8","tile","dram",["o",0.999819,0.0859,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","256x256","bfp8","tile","l1",["o",0.999816,0.1084,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","256x256","bfp8","tile","height",["o",0.999813,0.1002,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","256x256","bfp8","rm","dram",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","256x256","bfp8","rm","l1",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","256x256","bfp8","rm","height",["r",null,null,"Layout must be Layout::TILE for bfloat8_b or bfloat4_b! (assert.hpp:10",""],0],["matmul","256x256","fp32","tile","dram",["a",null,null,"UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],["o",1.0,0.0056,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_receiver_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"]],["matmul","256x256","fp32","tile","l1",["o",1.0,0.0056,"","bmm_metal2 reader_bmm_8bank_output_tiles_partitioned_metal2 writer_unary_interleaved_start_id"],0],["matmul","256x256","fp32","tile","height",["o",1.0,0.0056,"","bmm_large_block_zm_fused_bias_activation_metal2 reader_bmm_tile_layout_in0_sender_padding_metal2 reader_bmm_tile_layout_in1_receiver_writer_padding_metal2 reader_bmm_tile_layout_in1_sender_writer_padding_metal2"],0],["matmul","256x256","fp32","rm","dram",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","fp32","rm","l1",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0],["matmul","256x256","fp32","rm","height",["r",null,null,"Inputs to matmul must be tilized (assert.hpp:104)",""],0]];
+    var root = document.getElementById("fig-matrix");
+    var g = TT.canvas(root, 860, 455), ctx = g.ctx, C = TT.C;
+    root.insertBefore(document.getElementById("mx-modes"), root.firstChild);
+    var cols = [["tile", "dram"], ["tile", "l1"], ["tile", "height"], ["rm", "dram"], ["rm", "l1"], ["rm", "height"]];
+    var rows = [];
+    [["add", "64x128"], ["matmul", "64x128"], ["matmul", "256x256"]].forEach(function (o) {
+      ["bf16", "bfp8", "fp32"].forEach(function (d) { rows.push([o[0], o[1], d]); });
+    });
+    var X0 = 210, Y0 = 70, CW = 105, CH = 36;
+    var patched = false, sel = null, anim = 1, t0 = 0;
+    function cell(r, c) {
+      for (var k = 0; k < D.length; k++) {
+        var e = D[k];
+        if (e[0] === rows[r][0] && e[1] === rows[r][1] && e[2] === rows[r][2] && e[3] === cols[c][0] && e[4] === cols[c][1])
+          return { stock: e[5], patch: e[6] || e[5], changed: !!e[6] };
+      }
+      return null;
+    }
+    function color(v) {
+      if (v[0] === "o") return { f: C.green, a: 0.25 + 0.7 * Math.max(0, Math.min(1, (v[1] - 0.9997) / 0.0003 * 0.6 + 0.4)) };
+      if (v[0] === "r") return { f: C.muted, a: 0.25 };
+      return { f: C.red, a: 0.75 };
+    }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "layout \u2192", X0 - 10, 22, { font: "12px", color: C.muted, align: "right" });
+      TT.text(ctx, "TILE", X0 + 1.5 * CW, 22, { font: "bold 13px", color: C.yellow, align: "center" });
+      TT.text(ctx, "ROW_MAJOR", X0 + 4.5 * CW, 22, { font: "bold 13px", color: C.yellow, align: "center" });
+      for (var c = 0; c < 6; c++) TT.text(ctx, cols[c][1] === "height" ? "L1 height-shard" : cols[c][1] === "l1" ? "L1 interleaved" : "DRAM interleaved", X0 + c * CW + CW / 2, 48, { font: "11px", color: C.fg, align: "center" });
+      for (var r = 0; r < rows.length; r++) {
+        var y = Y0 + r * CH;
+        if (r % 3 === 0) { ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(10, y - 2); ctx.lineTo(X0 + 6 * CW, y - 2); ctx.stroke();
+          TT.text(ctx, rows[r][0] + " " + rows[r][1], 14, y + 1.5 * CH, { font: "bold 13px", color: C.blue }); }
+        TT.text(ctx, rows[r][2], X0 - 12, y + CH / 2, { font: "13px", mono: true, align: "right" });
+        for (var c = 0; c < 6; c++) {
+          var e = cell(r, c); if (!e) continue;
+          var v = patched ? e.patch : e.stock, k = color(v);
+          if (e.changed) { var a = patched ? anim : 1 - anim; var cs = color(e.stock), cp = color(e.patch);
+            k = a > 0.5 ? cp : cs; }
+          TT.box(ctx, X0 + c * CW + 3, y + 3, CW - 6, CH - 6, { fill: k.f, alpha: k.a, r: 4,
+            stroke: sel && sel[0] === r && sel[1] === c ? C.yellow : null, lw: 2.5 });
+          var lab = v[0] === "o" ? v[1].toFixed(6) : v[0] === "r" ? "rejected" : "ABORT";
+          TT.text(ctx, lab, X0 + c * CW + CW / 2, y + CH / 2, { font: "12px", mono: true, align: "center", color: v[0] === "a" ? "#fff" : C.fg });
+        }
+      }
+      TT.text(ctx, patched ? "ttsim + b11-ten3868.patch (Wormhole)" : "stock ttsim v1.15.0 (Wormhole)", X0, Y0 + 9 * CH + 22, { font: "bold 13px", color: patched ? C.green : C.orange });
+      TT.text(ctx, "cell text = PCC against torch (FP32 reference on the unquantized inputs)", X0, Y0 + 9 * CH + 42, { font: "12px", color: C.muted });
+    }
+    function show(r, c) {
+      var e = cell(r, c); if (!e) return;
+      var v = patched ? e.patch : e.stock, rd = document.getElementById("mx-read");
+      var head = rows[r][0] + " " + rows[r][1] + " " + rows[r][2] + " " + cols[c][0] + " " + cols[c][1] + (e.changed ? "   (changed by the patch)" : "");
+      if (v[0] === "o") rd.textContent = head + "\nPCC " + v[1] + "   max|err| " + v[2] + "\nkernels: " + v[4];
+      else rd.textContent = head + "\n" + (v[0] === "r" ? "rejected on the host: " : "ttsim abort: ") + v[3] + (v[4] ? "\nkernels compiled before the abort: " + v[4] : "");
+    }
+    function anim0() { anim = 0; t0 = performance.now(); requestAnimationFrame(function step(now) { anim = Math.min(1, (now - t0) / 700); draw(); if (anim < 1) requestAnimationFrame(step); }); }
+    var bar = document.getElementById("mx-modes");
+    [["stock", false], ["with b11-ten3868", true]].forEach(function (m) {
+      var b = document.createElement("button"); b.textContent = m[0]; if (!m[1]) b.className = "on";
+      b.onclick = function () { patched = m[1]; bar.querySelectorAll("button").forEach(function (x) { x.className = ""; }); b.className = "on"; anim0(); if (sel) show(sel[0], sel[1]); };
+      bar.appendChild(b);
+    });
+    g.canvas.addEventListener("click", function (ev) {
+      var rc = g.canvas.getBoundingClientRect(), x = (ev.clientX - rc.left) * g.W / rc.width, y = (ev.clientY - rc.top) * g.H / rc.height;
+      var c = Math.floor((x - X0) / CW), r = Math.floor((y - Y0) / CH);
+      if (c >= 0 && c < 6 && r >= 0 && r < rows.length) { sel = [r, c]; show(r, c); draw(); }
+    });
+    draw();
+  })();
+  </script>
+
+  <p>What the matrix says, cell by cell:</p>
+  <ul>
+    <li><b>Rejections happen on the host and cost nothing.</b> bfp8 must be TILE (a block-float exponent is shared by 16 datums of one face row, A05), and matmul wants tilized inputs. These are TT-NN's validation, and they would happen on silicon too.</li>
+    <li><b>Within one dtype, the memory config does not change an add's result</b>: all six bf16 cells give PCC 0.999997 and max error 0.0205. An add is element-wise, so where its tiles live cannot matter. Only bfp8 height-sharded differs slightly (0.0577 vs 0.0595). With the patch, the FP32 add is exact (max error 0.0): an SFPU add of two FP32 values, packed as FP32.</li>
+    <li><b>A ROW_MAJOR input that is height-sharded compiles 7 kernels instead of 3.</b> TT-NN tilizes it on the device first (<code>tilize_metal2</code>, with its own sharded reader and writer) and untilizes the result. Same answer, but 4 extra kernels, and extra programs on every call.</li>
+    <li><b>For matmul, the memory config changes the program.</b> The DRAM case compiles the 2D-multicast kernels (<code>reader_bmm_tile_layout_in0_sender/receiver</code>, <code>in1_sender/receiver</code>). L1-interleaved compiles <code>bmm_metal2</code> and <code>reader_bmm_8bank_output_tiles_partitioned_metal2</code>: the plain multi-core matmul with no reuse. Height-sharded compiles the 1D variant: an in0 sender but no in0 receiver. The max error shows it too: 0.0424 for DRAM vs 0.0604 for L1 and height (256×256 bf16), because a different program sums K in a different order.</li>
+    <li><b>The stock FP32 matmul aborts only on the DRAM row</b>, the 2D-multicast program. The L1 and height-sharded FP32 matmuls ran on stock ttsim with PCC 1.000000. "fp32 matmul aborts" (A18) is true of the program A18's call happened to get, not of every FP32 matmul.</li>
+  </ul>
+  <p>Why would putting the <em>output</em> in L1 select a different program? For an interleaved output of a shape that is not narrow, matmul's automatic config only takes the multicast paths when all three tensors are DRAM-interleaved, or when the per-core blocking gives a grid of more than one block (narrow shapes and sharded outputs have extra branches, not shown):</p>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp:1135-1139, 1183-1186, 1236-1237, 1368 @7aad8aac (trimmed)</div>
+<pre><code>const bool all_dram = input_tensor_a.memory_config().buffer_type() == BufferType::DRAM &amp;&amp;
+                      input_tensor_b.memory_config().buffer_type() == BufferType::DRAM &amp;&amp;
+                      mem_config.buffer_type() == BufferType::DRAM;
+...
+    if (!(num_blocks_rows == 1 &amp;&amp; num_blocks_cols == 1) &amp;&amp; ...) {   // get_core_range: a 1x1 block grid gives (0,0)
+...
+    bool use_mcast_2d_config =
+        all_dram_interleaved or (core_range.y == 0 and mem_config.is_sharded() and ...
+...
+return MatmulMultiCoreProgramConfig{};</code></pre>
+  <p>With M = N = 256, Mt = Nt = 8. The per-core factor (at most 16, capped at Mt and Nt) evidently covered the whole output as one block: <code>core_range</code> is then (0, 0), and an L1-interleaved output matches none of the multicast conditions. That leaves the fallback at line 1368, and the kernel list confirms it. A one-word change to <code>memory_config</code> silently swapped a reuse-and-multicast matmul for one with no reuse. The next step measures what that costs.</p>
+  <div class="callout gpu">On a GPU, the closest thing is cuBLAS choosing a different GEMM kernel for a different shape or alignment. You can see that choice with Nsight, but you rarely cause it by changing where the <em>output</em> lives. On Tenstorrent, placement is an input to kernel selection, so record the kernel list whenever you compare configs.</div>
+
+  <h2 id="traffic">Step 4: Count the bytes of each memory config</h2>
+  <p><a href="../chapters/a20-performance.html">A20</a> counted an element-wise add with ttsim and <code>patches/a20-counters.patch</code>, and found that a sharded add issues zero NoC commands. A matmul is more interesting, because its inputs are <em>reused</em>: each input tile is needed by a whole row or column of output tiles. The A20 counters log every NoC command a Tensix core issues, sorted by kind and by destination. I reused them unchanged with a matmul script, <code>workbench/py/b11_traffic.py</code>. It computes x[256, 256] @ w[256, 256] in bf16, places x and the output with one memory config, and keeps w DRAM-interleaved:</p>
+<pre><code>$W/build_ttsim.sh count wh &amp;&amp; (cd $LAB_HOME/ttsim-count &amp;&amp; patch -p1 &lt; $P/a20-counters.patch) &amp;&amp; $W/build_ttsim.sh count wh
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
+for m in dram l1 height block; do python -I $W/py/b11_traffic.py $m; python -I $W/py/b11_traffic.py $m prep; done</code></pre>
+<pre class="out"><code>B11TRAFFIC mem=dram out=TensorMemoryLayout.INTERLEAVED PCC=0.999981
+[5555] A20 noc dram_read    cmds=128 bytes=262144
+[5555] A20 noc dram_write   cmds=64 bytes=131072
+[5555] A20 noc mcast_sent   cmds=256 bytes=262656
+[5555] A20 noc mcast_recv   cmds=1792 bytes=1838592
+[5555] A20 noc atomic       cmds=896 bytes=3584
+B11TRAFFIC mem=l1 out=TensorMemoryLayout.INTERLEAVED PCC=0.999967
+[5210] A20 noc dram_read    cmds=512 bytes=1048576
+[5210] A20 noc l1_read      cmds=512 bytes=1048576
+[5210] A20 noc l1_write     cmds=64 bytes=131072
+B11TRAFFIC mem=height out=TensorMemoryLayout.HEIGHT_SHARDED PCC=0.999967
+[7224] A20 noc dram_read    cmds=64 bytes=131072
+[7224] A20 noc mcast_sent   cmds=17 bytes=131076
+[7224] A20 noc mcast_recv   cmds=119 bytes=917532
+[7224] A20 noc atomic       cmds=7 bytes=28
+B11TRAFFIC mem=block out=TensorMemoryLayout.BLOCK_SHARDED PCC=0.999977
+[5221] A20 noc dram_read    cmds=64 bytes=131072
+[5221] A20 noc mcast_sent   cmds=64 bytes=262272
+[5221] A20 noc mcast_recv   cmds=224 bytes=917952
+[5221] A20 noc atomic       cmds=96 bytes=384</code></pre>
+  <p>(Zero lines removed.) All four <code>prep</code> runs printed zero for every NoC counter, so every byte above belongs to the matmul. Tensors uploaded with <code>from_torch</code>, even straight into sharded L1, arrive over the host path of section 0, not over the NoC. The figure steps through the four configs.</p>
+
+  <div class="viz" id="fig-traffic"><div class="modebar" id="tr-modes"><span>Measure:</span></div></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-traffic");
+    var g = TT.canvas(root, 860, 340), ctx = g.ctx, C = TT.C;
+    root.insertBefore(document.getElementById("tr-modes"), root.firstChild);
+    var K = [["DRAM read", C.blue], ["DRAM write", C.purple], ["L1 read (other core)", C.yellow], ["L1 write", C.orange], ["multicast delivered", C.green]];
+    // bytes and commands, from the four real runs (mcast delivered includes 4-byte semaphore multicasts)
+    var R = [
+      { n: "DRAM interleaved", s: "2D multicast, 64 cores", b: [262144, 131072, 0, 0, 1838592], c: [128, 64, 0, 0, 1792] },
+      { n: "L1 interleaved", s: "MatmulMultiCore, no reuse", b: [1048576, 0, 1048576, 131072, 0], c: [512, 0, 512, 64, 0] },
+      { n: "L1 height-sharded", s: "1D in1 multicast, 8 cores", b: [131072, 0, 0, 0, 917532], c: [64, 0, 0, 0, 119] },
+      { n: "L1 block-sharded", s: "2D multicast, 4\u00d74 cores", b: [131072, 0, 0, 0, 917952], c: [64, 0, 0, 0, 224] }
+    ];
+    var mode = "b";
+    var steps = [
+      { dur: 1.0, text: "<b>x[256,256] @ w[256,256], bf16.</b> 64 output tiles, each the sum of 8 tile products. Every bar below is a count of NoC commands issued by Tensix cores, measured in ttsim with the A20 counters. Step to add one memory config at a time." },
+      { dur: 1.4, text: "<b>DRAM interleaved: 2D multicast.</b> Every input tile is read from DRAM <i>exactly once</i>: 128 tiles = 256 KiB. The sender cores multicast each to the 7 other cores in their row or column, which makes 896 tile deliveries plus 896 four-byte semaphore deliveries. Then the 64 output tiles are written back to DRAM." },
+      { dur: 1.4, text: "<b>L1 interleaved: no reuse.</b> Moving the output to L1 selected MatmulMultiCore (section 3). Each output tile's core reads its 8 x tiles and 8 w tiles itself: 512 DRAM reads of w plus 512 reads of x from other cores' L1. The DRAM reads are <b>4\u00d7</b> the multicast version's, for the same answer." },
+      { dur: 1.4, text: "<b>Height-sharded: x never moves.</b> Each of 8 cores already holds its 32 rows of x. One core reads w once (64 tiles, 128 KiB) and multicasts it in 16 data commands of 8 KiB plus one semaphore command, to the 7 others: 7 × 17 = 119 receptions. The output stays in place: no writes." },
+      { dur: 1.4, text: "<b>Block-sharded: 4\u00d74 cores.</b> Again w is read from DRAM once and the output stays put. Both operands now travel by multicast: 448 tiles' worth of deliveries plus semaphores. The DRAM column (blue) is the same as height-sharded." },
+      { dur: 1.2, text: "<b>What to take away.</b> The DRAM bytes span 8\u00d7 (1 MiB vs 128 KiB) across four memory configs of one matmul. Of the two interleaved configs, the one with 4× fewer DRAM reads issues by far the most NoC commands. Multicast trades DRAM reads for NoC deliveries. Whether that is faster depends on link bandwidth and contention, which ttsim does not model." }
+    ];
+    var st = TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var X0 = 200, BW = 600, Y0 = 50, RH = 64;
+      var max = mode === "b" ? 2.4 * 1048576 : 1920;
+      // axis
+      ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(X0, Y0 - 10); ctx.lineTo(X0, Y0 + 4 * RH); ctx.stroke();
+      var ticks = mode === "b" ? [0, 0.5, 1, 1.5, 2] : [0, 500, 1000, 1500];
+      ticks.forEach(function (v) { var x = X0 + BW * (mode === "b" ? v * 1048576 : v) / max;
+        ctx.strokeStyle = "#1a2028"; ctx.beginPath(); ctx.moveTo(x, Y0 - 10); ctx.lineTo(x, Y0 + 4 * RH); ctx.stroke();
+        TT.text(ctx, mode === "b" ? v + " MiB" : String(v), x, Y0 + 4 * RH + 14, { font: "11px", color: C.muted, align: "center" }); });
+      for (var r = 0; r < 4; r++) {
+        var y = Y0 + r * RH, vis = i >= r + 1, gr = (i === r + 1) ? t : 1;
+        TT.text(ctx, R[r].n, X0 - 12, y + 14, { font: "bold 13px", align: "right", color: vis ? C.fg : C.muted });
+        TT.text(ctx, R[r].s, X0 - 12, y + 32, { font: "11px", align: "right", color: C.muted });
+        if (!vis) continue;
+        var x = X0, vals = mode === "b" ? R[r].b : R[r].c;
+        for (var k = 0; k < 5; k++) {
+          var w = BW * vals[k] / max * gr;
+          var dim = (i === 5 && k !== 0) ? 0.25 : 0.85;
+          if (w > 0) { ctx.fillStyle = K[k][1]; ctx.globalAlpha = dim; ctx.fillRect(x, y + 4, w, 34); ctx.globalAlpha = 1; }
+          x += w;
+        }
+        var tot = vals.reduce(function (a, b) { return a + b; }, 0);
+        var lab = mode === "b" ? (vals[0] + vals[1]) / 1024 + " KiB DRAM r+w, " + (tot / 1048576).toFixed(2) + " MiB total" : tot.toLocaleString("en-US") + " commands received";
+        if (gr >= 1) TT.text(ctx, lab, Math.min(x + 8, X0 + BW - 4), y + 52, { font: "12px", mono: true, color: C.fg, align: x + 8 > X0 + BW - 200 ? "right" : "left" });
+      }
+      for (var k = 0; k < 5; k++) { var lx = 30 + k * 165; ctx.fillStyle = K[k][1]; ctx.fillRect(lx, 14, 12, 12);
+        TT.text(ctx, K[k][0], lx + 18, 20, { font: "12px" }); }
+    } });
+    var bar = document.getElementById("tr-modes");
+    [["bytes", "b"], ["NoC commands (receptions for multicast)", "c"]].forEach(function (m) {
+      var b = document.createElement("button"); b.textContent = m[0]; if (m[1] === "b") b.className = "on";
+      b.onclick = function () { mode = m[1]; bar.querySelectorAll("button").forEach(function (x) { x.className = ""; }); b.className = "on"; st.render(); };
+      bar.appendChild(b);
+    });
+  })();
+  </script>
+
+  <p>Check the DRAM case against arithmetic. Each core needs 8 x tiles and 8 w tiles, and 64 cores × 16 = 1,024 tile arrivals. The counters show 128 DRAM reads + 896 multicast tile deliveries = 1,024. Exactly the same number of tiles land in L1 as in the no-reuse L1 case (512 + 512 reads). The difference is <em>where they come from</em>: one DRAM read plus a fan-out, instead of eight separate reads. The 896 atomics match the deliveries one for one, which fits the receivers' semaphore increments of the multicast handshake A16 drew. In the height-sharded case, x is already where it is consumed, so only w moves: 64 + 7 × 64 = 512 tile arrivals.</p>
+  <p>The Tensix instruction counters printed by the same patch also differ, for the same output. T1 (math) retired 25,664 instructions for the DRAM case, 20,480 for L1-interleaved, 17,792 for height-sharded and 20,784 for block-sharded. The programs block the work differently, so even the math thread's instruction stream depends on the memory config.</p>
+  <div class="callout warn">These are exact counts of commands, not times. ttsim completes a NoC transfer inside the instruction that issues it (B05), so it says nothing about whether 896 multicast deliveries beat 512 extra DRAM reads. On silicon, the multicast's single DRAM read is the point (A16), but contention and link widths decide the rest. Use these numbers to check a mental model of an op's data movement. Do not use them to rank configs by speed.</div>
+  <div class="callout sim">The per-command view is one patch away: apply <a href="b05-noc-and-dram.html"><code>b05-noclog.patch</code></a> to the same copy, and each of these commands becomes a log line with its source, destination and length.</div>
+
+  <h2 id="differs">Step 5: Where ttsim and the documents disagree</h2>
+  <p>A test bench is only as good as its model. Here are the places where, in this lab, what ttsim did differs from what a document says silicon does or what the series' notes say ttsim does. Each one is stated narrowly.</p>
+  <h3>1. The TEN-3868 dummy unpack: tt-llk relies on what the ISA spec leaves undefined</h3>
+  <ul>
+    <li><b>The ISA spec</b> (<code>UNPACR_Regular.md</code> @be83310): FP32 → FP32 into SrcA is <code>UndefinedBehavior</code> (lines 641-647). A non-zero <code>ContextNumber</code> is <code>UnsupportedFunctionality</code> with "No known usage, confidence in specification below is weak" (line 36).</li>
+    <li><b>tt-llk for Wormhole</b> (<code>cunpack_common.h:981-983</code>) issues exactly such an instruction, with <code>CfgContextId = context_id</code> (0 or 1) and the tile's FP32 formats, after every unpack-to-Dst tile. It does so on purpose, to work around hardware bug TEN-3868.</li>
+    <li><b>Silicon</b>, by implication, runs it every time an FP32 op unpacks to Dst: these tests are written for Wormhole hardware, and the LLK comment says the instruction is needed there. I could not check this on silicon.</li>
+    <li><b>ttsim</b> follows the ISA spec literally and ends the process. That aborted 98 of the 354 tests in my slice. With the eight-line patch, 96 of them pass and 2 are the test's own expected failures (<code>xfail</code>), and nothing else changed.</li>
+  </ul>
+  <p>So the usage the ISA calls unknown has a known user, and that user is tt-llk itself. The ISA describes the instruction in isolation. The LLK relies on the side effect of a hardware bug fix, which is described nowhere public. A simulator built from the spec has to choose one of them.</p>
+  <h3>2. Wormhole HiFi4 + FP32 accumulation</h3>
+  <p>TT-NN prints a warning when you combine them on Wormhole:</p>
+<pre class="out"><code>warning | Op | On Wormhole with fp32 accumulation, output accuracy can be worse with HiFi4 than HiFi3 due to a hardware bug. Prefer using HiFi3 with fp32 accumulation on Wormhole. (compute_kernel_config.cpp:66)</code></pre>
+  <p>The source comment (<code>compute_kernel_config.cpp:44</code>) points to <a href="https://github.com/tenstorrent/tt-metal/issues/38306">issue #38306</a>. That issue reports, so far seen only on Wormhole, a few deterministic outputs off by roughly a power of two (1 bad point in a 4096³ matmul). It also says "Blackhole numerics look different from Wormhole". I ran a 128×1024 @ 1024×128 bf16 matmul with FP32 accumulation at HiFi2/3/4 on patched Wormhole ttsim and stock Blackhole ttsim (<code>workbench/py/b11_s3_hifi.py</code>; the last three lines compare the two runs' tensors, saved with <code>B11_SAVE=&lt;file&gt;.pt</code>, using <code>torch.equal</code>):</p>
+<pre class="out"><code>HiFi2: mean|err| 1.041e-01  max|err| 5.717e-01
+HiFi3: mean|err| 8.225e-03  max|err| 4.194e-02
+HiFi4: mean|err| 8.052e-03  max|err| 3.961e-02
+HiFi3 == HiFi4 bit for bit: False  elements that differ: 16383 of 16384
+HiFi2 WH==BH bitwise: True 0
+HiFi3 WH==BH bitwise: True 0
+HiFi4 WH==BH bitwise: True 0</code></pre>
+  <p>In ttsim, HiFi4 is slightly <em>better</em> than HiFi3, and the Wormhole and Blackhole builds give bit-identical results at every fidelity. The issue says silicon numerics differ between the two. My test is far too small to have hit the rare bad points, so it does not show that ttsim lacks the bug. What it does show is that ttsim's two builds share one matmul arithmetic here (its <code>mvmul</code> arithmetic has no per-architecture branch; the one Wormhole-only step in its matmul, a source-format mask, leaves bf16 inputs unchanged). A Wormhole-only FPU difference is therefore not modelled, and a ttsim pass cannot vouch for one.</p>
+  <h3>3. The device profiler produces data, except for the last program</h3>
+  <p>The series' feasibility notes (<code>research/06-feasibility.md</code>) say <code>TT_METAL_DEVICE_PROFILER=1</code> "produces a CSV with only the header". For a single-program metal example that is what happens (A20 reproduces it), but not for TT-NN here. Three <code>ttnn.add</code> calls on a 64×64 tensor wrote a 3,762-line <code>profile_log_device.csv</code>, with or without an explicit <code>ttnn.ReadDeviceProfiler</code>:</p>
+<pre class="out"><code>ARCH: wormhole_b0, CHIP_FREQ[MHz]: 0, Max Compute Cores: 72
+PCIe slot, core_x, core_y, RISC processor type, timer_id, time[cycles since reset], data, run host ID, ...
+0,1,1,BRISC,46845,4426,0,1024,,,BRISC-FW,ZONE_START,439,.../brisc.cc,</code></pre>
+  <p>The 3,760 data rows are FW and KERNEL start/end zones for all five RISC-Vs, for run host IDs 1024 and 2048 on all 64 cores (1,280 rows each), and 1,200 rows for the last op, 3072: four of its cores are missing. The same effect most likely explains the empty file in the notes and in A20. The firmware sets <code>RUN_MSG_DONE</code> inside its <code>BRISC-FW</code> zone, and only the zone's destructor afterwards pushes the core's markers to DRAM (<code>hw/firmware/src/tt-1xx/brisc.cc:438, 600</code> and <code>hw/inc/api/debug/kernel_profiler.hpp:801-803</code> @7aad8aac). On silicon that push finishes long before the host reads. Under ttsim the cores only run while the host polls, and the host reads the profiler buffers as soon as it sees "done", so the last program's push has barely started. Earlier programs flush while the host polls for the next one. A metal example that runs one program therefore gets only the header; a single <code>ttnn.add</code> gets 704 rows, with no TRISC1 or TRISC2 zones at all; and twenty extra <code>to_torch</code> reads after it raise that to 884. Two things stop this from being a performance tool: the timestamps are simulated clocks (one TRISC1 kernel zone spans 4589 → 4657), and <code>CHIP_FREQ</code> is 0 MHz, so no tool can convert them to time. What the zones are good for is ordering: which RISC started its kernel before which.</p>
+  <h3>4. Not differences, but easy to mistake for them</h3>
+  <ul>
+    <li>Trace is not a ttsim limitation. It is refused by tt-metal's slow-dispatch queue, and it works under ttsim in fast dispatch.</li>
+    <li>The 16 skipped sub-device tests are not a ttsim limitation either. The skip keys on the environment variable, and they pass in fast dispatch.</li>
+    <li>The 64-core grid comes from tt-metal's core descriptor, not from a ttsim limit.</li>
+  </ul>
+
+  <h2 id="exercises">Exercises, with answers</h2>
+  <details class="quiz"><summary>1. Without reading the counters, predict the DRAM-interleaved case's DRAM read and write bytes. Then explain the 896 atomics.</summary>
+  <p>x and w are 8 × 8 = 64 tiles each, 2,048 bytes per bf16 tile. A 2D-multicast matmul reads each input tile once: 128 × 2,048 = 262,144 bytes, which matches <code>dram_read bytes=262144</code>. The output is 64 tiles: 131,072 bytes written, which matches too. Each of the 896 tile deliveries is acknowledged by its receiver incrementing a semaphore in the sender's L1 (the receiver-ready handshake of A16). That is one 4-byte atomic per delivery: 896 × 4 = 3,584 bytes, as printed.</p></details>
+  <details class="quiz"><summary>2. Run the 16 sub-device add tests that slow dispatch skips. What do you have to change, and what happens?</summary>
+<pre><code>env -u TT_METAL_SLOW_DISPATCH_MODE pytest -p no:cacheprovider -o addopts= --import-mode=importlib -q $T/eltwise/test_add.py -k sub_devices</code></pre>
+<pre class="out"><code>16 passed, 86 deselected in 26.93s
+[1797441] 28.6 seconds (62.8 KHz)</code></pre>
+  <p>Only the environment variable: <code>skip_for_slow_dispatch</code> tests it with <code>os.environ.get(...) == "1"</code>. In fast dispatch the clock count is far higher (1.8 M for the 16 tests). I did not break the clocks down. Since the host drives them, they mostly measure how long it polled while dispatch firmware forwarded the work. More clocks, but only 27 s.</p></details>
+  <details class="quiz"><summary>3. Apply <code>b11-api-count.patch</code> and compare one 32×32 add in slow and fast dispatch. Which uses more host writes, and why?</summary>
+<pre class="out"><code>slow: B11API pci_mem_rd calls=4919 bytes=21824  pci_mem_wr calls=23551 bytes=722884  clock calls=4881 clocks=4881
+fast: B11API pci_mem_rd calls=4960 bytes=19944  pci_mem_wr calls=18428 bytes=313140  clock calls=13440 clocks=13440</code></pre>
+  <p>Slow dispatch writes 2.3× the bytes. In slow dispatch the host writes each worker's binaries and arguments itself. In fast dispatch the host hands command packets to the prefetcher (A17), and the dispatch firmware fans them out to the workers over the NoC, where the host's counters cannot see them. That is consistent with fewer host writes. Fast dispatch also took 2.75× the clocks; my reading is that the dispatch firmware's loops have to run before the workers start, but I did not measure that. Neither number is a time.</p></details>
+  <details class="quiz"><summary>4. The matmul explorer's FP32 row aborts only for DRAM. Using the kernel lists, which kernel is the likely culprit, and why do the height-sharded FP32 matmuls survive with the same compute kernel?</summary>
+  <p>The DRAM case is the only one that combines <code>bmm_large_block_zm_fused_bias_activation_metal2</code> with the 2D in0 receiver. Height-sharded uses the same compute kernel and survives, so the compute kernel name alone does not decide it. The abort is the TEN-3868 dummy, which only runs after an <em>unpack-to-Dst</em>, in context 1. In this compute kernel, unpack-to-Dst is used to reload partial sums from L1 when K is split into more than one block (the "crossblock reload" that <code>test_matmul_fp32_crossblock_reload_precision</code> exercises, and which also aborted). The 2D config splits K into blocks. My reading is that the 1D config here did not, but I did not confirm it from the chosen <code>in0_block_w</code>, so treat it as a hypothesis. To test it, print <code>ttnn.matmul</code>'s program config, or count unpack-to-Dst UNPACRs with the <code>why</code> build.</p></details>
+  <details class="quiz"><summary>5. Run <code>test_sum_global</code> on Blackhole. What do you expect, and what is the evidence that the Wormhole aborts were not bugs in the reduction?</summary>
+<pre class="out"><code>collected 96 tests
+pytest runs: 1
+counts: PASSED=96 ABORTED=0
+real	1m38.052s</code></pre>
+  <p>All 96 pass on Blackhole, and all 96 pass on Wormhole with the patch, which only skips one instruction that never sets dvalid. If the reduction were wrong, its values would fail the PCC and tolerance checks on both architectures (the test checks PCC, rtol, atol and a Frobenius norm). Instead the same op produced correct numbers wherever the dummy unpack was out of the way.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>TT-NN reaches ttsim through one variable.</b> <code>TT_METAL_SIMULATOR</code> switches the target, and UMD turns every device access into a call into <code>libttsim.so</code>. A 32×32 add was 23,551 PCIe writes and 4,881 host-driven clocks, identical on every run.</li>
+    <li><b>tt-metal's pytest suite runs unmodified</b>, at roughly 0.3 to 0.8 s per small test. A ttsim error calls <code>_Exit(1)</code>, so one abort kills the whole run. <code>b11_pytest.py</code> restarts and attributes each abort to its test and its ttsim message.</li>
+    <li><b>Every non-pass in a 354-test slice was a skip or a simulator abort</b>, and every Wormhole abort traced to one instruction: the dummy UNPACR that tt-llk issues after unpack-to-Dst for hardware bug TEN-3868. The ISA calls that instruction undefined or unsupported. Blackhole's LLK does not issue it, and Blackhole passed everything. An eight-line ttsim patch (a modelling workaround, not a ttsim bug fix) turned the 98 aborts into 96 passes and 2 expected failures, and changed no other result.</li>
+    <li><b>The explorer shows what pytest hides</b>: host-side rejections, the kernels each config compiles, and that a matmul's memory config selects its program. An L1-interleaved output fell back to a matmul with no reuse.</li>
+    <li><b>Exact NoC counts per memory config</b>: DRAM reads ranged from 1 MiB (no reuse) to 128 KiB (sharded) for the same matmul, and the multicast configs swapped DRAM reads for NoC deliveries. Counts, not times.</li>
+    <li><b>Know what a pass means.</b> ttsim's WH and BH builds gave bit-identical matmuls where silicon is reported to differ, and its profiler timestamps are host-driven clocks. A ttsim pass checks values and data movement against ttsim's model of the chip, nothing more.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>pytest prints nothing after <code>[4767] ERROR: UndefinedBehavior: ...</code>, not even a failure. Why, and how would you find which test caused it?</summary><p>ttsim's <code>ttsim_error</code> calls <code>_Exit(1)</code>, which ends the process without running Python's exception machinery, atexit handlers or pytest's reporting. The culprit is the test that started last: run with <code>-v -s</code> so that pytest prints each node id before running it, then take the last id before the ERROR line. <code>b11_pytest.py</code> does exactly that and reruns with the test deselected.</p></details>
+  <details class="quiz"><summary>An FP32 add aborts with <code>unpack_to_dst=0 in_data_format=0 out_data_format=0</code>, yet its JIT descriptor says both operands are unpacked to Dst. Resolve the contradiction.</summary><p>The operands are unpacked to Dst. The failing UNPACR is a different instruction: tt-llk's dummy unpack to SrcA after the last unpack-to-Dst (TEN-3868). It runs with the tile's FP32 formats still configured but unpack-to-Dst switched off, so it is formally an FP32 → FP32 unpack into SrcA, which the ISA calls UndefinedBehavior. ttsim's instrumented message showed it directly: four earlier to-Dst UNPACRs, then this one with <code>zero_write2=1</code> and no dvalid.</p></details>
+  <details class="quiz"><summary>You change <code>memory_config=ttnn.DRAM_MEMORY_CONFIG</code> to <code>ttnn.L1_MEMORY_CONFIG</code> on a 256×256 matmul and its max error changes from 0.0424 to 0.0604. Is L1 less accurate?</summary><p>No. Memory placement cannot change arithmetic, but it changed the program. With an L1 output the inputs are not all DRAM-interleaved, and the whole output is one per-core block, so the automatic config falls back to <code>MatmulMultiCoreProgramConfig</code>. That is a different kernel with a different accumulation order and blocking. Compare kernel lists (or program configs) before you compare numbers.</p></details>
+  <details class="quiz"><summary>The DRAM-interleaved matmul reads 128 tiles from DRAM and the L1-interleaved one reads 512 from DRAM and 512 from other cores. Can you conclude the first is about 4× faster on silicon?</summary><p>No. The first also does 896 multicast deliveries plus 896 semaphore atomics, and ttsim models none of the costs: DRAM bandwidth, NoC link occupancy, multicast fan-out, contention, or overlap of compute with data movement. The counts tell you which resources each program uses, and how much of each. Speed needs silicon or a timing model.</p></details>
+  <details class="quiz"><summary>Which of these failed on ttsim because of tt-metal rather than ttsim: (a) trace in slow dispatch, (b) FP32 add on Wormhole, (c) bfp8 ROW_MAJOR tensor, (d) sub-device add tests?</summary><p>(a) tt-metal: the slow-dispatch command queue throws <code>Not supported for slow dispatch</code>. Trace works in fast dispatch on ttsim. (c) TT-NN's host-side validation, the same on silicon. (d) A test-level skip keyed on the environment variable; they pass in fast dispatch. Only (b) is a ttsim decision: it enforces the ISA on an instruction the Wormhole LLK issues deliberately.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/index.html">TT-NN documentation</a>: the official API reference for the ops, tensors and memory configs swept here.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html">TT-NN: Tensor</a>: layouts, dtypes and the TILE/ROW_MAJOR rules behind the explorer's host-side rejections.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/tree/main/tests/ttnn/unit_tests">tt-metal: tests/ttnn/unit_tests</a>: the test suite run in step 1; browse it for small files to add to your slice.</li>
+    <li><a href="https://docs.pytest.org/en/stable/how-to/usage.html">pytest: How to invoke pytest</a>: <code>-k</code> expressions, node ids and <code>--deselect</code>.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator; <code>src/tensix.cpp</code> holds <code>TENSIX_EXECUTE_UNPACR</code>, and <code>src/libttsim.cpp</code> the API UMD calls.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/UNPACR_Regular.md">tt-isa-documentation: UNPACR</a>: the functional model, including the UndefinedBehavior and UnsupportedFunctionality cases from step 2.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Unpackers/FormatConversion.md">tt-isa-documentation: Unpacker format conversion</a>: which L1 formats may reach SrcA, SrcB and Dst.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cunpack_common.h">tt-llk: cunpack_common.h (Wormhole)</a>: <code>unpack_to_dest_tile_done</code> and the TEN-3868 workaround.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/issues/38306">tt-metal issue #38306</a>: the Wormhole HiFi4 + FP32-accumulation matmul error behind TT-NN's warning.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_layouts/tensor_layouts.md">Tech report: Tensor and memory layouts</a>: interleaved vs height, width and block sharding, as counted in step 4.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">Tech report: LLMs on Tenstorrent</a>: where sharded and multicast matmul configs matter in practice, and the PCC discipline the explorer borrows.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_program_profiler.html">TT-Metalium: Device program profiler</a>: the zones and CSV columns from step 5, and how they are used on silicon.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a19-op-anatomy-compilers.html">&larr; 19 How an op is built, and the compiler stack</a><a class="next" href="../index.html">Back to the index &rarr;</a></div>
+</main>
+</body>
+</html>

@@ -612,7 +612,7 @@ fp32_dest_acc_en=False MathFidelity.HiFi2   mean|err| 0.10234  max|err| 0.9157
 fp32_dest_acc_en=False MathFidelity.HiFi3   mean|err| 0.10931  max|err| 0.9344
 fp32_dest_acc_en=False MathFidelity.HiFi4   mean|err| 0.10931  max|err| 0.9344
 [10142] ERROR: UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code></pre>
-  <p>Two findings. HiFi3 and HiFi4 are identical, and both slightly <em>worse</em> than HiFi2. That fits A06's reading of ttsim's MVMUL: with a bfloat16 Dst, each phase's partial products are aligned and rounded to Dst's 8-bit significand before they are added, so extra phases add rounding steps without adding bits that survive. The error floor here is the bfloat16 accumulator, not the multiplier. The way to lower it is <code>fp32_dest_acc_en=True</code>, and that is where the run stopped: the first matmul with an FP32 Dst hit an unpacker configuration (<code>cfg_context_id=1</code>) that ttsim v1.15.0 reports as <code>UnsupportedFunctionality</code>. On silicon this setting is common; under this simulator it is out of reach for matmul.</p>
+  <p>Two findings. HiFi3 and HiFi4 are identical, and both slightly <em>worse</em> than HiFi2. That fits A06's reading of ttsim's MVMUL: with a bfloat16 Dst, each phase's partial products are aligned and rounded to Dst's 8-bit significand before they are added, so extra phases add rounding steps without adding bits that survive. The error floor here is the bfloat16 accumulator, not the multiplier. The way to lower it is <code>fp32_dest_acc_en=True</code>, and that is where the run stopped: the first matmul with an FP32 Dst hit an unpacker configuration (<code>cfg_context_id=1</code>) that ttsim v1.15.0 reports as <code>UnsupportedFunctionality</code>. On silicon this setting is common; under this simulator it is out of reach for matmul in this configuration (DRAM-interleaved tensors, which get the 2D-multicast program). <a href="../sim-labs/b11-ttnn-on-sim.html#explore">B11</a> shows that the same FP32 matmul with an L1 or height-sharded output runs, and why.</p>
   <div class="callout warn">The fidelity effects above are for random Gaussian inputs on one shape. They are a measurement, not a law. The general rule from A06 holds: fidelity buys bits on the multiplier side, the Dst format decides how many of them survive, and the weight dtype can make both moot.</div>
 
   <h2 id="path">From ttnn.add down to the kernels</h2>
@@ -776,7 +776,7 @@ ttnn.close_device(device)</code></pre>
     <tr><td>add, matmul, softmax, linear with a GELU activation (run as a separate op, see above)</td><td>works; PCC 0.9997–0.999998</td></tr>
     <tr><td>bfloat8_b and bfloat4_b tensors and matmuls</td><td>works</td></tr>
     <tr><td>MathFidelity LoFi / HiFi2 / HiFi3 / HiFi4, packer_l1_acc</td><td>works, measurably different results</td></tr>
-    <tr><td><code>fp32_dest_acc_en=True</code> on matmul</td><td><b>fails</b>: <code>UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code></td></tr>
+    <tr><td><code>fp32_dest_acc_en=True</code> on matmul</td><td><b>fails</b> in this configuration (DRAM-interleaved): <code>UnsupportedFunctionality: tensix_unpacr: cfg_context_id=1</code>; other program configs can run (<a href="../sim-labs/b11-ttnn-on-sim.html#explore">B11</a>)</td></tr>
     <tr><td>L1 interleaved; height, width and block sharding; add on sharded tensors</td><td>works, WH and BH</td></tr>
     <tr><td>Matmul with <code>MatmulMultiCoreReuseMultiCastProgramConfig</code> on 2×2 cores</td><td>works</td></tr>
   </table>

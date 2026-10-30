@@ -1,0 +1,13 @@
+import time, torch, ttnn
+t0 = time.time()
+device = ttnn.open_device(device_id=0)
+print("grid", device.compute_with_storage_grid_size(), "arch", device.arch())
+torch.manual_seed(0)
+a = torch.randn(32, 32); b = torch.randn(32, 32)
+ta = ttnn.from_torch(a, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+tb = ttnn.from_torch(b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+out = ttnn.to_torch(ttnn.add(ta, tb)).float()
+ref = (a.bfloat16().float() + b.bfloat16().float())
+print("max abs diff vs torch:", (out - ref).abs().max().item())
+ttnn.close_device(device)
+print(f"wall {time.time()-t0:.1f}s")

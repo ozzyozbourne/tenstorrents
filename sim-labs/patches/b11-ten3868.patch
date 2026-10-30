@@ -1,0 +1,17 @@
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -3151,6 +3151,14 @@
+ }
+ 
+ TENSIX_EXECUTE_UNPACR() {
++#if TT_ARCH_VERSION == 0
++    // B11: Wormhole's LLK follows every unpack-to-Dst tile with one dummy UNPACR to SrcA (hardware bug
++    // TEN-3868): all-zero datums, no dvalid, no address increment, in the tile's config context.
++    // Nothing reads what it writes, so treat it as a no-op instead of checking its (FP32) formats.
++    if (zero_write2 && !set_dat_valid && !unpack_block_selection && !addr_mode) {
++        return true;
++    }
++#endif
+     TTSIM_VERIFY(last, UnsupportedFunctionality, "last=%d", last);
+     TTSIM_VERIFY(!search_cache_flush, UnsupportedFunctionality, "search_cache_flush=%d", search_cache_flush);
+     TTSIM_VERIFY(!row_search, UnsupportedFunctionality, "row_search=%d", row_search);
