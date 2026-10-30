@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A09 · Memory: L1, DRAM, interleaving and sharding · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a08-noc.html">&larr; Prev</a>
+  <a href="a10-first-program.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 09</span><span class="tag">Prerequisites: A03, A08</span>
+  <h1><span class="num">09.</span> Memory: L1, DRAM, interleaving and sharding</h1>
+  <p class="subtitle">The chip has no cache to decide where data lives, so software decides. By the end you will be able to take any page of any buffer and say which bank holds it, at what address, and how many NoC hops it is from the core that needs it.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#nocache">No caches, on purpose</a></li>
+      <li><a href="#hierarchy">The hierarchy: four distances</a></li>
+      <li><a href="#l1">L1: a scratchpad, not a cache</a></li>
+      <li><a href="#dram">DRAM: controllers, channels and banks</a></li>
+      <li><a href="#pages">Pages and interleaving</a></li>
+      <li><a href="#sharding">Sharding: putting data where the work is</a></li>
+      <li><a href="#bandwidth">The DRAM bandwidth story: 267 of 288 GB/s</a></li>
+      <li><a href="#allocator">Sidebar: the allocator</a></li>
+      <li><a href="#chips">Across chips: no shared memory at all</a></li>
+      <li><a href="#sim">In the simulator</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Take a small tensor: 128 × 128 values in bfloat16. That is 32 KiB. The chip works in 32 × 32 tiles, so the tensor is a 4 × 4 grid of 16 tiles, each 2 KiB. Now look at where it could go on a Wormhole chip. The chip has 12 GiB of DRAM, reached through 12 banks along two columns of the die. It also has 64 usable worker cores in this setup, and each has about 1.4 MiB of its own SRAM.</p>
+  <p>On a GPU you would call <code>cudaMalloc</code>, get one pointer, and let the cache hierarchy find the bytes when a thread asks for them. Tenstorrent chips have no such hierarchy. Nothing moves data closer to the core that will use it, and no hardware tracks which copy is newest. So the opening question of this chapter is a real one:</p>
+  <div class="callout key">With no cache, who decides where each byte lives? You do. Usually you decide through a few well-chosen defaults, and the rest of this chapter is about what those defaults are and when to override them.</div>
+  <p>We will work up to a single picture: the same 16 coloured tiles, moved between DRAM banks and core L1s, with a hop counter on every core. The steps on the way are: why there is no cache, what each level of memory is, how a buffer is cut into pages and dealt round-robin to banks, and how sharding pins pages to the cores that compute on them.</p>
+
+  <h2 id="nocache">No caches, on purpose</h2>
+  <p>A cache is a deal. You write code as if memory were one big flat array, and the hardware guesses which parts you will touch next and keeps copies nearby. When it guesses right, everything is fast. When it guesses wrong, you stall, and how long you stall depends on what else is happening on the chip. With many cores, the hardware must also keep every copy consistent. That is <i>coherence</i>, and it costs snoop traffic, directory state and silicon area.</p>
+  <p>Tenstorrent refuses the deal. The Metalium programming guide says so directly. The chips "deliberately omit cache hierarchies found in traditional CPU and GPU architectures". The on-chip SRAM "functions as addressable memory rather than transparent cache". This explicit model "eliminates cache coherency protocols and provides predictable memory access latency, but places responsibility on developers to manage data placement and movement patterns effectively" (<code>METALIUM_GUIDE.md:233-237</code>).</p>
+  <p>Why is this a good trade for AI work in particular? Look at a matmul or an attention layer. You know every address it will touch before it starts. The access pattern is not data-dependent, so a cache's guessing buys nothing. What it adds is jitter and area. If software already knows the schedule, it can issue the reads itself, early, as DMA over the NoC, and overlap them with compute. You met that NoC in <a href="a08-noc.html">A08</a>.</p>
+  <div class="callout gpu">A GPU has registers, shared memory (a scratchpad you manage), L1 and L2 caches managed by hardware, and HBM. CUDA programmers already hand-manage one level: shared memory. A Tenstorrent chip makes <i>every</i> level work like shared memory. The L1 in each Tensix behaves like a 1.4 MiB block of CUDA <code>__shared__</code> memory that other cores can also write into over the NoC. DRAM is not mapped into any core's address space at all. You reach it only by DMA.</div>
+  <div class="callout warn">"No caches" means no <i>data</i> caches between cores and memory. Some small caches do exist, and you should know about them. Each baby RISC-V core has a small instruction cache in front of L1, 0.5–2 KiB according to <code>memory_for_kernel_developers.rst:16</code>. On Blackhole, each baby core also has a 64-byte L0 <i>data</i> cache: four 16-byte lines, not coherent, and flushed by any <code>fence</code> (tt-isa-documentation <code>BlackholeA0/TensixTile/BabyRISCV/README.md</code>, section "L0 Data Cache"). Blackhole's 16 SiFive x280 "big" cores have ordinary coherent caches. None of these sits between DRAM and the compute engines.</div>
+
+  <h2 id="hierarchy">The hierarchy: four distances</h2>
+  <p>Without caches, the memory hierarchy is simply a list of places data can sit, ordered by how far it is from the core that wants it. An analogy helps here. Think of a worker at a desk. The worker has a pocket notebook, a desk, a library across campus with a row of checkout counters, and other campuses reachable only by courier.</p>
+  <table>
+    <tr><th>Level</th><th>Size (Wormhole)</th><th>Who can touch it</th><th>How</th></tr>
+    <tr><td><b>Local data RAM</b> (pocket notebook)</td><td>4 KiB (BRISC, NCRISC), 2 KiB (each TRISC)</td><td>Only its own RISC-V core</td><td>Ordinary load/store, 2-cycle load latency. The stack lives here.</td></tr>
+    <tr><td><b>L1</b> (the desk)</td><td>1464 KiB per Tensix (1536 KiB on Blackhole)</td><td>All five cores of the Tensix, the unpackers/packers, and any other tile via the NoC</td><td>Load/store from RISC-V (≥ 8 cycles), wide ports for the engines, NoC reads and writes</td></tr>
+    <tr><td><b>DRAM</b> (the library)</td><td>12 GiB GDDR6 in 12 banks</td><td>Anyone, but only through the NoC</td><td><code>noc_async_read/write</code> to a DRAM tile's (x, y, address)</td></tr>
+    <tr><td><b>Other chips</b> (other campuses)</td><td>Another chip's DRAM and L1</td><td>Only Ethernet cores</td><td>Explicit packets over Ethernet links. There are no shared addresses.</td></tr>
+  </table>
+  <p>The sizes come from the ISA documentation: <code>WormholeB0/TensixTile/BabyRISCV/README.md</code> lines 9 and 119 give the local RAMs and the 2- versus ≥8-cycle latencies, and <code>L1.md:3</code> gives the L1 size. The most important fact in the table is the last column. In a Tensix, a RISC-V core can only <i>load</i> and <i>store</i> to its private RAM and its own L1. Everything else is an address of the form <b>(x, y, local_address)</b>, and you reach it by asking the NoC to fetch it. The kernel-developer guide makes the point in code:</p>
+  <div class="filename">tt-metal/docs/source/tt-metalium/tt_metal/advanced_topics/memory_for_kernel_developers.rst:41-43 @7aad8aac</div>
+<pre><code>// `dram_addr` is a DRAM address, however the address is not mapped in the RISC-V address space
+// and the content must be explicitly fetched from DRAM using NoC APIs and requesting a transfer
+uint32_t dram_addr = get_arg_val&lt;uint32_t&gt;(0);</code></pre>
+  <p>Where the analogy breaks: a real library has one front desk, but this "library" is spread along both edges of the chip, and the walk to it depends on which counter you use. The NoC is a one-way torus (rightwards and downwards on NoC 0, as in A08), so "nearby" is not symmetric. A counter one step to your left can be nine steps away.</p>
+
+  <h2 id="l1">L1: a scratchpad, not a cache</h2>
+  <p>The ISA spec itself warns about the name: "This RAM is called 'L1', but this is somewhat of a misnomer, as it is suggestive of a hardware-managed cache, which is not the case - this is plain RAM" (<code>WormholeB0/TensixTile/L1.md:3</code>). So what lives in those 1464 KiB? Looking from address 0 upwards on Wormhole:</p>
+  <ul>
+    <li><b>Reserved runtime area</b>, about the first 35 KiB: the boot code, mailboxes used by the host and dispatch to launch kernels, firmware for each of the five RISC-V cores, NoC counters and fabric routing tables. These are the <code>MEM_*</code> regions in <code>tt_metal/hw/inc/internal/tt-1xx/wormhole/dev_mem_map.h:84-163</code>.</li>
+    <li><b>Kernel config region</b>, 69 KiB (<code>wh_hal_tensix.cpp:42</code>). Each program places its kernel binaries ("kernel text"), runtime arguments, semaphores and circular-buffer configuration here.</li>
+    <li><b>The unreserved region</b>, everything else, which starts at <code>0x19E60</code> on this build. There are 1,393,056 bytes (1360 KiB) left for your data. <i>Circular buffers</i> (CBs) grow upward from the bottom of this region. <i>L1 buffers</i>, which the allocator manages, grow downward from the top. A11 covers circular buffers. For now, think of them as the per-program staging areas between the reader, compute and writer kernels.</li>
+  </ul>
+  <p>The 1360 KiB figure is not a guess. It is what the allocator reported in the simulator run <a href="#sim">below</a>: <code>L1 banks=64 bank_size=1393056 B</code> out of <code>worker_l1_size=1499136 B</code>.</p>
+
+  <h3>Banking inside one L1</h3>
+  <p>"One L1 bank per core" in the allocator's language means one allocation unit per core. Physically, each Wormhole L1 is built from <b>16 banks of 91.5 KiB</b>, and each bank can do one 128-bit read or write per cycle. Sixteen access ports sit in front of them. Any port can reach any bank, and when two ports want the same bank in the same cycle, one of them waits (<code>L1.md:5</code>). That is why the engines get very different bandwidth from the RISC-V cores (<code>L1.md:25-53</code>):</p>
+  <ul>
+    <li>An <b>unpacker</b> can read 4 × 128 bits per cycle. With both unpackers running, they share 5 × 128 bits.</li>
+    <li>Each of the four <b>packers</b> writes 128 bits per cycle.</li>
+    <li>Each <b>NoC</b> has two read and two write connections to L1: 256 bits per cycle each way, which matches the 256-bit router links.</li>
+    <li>A <b>baby RISC-V</b> store is always a "narrow" write. Narrow writes are implemented as a read-modify-write that blocks the bank for five cycles. That works out to one 32-bit store per five cycles, or 6.4 bits per cycle.</li>
+  </ul>
+  <p>Compare 6.4 bits per cycle with 512 bits per cycle for the unpacker. That ratio is why the RISC-V cores direct the work and do not do it. Kernels ask the NoC, the unpackers and the packers to move bytes, and the RISC-V cores mostly write descriptors and wait on counters. The spec puts it bluntly: RISC-V cores are "<i>strongly</i> encouraged to instruct other clients to access L1 on their behalf".</p>
+  <div class="callout warn">Do not pass the address of a stack variable to <code>noc_async_read</code>. The stack is in core-private local RAM, which is mapped at the same address on every core, and the NoC cannot see it. The guide calls this out as code that "<b>will not</b> work" (<code>memory_for_kernel_developers.rst:88-101</code>). Only L1 addresses can be DMA sources or destinations.</div>
+
+  <h2 id="dram">DRAM: controllers, channels and banks</h2>
+  <p>Three words get mixed up here, and different sources use them differently, so let us pin them down for Wormhole.</p>
+  <ul>
+    <li>A <b>GDDR6 channel</b> is 1 GiB of memory behind a 16-bit data bus running at 12 GT/s, giving 24 GB/s. Wormhole has <b>12</b> of them.</li>
+    <li>A <b>controller</b> (the DRAM "channel" in UMD and soc-descriptor terms, confusingly) owns two GDDR6 channels. Wormhole has <b>6</b>. Each controller appears on the NoC as <b>three</b> DRAM tiles, so there are 18 DRAM tiles in total. All three tiles of a controller reach the same memory: "Reading from different D1 tiles at the same address returns the same data" (<code>memory_for_kernel_developers.rst:114-115</code>).</li>
+    <li>A <b>bank</b> is what the allocator and kernels count. On Wormhole it is a 1 GiB <i>view</i>: one controller, seen through one chosen tile, at address offset 0 (the first GDDR6 channel) or 1 GiB (the second). 6 controllers × 2 views = <b>12 banks</b>.</li>
+  </ul>
+  <p>The ISA docs confirm the hardware side: "There are 18 DRAM tiles per Wormhole ASIC, collectively exposing 12x 1 GiB channels of GDDR6". Through the NoC, a DRAM tile's addresses <code>0x0_0000_0000</code>–<code>0x0_3FFF_FFFF</code> are channel 0 and <code>0x0_4000_0000</code>–<code>0x0_7FFF_FFFF</code> are channel 1 (<code>WormholeB0/DRAMTile/README.md:3, 40-41</code>). The software side, meaning which tile and which offset form each bank, is in the soc descriptor:</p>
+  <div class="filename">tt-metal/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml:11-38,101-102 @7aad8aac (condensed)</div>
+<pre><code>dram:
+  [
+    [0-0, 0-1, 0-11],     # controller 0: three NoC tiles, same memory
+    [0-5, 0-6, 0-7],      # controller 1
+    [5-0, 5-1, 5-11],
+    [5-2, 5-9, 5-10],
+    [5-3, 5-4, 5-8],
+    [5-5, 5-6, 5-7]
+  ]
+dram_views:
+  [
+    { channel: 0, eth_endpoint: [0, 0], worker_endpoint: [2, 2], address_offset: 0 },
+    { channel: 0, eth_endpoint: [0, 0], worker_endpoint: [1, 1], address_offset: 1073741824 },
+    ...   # 12 views in all, two per controller
+  ]
+dram_view_size:
+  1073741824</code></pre>
+  <p>(The <code># controller</code> comments are mine.) Read the first view like this: bank 0 is controller 0, reached by workers through endpoint index 2 of that controller's list, which is tile <code>0-11</code>, at offset 0. Bank 1 is the <i>same controller</i> through tile <code>0-1</code>, at offset 1 GiB. You do not have to decode the rest by hand. The probe program in the <a href="#sim">simulator section</a> asked the allocator, and it printed the full table:</p>
+  <table>
+    <tr><th>Bank</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th></tr>
+    <tr><td>Controller</td><td>0</td><td>0</td><td>1</td><td>1</td><td>2</td><td>2</td><td>3</td><td>3</td><td>4</td><td>4</td><td>5</td><td>5</td></tr>
+    <tr><td>NoC tile (x-y)</td><td>0-11</td><td>0-1</td><td>0-5</td><td>0-7</td><td>5-1</td><td>5-11</td><td>5-2</td><td>5-9</td><td>5-8</td><td>5-3</td><td>5-5</td><td>5-7</td></tr>
+    <tr><td>Offset</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td></tr>
+  </table>
+  <p>Blackhole is simpler. It has 8 controllers and 8 banks of 4080 MiB each (<code>dram_bank_size: 4278190080</code> in <code>blackhole_140_arch.yaml</code>), with no split into two views. The p150 has 32 GB of GDDR6 on a 256-bit bus at 16 GT/s, for 512 GB/s according to the <a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole spec page</a>.</p>
+  <div class="callout warn"><b>Sources disagree on "how many DRAM banks does Wormhole interleave over?"</b> The kernel-developer guide's figure says a 64-tile buffer "round-robins across the 6 DRAM controllers" (<code>memory_for_kernel_developers.rst:216</code>). The allocator report says "on Wormhole there are 12 ~1GB DRAM banks" (<code>tech_reports/memory/allocator.md:21</code>). The code follows the allocator: <code>num_dram_channels = soc_desc.get_num_dram_views()</code> (<code>l1_banking_allocator.cpp:236</code>), and the simulator run below printed <code>DRAM banks=12</code>. Consecutive pages therefore alternate between the two GDDR6 channels of one controller before moving to the next controller. So both statements are true in a sense: pages 0 and 1 hit controller 0, and pages 0–11 together touch all 6 controllers.</div>
+  <p>And ttsim? It models the memory per <i>controller</i>, not per bank. Each simulated chip gets one anonymous <code>mmap</code> per controller, and a comment admits the shortcut:</p>
+  <div class="filename">ttsim/src/config.h:14,35 and src/sim.cpp:37 @b3620244</div>
+<pre><code>#define NUM_DRAM_CHANNELS 6 // technically it's 12 channels, 2 for each of the 6 DRAM tiles, but doesn't matter
+#define DRAM_CHANNEL_SIZE 0x80000000ull // 2GiB for each of the 6 DRAM tiles (12GB total)
+g_dram[i].p_mem = (uint8_t *)mmap(nullptr, DRAM_CHANNEL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);</code></pre>
+  <p>A NoC read to any of a controller's three tiles lands in the same 2 GiB array, and the 1 GiB offset that tt-metal adds for odd banks simply indexes into the upper half: <code>memcpy(p, &amp;g_dram[tile_id].p_mem[addr], size)</code> (<code>src/tile.cpp:2785-2786</code>). Because the mapping is <code>MAP_NORESERVE</code>, 12 GiB of "DRAM" costs nothing until it is touched. "Doesn't matter" is right for a functional simulator. It would matter for a timing model, because the two GDDR6 channels are separate 24 GB/s pipes.</p>
+
+  <h2 id="pages">Pages and interleaving</h2>
+  <p>A kernel gets <i>one</i> address for a buffer, yet the buffer is spread over 12 banks (or 64 L1s). How do those fit together? Two rules handle it: pages, and lockstep.</p>
+  <h3>Pages</h3>
+  <p>Without a flat address space, you have to choose how big a chunk to store in one place before moving to the next. That chunk is the <b>page</b>: "The chunk size, or the amount of data stored before switching to the next storage location, is referred to as the page size" (<code>memory_for_kernel_developers.rst:133</code>). In practice:</p>
+  <ul>
+    <li><b>Tiled layout:</b> one page = one tile. A bf16 32×32 tile is 2048 bytes. A bfp8_b tile is 1088 bytes: 1024 mantissa bytes plus 64 bytes of shared exponents (<code>tt_backend_api_types.hpp:129</code>).</li>
+    <li><b>Row-major layout:</b> one page = one row, which ttnn calls a "stick".</li>
+    <li><b>Anything you like</b> for raw Metalium buffers. <code>shard_data_rm</code> uses 4-byte pages (two bf16 values per stick).</li>
+  </ul>
+  <h3>Interleaving: dealing cards</h3>
+  <p>An <b>interleaved</b> buffer deals its pages to the banks like a dealer dealing cards: page 0 to bank 0, page 1 to bank 1, … page 11 to bank 11, page 12 back to bank 0. Every new buffer starts dealing at bank 0 (<code>tensor_layouts.md:97-99</code>). Each bank stores its pages one after another. So page <i>p</i> is the ⌊<i>p</i>/12⌋-th page <i>inside</i> bank <i>p</i> mod 12. Here is that sentence as the device-side code, which runs on a RISC-V core inside a reader kernel:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:226-238 @7aad8aac</div>
+<pre><code>template &lt;bool DRAM&gt;
+uint64_t get_dram_noc_addr(
+    const uint32_t id,
+    const uint32_t page_size,
+    const uint32_t bank_base_address,
+    const uint32_t offset = 0,
+    uint8_t noc = noc_index) {
+    uint32_t bank_offset_index = interleaved_addr_gen::get_bank_offset_index&lt;true&gt;(id);
+    uint32_t bank_index = interleaved_addr_gen::get_bank_index&lt;true&gt;(id, bank_offset_index);
+    uint32_t addr =
+        (bank_offset_index * align_power_of_2(page_size, interleaved_addr_gen::get_allocator_alignment&lt;true&gt;())) +
+        bank_base_address + offset + bank_to_dram_offset[bank_index];
+    return noc_address_backend::bank_address&lt;true&gt;(bank_index, addr, noc);
+}</code></pre>
+  <ul>
+    <li><code>get_bank_offset_index(id)</code> is <code>id / NUM_DRAM_BANKS</code>: which row inside the bank. When the bank count is a power of two (8 on Blackhole) it becomes a shift. For 12 it is a multiply-by-reciprocal, <code>udivsi3_const_divisor</code> (same file, lines 20-34), because a hardware divide on a baby core takes 6 to 33 cycles (tt-isa-documentation <code>WormholeB0/TensixTile/BabyRISCV/README.md:46-49</code>).</li>
+    <li><code>get_bank_index</code> is the remainder: which bank.</li>
+    <li>The page size is rounded up to the DRAM alignment: 32 bytes on Wormhole, 64 on Blackhole (<code>LOG_BASE_2_OF_DRAM_ALIGNMENT</code> 5 and 6 in each <code>core_config.h</code>). A 4-byte stick therefore occupies 32 bytes.</li>
+    <li><code>bank_base_address</code> is the buffer's single address, the same for every bank. That only works because of lockstep allocation, described next.</li>
+    <li><code>bank_to_dram_offset[bank_index]</code> adds the 1 GiB view offset for the odd Wormhole banks.</li>
+    <li><code>bank_address</code> finally attaches the bank's NoC (x, y), giving the 64-bit NoC address that <code>noc_async_read</code> takes.</li>
+  </ul>
+  <p>Modern kernels rarely call this directly. They build a <code>TensorAccessor</code> and call <code>noc_async_read_page(i, accessor, l1_addr)</code>, which does the same arithmetic for interleaved <i>and</i> sharded buffers, in DRAM or L1, chosen at compile time (<code>memory_for_kernel_developers.rst:219-276</code>). A11 covers the accessor.</p>
+
+  <h3>Lockstep: one address for all banks</h3>
+  <p>For one address to work in every bank, the allocator reserves the <i>same</i> range in every bank, even banks that get fewer pages. "Each bank reserves the same amount of space for a given buffer regardless of how many banks the data is in" (<code>allocator.md:33</code>). The simulator shows it directly. Three DRAM buffers allocated one after another, with 1, 14 and 1 bf16 tiles:</p>
+<pre><code>DRAM interleaved: d0 (1 page) @0x2d4c40, d1 (14 pages) @0x2d5440, d2 (1 page) @0x2d6440</code></pre>
+  <p>d0 holds one page, which sits in bank 0, yet the next buffer starts 0x800 = 2048 bytes later in <i>all</i> banks. d1 has 14 pages, so banks 0 and 1 hold two pages and banks 2–11 hold one. Every bank still reserves ⌈14/12⌉ = 2 pages, which is why d2 starts 0x1000 = 4096 bytes after d1. That wastes 10 page-slots. In return, kernels get one pointer, and the same pointer works on any chip generation. The kernel guide states the trade-off plainly: "kernels receive a single address parameter instead of N hardware-dependent pointers, at the cost of some memory waste" (<code>memory_for_kernel_developers.rst:181</code>).</p>
+
+  <p>Now try it. Pick a page id and a page type. The figure shows the bank, the address computed by the code above, the DRAM tile it lives on, and the NoC 0 route the data takes back to a reader on logical core (0,0), which is NoC tile (1,1) on an unharvested Wormhole.</p>
+
+  <div class="viz" id="figpage"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figpage");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    // Bank -> NoC0 tile on Wormhole, as printed by the a09_memmap probe in ttsim.
+    var BANK = [[0,11],[0,1],[0,5],[0,7],[5,1],[5,11],[5,2],[5,9],[5,8],[5,3],[5,5],[5,7]];
+    var CTRL_COL = [C.blue, C.yellow, C.green, C.pink, C.orange, C.purple];
+    var DRAMC = {"0,0":0,"0,1":0,"0,11":0,"0,5":1,"0,6":1,"0,7":1,"5,0":2,"5,1":2,"5,11":2,"5,2":3,"5,9":3,"5,10":3,"5,3":4,"5,4":4,"5,8":4,"5,5":5,"5,6":5,"5,7":5};
+    var BASE = 0x2d4c40, NB = 12, ALIGN = 32, READER = [1, 1];
+    var ctrl = document.createElement("div"); ctrl.className = "controls";
+    ctrl.innerHTML = '<label>page id <input type="range" min="0" max="47" value="13" id="pg-id"></label><span id="pg-idv" style="min-width:2.5em;color:#ffd866">13</span>' +
+      '<label>page <select id="pg-ty"><option value="2048">bf16 tile (2048 B)</option><option value="1088">bfp8_b tile (1088 B)</option><option value="4">4-byte stick (shard_data_rm)</option></select></label>';
+    root.appendChild(ctrl);
+    var narr = document.createElement("div"); narr.className = "narration"; root.appendChild(narr);
+    var sl = ctrl.querySelector("#pg-id"), sv = ctrl.querySelector("#pg-idv"), ty = ctrl.querySelector("#pg-ty");
+    function hex(n) { return "0x" + n.toString(16); }
+    function cellType(x, y) {
+      if (DRAMC[x + "," + y] !== undefined) return "D";
+      if (x === 0 && y === 10) return "A";
+      if (x === 0 && y === 3) return "P";
+      if (x === 0) return "R";
+      if (y === 0 || y === 6) return "E";
+      return "T";
+    }
+    var GX = 30, GY = 40, CW = 30, CH = 30;
+    function cx(x) { return GX + x * CW + CW / 2; }
+    function cy(y) { return GY + y * CH + CH / 2; }
+    function draw() {
+      var id = +sl.value, page = +ty.value; sv.textContent = id;
+      var bank = id % NB, row = Math.floor(id / NB);
+      var ap = Math.ceil(page / ALIGN) * ALIGN;
+      var local = BASE + row * ap;
+      var off = (bank % 2) ? 0x40000000 : 0;
+      var t = BANK[bank];
+      TT.clear(ctx, g.W, g.H);
+      TT.text(ctx, "Wormhole NoC grid (NoC 0 coordinates)", GX, 20, { color: C.muted, font: "13px" });
+      for (var y = 0; y < 12; y++) for (var x = 0; x < 10; x++) {
+        var k = cellType(x, y), fill = C.bg3, a = 0.6, lab = "";
+        if (k === "D") { fill = CTRL_COL[DRAMC[x + "," + y]]; a = 0.22; }
+        if (k === "E") { fill = C.teal; a = 0.12; lab = "E"; }
+        if (k === "A") { fill = C.purple; a = 0.3; lab = "A"; }
+        if (k === "P") { fill = C.purple; a = 0.3; lab = "P"; }
+        if (k === "R") { fill = C.bg2; a = 1; }
+        TT.box(ctx, GX + x * CW + 1, GY + y * CH + 1, CW - 2, CH - 2, { fill: fill, alpha: a, r: 3, label: lab, color: C.muted, font: "10px" });
+      }
+      // bank labels
+      for (var b = 0; b < NB; b++) {
+        var bt = BANK[b];
+        TT.text(ctx, "b" + b, cx(bt[0]), cy(bt[1]), { align: "center", font: "10px", mono: true, color: C.fg });
+      }
+      // NoC0 route: right (with wrap) then down (with wrap), from DRAM tile to reader
+      var hx = ((READER[0] - t[0]) % 10 + 10) % 10, hy = ((READER[1] - t[1]) % 12 + 12) % 12;
+      var pts = [[t[0], t[1]]], px = t[0], py = t[1];
+      for (var i = 0; i < hx; i++) { px = (px + 1) % 10; pts.push([px, py]); }
+      for (i = 0; i < hy; i++) { py = (py + 1) % 12; pts.push([px, py]); }
+      ctx.strokeStyle = C.yellow; ctx.lineWidth = 2.5;
+      for (i = 1; i < pts.length; i++) {
+        var p0 = pts[i - 1], p1 = pts[i];
+        ctx.beginPath();
+        if (p1[0] < p0[0]) { // x wrap
+          ctx.moveTo(cx(p0[0]), cy(p0[1])); ctx.lineTo(GX + 10 * CW + 6, cy(p0[1]));
+          ctx.moveTo(GX - 6, cy(p1[1])); ctx.lineTo(cx(p1[0]), cy(p1[1]));
+        } else if (p1[1] < p0[1]) { // y wrap
+          ctx.moveTo(cx(p0[0]), cy(p0[1])); ctx.lineTo(cx(p0[0]), GY + 12 * CH + 6);
+          ctx.moveTo(cx(p1[0]), GY - 6); ctx.lineTo(cx(p1[0]), cy(p1[1]));
+        } else { ctx.moveTo(cx(p0[0]), cy(p0[1])); ctx.lineTo(cx(p1[0]), cy(p1[1])); }
+        ctx.stroke();
+      }
+      TT.box(ctx, GX + t[0] * CW + 1, GY + t[1] * CH + 1, CW - 2, CH - 2, { stroke: C.yellow, lw: 3, r: 3 });
+      TT.box(ctx, GX + READER[0] * CW + 3, GY + READER[1] * CH + 3, CW - 6, CH - 6, { fill: C.green, alpha: 0.85, r: 3, label: "R", color: "#000", font: "bold 11px" });
+      TT.text(ctx, "R = reader core, logical (0,0)", GX, GY + 12 * CH + 22, { color: C.green, font: "12px" });
+      TT.text(ctx, "yellow = NoC 0 data path: " + (hx + hy) + " hop" + (hx + hy === 1 ? "" : "s") + " (" + hx + " right, " + hy + " down, with wrap-around)", GX, GY + 12 * CH + 40, { color: C.yellow, font: "12px" });
+      // bank strip
+      var SX = 380, SY = 92, BW = 40, RH = 22, rows = 4;
+      TT.text(ctx, "12 DRAM banks, pages dealt round-robin (rows = position inside a bank)", SX, 20, { color: C.muted, font: "13px" });
+      for (b = 0; b < NB; b++) {
+        var col = CTRL_COL[Math.floor(b / 2)];
+        TT.box(ctx, SX + b * BW + 2, SY - 26, BW - 4, 20, { fill: col, alpha: 0.25, r: 3, label: "b" + b, color: C.fg, font: "11px", mono: true });
+        for (var r = 0; r < rows; r++) {
+          var pid = r * NB + b, on = pid <= id, cur = pid === id;
+          TT.box(ctx, SX + b * BW + 2, SY + r * RH, BW - 4, RH - 3, { fill: cur ? C.yellow : (on ? col : C.bg3), alpha: cur ? 0.95 : (on ? 0.45 : 0.6), r: 2, label: String(pid), color: cur ? "#000" : C.fg, font: "11px", mono: true });
+        }
+      }
+      for (var c = 0; c < 6; c++) TT.text(ctx, "controller " + c, SX + c * 2 * BW + BW, SY - 44, { align: "center", color: CTRL_COL[c], font: "11px" });
+      // arithmetic
+      var L = SX, Y0 = SY + rows * RH + 30, lh = 24;
+      var lines = [
+        ["bank  = " + id + " mod 12 = " + bank, C.fg],
+        ["row   = floor(" + id + " / 12) = " + row, C.fg],
+        ["page  = " + page + " B  ->  aligned to 32 B: " + ap + " B", C.fg],
+        ["local = base + row x page = " + hex(BASE) + " + " + row + " x " + ap + " = " + hex(local), C.fg],
+        ["+ view offset (" + (off ? "odd bank: 2nd GDDR6 channel" : "even bank: 1st channel") + ") = " + hex(off), C.fg],
+        ["NoC address = tile (" + t[0] + "," + t[1] + "), addr " + hex(local + off), C.yellow]
+      ];
+      for (i = 0; i < lines.length; i++) TT.text(ctx, lines[i][0], L, Y0 + i * lh, { mono: true, font: "13px", color: lines[i][1] });
+      TT.text(ctx, "base 0x2d4c40 = first free DRAM address in the ttsim run below", L, Y0 + lines.length * lh + 6, { color: C.muted, font: "11px" });
+      narr.innerHTML = "<b>Page " + id + "</b> lands in <b>bank " + bank + "</b> (controller " + Math.floor(bank / 2) + "), " + (row === 0 ? "as the first page in that bank" : "as page #" + row + " inside it") +
+        ". Banks " + (bank - bank % 2) + " and " + (bank - bank % 2 + 1) + " share one controller, so consecutive pages alternate between its two GDDR6 channels. The data returns to the reader in " + (hx + hy) + " NoC 0 hop" + (hx + hy === 1 ? "" : "s") + ".";
+    }
+    sl.oninput = draw; ty.onchange = draw; draw();
+  })();
+  </script>
+  <p>Try page 0 and page 1. Both live on controller 0, but bank 0 is reached through tile (0,11) and bank 1 through tile (0,1). For the reader at (1,1), the first is 3 hops away and the second only 1: the data goes one step right, and from (0,11) also two steps down across the wrap-around. Now try page 4, on tile (5,1). It is 4 columns to the <i>right</i> of the reader, and NoC 0 only flows rightwards, so the data cannot step back left. It goes right from column 5 through 9, wraps around to column 0 and arrives at column 1: 6 hops. No single reader is close to every bank. Interleaving avoids hot spots by spreading every buffer evenly, and pays for that with distance.</p>
+
+  <h3>A real run: one stick per bank</h3>
+  <p><code>shard_data_rm</code> makes the page idea concrete. It writes 16 bf16 values, 2, 4, …, 32, to an interleaved DRAM buffer with <b>4-byte pages</b>:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/shard_data_rm/shard_data_rm.cpp:94-96 @7aad8aac</div>
+<pre><code>uint32_t src_buffer_size = num_values * data_size;
+distributed::DeviceLocalBufferConfig input_dram_config{
+    .page_size = input_unit_size, .buffer_type = tt_metal::BufferType::DRAM};</code></pre>
+  <p>The 16 values make 8 pages, so the sticks go to banks 0 through 7, one each, each padded to 32 bytes. Four cores then each pull "their" two sticks into a circular buffer by page id (<code>s0.get_noc_addr(stick_id)</code> in the reader kernel) and print them:</p>
+  <div class="filename">$ TT_METAL_DPRINT_CORES='(0,0)-(0,3)' $EX/metal_example_shard_data_rm   # ttsim, Wormhole, run in this orb (log lines trimmed)</div>
+<pre><code>Original tensor values: 2.0 4.0 6.0 8.0 10.0 12.0 14.0 16.0 18.0 20.0 22.0 24.0 26.0 28.0 30.0 32.0 
+0:0-2:BR: Core (0,2): 18 20 22 24 
+0:0-3:BR: Core (0,3): 26 28 30 32 
+0:0-0:BR: Core (0,0): 2 4 6 8 
+0:0-1:BR: Core (0,1): 10 12 14 16 
+Program finished successfully.
+[8280] 0.5 seconds (16.7 KHz)</code></pre>
+  <p>Core (0,1) asked for sticks 2 and 3, which means banks 2 and 3: two reads to two different DRAM tiles for 8 bytes of data. That is the price of interleaving with tiny pages. The prints arrive out of order because the four cores run concurrently, and nothing orders their DPRINT output.</p>
+
+  <h2 id="sharding">Sharding: putting data where the work is</h2>
+  <p>Interleaving answers "where should this buffer live so no bank is a hot spot?" It does not answer "where should this buffer live so the core that computes on it already has it?" That is <b>sharding</b>. You cut the tensor into rectangular <i>shards</i> and assign each shard to one bank. For L1 that means one core. The tensor-sharding report lists the 2D options (<code>tensor_sharding.md:20-161</code>). All dimensions except the last are first flattened into a height H, so the tensor is H × W:</p>
+  <ul>
+    <li><b>Height sharding</b>: horizontal bands. Each shard has the full width W and H/N rows. Good when each row can be processed alone, as in eltwise ops, layernorm over W, and matmul activations split by M.</li>
+    <li><b>Width sharding</b>: vertical strips. Each shard has the full height and W/N columns. Typical for decode activations: 32 rows and a very wide hidden dimension.</li>
+    <li><b>Block sharding</b>: a 2D grid of blocks onto a 2D grid of cores, which the report describes as "a 1-to-1 mapping onto a corresponding 2D grid of memory banks". Good for 2D-parallel matmuls.</li>
+    <li><b>Orientation</b> (<code>ROW_MAJOR</code> or <code>COL_MAJOR</code>) sets the order in which shards are handed to the cores of the grid: along rows of cores first, or down columns first.</li>
+  </ul>
+  <p>Here is our 16-tile tensor again, in every arrangement we have discussed. Watch the hop counters. In the interleaved arrangements, assume the op runs on logical cores (0,0)–(3,0) and that core <i>i</i> needs row <i>i</i> of the tensor. Each count is the number of NoC 0 hops its four tiles travel to reach it, computed with the same right-then-down torus rule as in A08, on the unharvested layout that ttsim models (see <a href="#sim">In the simulator</a>). Only the returning data is counted, not the read request.</p>
+
+  <div class="viz" id="figaha"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figaha");
+    var g = TT.canvas(root, 900, 500), ctx = g.ctx, C = TT.C;
+    var BANK = [[0,11],[0,1],[0,5],[0,7],[5,1],[5,11],[5,2],[5,9],[5,8],[5,3],[5,5],[5,7]];
+    // L1 bank -> logical core, banks 0..15, as printed by the probe (allocator shuffles L1 bank ids with a fixed seed)
+    var L1B = [[1,4],[4,4],[4,1],[2,2],[6,0],[7,3],[3,0],[5,2],[2,5],[5,4],[3,2],[6,7],[3,3],[7,4],[2,1],[6,4]];
+    var DRAMSET = {"0,0":1,"0,1":1,"0,11":1,"0,5":1,"0,6":1,"0,7":1};
+    function phys(l) { return [l[0] < 4 ? l[0] + 1 : l[0] + 2, l[1] < 5 ? l[1] + 1 : l[1] + 2]; }
+    function hops(s, d) { return ((d[0] - s[0]) % 10 + 10) % 10 + ((d[1] - s[1]) % 12 + 12) % 12; }
+    var ROWC = [C.blue, C.yellow, C.green, C.pink];
+    var GX = 300, GY = 40, CW = 56, CH = 33;
+    var TX = 30, TY = 110, TS = 50;
+    // placement functions: return {cell:[x,y] or null (host), slot, consumer logical core}
+    var MODES = [
+      { key: "host", name: "On the host" },
+      { key: "dram", name: "DRAM interleaved" },
+      { key: "l1i", name: "L1 interleaved" },
+      { key: "height", name: "L1 height-sharded (4 cores)" },
+      { key: "width", name: "L1 width-sharded (4 cores)" },
+      { key: "block", name: "L1 block-sharded (2x2 cores)" }
+    ];
+    function place(mode, p) {
+      var r = Math.floor(p / 4), c = p % 4;
+      switch (mode) {
+        case "host": return { cell: null, slot: p, cons: null };
+        case "dram": return { cell: BANK[p % 12], slot: Math.floor(p / 12), cons: [r, 0] };
+        case "l1i": return { cell: phys(L1B[p]), slot: 0, cons: [r, 0] };
+        case "height": return { cell: phys([r, 0]), slot: c, cons: [r, 0] };
+        case "width": return { cell: phys([c, 0]), slot: r, cons: [c, 0] };
+        case "block": return { cell: phys([Math.floor(c / 2), Math.floor(r / 2)]), slot: (r % 2) * 2 + (c % 2), cons: [Math.floor(c / 2), Math.floor(r / 2)] };
+      }
+    }
+    function pos(mode, p) {
+      var pl = place(mode, p);
+      if (!pl.cell) { var r = Math.floor(p / 4), c = p % 4; return [TX + c * TS + 3, TY + r * TS + 3, TS - 6, TS - 6]; }
+      var w = (CW - 8) / 2, h = (CH - 6) / 2;
+      return [GX + pl.cell[0] * CW + 3 + (pl.slot % 2) * (w + 2), GY + pl.cell[1] * CH + 2 + Math.floor(pl.slot / 2) * (h + 1), w, h];
+    }
+    function hopTable(mode) {
+      var per = {}, total = 0;
+      for (var p = 0; p < 16; p++) {
+        var pl = place(mode, p); if (!pl.cons) return null;
+        var d = phys(pl.cons), h = hops(pl.cell, d), k = pl.cons.join(",");
+        per[k] = (per[k] || 0) + h; total += h;
+      }
+      return { per: per, total: total };
+    }
+    var steps = MODES.map(function (m, i) {
+      var t = hopTable(m.key), txt;
+      if (m.key === "host") txt = "<b>The tensor.</b> 128 × 128 bf16 = 4 × 4 tiles of 2 KiB each. Each tensor row has its own colour, and each tile shows its page id (row-major, 0–15). Press Step to send it to the device.";
+      else {
+        var parts = []; for (var k in t.per) parts.push("(" + k + "): " + t.per[k]);
+        if (m.key === "dram") txt = "<b>DRAM interleaved</b> (the default). Page p goes to bank p mod 12, so pages 12–15 wrap back to banks 0–3. Core i must fetch row i from four different banks. NoC 0 hops per core: " + parts.join(", ") + ". <b>Total " + t.total + "</b>.";
+        else if (m.key === "l1i") txt = "<b>L1 interleaved.</b> Pages are dealt to L1 banks. The allocator <i>shuffles</i> L1 bank ids with a fixed seed, so bank 0 is logical core (1,4), not (0,0). The data is on-chip but scattered. Hops per core: " + parts.join(", ") + ". <b>Total " + t.total + "</b>.";
+        else if (m.key === "height") txt = "<b>Height-sharded</b>, shard = 32 × 128 (one tile-row). Core (i,0) holds tensor row i, which is exactly what it computes on. Hops: <b>0</b>. The data never touches the NoC during the op.";
+        else if (m.key === "width") txt = "<b>Width-sharded</b>, shard = 128 × 32 (one tile-column). Core (j,0) holds column j: tiles j, j+4, j+8, j+12. Each core now has one tile of every colour. Hops: <b>0</b> for an op that works column by column.";
+        else txt = "<b>Block-sharded</b> on a 2 × 2 grid, shard = 64 × 64. Block (row r, col c) goes to core (x=c, y=r), as tensor_sharding.md describes. Hops: <b>0</b>. Same tensor, same bytes, a different owner for every tile.";
+      }
+      return { dur: i === 0 ? 0.6 : 1.4, text: txt };
+    });
+    var from = 0;
+    function drawGrid() {
+      for (var y = 0; y < 12; y++) for (var x = 0; x < 10; x++) {
+        var isD = x === 5 || DRAMSET[x + "," + y], fill = C.bg3, a = 0.55;
+        if (isD) { fill = C.orange; a = 0.16; }
+        else if (x === 0) { fill = C.bg2; a = 1; }
+        else if (y === 0 || y === 6) { fill = C.teal; a = 0.08; }
+        TT.box(ctx, GX + x * CW + 1, GY + y * CH + 1, CW - 2, CH - 2, { fill: fill, alpha: a, r: 3 });
+      }
+      for (var b = 0; b < 12; b++) TT.text(ctx, "b" + b, GX + BANK[b][0] * CW + CW - 4, GY + BANK[b][1] * CH + CH - 7, { align: "right", font: "9px", color: C.orange });
+      TT.text(ctx, "Wormhole NoC grid: DRAM tiles orange, workers grey", GX, 22, { color: C.muted, font: "12px" });
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        drawGrid();
+        TT.text(ctx, "128 × 128 bf16 tensor", TX, TY - 30, { color: C.muted, font: "12px" });
+        for (var p = 0; p < 16; p++) { var hp = pos("host", p); TT.box(ctx, hp[0], hp[1], hp[2], hp[3], { stroke: C.border, r: 3 }); }
+        var cur = MODES[i].key, prev = MODES[Math.max(0, i - 1)].key;
+        var tab = hopTable(cur);
+        // consumer highlight + fetch lines
+        if (tab && t > 0.6) {
+          for (p = 0; p < 16; p++) {
+            var pl = place(cur, p), d = phys(pl.cons);
+            if (cur === "dram" || cur === "l1i") {
+              ctx.globalAlpha = 0.45; ctx.strokeStyle = ROWC[Math.floor(p / 4)]; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+              ctx.beginPath(); ctx.moveTo(GX + pl.cell[0] * CW + CW / 2, GY + pl.cell[1] * CH + CH / 2); ctx.lineTo(GX + d[0] * CW + CW / 2, GY + d[1] * CH + CH / 2); ctx.stroke();
+              ctx.setLineDash([]); ctx.globalAlpha = 1;
+            }
+          }
+          for (var k in tab.per) {
+            var lc = k.split(",").map(Number), pc = phys(lc);
+            TT.box(ctx, GX + pc[0] * CW + 1, GY + pc[1] * CH + 1, CW - 2, CH - 2, { stroke: C.green, lw: 2.5, r: 3 });
+          }
+        }
+        for (p = 0; p < 16; p++) {
+          var a = pos(i === 0 ? "host" : prev, p), b = pos(cur, p);
+          var x = TT.lerp(a[0], b[0], t), y = TT.lerp(a[1], b[1], t), w = TT.lerp(a[2], b[2], t), h = TT.lerp(a[3], b[3], t);
+          TT.box(ctx, x, y, w, h, { fill: ROWC[Math.floor(p / 4)], alpha: 0.85, r: 2, label: String(p), color: "#000", font: (w > 30 ? "bold 14px" : "bold 9px"), mono: true });
+        }
+        // hop panel
+        TT.text(ctx, MODES[i].name, TX, 330, { color: C.yellow, font: "bold 15px" });
+        if (tab) {
+          var yy = 356;
+          TT.text(ctx, "NoC 0 hops to each consumer core:", TX, yy, { color: C.muted, font: "12px" });
+          var keys = Object.keys(tab.per).sort(function (u, v) { var a1 = u.split(",").map(Number), b1 = v.split(",").map(Number); return a1[1] - b1[1] || a1[0] - b1[0]; });
+          keys.forEach(function (k2, j) {
+            TT.text(ctx, "core (" + k2 + ")", TX, yy + 22 + j * 20, { mono: true, font: "12px", color: C.fg });
+            var hv = tab.per[k2];
+            TT.box(ctx, TX + 100, yy + 14 + j * 20, Math.max(2, hv * 2), 14, { fill: hv ? C.red : C.green, alpha: 0.8, r: 2 });
+            TT.text(ctx, String(hv), TX + 106 + hv * 2, yy + 22 + j * 20, { mono: true, font: "12px", color: hv ? C.red : C.green });
+          });
+          TT.text(ctx, "total: " + tab.total + " hops", TX, yy + 22 + keys.length * 20 + 6, { color: tab.total ? C.red : C.green, font: "bold 13px" });
+        }
+      }
+    });
+  })();
+  </script>
+  <p>The tensor is the same in every frame, and so are the 32 KiB. Only the owner of each tile changes, and with it the NoC traffic the op will cause. The totals are 158 hops for DRAM interleaved, 199 for L1 interleaved, and 0 for any sharding that matches how the op splits its work. Two details are worth a second look:</p>
+  <ul>
+    <li><b>L1 interleaved is not "local".</b> The data is on-chip, but it is dealt across 64 L1 banks in shuffled order. The allocator deliberately randomises which core is bank 0 (<code>std::shuffle</code> with a fixed seed, <code>l1_banking_allocator.cpp:80-87</code>), presumably to spread small buffers across the grid. The exact order depends on the C++ standard library; the figure uses the order this build printed. So core (0,0) holds none of row 0, and on this layout the traffic is <i>worse</i> than from DRAM.</li>
+    <li><b>Sharding only pays when the shard matches the work.</b> Width-sharding makes every core hold one tile of every row. For a row-wise op such as a softmax over W, that would be the wrong choice: each core would need the other three cores' tiles. The layout is a promise about the <i>op</i>, not about the tensor.</li>
+  </ul>
+  <div class="callout key">Interleaving is the default because it is safe for every op: no bank is a hot spot. Sharding is a contract between the data layout and an op's work split. When the contract holds, the op reads from its own L1 and the NoC sits idle.</div>
+
+  <h3>The same thing, from the allocator's mouth</h3>
+  <p>The figure above is drawn from real allocator output. The probe program asked tt-metal for the page-to-core mapping of a 4 × 4-tile L1 buffer under each sharding mode (<code>Buffer::get_buffer_page_mapping()</code>):</p>
+  <div class="filename">$ $LAB_HOME/host/a09_memmap   # ttsim, Wormhole; source: sim-labs/workbench/host/a09_memmap.cpp (trimmed)</div>
+<pre><code>HEIGHT sharded 4x4 tiles, shard 32x128 elems, @0x16a000:
+   core 0-0 holds tiles [0, 1, 2, 3]
+   core 1-0 holds tiles [4, 5, 6, 7]
+   core 2-0 holds tiles [8, 9, 10, 11]
+   core 3-0 holds tiles [12, 13, 14, 15]
+WIDTH  sharded 4x4 tiles, shard 128x32 elems, @0x16a000:
+   core 0-0 holds tiles [0, 4, 8, 12]
+   ...
+BLOCK  sharded 4x4 tiles, shard 64x64 elems, @0x16a000:
+   core 0-0 holds tiles [0, 1, 4, 5]
+   core 0-1 holds tiles [8, 9, 12, 13]
+   core 1-0 holds tiles [2, 3, 6, 7]
+   core 1-1 holds tiles [10, 11, 14, 15]
+BLOCK/COL_MAJOR sharded 4x4 tiles, shard 64x64 elems, @0x16a000:
+   core 0-0 holds tiles [0, 1, 4, 5]
+   core 0-1 holds tiles [2, 3, 6, 7]
+   core 1-0 holds tiles [8, 9, 12, 13]
+   core 1-1 holds tiles [10, 11, 14, 15]</code></pre>
+  <p>The last two blocks show what orientation does. With <code>ROW_MAJOR</code>, the second shard (tiles 2, 3, 6, 7) goes to the next core <i>along the row</i>, core (1,0). With <code>COL_MAJOR</code>, it goes to the next core <i>down the column</i>, core (0,1). The cut is identical; only the order in which cores are handed shards changes. Each buffer was freed before the next was created, so all four reuse the address 0x16a000.</p>
+
+  <h3>Sharding with no data movement at all: <code>vecadd_sharding</code></h3>
+  <p>The <code>vecadd_sharding</code> example takes the idea to its limit. A, B and C are all sharded in L1, and the circular buffers the compute kernel reads from are placed <i>on top of</i> those L1 buffers. So there is no reader kernel, no writer kernel and no NoC traffic during the add:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/vecadd_sharding/vecadd_sharding.cpp:65-69,172-184 @7aad8aac (condensed)</div>
+<pre><code>CircularBufferConfig cb_config = CircularBufferConfig(n_tiles * tile_size, {{cb, tt::DataFormat::Float16_b}})
+                                     .set_page_size(cb, tile_size)
+                                     // IMPORTANT: assign L1 buffer address to circular buffer directly so that
+                                     // no extra allocation and data copy
+                                     .set_globally_allocated_address(*(l1_buf-&gt;get_backing_buffer()));
+...
+ShardSpecBuffer spec(
+    // core_sets: The set of cores to shard the buffer across
+    cores,
+    // shard_shape: The size of each shard in the buffer
+    {uint32_t(num_tiles_per_core_x * tt::constants::TILE_HEIGHT),
+     uint32_t(num_tiles_per_core_y * tt::constants::TILE_WIDTH)},
+    // shard_orientation: The orientation of the shards in the buffer
+    ShardOrientation::ROW_MAJOR,
+    // page_shape: The shape of each page in the buffer (most likely equals to tile size as that's what the compute
+    // engines expect)
+    {tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH},
+    // tensor2d_shape_in_pages: The shape of the tensor in pages/(tiles)
+    {n_tiles_y, n_tiles_x});</code></pre>
+  <div class="filename">$ $EX/metal_example_vecadd_sharding -s height   # then -s width, -s block; ttsim, Wormhole (trimmed)</div>
+<pre><code>Sharding 4x4 tiles to 4x1 cores in TensorMemoryLayout::HEIGHT_SHARDED mode
+Each core will handle 1x4 tiles
+
+Kernel execution finished. Reading results...
+Partial results: (note we are running under BFP16. It's going to be less accurate)
+Core 0:
+index 0: 4.1875 + 1.0546875 = 5.25
+index 1: 6.75 + 4.46875 = 11.25
+index 2: 2.5 + 9.5 = 12
+...
+Core 3:
+index 12288: 5.59375 + 4 = 9.625
+...
+All results match expected values within tolerance.
+[4647] 0.2 seconds (19.1 KHz)
+
+Sharding 4x4 tiles to 1x4 cores in TensorMemoryLayout::WIDTH_SHARDED mode
+Each core will handle 4x1 tiles
+All results match expected values within tolerance.
+[4642] 0.2 seconds (28.5 KHz)
+
+Sharding 4x4 tiles to 2x2 cores in TensorMemoryLayout::BLOCK_SHARDED mode
+Each core will handle 2x2 tiles
+All results match expected values within tolerance.
+[4650] 0.2 seconds (27.6 KHz)</code></pre>
+  <p>Index 12288 = 3 × 4096 is where core 3's elements start: 4 tiles × 1024 values per core. The host write (<code>EnqueueWriteMeshBuffer</code>) is the step that scatters the shards to their cores. After that the kernel only ever touches its own L1. Remember that the bracketed simulator clock counts are <i>not</i> performance (see B00). The three modes cost about the same here because ttsim does not model timing at all.</p>
+
+  <h3>From Python</h3>
+  <p>TT-NN wraps the same machinery in <code>MemoryConfig</code> and <code>ShardSpec</code>. A18 covers it properly. Here is a minimal check that runs under ttsim, putting the same 128 × 128 tensor in DRAM, then height- and width-sharded over cores (0,0)–(3,0), with a ReLU on each:</p>
+  <div class="filename">$LAB_HOME/py/shard.py (written for this chapter; excerpt: seeding, open/close_device and the final shard-spec print are omitted; run with the workbench env and python_env active)</div>
+<pre><code>x = torch.randn((128, 128), dtype=torch.bfloat16)          # 4x4 tiles
+grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
+cfgs = {
+    "DRAM interleaved": ttnn.DRAM_MEMORY_CONFIG,
+    "L1 height-sharded": ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+                          ttnn.ShardSpec(grid, [32, 128], ttnn.ShardOrientation.ROW_MAJOR)),
+    "L1 width-sharded": ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+                          ttnn.ShardSpec(grid, [128, 32], ttnn.ShardOrientation.ROW_MAJOR)),
+}
+for name, mc in cfgs.items():
+    t = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=device, memory_config=mc)
+    y = ttnn.to_torch(ttnn.relu(t))
+    print(f"{name:18s} addr=0x{t.buffer_address():x} layout={t.memory_config().memory_layout} "
+          f"match={torch.equal(y, torch.relu(x))}")</code></pre>
+<pre><code>DRAM interleaved   addr=0x2d4c40 layout=TensorMemoryLayout.INTERLEAVED match=True
+L1 height-sharded  addr=0x16c000 layout=TensorMemoryLayout.HEIGHT_SHARDED match=True
+L1 width-sharded   addr=0x16a000 layout=TensorMemoryLayout.WIDTH_SHARDED match=True
+shard spec: ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":3,"y":0}], shape=[32, 128], orientation=ShardOrientation::ROW_MAJOR}
+[5429] 3.3 seconds (1.7 KHz)</code></pre>
+  <p>The addresses tell the allocator's story, which the sidebar explains. The DRAM tensor sits at the very bottom of free DRAM, at the same 0x2d4c40 as d0 in the C++ probe. The height-sharded tensor sits 8 KiB below the top of L1 (0x16E000 − 0x2000): one 4-tile shard per core. The width-sharded tensor is allocated while the height-sharded one is still alive, so it lands another 8 KiB lower.</p>
+
+  <h3>Why it matters: the numbers</h3>
+  <p>The LLM tech report ranks the four ways an op can read its inputs on Wormhole (<code>tech_reports/LLMs/llms.md:1844-1852</code>):</p>
+  <table>
+    <tr><th>Source</th><th>What the report says</th></tr>
+    <tr><td>DRAM interleaved</td><td>"Each tile … is read from a different DRAM bank. This is the ttnn default and is the slowest way to read data. A matmul can expect to read around <b>190 GB/s</b> on a Wormhole like this."</td></tr>
+    <tr><td>DRAM sharded</td><td>Each bank's slice is read by the core closest to that bank: "around <b>240 GB/s</b> on a Wormhole". Used "for DRAM-bound matmuls and nothing else".</td></tr>
+    <tr><td>L1 interleaved</td><td>"Tiles are interleaved across the L1 of all the cores and are read across the NoC."</td></tr>
+    <tr><td>L1 sharded</td><td>"particularly fast when the data an OP requires is already placed in L1 of the correct core, avoiding the NOC entirely".</td></tr>
+  </table>
+  <p>The report's rule of thumb follows: "Activations are placed in L1 and weights placed in DRAM." Activations are produced and consumed by neighbouring ops, so a sharded layout can flow from one op to the next without ever leaving L1. METALIUM_GUIDE calls this an alternative to aggressive fusion: intermediate data "can persist in SRAM across multiple operations without eviction pressure" (<code>METALIUM_GUIDE.md:210</code>). Weights are too big for 64 × 1.4 MiB, so they stream from DRAM, and the next section is about streaming them as fast as the GDDR6 allows.</p>
+
+  <h2 id="bandwidth">The DRAM bandwidth story: 267 of 288 GB/s</h2>
+  <p>Start with the ceiling. Each GDDR6 channel moves 16 bits per transfer at 12 GT/s, which is 24 GB/s. Twelve channels give <b>288 GB/s</b>. Self-refresh and similar overheads cost a few percent, so "well-written software can expect to achieve approximately 92% of the theoretical maximum" (<code>WormholeB0/DRAMTile/README.md:66</code>). Note also that one NoC hop sustains 32 GB/s. A single channel (24 GB/s) is therefore slower than a link (same file, line 70). By the same arithmetic, two channels' traffic sharing a link (48 GB/s) would be more than the link can carry.</p>
+  <p>The Saturating_DRAM_bandwidth tech report describes how the team actually reached that 92%, and it is a story about placement more than code:</p>
+  <ol>
+    <li><b>Saturate one bank.</b> A reader that issues a block of reads and then waits on a barrier leaves the bank idle between blocks. The fix is to tag each block with a <i>transaction ID</i> and barrier only on the <i>older</i> block, so one request is always in flight (<code>Saturating_DRAM_bandwidth.md:11-13</code>).</li>
+    <li><b>One reader per bank, and each reader reads only its own bank</b>, "otherwise serving multiple readers per bank would cause serious NoC congestion" (line 24).</li>
+    <li><b>Put each reader next to its bank.</b> With 12 readers in the top rows, NoC 0 routes for different banks overlap. Placing each reader beside its bank makes the return route a single hop, with no overlap (lines 26-31).</li>
+    <li><b>Two readers share each row</b> (DRAM sits in two columns), so their <i>requests</i> still share links. Giving them <b>different virtual channels</b> makes the routers round-robin between them instead of serving them first-come, first-served (line 31).</li>
+    <li><b>Harvesting.</b> On n150 and n300 some worker rows are disabled, and which ones varies per chip. A reader whose ideal spot is harvested is shifted right and up until its route overlaps no other (lines 40-42).</li>
+  </ol>
+  <p>The result (line 64-69):</p>
+  <table>
+    <tr><th>Test (Wormhole)</th><th>DRAM at 12 GT/s</th><th>DRAM at 14 GT/s</th></tr>
+    <tr><td>Spec</td><td>288 GB/s</td><td>336 GB/s</td></tr>
+    <tr><td>DRAM micro-benchmark</td><td><b>267 GB/s</b> (92.7%)</td><td>310 GB/s</td></tr>
+    <tr><td>Llama3-70 decode matmuls</td><td>239–260</td><td>247–294</td></tr>
+    <tr><td>Mixtral 8x7b decode matmuls</td><td>243–261</td><td>267–300</td></tr>
+  </table>
+  <p>The matmul rows depend on <b>DRAM sharding</b>. The weight tensor in1 is width-sharded into the 12 banks, shard D<i>k</i> into bank <i>k</i>. The reader <i>and</i> the compute kernel for shard <i>k</i> sit on the core next to bank <i>k</i>, and the small activation tensor is multicast to them (lines 49-56). Compare that with the default: in the interleaved layout every reader touches every bank, which is why the LLM report quotes about 190 GB/s for it. Same chip, same GDDR6, roughly a 25% difference, and all of it from placement. The report's last section adds a trap: 12 rarely divides a weight width evenly in 32-wide tiles, so the last bank gets a ragged shard (lines 72-73).</p>
+  <div class="callout gpu">On a GPU, the memory controller interleaves physical addresses across HBM channels in hardware, usually at a granularity of a few hundred bytes, and you never choose. Here the "interleave" is a software policy at page granularity that you can see and override. That gives you control, and the 190 → 240+ GB/s gap shows it is worth having.</div>
+
+  <h2 id="allocator">Sidebar: the allocator</h2>
+  <p>Someone has to hand out those base addresses. The allocator is a host-side bookkeeper: it "assigns addresses for <code>Buffers</code> and maintains a record of what is free or in-use", and it never touches device memory itself (<code>allocator.md:3</code>). Its rules fit on one card:</p>
+  <ul>
+    <li><b>First-fit, from either end.</b> One free list per region, where each allocation can ask for the lowest or the highest fitting address (<code>allocator.md:13</code>).</li>
+    <li><b>DRAM is bottom-up, L1 is top-down.</b> The default is set in one line:</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/impl/buffers/buffer.cpp:497 @7aad8aac</div>
+<pre><code>bottom_up_(bottom_up.value_or(buffer_type == BufferType::DRAM || buffer_type == BufferType::TRACE)),</code></pre>
+  <ul>
+    <li><b>Why L1 grows down:</b> circular buffers are usually <i>not</i> allocator-managed. Each program places its CBs upward from the bottom of the unreserved region, as the code says: "CBs grow up from DEFAULT_UNRESERVED" (<code>program.cpp:2570</code>). Growing L1 buffers from the other end keeps the two from colliding. Before a program runs, a validation step checks that its CBs do not reach the lowest L1 buffer (<code>allocator.md:53-61</code>).</li>
+    <li><b>Why DRAM grows up:</b> user data grows upward, while things like program binaries are allocated top-down so they do not fragment it (<code>allocator.md:13</code>).</li>
+    <li><b>Lockstep in every bank</b>, as above. The L1 bank size is whatever the reserved area leaves over:</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/impl/allocator/l1_banking_allocator.cpp:119-124 @7aad8aac</div>
+<pre><code>// There is only l1_bank_size bytes available for L1 buffers to be allocated in
+uint64_t l1_bank_size = config_-&gt;worker_l1_size - config_-&gt;l1_unreserved_base;
+uint64_t interleaved_address_limit = static_cast&lt;uint64_t&gt;(config_-&gt;worker_l1_size - l1_bank_size);
+uint64_t allocatable_l1_size =
+    static_cast&lt;uint64_t&gt;(config_-&gt;worker_l1_size) - config_-&gt;l1_unreserved_base - config_-&gt;l1_small_size;
+// Assuming top down allocation for L1 buffers so the allocatable memory space is the top l1_bank_size bytes of L1</code></pre>
+  <p>Step through what the probe did, with the addresses it printed. The L1 bar uses a broken scale so that both ends of the 1464 KiB are visible.</p>
+
+  <div class="viz" id="figmap"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("figmap");
+    var g = TT.canvas(root, 900, 520), ctx = g.ctx, C = TT.C;
+    var TOP = 0x16E000, UNRES = 0x19E60, KCFG = UNRES - 69 * 1024;
+    // L1 broken axis: low segment [0, 0x22000] -> y in [490, 250]; high segment [0x168000, 0x16E000] -> y in [210, 40]
+    var LO_MAX = 0x22000, HI_MIN = 0x168000;
+    function ly(a) {
+      if (a <= LO_MAX) return 490 - (a / LO_MAX) * 240;
+      return 210 - ((a - HI_MIN) / (TOP - HI_MIN)) * 170;
+    }
+    var DLO = 0x2d4000, DHI = 0x2d7000;
+    function dy(a) { return 490 - ((a - DLO) / (DHI - DLO)) * 440; }
+    function hex(n) { return "0x" + n.toString(16); }
+    var LX = 150, LW = 160, DX = 620, DW = 200;
+    var L1A = [
+      { s: 0x16D800, e: 0x16E000, name: "l0: 1 page", col: C.blue },
+      { s: 0x16C800, e: 0x16D800, name: "l1: 100 pages -> 2/bank", col: C.green },
+      { s: 0x16C000, e: 0x16C800, name: "l2: 1 page", col: C.pink }
+    ];
+    var CBS = [
+      { s: UNRES, e: UNRES + 4096, name: "CB c_0 (2 tiles)", col: C.yellow },
+      { s: UNRES + 4096, e: UNRES + 8192, name: "CB c_1 (2 tiles)", col: C.yellow },
+      { s: UNRES + 8192, e: UNRES + 12288, name: "CB c_16 (2 tiles)", col: C.yellow }
+    ];
+    var DR = [
+      { s: 0x2d4c40, e: 0x2d5440, name: "d0: 1 page @0x2d4c40", col: C.blue },
+      { s: 0x2d5440, e: 0x2d6440, name: "d1: 14 pages @0x2d5440", col: C.green },
+      { s: 0x2d6440, e: 0x2d6c40, name: "d2: 1 page @0x2d6440", col: C.pink }
+    ];
+    var steps = [
+      { dur: 0.8, text: "<b>A fresh Wormhole L1</b> (left), 1464 KiB = 0x16E000 bytes. The bottom holds firmware, mailboxes and NoC/fabric tables (about 35 KiB), then the 69 KiB kernel-config region (kernel binaries, runtime args, CB configs). Free space starts at <b>0x19E60</b>. Right: the bottom of one DRAM bank. The first 0x2d4c40 bytes are reserved on this build." },
+      { dur: 1.0, text: "<b>Allocate l0</b>, one 2 KiB page in L1. L1 is top-down, so it lands at <b>0x16D800</b> = top − 2 KiB. Lockstep: all 64 cores reserve this range, even though only one core holds the page." },
+      { dur: 1.0, text: "<b>Allocate l1</b>, 100 pages over 64 L1 banks, so ⌈100/64⌉ = 2 pages = 4 KiB per bank, at <b>0x16C800</b>. 28 of the 128 page slots stay empty." },
+      { dur: 1.0, text: "<b>Allocate l2</b>, one page, at <b>0x16C000</b>. The L1 buffers stack downward." },
+      { dur: 1.2, text: "<b>A program creates circular buffers.</b> CBs belong to the program, not the allocator: they grow <i>up</i> from 0x19E60 (sizes illustrative: three 2-tile CBs). The free gap between the CB top and the lowest buffer is what both sides compete for." },
+      { dur: 1.2, text: "<b>DRAM is bottom-up.</b> d0 (1 page) at <b>0x2d4c40</b>, d1 (14 pages → ⌈14/12⌉ = 2 per bank) at <b>0x2d5440</b>, d2 at <b>0x2d6440</b>. These are exactly the addresses the probe printed." },
+      { dur: 1.0, text: "<b>The safety net.</b> If a program's CBs would grow past the lowest L1 buffer, tt-metal refuses to run it: a validation step checks that CBs and L1 buffers do not overlap (allocator.md:61). Nothing in hardware would catch the overlap." }
+    ];
+    function region(x, w, y0, y1, o) { TT.box(ctx, x, Math.min(y0, y1), w, Math.max(2, Math.abs(y1 - y0)), o); }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        TT.text(ctx, "L1 of one Tensix (same map on all 64 cores)", LX - 40, 16, { color: C.muted, font: "12px" });
+        TT.text(ctx, "one DRAM bank (same map in all 12)", DX - 20, 16, { color: C.muted, font: "12px" });
+        // L1 outline (two segments)
+        region(LX, LW, ly(TOP), ly(HI_MIN), { stroke: C.border, fill: C.bg2, alpha: 1 });
+        region(LX, LW, ly(LO_MAX), ly(0), { stroke: C.border, fill: C.bg2, alpha: 1 });
+        // break marks
+        ctx.strokeStyle = C.muted; ctx.lineWidth = 1.5; ctx.beginPath();
+        for (var k = 0; k < 2; k++) { var yb = 222 + k * 12; ctx.moveTo(LX - 8, yb + 4); ctx.lineTo(LX + 6, yb - 4); ctx.moveTo(LX + LW - 6, yb + 4); ctx.lineTo(LX + LW + 8, yb - 4); }
+        ctx.stroke();
+        TT.text(ctx, "≈ 1.3 MiB of free space not drawn", LX + LW + 14, 229, { color: C.muted, font: "11px" });
+        // reserved + kernel config
+        region(LX, LW, ly(0), ly(KCFG), { fill: C.red, alpha: 0.35, label: "firmware etc. (~35 KiB)", font: "11px" });
+        region(LX, LW, ly(KCFG), ly(UNRES), { fill: C.purple, alpha: 0.35, label: "kernel config (69 KiB)", font: "11px" });
+        var addrL = [[0, "0x0"], [UNRES, "0x19E60"], [LO_MAX, "0x22000"], [HI_MIN, "0x168000"], [TOP, "0x16E000"]];
+        addrL.forEach(function (a) { TT.text(ctx, a[1], LX - 8, ly(a[0]), { align: "right", mono: true, font: "11px", color: C.muted }); });
+        // L1 buffers
+        for (var b = 0; b < 3; b++) {
+          if (i < b + 1) break;
+          var al = i === b + 1 ? t : 1;
+          region(LX, LW, ly(L1A[b].e), ly(L1A[b].e) + (ly(L1A[b].s) - ly(L1A[b].e)) * al, { fill: L1A[b].col, alpha: 0.75, stroke: C.bg, lw: 1 });
+          TT.text(ctx, L1A[b].name + " @" + hex(L1A[b].s), LX + LW + 12, (ly(L1A[b].s) + ly(L1A[b].e)) / 2, { font: "12px", color: L1A[b].col });
+        }
+        if (i >= 1) TT.arrow(ctx, LX + LW + 260, 50, LX + LW + 260, 160, { color: C.blue, lw: 2 });
+        if (i >= 1) TT.text(ctx, "top-down", LX + LW + 252, 105, { align: "right", color: C.blue, font: "12px" });
+        // CBs
+        if (i >= 4) {
+          for (b = 0; b < 3; b++) {
+            var a2 = i === 4 ? Math.max(0, Math.min(1, t * 3 - b)) : 1;
+            if (a2 <= 0) continue;
+            region(LX, LW, ly(CBS[b].s), ly(CBS[b].s) + (ly(CBS[b].e) - ly(CBS[b].s)) * a2, { fill: CBS[b].col, alpha: 0.6, stroke: C.bg, lw: 1 });
+          }
+          TT.text(ctx, "CBs c_0, c_1, c_16 (3 x 4 KiB) from 0x19E60", LX + LW + 14, ly(UNRES + 6144), { color: C.yellow, font: "12px" });
+          TT.arrow(ctx, LX + LW + 40, 480, LX + LW + 40, 400, { color: C.yellow, lw: 2 });
+          TT.text(ctx, "CBs grow up (program-managed)", LX + LW + 50, 445, { color: C.yellow, font: "12px" });
+        }
+        // DRAM bar
+        region(DX, DW, dy(DLO), dy(DHI), { stroke: C.border, fill: C.bg2, alpha: 1 });
+        region(DX, DW, dy(DLO), dy(0x2d4c40), { fill: C.red, alpha: 0.3, label: "reserved", font: "11px" });
+        [[DLO, "0x2d4000"], [0x2d4c40, "0x2d4c40"], [DHI, "0x2d7000"]].forEach(function (a) { TT.text(ctx, a[1], DX - 8, dy(a[0]), { align: "right", mono: true, font: "11px", color: C.muted }); });
+        TT.text(ctx, "… continues up to 1 GiB", DX + DW / 2, 36, { align: "center", color: C.muted, font: "11px" });
+        if (i >= 5) {
+          for (b = 0; b < 3; b++) {
+            var a3 = i === 5 ? Math.max(0, Math.min(1, t * 3 - b)) : 1;
+            if (a3 <= 0) continue;
+            region(DX, DW, dy(DR[b].s), dy(DR[b].s) + (dy(DR[b].e) - dy(DR[b].s)) * a3, { fill: DR[b].col, alpha: 0.75, stroke: C.bg, lw: 1 });
+            if (a3 > 0.9) TT.text(ctx, DR[b].name, DX + DW / 2, (dy(DR[b].s) + dy(DR[b].e)) / 2, { align: "center", font: "11px", color: "#000" });
+          }
+          TT.arrow(ctx, DX + DW + 30, 470, DX + DW + 30, 300, { color: C.green, lw: 2 });
+          TT.text(ctx, "bottom-up", DX + DW + 30, 285, { align: "center", color: C.green, font: "12px" });
+        }
+        if (i >= 6) {
+          var yTop = ly(UNRES + 12288);
+          TT.arrow(ctx, LX + LW / 2, yTop - 4, LX + LW / 2, 262, { color: C.red, lw: 2 });
+          TT.text(ctx, "CB top must stay below the lowest L1 buffer;", LX + LW + 14, 254, { color: C.red, font: "12px" });
+          TT.text(ctx, "checked on the host before every launch", LX + LW + 14, 272, { color: C.red, font: "12px" });
+        }
+      }
+    });
+  })();
+  </script>
+  <p>A few more allocator facts you will meet later:</p>
+  <ul>
+    <li><b>Alignment:</b> addresses and page strides are padded to <code>DRAM_ALIGNMENT</code> so that DRAM-to-L1 reads never break NoC alignment (<code>allocator.md:45-49</code>). Breaking that rule on purpose is a B05 exercise. ttsim reports it as <code>UndefinedBehavior</code>.</li>
+    <li><b>L1_SMALL</b> is an optional region at the top of L1, kept for small buffers that some ops need (conv2d, for example). You opt in with <code>l1_small_size</code> when opening the device.</li>
+    <li><b>Memory reports:</b> <code>ttnn.device.dump_device_memory_state(device, prefix="")</code> or the C++ <code>DumpDeviceMemoryState</code> write CSV reports with per-bank usage and the address, size and status of every block (<code>allocator.md:63-93</code>).</li>
+  </ul>
+
+  <h2 id="chips">Across chips: no shared memory at all</h2>
+  <p>On one chip there is at least a common <i>naming</i> scheme, (x, y, address), and any core can reach any tile through the NoC. Between chips even that is gone. "In a multichip system, there is no concept of shared memory or global addressability across chips for Wormhole or Blackhole" (<code>tech_reports/EthernetMultichip/BasicEthernetGuide.md:188</code>). Only Ethernet cores can send across a link, and only into the L1 of the Ethernet core at the other end. Longer routes are relayed hop by hop. So a tensor "on" a two-chip n300 is really two tensors, one per chip, each allocated by its own allocator with its own lockstep addresses. Keeping them consistent is the job of collective operations that software issues explicitly. ttsim mirrors this: each simulated chip has its own <code>ChipState</code> with its own <code>dram[]</code> mmaps (<code>src/sim.h:572-582</code>), and nothing is shared. <a href="a21-many-chips.html">A21</a> builds meshes and collectives on top of this.</p>
+
+  <h2 id="sim">In the simulator</h2>
+  <p>Every address on this page came from runs in this orb, against ttsim's Wormhole model. Besides the two stock examples, I wrote a small probe host program (<code>sim-labs/workbench/host/a09_memmap.cpp</code>, built with <code>build_host.sh</code> in about 6 s). It opens the device, prints the allocator's view of the banks, allocates a few buffers and dumps the sharded page mappings. Its first lines:</p>
+  <div class="filename">$ $LAB_HOME/host/a09_memmap   # ttsim, Wormhole (trimmed)</div>
+<pre><code>DRAM banks=12 bank_size=1021 MiB alignment=32 B
+L1 banks=64 bank_size=1393056 B (1360 KiB) of worker_l1_size=1499136 B, alignment=16 B
+compute grid = 8x8
+  DRAM bank  0 -&gt; logical dram core 0-0 virtual coord 0-11 bank_offset=0x0
+  DRAM bank  1 -&gt; logical dram core 1-0 virtual coord 0-1 bank_offset=0x40000000
+  DRAM bank  2 -&gt; logical dram core 2-0 virtual coord 0-5 bank_offset=0x0
+  ...
+  DRAM bank 11 -&gt; logical dram core 11-0 virtual coord 5-7 bank_offset=0x40000000
+worker logical (0,0) (3,0) (0,3) (7,7) -&gt; virtual 18-18 21-18 18-21 25-25
+  L1 bank 0 -&gt; logical core 1-4
+  L1 bank 1 -&gt; logical core 4-4
+  ...
+DRAM interleaved: d0 (1 page) @0x2d4c40, d1 (14 pages) @0x2d5440, d2 (1 page) @0x2d6440
+L1 interleaved:   l0 (1 page) @0x16d800, l1 (100 pages) @0x16c800, l2 (1 page) @0x16c000
+[4179] 0.1 seconds (29.8 KHz)</code></pre>
+  <p>Notes on reading this. The 1021 MiB per DRAM bank is 1 GiB minus the reserved 0x2d4c40 at the bottom. Wormhole's DRAM tiles have identical virtual and NoC 0 coordinates, but its Tensix cores use the translated range 18–25 (A08), so the probe cannot show their physical tiles directly. ttsim's Wormhole <code>soc_descriptor.yaml</code> lists no harvested workers (<code>harvested_workers: []</code>), so the hop figures above use the unharvested physical layout, with logical (0,0) at NoC tile (1,1). On a harvested n150 or n300 the rows shift, and so do the hop counts. On Blackhole (<code>env.sh bh</code>) the same probe prints <code>DRAM banks=8 bank_size=4074 MiB alignment=64 B</code> and <code>L1 banks=110</code>, and every bank's offset is 0 because there is no two-view split.</p>
+  <div class="callout sim">To reproduce and break these mechanisms yourself: <a href="../sim-labs/b05-noc-and-dram.html">B05, NoC transactions, DRAM and the alignment trap</a> logs every NoC transfer of a DRAM loopback (watch the page-to-bank arithmetic happen) and misaligns a read so that both ttsim and Watcher catch it. <a href="../sim-labs/b11-ttnn-on-sim.html">B11, TT-NN on the simulator</a> goes further with ttnn memory configs, sharding and <code>dump_device_memory_state</code>.</div>
+  <div class="callout warn">ttsim is functional, not a timing model. It gets every byte to the right address, and it will flag undefined behaviour such as misaligned NoC transfers. It cannot show you the 190 versus 240 GB/s difference, NoC congestion, or bank conflicts inside L1. Use it to check <i>where</i> data goes, not how fast it gets there.</div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>There are no data caches and no coherence. That is deliberate: AI access patterns are known ahead of time, so explicit DMA gives predictable latency and saves the area coherence would cost. Small exceptions exist: instruction caches, Blackhole's 64-byte non-coherent L0, and the x280 cores.</li>
+    <li>The hierarchy is: core-private RAM (2–4 KiB, 2-cycle loads) → L1 (1464 KiB per Tensix, 16 banks × 128 bits, plain RAM) → DRAM, reached only by NoC DMA → other chips, reached only over Ethernet. Every non-local address is (x, y, local address).</li>
+    <li>L1 holds firmware and mailboxes, a 69 KiB kernel-config region, then free space where CBs grow up from 0x19E60 and allocator buffers grow down from 0x16E000.</li>
+    <li>Wormhole DRAM has 6 controllers × 2 GDDR6 channels = 12 banks of 1 GiB. Each bank is a (tile, offset) view, and odd banks sit at +1 GiB. Blackhole has 8 banks of 4080 MiB.</li>
+    <li>Buffers are cut into pages: a tile, a row, or any size you choose. Interleaving deals page <i>p</i> to bank <i>p</i> mod N at row ⌊<i>p</i>/N⌋, starting at bank 0. Lockstep allocation gives every bank the same range, so one address works everywhere.</li>
+    <li>Sharding assigns rectangles (height, width or block, with row- or column-major orientation) to specific cores or banks. When the shard matches the op's work split, the op reads its own L1 and does zero NoC hops.</li>
+    <li>Placement is performance. Wormhole reaches 267 of 288 GB/s in a micro-benchmark and 239–261 GB/s in decode matmuls with DRAM-sharded weights, against about 190 GB/s for the interleaved default.</li>
+    <li>The allocator is host-side and first-fit: DRAM bottom-up, L1 top-down, CBs checked against L1 buffers before launch.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. On Wormhole, a bf16 tiled buffer has 30 pages, interleaved in DRAM. How many bytes does it reserve in each bank, and how many in total?</summary><p>⌈30/12⌉ = 3 pages per bank × 2048 B = 6144 B per bank, and 12 × 6144 = 73,728 B in total for 61,440 B of data. Banks 0–5 hold 3 pages and banks 6–11 hold 2, but lockstep allocation reserves the same 3-page range in all of them, so that one base address works in every bank.</p></details>
+  <details class="quiz"><summary>2. Page 29 of that buffer: which bank, which DRAM tile, and what local address if the buffer starts at 0x2d4c40?</summary><p>Bank = 29 mod 12 = 5. Row = ⌊29/12⌋ = 2. Local address = 0x2d4c40 + 2 × 2048 = 0x2d5c40. Bank 5 is controller 2's second view, so the 1 GiB offset is added: the NoC request goes to tile (5,11) at address 0x402d5c40. Check it with the page-to-bank figure.</p></details>
+  <details class="quiz"><summary>3. Why does the allocator place L1 buffers top-down instead of bottom-up like DRAM?</summary><p>Because circular buffers are normally placed by each program, not by the allocator, and they grow upward from the start of the unreserved region (0x19E60 here). If L1 buffers also grew upward, the two would compete for the same addresses and fragment each other. Growing from opposite ends leaves one free gap in the middle, and tt-metal checks before launch that the CB top stays below the lowest L1 buffer.</p></details>
+  <details class="quiz"><summary>4. A 4 × 4-tile tensor is block-sharded on cores (0,0)–(1,1). Which core holds tiles 2, 3, 6, 7 with ROW_MAJOR orientation, and with COL_MAJOR?</summary><p>Tiles 2, 3, 6, 7 are the top-right 2 × 2 block, which is the second shard. ROW_MAJOR hands shards to cores along the row first, so it goes to core (1,0). COL_MAJOR goes down the column first, so it goes to core (0,1). The probe run printed exactly this.</p></details>
+  <details class="quiz"><summary>5. The DRAM micro-benchmark reaches 267 GB/s, but an interleaved matmul gets about 190 GB/s. The GDDR6 is identical. Where does the bandwidth go?</summary><p>Into the NoC, not the DRAM. With interleaving, every reader core requests pages from every bank, so routes from different banks cross and share links. One hop carries 32 GB/s, and two channels' worth of traffic is 48 GB/s. The benchmark and the DRAM-sharded matmul put one reader beside each bank, give its return path a single hop, and use separate virtual channels for the two readers in a row. Barriers on transaction IDs then keep each bank busy continuously.</p></details>
+  <details class="quiz"><summary>6. On an n300 (two Wormhole chips), can a reader kernel on chip 0 call noc_async_read with the address of a buffer that lives in chip 1's DRAM?</summary><p>No. A NoC address is (x, y, local address) on <i>this</i> chip's NoC, and there is no global address space across chips. The data has to move explicitly: into an Ethernet core's L1 on chip 0, over the link into the peer Ethernet core's L1 on chip 1, and then onwards. Higher layers such as TT-Fabric and the CCLs do this for you (A21).</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/memory_for_kernel_developers.html">Memory from a kernel developer's perspective</a>: the official guide to (x, y, addr) addressing, lockstep allocation, interleaving and sharding.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/memory/allocator.md">Allocator tech report</a>: banks, lockstep, top-down versus bottom-up, CBs and memory reports.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_layouts/tensor_layouts.md">Tensor layouts tech report</a>: row-major versus tiled pages, faces, and interleaved storage.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/tensor_sharding/tensor_sharding.md">Tensor sharding tech report</a>: height, width, block and ND sharding with ttnn examples.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Saturating_DRAM_bandwidth/Saturating_DRAM_bandwidth.md">Saturating DRAM bandwidth</a>: how Wormhole reached 92% of peak, including reader placement, VCs and DRAM-sharded matmul.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/L1.md">ISA docs: L1</a>: banks, ports, per-client bandwidth and atomics.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/DRAMTile/README.md">ISA docs: DRAM tiles</a>: 18 tiles and 12 channels, the NoC address map, router buffering and measured bandwidth.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/llms.md">LLMs tech report</a>: section 4.6.1 ranks DRAM/L1 × interleaved/sharded, and explains why activations go in L1 and weights in DRAM.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: the "Where is the cache hierarchy" section on why there is none.</li>
+    <li><a href="https://supermina999.github.io/sharding-visual/">Sharding visualiser</a>: an interactive tool for trying shard shapes and grids.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/EthernetMultichip/BasicEthernetGuide.md">Basic Ethernet multichip guide</a>: no shared memory across chips, and how ERISC cores move data.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole card specifications</a>: GDDR6 capacity, speed and bandwidth per card.</li>
+  </ul>
+
+  <div class="pager"><a href="a08-noc.html">&larr; 08 The Network-on-Chip</a><a class="next" href="a10-first-program.html">10 Your first TT-Metalium program &rarr;</a></div>
+</main>
+</body>
+</html>
