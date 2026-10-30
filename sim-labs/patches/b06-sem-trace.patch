@@ -1,0 +1,130 @@
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -9,6 +9,29 @@
+ #include "sim.h"
+ #include "tensix_decode.h" // generated
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++
++// B06 lab: log Tensix semaphore traffic (SEMINIT/SEMPOST/SEMGET/SEMWAIT and TRISC MMIO accesses) of ONE tile.
++//   B06_SEM_OUT=file enables it; B06_TILE=n picks the tile (default 0).
++// Line format: <clock> T<thread> <event> sem<i> <value before>-><value after> max=<m> [detail]
++struct B06SemTrace {
++    FILE *f = nullptr;
++    uint32_t tile = 0;
++    uint64_t blocked_since[3] = {}; // clock of a SEMWAIT's first blocked attempt, per thread (0 = not blocked)
++    uint64_t tries[3] = {};
++    B06SemTrace() {
++        if (const char *p = getenv("B06_SEM_OUT")) f = fopen(p, "w");
++        if (const char *p = getenv("B06_TILE")) tile = atoi(p);
++    }
++    ~B06SemTrace() { if (f) fclose(f); }
++    bool on(uint32_t tile_id) const { return f && tile_id == tile; }
++};
++static B06SemTrace s_b06;
++void b06_sem_mmio(uint32_t tile_id, uint32_t pipe, const char *what, uint32_t sem, uint32_t before, uint32_t after, uint32_t max) {
++    if (s_b06.on(tile_id))
++        fprintf(s_b06.f, "%llu T%u %s sem%u %u->%u max=%u\n", (unsigned long long)g_clock, pipe, what, sem, before, after, max);
++}
+ 
+ #define IS_TENSIX_NOP(inst) (bits<31,24>(inst) == TENSIX_OPCODE_NOP)
+ 
+@@ -5523,6 +5546,9 @@
+         "sem_sel=0x%x: after this thread's SEMWAIT on it, whose block mask 0x%x lacks B1", sem_sel, p_tensix->wait_block[pipe]);
+     TTSIM_VERIFY(init_value <= max_value, NonContractualBehavior, "init_value=%d is greater than max_value=%d", init_value, max_value);
+ 
++    if (s_b06.on(p_tensix->tile_id))
++        fprintf(s_b06.f, "%llu T%u SEMINIT sem%u %u->%u max=%u\n", (unsigned long long)g_clock, pipe, sem_index,
++                p_tensix->sem[sem_index], init_value, max_value);
+     p_tensix->sem[sem_index] = init_value;
+     p_tensix->sem_max[sem_index] = max_value;
+     return true;
+@@ -5537,6 +5563,9 @@
+ 
+     TTSIM_VERIFY(p_tensix->sem[sem_index] < p_tensix->sem_max[sem_index], NonContractualBehavior,
+         "sem=%d sem_max=%d", p_tensix->sem[sem_index], p_tensix->sem_max[sem_index]);
++    if (s_b06.on(p_tensix->tile_id))
++        fprintf(s_b06.f, "%llu T%u SEMPOST sem%u %u->%u max=%u\n", (unsigned long long)g_clock, pipe, sem_index,
++                p_tensix->sem[sem_index], p_tensix->sem[sem_index] + 1, p_tensix->sem_max[sem_index]);
+     p_tensix->sem[sem_index]++;
+     return true;
+ }
+@@ -5549,6 +5578,9 @@
+         "sem_sel=0x%x: after this thread's SEMWAIT on it, whose block mask 0x%x lacks B1", sem_sel, p_tensix->wait_block[pipe]);
+ 
+     TTSIM_VERIFY(p_tensix->sem[sem_index], NonContractualBehavior, "sem=%d sem_max=%d", p_tensix->sem[sem_index], p_tensix->sem_max[sem_index]);
++    if (s_b06.on(p_tensix->tile_id))
++        fprintf(s_b06.f, "%llu T%u SEMGET sem%u %u->%u max=%u\n", (unsigned long long)g_clock, pipe, sem_index,
++                p_tensix->sem[sem_index], p_tensix->sem[sem_index] - 1, p_tensix->sem_max[sem_index]);
+     p_tensix->sem[sem_index]--;
+     return true;
+ }
+@@ -5570,15 +5602,25 @@
+     for (uint32_t sems = sem_sel; sems; sems &= sems - 1) {
+         uint32_t sem_index = __builtin_ctz(sems);
+         TTSIM_VERIFY(sem_index < std::size(p_tensix->sem), AssertionFailure, "sem_index=%d out of range", sem_index);
+-        if (wait_sem_cond == 2) { // wait while max
+-            if (p_tensix->sem[sem_index] >= p_tensix->sem_max[sem_index]) {
+-                return false;
+-            }
+-        } else { // wait while zero
+-            if (!p_tensix->sem[sem_index]) {
+-                return false;
++        bool blocked = (wait_sem_cond == 2) ? (p_tensix->sem[sem_index] >= p_tensix->sem_max[sem_index]) // wait while max
++                                            : !p_tensix->sem[sem_index];                                 // wait while zero
++        if (s_b06.on(p_tensix->tile_id)) {
++            if (blocked && !s_b06.tries[pipe]++) {
++                s_b06.blocked_since[pipe] = g_clock;
++                fprintf(s_b06.f, "%llu T%u SEMWAIT-BLOCK sem%u %u->%u max=%u %s\n", (unsigned long long)g_clock, pipe, sem_index,
++                        p_tensix->sem[sem_index], p_tensix->sem[sem_index], p_tensix->sem_max[sem_index],
++                        wait_sem_cond == 2 ? "on_max" : "on_zero");
++            } else if (!blocked) {
++                fprintf(s_b06.f, "%llu T%u SEMWAIT-PASS sem%u %u->%u max=%u %s tries=%llu waited=%llu\n", (unsigned long long)g_clock, pipe,
++                        sem_index, p_tensix->sem[sem_index], p_tensix->sem[sem_index], p_tensix->sem_max[sem_index],
++                        wait_sem_cond == 2 ? "on_max" : "on_zero", (unsigned long long)s_b06.tries[pipe],
++                        (unsigned long long)(s_b06.tries[pipe] ? g_clock - s_b06.blocked_since[pipe] : 0));
++                s_b06.tries[pipe] = 0;
+             }
+         }
++        if (blocked) {
++            return false;
++        }
+     }
+     p_tensix->wait_block[pipe] = block;
+     p_tensix->wait_sems[pipe] = sem_sel;
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -1887,6 +1887,8 @@
+     return true;
+ }
+ 
++void b06_sem_mmio(uint32_t tile_id, uint32_t pipe, const char *what, uint32_t sem, uint32_t before, uint32_t after, uint32_t max); // tensix.cpp
++
+ static std::pair<bool, uint32_t> tensix_pc_buf_rd32(uint32_t tile_id, uint32_t riscv_id, uint32_t offset) {
+     auto [tensix_id, pipe] = trisc_pipe(riscv_id);
+     TensixTile *p_tile = &g_t_tiles[tile_id];
+@@ -1913,6 +1915,14 @@
+         case TENSIX_PC_BUF_SEMAPHORE(0) / 4 ... TENSIX_PC_BUF_SEMAPHORE(7) / 4: {
+             uint32_t sem_index = (offset - TENSIX_PC_BUF_SEMAPHORE(0)) / 4;
+             TTSIM_ASSERT(sem_index < std::size(p_tile->tensix[tensix_id].sem));
++            { // B06: log a TRISC's MMIO read of a semaphore when the value it sees changes
++                static uint8_t last_seen[3][8];
++                uint32_t v = p_tile->tensix[tensix_id].sem[sem_index];
++                if (last_seen[pipe][sem_index] != v + 1) {
++                    last_seen[pipe][sem_index] = v + 1;
++                    b06_sem_mmio(tile_id, pipe, "MMIO-READ", sem_index, v, v, p_tile->tensix[tensix_id].sem_max[sem_index]);
++                }
++            }
+             return {true, p_tile->tensix[tensix_id].sem[sem_index]};
+         }
+         default: TTSIM_ERROR(UnimplementedFunctionality, "offset=0x%x", offset);
+@@ -1930,6 +1940,8 @@
+             uint32_t sem_index = (offset - TENSIX_PC_BUF_SEMAPHORE(0)) / 4;
+             TTSIM_ASSERT(sem_index < std::size(p_tile->tensix[tensix_id].sem));
+             TensixState *p_tensix = &p_tile->tensix[tensix_id];
++            b06_sem_mmio(tile_id, pipe, data == 1 ? "MMIO-GET" : "MMIO-POST", sem_index, p_tensix->sem[sem_index],
++                         data == 1 ? p_tensix->sem[sem_index] - 1 : p_tensix->sem[sem_index] + 1, p_tensix->sem_max[sem_index]);
+             if (data == 1) {
+                 TTSIM_VERIFY(p_tensix->sem[sem_index], NonContractualBehavior, "sem%d underflow", sem_index);
+                 p_tensix->sem[sem_index]--;

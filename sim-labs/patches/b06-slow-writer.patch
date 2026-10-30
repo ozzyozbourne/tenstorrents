@@ -1,0 +1,11 @@
+--- a/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/write_tile.cpp
++++ b/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/write_tile.cpp
+@@ -28,6 +28,8 @@
+     for (uint32_t i = 0; i < n_tiles; i++) {
+         // Make sure there is a tile in the circular buffer
+         cb_out.wait_front(1);
++        // B06: a deliberately slow writer. Spin for 300 simulator clocks before each tile.
++        for (uint32_t t0 = get_timestamp_32b(); get_timestamp_32b() - t0 < 300;) {}
+         // write the tile to DRAM
+         noc.async_write(cb_out, out0, tile_size_bytes, {}, {.page_id = i});
+         noc.async_write_barrier();  // This will wait until the write is done. As an alternative,

@@ -1,0 +1,83 @@
+--- a/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp
++++ b/tt_metal/programming_examples/eltwise_binary/kernels/dataflow/read_tiles.cpp
+@@ -7,6 +7,7 @@
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/circular_buffer.h"
+ #include "api/tensor/noc_traits.h"
++#include "api/debug/dprint.h"
+ 
+ void kernel_main() {
+     // Read parameters from the kernel arguments
+@@ -41,6 +42,8 @@
+     // Loop over all the tiles and read them into the circular buffers
+     for (uint32_t i = 0; i < n_tiles; i++) {
+         // First make sure there is space in the circular buffers to be written to.
++        if (i < 6) DPRINT("R i={} pre-reserve wr={:#x} recv={} ack={}\n", i, cb_in0_buf.get_write_ptr(),
++                          *get_cb_tiles_received_ptr(cb_in0), *get_cb_tiles_acked_ptr(cb_in0));
+         cb_in0_buf.reserve_back(1);
+         cb_in1_buf.reserve_back(1);  // wait until we have 1 free slot. This blocks if the
+                                      // other kernels cannot consume the tiles fast enough.
+@@ -52,7 +55,10 @@
+ 
+         noc.async_read_barrier();  // Wait until tile reads are done
+         cb_in0_buf.push_back(1);
+-        cb_in1_buf.push_back(1);  // mark the tiles as ready. From this point forward kernels
++        cb_in1_buf.push_back(1);
++        if (i < 6) DPRINT("R i={} post-push   wr={:#x} recv={} ack={}\n", i, cb_in0_buf.get_write_ptr(),
++                          *get_cb_tiles_received_ptr(cb_in0), *get_cb_tiles_acked_ptr(cb_in0));
++        // mark the tiles as ready. From this point forward kernels
+                                   // calling `cb_wait_front` will see this tile
+     }
+ }
+--- a/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp
++++ b/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp
+@@ -7,6 +7,7 @@
+ #include "api/compute/tile_move_copy.h"
+ #include "api/compute/eltwise_binary.h"
+ #include "api/compute/compute_kernel_api.h"
++#include "api/debug/dprint.h"
+ 
+ void kernel_main() {
+     uint32_t n_tiles = get_arg_val<uint32_t>(0);
+@@ -29,12 +30,19 @@
+     // switch operation to something else. Since we are only adding tiles, this function
+     // is only called once before the loop.
+     add_init(cb_in0, cb_in1);
++    DPRINT_UNPACK("U view: c0 base={:#x} limit={:#x} pages={} | c16 wr={:#x}\n", get_local_cb_interface(cb_in0).fifo_rd_ptr << 4,
++        get_local_cb_interface(cb_in0).fifo_limit << 4, get_local_cb_interface(cb_in0).fifo_num_pages, get_local_cb_interface(cb_out0).fifo_wr_ptr << 4);
++    DPRINT_PACK("P view: c16 base={:#x} limit={:#x} pages={} | c0 rd={:#x}\n", get_local_cb_interface(cb_out0).fifo_wr_ptr << 4,
++        get_local_cb_interface(cb_out0).fifo_limit << 4, get_local_cb_interface(cb_out0).fifo_num_pages, get_local_cb_interface(cb_in0).fifo_rd_ptr << 4);
+ 
+     // Loop over all the tiles and perform the computation
+     for (uint32_t i = 0; i < n_tiles; i++) {
+         // Wait until there is a tile in both input circular buffers
+         cb_wait_front(cb_in0, 1);
+         cb_wait_front(cb_in1, 1);
++        if (i < 6) DPRINT_UNPACK("U i={} waited    rd={:#x} recv={} ack(local)={} ack(reg)={}\n", i,
++            get_local_cb_interface(cb_in0).fifo_rd_ptr << 4, *get_cb_tiles_received_ptr(cb_in0),
++            get_local_cb_interface(cb_in0).tiles_acked, *get_cb_tiles_acked_ptr(cb_in0));
+         // Make sure there is registers we can use and hold it. The register can be being used by other
+         // components. So we need to be sure before we use it. Thus even though there is 16 registers, each
+         // time acquire a register, we get 8 of them that we can use until released.
+@@ -46,12 +54,21 @@
+         tile_regs_wait();
+         // Make sure there is space in the output circular buffer
+         cb_reserve_back(cb_out0, 1);
++        if (i < 6) DPRINT_PACK("P i={} reserved  wr={:#x} recv(local)={} recv(reg)={} ack={}\n", i,
++            get_local_cb_interface(cb_out0).fifo_wr_ptr << 4, get_local_cb_interface(cb_out0).tiles_received,
++            *get_cb_tiles_received_ptr(cb_out0), *get_cb_tiles_acked_ptr(cb_out0));
+         // Copy the result from adding the tiles to the output circular buffer
+         pack_tile(dst_reg, cb_out0);
+         // Mark the output tile as ready and pop the input tiles
+         cb_push_back(cb_out0, 1);
+         cb_pop_front(cb_in0, 1);
+         cb_pop_front(cb_in1, 1);
++        if (i < 6) DPRINT_UNPACK("U i={} popped    rd={:#x} ack(local)={} ack(reg)={}\n", i,
++            get_local_cb_interface(cb_in0).fifo_rd_ptr << 4, get_local_cb_interface(cb_in0).tiles_acked,
++            *get_cb_tiles_acked_ptr(cb_in0));
++        if (i < 6) DPRINT_PACK("P i={} pushed    wr={:#x} recv(local)={} recv(reg)={}\n", i,
++            get_local_cb_interface(cb_out0).fifo_wr_ptr << 4, get_local_cb_interface(cb_out0).tiles_received,
++            *get_cb_tiles_received_ptr(cb_out0));
+         // Release the held register
+         tile_regs_release();
+     }

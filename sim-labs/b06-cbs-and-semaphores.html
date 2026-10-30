@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B06 · Circular buffers and semaphores · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  table.t { border-collapse: collapse; margin: 1.2rem 0; font-size: 15px; width: 100%; }
+  table.t th, table.t td { border: 1px solid var(--border); padding: .35rem .6rem; text-align: left; vertical-align: top; }
+  table.t th { background: var(--bg2); color: var(--yellow); font-weight: 600; }
+  table.t td.n { text-align: right; font-family: var(--mono); }
+  .modebar { display:flex; gap:.5rem; flex-wrap:wrap; padding:.6rem .8rem; background:var(--bg2); border-top:1px solid var(--border); font-size:14px; align-items:center; }
+  .modebar span { color:var(--muted); }
+  .modebar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .7rem; cursor: pointer; font: inherit; font-size: 14px; }
+  .modebar button.on { background: var(--blue); color: #000; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a12-compute-kernels.html">&larr; Prev</a>
+  <a href="../chapters/a13-llk-mops-jit.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B06</span><span class="tag">Prerequisites: A11, A12, B00</span>
+  <h1><span class="num">B06.</span> Circular buffers and semaphores</h1>
+  <p class="subtitle">Watch four CPUs move the pointers of two circular buffers, log every semaphore operation of the Dst handshake from inside the simulator, then write your own reader/compute/writer program, and break it three ways to see what ttsim and Watcher report.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. Every clock number on this page (the <code>[4727]</code> at the end of a run, the timestamps in the traces) counts ttsim's own steps, which the host drives. They are good for one thing: putting events in order within one run. They say nothing about how long anything takes on a real Wormhole or Blackhole. Where a result depends on timing (break B below), the simulator shows you <em>one</em> possible interleaving, and silicon may show another.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">Setup</a></li>
+      <li><a href="#pointers">Lab step 1: watch the CB pointers move</a></li>
+      <li><a href="#sem">Lab step 2: trace the Dst semaphore inside ttsim</a></li>
+      <li><a href="#own">Lab step 3: write it yourself</a></li>
+      <li><a href="#break">Lab step 4: break it three ways</a></li>
+      <li><a href="#exercises">Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p><a href="../chapters/a11-dataflow-and-cbs.html">A11</a> built the circular buffer from two counters and two private pointers. <a href="../chapters/a12-compute-kernels.html">A12</a> showed that the compute kernel is three programs, and that they hand Dst back and forth with one 4-bit semaphore. Both chapters ran experiments: A11 printed the reader's write pointer, A12 printed the semaphore from each TRISC and broke the handshake by releasing twice.</p>
+  <p>This lab asks a sharper question. Take <code>eltwise_binary</code>, freeze it at the moment the reader pushes its fourth tile, and ask:</p>
+  <p style="text-align:center"><em>Where is every pointer, what does each of the four CPUs believe the counters say, and what value is the MATH_PACK semaphore at?</em></p>
+  <p>The CPUs will not agree. Each holds a private copy of part of the state, some of it is updated later by a Tensix instruction, and two of the four CPUs never initialise half the fields at all. By the end you will have watched all of that in a time-ordered trace, logged the semaphore from inside ttsim's model of the Sync Unit, written a 3-kernel program of your own that passes on Wormhole and Blackhole, and broken it on purpose in ways that ttsim, Watcher, or neither can catch.</p>
+  <p>Every command below was run in this orb against tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code>. Every output block is pasted from those runs and trimmed with <code>…</code>.</p>
+
+  <h2 id="setup">0. Setup</h2>
+<pre><code>export LAB_HOME=$HOME/ttlab/b06
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
+P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+source $W/env.sh wh                       # stock Wormhole ttsim; cds into $LAB_HOME/run
+$EX/metal_example_eltwise_binary          # Test Passed   [7959]</code></pre>
+  <p><code>env.sh</code> sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code>, so a kernel copied there under the path the host asks for replaces the stock one (<a href="b00-workbench.html">B00</a>). The patches for this lab are <code>sim-labs/patches/b06-*.patch</code>: three kernel overlays for <code>eltwise_binary</code> and one for ttsim. The program you write in step 3 lives in <code>sim-labs/workbench/host/b06_scale_add.cpp</code> and <code>sim-labs/workbench/kernels/b06/</code>.</p>
+
+  <h2 id="pointers">1. Watch the CB pointers move</h2>
+  <h3>1a. Four views of two CBs</h3>
+  <p><code>eltwise_binary</code> streams 64 tiles: the reader (BRISC) fills <code>c_0</code> and <code>c_1</code>, the compute kernel adds them into <code>c_16</code>, and the writer (NCRISC) drains <code>c_16</code>. Each CB has 2 pages of 2048 bytes. A11 already printed the reader's side. Here we add the compute side, and we print it from <em>two</em> TRISCs, because <code>cb_wait_front</code>/<code>cb_pop_front</code> compile only into TRISC0 (UNPACK) and <code>cb_reserve_back</code>/<code>cb_push_back</code> only into TRISC2 (PACK) (A12).</p>
+  <p>The patch <code>b06-cb-dprint.patch</code> adds <code>DPRINT</code>s to two overlay copies. In the reader it prints the write pointer and both stream-register counters of <code>c_0</code> before each reserve and after each push. In the compute kernel the interesting additions are these:</p>
+  <div class="filename">sim-labs/patches/b06-cb-dprint.patch (compute side, excerpt)</div>
+<pre><code>    DPRINT_UNPACK("U view: c0 base={:#x} limit={:#x} pages={} | c16 wr={:#x}\n",
+        get_local_cb_interface(cb_in0).fifo_rd_ptr &lt;&lt; 4, get_local_cb_interface(cb_in0).fifo_limit &lt;&lt; 4,
+        get_local_cb_interface(cb_in0).fifo_num_pages, get_local_cb_interface(cb_out0).fifo_wr_ptr &lt;&lt; 4);
+    DPRINT_PACK("P view: c16 base={:#x} limit={:#x} pages={} | c0 rd={:#x}\n", ...same fields, other CB...);
+    ...
+        if (i &lt; 6) DPRINT_UNPACK("U i={} waited    rd={:#x} recv={} ack(local)={} ack(reg)={}\n", i,
+            get_local_cb_interface(cb_in0).fifo_rd_ptr &lt;&lt; 4, *get_cb_tiles_received_ptr(cb_in0),
+            get_local_cb_interface(cb_in0).tiles_acked, *get_cb_tiles_acked_ptr(cb_in0));</code></pre>
+  <p>Two details in it are already lessons. The <code>&lt;&lt; 4</code> is there because on a TRISC the CB pointers are not byte addresses: <code>setup_local_cb_read_write_interfaces</code> shifts them right by <code>cb_addr_shift</code>, which is <code>CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT = 4</code> on TRISCs and 0 on BRISC/NCRISC (<code>circular_buffer_interface.h:138-142</code>, <code>circular_buffer_constants.h:31</code>). The unpacker and packer address L1 in 16-byte words, so the firmware stores pointers in their unit. And we print both a <em>local</em> counter (a field of the TRISC's own <code>LocalCBInterface</code>) and the <em>register</em> (the shared stream register), because on the compute side they are different things. Apply and run:</p>
+<pre><code>R=tt_metal/programming_examples/eltwise_binary/kernels
+mkdir -p $LAB_HOME/kernels/$R && cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-cb-dprint.patch)
+TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_eltwise_binary</code></pre>
+  <div class="filename">output (Wormhole ttsim, this orb; first two iterations)</div>
+<pre><code>0:0-0:TR0: U view: c0 base=0x19e60 limit=0x1ae60 pages=0 | c16 wr=0x0
+0:0-0:BR: R i=0 pre-reserve wr=0x19e60 recv=0 ack=0
+0:0-0:TR2: P view: c16 base=0x1be60 limit=0x1ce60 pages=2 | c0 rd=0x0
+0:0-0:TR0: U i=0 waited    rd=0x19e60 recv=1 ack(local)=0 ack(reg)=0
+0:0-0:BR: R i=0 post-push   wr=0x1a660 recv=1 ack=1
+0:0-0:TR2: P i=0 reserved  wr=0x1be60 recv(local)=0 recv(reg)=0 ack=0
+0:0-0:TR0: U i=0 popped    rd=0x1a660 ack(local)=1 ack(reg)=1
+0:0-0:BR: R i=1 pre-reserve wr=0x1a660 recv=1 ack=1
+0:0-0:TR2: P i=0 pushed    wr=0x1c660 recv(local)=1 recv(reg)=1
+0:0-0:BR: R i=1 post-push   wr=0x19e60 recv=2 ack=1
+0:0-0:TR0: U i=1 waited    rd=0x1a660 recv=2 ack(local)=1 ack(reg)=1
+...
+Test Passed
+[13635] 1.0 seconds (13.6 KHz)</code></pre>
+  <p>Read the two "view" lines first. TRISC0 knows <code>c_0</code>'s base and limit but thinks it has <b>0 pages</b>, and its write pointer for <code>c_16</code> is <b>0x0</b>. TRISC2 knows <code>c_16</code> has 2 pages, but its read pointer for <code>c_0</code> is <b>0x0</b>. Nothing is broken. Each TRISC fills in only the half of the interface it uses:</p>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/trisc.cc:79-93, 157-165 @7aad8aac (trimmed)</div>
+<pre><code>#if !defined(UCK_CHLKC_MATH)
+uint32_t tt_l1_ptr* cb_l1_base __attribute__((used));
+CBInterface cb_interface[NUM_CIRCULAR_BUFFERS] __attribute__((used));
+#endif
+
+#if defined(UCK_CHLKC_UNPACK)
+constexpr bool cb_init_read = true;
+...
+#if defined(UCK_CHLKC_PACK)
+constexpr bool cb_init_write = true;
+...
+#if !defined(UCK_CHLKC_MATH)
+        ...
+        setup_local_cb_read_write_interfaces&lt;cb_init_read, cb_init_write, cb_init_write, false&gt;(
+            cb_l1_base, 0, local_cb_mask_low);</code></pre>
+  <p>UNPACK initialises read pointers only; PACK initialises write pointers and the page count only. The page count matters only to a producer, because only <code>cb_reserve_back</code> computes free space (<code>fifo_num_pages − (received − acked)</code>); a consumer just needs <code>received − acked ≥ n</code>. And TRISC1, the math core, has no <code>cb_interface</code> array in its binary at all. It never touches a CB, which is also why A12's math thread needs the semaphore.</p>
+  <p>Now the counters. TRISC0 prints <code>ack(local)</code> and <code>ack(reg)</code>, and they agree here. They are not the same variable. In <code>llk_pop_tiles</code>, TRISC0 adds to its local <code>tiles_acked</code> immediately, but the stream register is written by a <code>STOREREG</code> that the TRISC pushes into its Tensix thread behind a <code>STALLWAIT</code> on the unpacker (A12 quoted it, <code>llk_io_unpack.h:99-102</code>). The wait loop compares the <em>register</em> <code>received</code> against the <em>local</em> <code>acked</code>:</p>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_io/llk_io_unpack.h:76-84 @7aad8aac</div>
+<pre><code>    uint16_t num_tiles_recv;
+    {
+        SYNC_WAIT("SYNC-CB-WAIT", operand);
+        do {
+            tiles_received = (std::uint16_t)reg_read((std::uint32_t)tiles_received_ptr);
+            num_tiles_recv = tiles_received - get_local_cb_interface(input).tiles_acked;
+        } while (num_tiles_recv &lt; num_tiles_u);
+    }</code></pre>
+  <p>The packer mirrors it: <code>cb_reserve_back</code> on TRISC2 uses its local <code>tiles_received</code> and the register <code>acked</code> (<code>llk_io_pack.h:32-43</code>). Each side trusts its own local count of what <em>it</em> did and reads the register for what the <em>other</em> side did. Remember that <code>uint16_t</code> subtraction; break B will trip over it.</p>
+  <div class="callout warn">This log is not a timeline. Line order across <code>BR</code>, <code>TR0</code> and <code>TR2</code> is the order the host drained the print buffers (A12). Worse, <code>DPRINT</code> is slow and changes what it measures: <code>R i=0 post-push … ack=1</code> says that by the time the reader had printed, compute had already consumed tile 0. The run took <code>[13635]</code> ttsim clocks against <code>[7959]</code> without the prints. (Reruns gave between 11,669 and 13,635: with prints on, the count also depends on how fast the host drains the buffers.)</div>
+
+  <h3>1b. A flight recorder with a clock</h3>
+  <p>To get a real timeline, record instead of print. Every RISC-V in a Tensix tile can read the wall clock register <code>RISCV_DEBUG_REG_WALL_CLOCK_L</code> (<code>get_timestamp_32b()</code> in <code>risc_common.h:244-246</code>), and ttsim returns its global clock there (<code>ttsim/src/tile.cpp:1034</code>), so timestamps from different cores are comparable. The patch <code>b06-cb-recorder.patch</code> stores <code>(clock, pointer, received, acked)</code> into a small array after each CB call and prints the array once, after the loop. It instruments all four CPUs for the first 8 tiles: reserve/push on BRISC (<code>c_0</code>), wait/pop on TRISC0 (<code>c_0</code>), reserve/push on TRISC2 (<code>c_16</code>) and wait/pop on NCRISC (<code>c_16</code>).</p>
+  <div class="filename">sim-labs/patches/b06-cb-recorder.patch (compute side, excerpt)</div>
+<pre><code>struct Ev { uint32_t t; uint16_t ptr16, recv, ack, pad; };
+constexpr uint32_t NREC = 8;
+#define CLK() reg_read(RISCV_DEBUG_REG_WALL_CLOCK_L)
+...
+    UNPACK(Ev uw[NREC]; Ev up[NREC];)      // arrays exist only in TRISC0's binary
+    PACK(Ev pr[NREC]; Ev pp[NREC];)        // ...and these only in TRISC2's (2 KiB of data RAM each)
+...
+        PACK(if (i &lt; NREC) pp[i] = Ev{CLK(), (uint16_t)get_local_cb_interface(cb_out0).fifo_wr_ptr,
+            (uint16_t)*get_cb_tiles_received_ptr(cb_out0), (uint16_t)*get_cb_tiles_acked_ptr(cb_out0), 0};)</code></pre>
+<pre><code>rm -rf $LAB_HOME/kernels/tt_metal; mkdir -p $LAB_HOME/kernels/$R &amp;&amp; cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-cb-recorder.patch)
+TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_eltwise_binary | grep -o "EV.*" | sort -n -k2</code></pre>
+  <div class="filename">output (Wormhole ttsim; the first 22 of 64 events, sorted by clock; the absolute clocks, and the order of events that share a clock, differ from run to run)</div>
+<pre><code>EV 6952 R reserved c0 i=0 ptr=0x19e60 recv=0 ack=0
+EV 6984 P reserved c16 i=0 ptr=0x1be60 recv=0 ack=0
+EV 7005 R pushed   c0 i=0 ptr=0x1a660 recv=1 ack=0
+EV 7008 U waited   c0 i=0 ptr=0x19e60 recv=1 ack=0
+EV 7030 P pushed   c16 i=0 ptr=0x1c660 recv=0 ack=0
+EV 7030 R reserved c0 i=1 ptr=0x1a660 recv=1 ack=0
+EV 7030 U popped   c0 i=0 ptr=0x1a660 recv=1 ack=1
+EV 7032 W waited   c16 i=0 ptr=0x1be60 recv=1 ack=0
+EV 7042 P reserved c16 i=1 ptr=0x1c660 recv=1 ack=0
+EV 7080 W popped   c16 i=0 ptr=0x1c660 recv=1 ack=1
+EV 7081 U waited   c0 i=1 ptr=0x1a660 recv=2 ack=1
+EV 7083 R pushed   c0 i=1 ptr=0x19e60 recv=2 ack=1
+EV 7095 P pushed   c16 i=1 ptr=0x1be60 recv=1 ack=1
+EV 7103 P reserved c16 i=2 ptr=0x1be60 recv=2 ack=1
+EV 7103 R reserved c0 i=2 ptr=0x19e60 recv=2 ack=2
+EV 7105 W waited   c16 i=1 ptr=0x1c660 recv=2 ack=1
+EV 7109 U popped   c0 i=1 ptr=0x19e60 recv=2 ack=2
+EV 7152 P pushed   c16 i=2 ptr=0x1c660 recv=2 ack=2
+EV 7154 R pushed   c0 i=2 ptr=0x1a660 recv=3 ack=2
+EV 7156 U waited   c0 i=2 ptr=0x19e60 recv=3 ack=2
+EV 7157 W popped   c16 i=1 ptr=0x1be60 recv=2 ack=2
+...
+EV 7602 W popped   c16 i=7 ptr=0x1be60 recv=8 ack=8</code></pre>
+  <p>Each line is one CPU's snapshot just after a CB call returned. Step through all 64 of them on the rings below. The outer arrow is the producer's private write pointer, the inner arrow the consumer's private read pointer, and a filled page holds a tile that has been pushed and not yet popped.</p>
+
+  <div class="viz" id="ring"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("ring");
+    var g = TT.canvas(root, 900, 490), ctx = g.ctx, C = TT.C;
+    // Real trace: [clock, core, action, cb, tile, ptr(bytes), received(reg), acked(reg)], sorted by clock.
+    var EV = [[6952,"R","reserved","c0",0,106080,0,0],[6984,"P","reserved","c16",0,114272,0,0],[7005,"R","pushed","c0",0,108128,1,0],[7008,"U","waited","c0",0,106080,1,0],[7030,"P","pushed","c16",0,116320,0,0],[7030,"U","popped","c0",0,108128,1,1],[7030,"R","reserved","c0",1,108128,1,0],[7032,"W","waited","c16",0,114272,1,0],[7042,"P","reserved","c16",1,116320,1,0],[7080,"W","popped","c16",0,116320,1,1],[7081,"U","waited","c0",1,108128,2,1],[7083,"R","pushed","c0",1,106080,2,1],[7095,"P","pushed","c16",1,114272,1,1],[7103,"P","reserved","c16",2,114272,2,1],[7103,"R","reserved","c0",2,106080,2,2],[7105,"W","waited","c16",1,116320,2,1],[7109,"U","popped","c0",1,106080,2,2],[7152,"P","pushed","c16",2,116320,2,2],[7154,"R","pushed","c0",2,108128,3,2],[7156,"U","waited","c0",2,106080,3,2],[7157,"W","popped","c16",1,114272,2,2],[7178,"W","waited","c16",2,114272,3,2],[7178,"U","popped","c0",2,108128,3,3],[7178,"P","reserved","c16",3,116320,2,2],[7178,"R","reserved","c0",3,108128,3,3],[7213,"P","pushed","c16",3,114272,3,2],[7226,"W","popped","c16",2,116320,3,3],[7229,"U","waited","c0",3,108128,4,3],[7232,"R","pushed","c0",3,106080,4,3],[7251,"W","waited","c16",3,116320,4,3],[7251,"P","reserved","c16",4,114272,3,3],[7251,"R","reserved","c0",4,106080,4,4],[7257,"U","popped","c0",3,106080,4,4],[7269,"P","pushed","c16",4,116320,4,3],[7303,"W","popped","c16",3,114272,4,4],[7303,"R","pushed","c0",4,108128,5,4],[7304,"U","waited","c0",4,106080,5,4],[7310,"P","reserved","c16",5,116320,4,4],[7326,"U","popped","c0",4,108128,5,5],[7326,"R","reserved","c0",5,108128,5,5],[7328,"W","waited","c16",4,114272,5,4],[7330,"P","pushed","c16",5,114272,5,4],[7376,"W","popped","c16",4,116320,5,5],[7379,"P","reserved","c16",6,114272,5,5],[7381,"R","pushed","c0",5,106080,6,5],[7381,"U","waited","c0",5,108128,6,5],[7403,"R","reserved","c0",6,106080,6,6],[7403,"P","pushed","c16",6,116320,6,5],[7405,"W","waited","c16",5,116320,6,5],[7409,"U","popped","c0",5,106080,6,6],[7452,"R","pushed","c0",6,108128,7,6],[7456,"U","waited","c0",6,106080,7,6],[7457,"W","popped","c16",5,114272,6,6],[7457,"P","reserved","c16",7,116320,6,6],[7478,"W","waited","c16",6,114272,7,6],[7478,"U","popped","c0",6,108128,7,7],[7478,"R","reserved","c0",7,108128,7,6],[7478,"P","pushed","c16",7,114272,7,6],[7526,"W","popped","c16",6,116320,7,7],[7529,"U","waited","c0",7,108128,8,7],[7530,"R","pushed","c0",7,106080,8,7],[7551,"W","waited","c16",7,116320,8,7],[7557,"U","popped","c0",7,106080,8,8],[7602,"W","popped","c16",7,114272,8,8]];
+    var CORE = { R: ["BRISC (reader)", C.blue], U: ["TRISC0 (unpack)", C.green], P: ["TRISC2 (pack)", C.orange], W: ["NCRISC (writer)", C.purple] };
+    var BASE = { c0: 0x19e60, c16: 0x1be60 };
+    function hex(v) { return "0x" + v.toString(16); }
+    // Replay the events into states. A pointer's "laps" counts pages advanced, so arrows always turn clockwise.
+    var states = [], st = {
+      c0: { page: [null, null], fill: [false, false], wr: 0, rd: 0, recv: 0, ack: 0, who: "" },
+      c16: { page: [null, null], fill: [false, false], wr: 0, rd: 0, recv: 0, ack: 0, who: "" } };
+    function clone(o) { return JSON.parse(JSON.stringify(o)); }
+    states.push(clone(st));
+    EV.forEach(function (e) {
+      var r = st[e[3]], i = e[4], pg = i % 2;
+      if (e[2] === "reserved") { r.wr = i; r.page[pg] = i; r.fill[pg] = "filling"; }
+      if (e[2] === "pushed") { r.wr = i + 1; r.page[pg] = i; r.fill[pg] = true; }
+      if (e[2] === "waited") { r.rd = i; }
+      if (e[2] === "popped") { r.rd = i + 1; r.fill[pg] = false; }
+      r.recv = e[6]; r.ack = e[7]; r.who = e[1];
+      states.push(clone(st));
+    });
+    function narr(k) {
+      if (k === 0) return "<b>Before the loop.</b> Two rings of 2 pages each. <code>c_0</code> sits at 0x19e60 (pages 0x19e60 and 0x1a660, limit 0x1ae60); <code>c_16</code> at 0x1be60. Press <b>Play</b> or <b>Step</b> to replay the 64 real events from the recorder run, in clock order.";
+      var e = EV[k - 1], who = CORE[e[1]][0], i = e[4], cb = e[3] === "c0" ? "c_0" : "c_16";
+      var pg = (e[5] - BASE[e[3]]) / 2048;
+      var s = "<b>t=" + e[0] + ", " + who + "</b>: ";
+      if (e[2] === "reserved") s += "returned from <code>cb_reserve_back</code> for tile " + i + " of " + cb + ". Write pointer " + hex(e[5]) + " (page " + pg + "). It read received=" + e[6] + ", acked=" + e[7] + ", so free pages = 2 − (" + e[6] + " − " + e[7] + ") = " + (2 - (e[6] - e[7])) + ".";
+      if (e[2] === "pushed") {
+        s += "pushed tile " + i + ". Its write pointer moved to " + hex(e[5]) + (pg === 0 ? " (it hit the limit and snapped back to the base)" : "") + ". The received register reads " + e[6] + ".";
+        if (e[1] === "P" && e[6] < i + 1) s += " <b>Not " + (i + 1) + " yet:</b> TRISC2 bumped its local count, but the register is written by a STOREREG that waits behind the packer (llk_io_pack.h:68-70).";
+      }
+      if (e[2] === "waited") s += "passed <code>cb_wait_front</code> for tile " + i + ": received − acked = " + e[6] + " − " + e[7] + " ≥ 1. Read pointer " + hex(e[5]) + " (page " + pg + ").";
+      if (e[2] === "popped") s += "popped tile " + i + ". Its read pointer moved to " + hex(e[5]) + (pg === 0 ? " (wrapped)" : "") + "; the acked register reads " + e[7] + ".";
+      if (k === 7) s += " Note the overlap: BRISC got page 1 for tile 1 while page 0 was still in use. That is the second page doing its job.";
+      return s;
+    }
+    var steps = [];
+    for (var k = 0; k <= EV.length; k++) steps.push({ dur: 0.7, text: narr(k) });
+    function ring(cx, cy, key, title, prod, cons, s0, s1, t, hot) {
+      var R = 92, w = 30;
+      TT.text(ctx, title, cx, 20, { align: "center", font: "bold 15px", color: C.yellow });
+      TT.text(ctx, "wr: producer " + CORE[prod][0], cx - 200, 44, { font: "12px", color: CORE[prod][1] });
+      TT.text(ctx, "rd: consumer " + CORE[cons][0], cx - 200, 62, { font: "12px", color: CORE[cons][1] });
+      for (var p = 0; p < 2; p++) {
+        var a0 = -Math.PI + p * Math.PI, a1 = a0 + Math.PI;
+        ctx.beginPath(); ctx.arc(cx, cy, R, a0 + 0.03, a1 - 0.03); ctx.arc(cx, cy, R - w, a1 - 0.03, a0 + 0.03, true); ctx.closePath();
+        var f = s1[key].fill[p];
+        ctx.fillStyle = f === true ? CORE[prod][1] : (f === "filling" ? C.bg3 : C.bg2);
+        ctx.globalAlpha = f === true ? 0.55 : 1; ctx.fill(); ctx.globalAlpha = 1;
+        ctx.strokeStyle = f === "filling" ? CORE[prod][1] : C.border; ctx.lineWidth = f === "filling" ? 2 : 1; ctx.setLineDash(f === "filling" ? [5, 4] : []); ctx.stroke(); ctx.setLineDash([]);
+        var am = (a0 + a1) / 2, lx = cx + Math.cos(am) * (R - w / 2), ly = cy + Math.sin(am) * (R - w / 2);
+        var lab = s1[key].page[p] === null ? "empty" : (f === true ? "tile " + s1[key].page[p] : (f === "filling" ? "filling " + s1[key].page[p] : "(old " + s1[key].page[p] + ")"));
+        TT.text(ctx, lab, lx, ly, { align: "center", font: "12px", color: f === true ? C.fg : C.muted });
+        var addr = BASE[key] + p * 2048;
+        TT.text(ctx, "page " + p + " " + hex(addr), cx - R - 10, cy + (p === 0 ? -40 : 40), { align: "right", font: "11px", mono: true, color: C.muted });
+      }
+      function arrowAt(laps0, laps1, outer, col, lab) {
+        var lp = TT.lerp(laps0, laps1, t), ang = -Math.PI / 2 + lp * Math.PI;
+        var r1 = outer ? R + 40 : R - w - 34, r2 = outer ? R + 4 : R - w - 4;
+        TT.arrow(ctx, cx + Math.cos(ang) * r1, cy + Math.sin(ang) * r1, cx + Math.cos(ang) * r2, cy + Math.sin(ang) * r2, { color: col, lw: 3, head: 10 });
+        var rl = outer ? R + 52 : R - w - 44;
+        TT.text(ctx, lab, cx + Math.cos(ang) * rl, cy + Math.sin(ang) * rl, { align: "center", font: "bold 12px", color: col });
+      }
+      arrowAt(s0[key].wr, s1[key].wr, true, CORE[prod][1], "wr");
+      arrowAt(s0[key].rd, s1[key].rd, false, CORE[cons][1], "rd");
+      var y = cy + R + 70;
+      TT.text(ctx, "received (reg) = " + s1[key].recv + "    acked (reg) = " + s1[key].ack, cx, y, { align: "center", font: "13px", mono: true, color: hot ? C.yellow : C.fg });
+      TT.text(ctx, s1[key].who ? "as read by " + CORE[s1[key].who][0] : "", cx, y + 18, { align: "center", font: "12px", color: C.muted });
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (k, t) {
+        TT.clear(ctx, g.W, g.H);
+        var s0 = states[Math.max(0, k - 1)], s1 = states[k];
+        if (k === 0) { s0 = s1; }
+        var hotcb = k > 0 ? EV[k - 1][3] : "";
+        ring(235, 230, "c0", "CB c_0 (input A)", "R", "U", s0, s1, t, hotcb === "c0");
+        ring(680, 230, "c16", "CB c_16 (output)", "P", "W", s0, s1, t, hotcb === "c16");
+        // timeline of all events
+        var x0 = 40, x1 = 860, ty = 452, tmin = 6940, tmax = 7610;
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0, ty); ctx.lineTo(x1, ty); ctx.stroke();
+        EV.forEach(function (e, j) {
+          var x = x0 + (e[0] - tmin) / (tmax - tmin) * (x1 - x0), cur = j === k - 1;
+          ctx.fillStyle = CORE[e[1]][1]; ctx.globalAlpha = j < k ? 1 : 0.25;
+          var lane = { R: -12, U: -4, P: 4, W: 12 }[e[1]];
+          ctx.fillRect(x - (cur ? 3 : 1.5), ty + lane - (cur ? 4 : 2.5), cur ? 6 : 3, cur ? 8 : 5); ctx.globalAlpha = 1;
+        });
+        TT.text(ctx, "ttsim clock " + tmin, x0, ty + 22, { font: "11px", color: C.muted });
+        TT.text(ctx, String(tmax), x1, ty + 22, { font: "11px", color: C.muted, align: "right" });
+        TT.text(ctx, k > 0 ? "t = " + EV[k - 1][0] : "", 450, ty + 22, { font: "12px", color: C.yellow, align: "center" });
+      }
+    });
+  })();
+  </script>
+
+  <p>Five things to take from the trace:</p>
+  <ul>
+    <li><b>The pointers really are private.</b> BRISC's <code>wr</code> and TRISC0's <code>rd</code> for <code>c_0</code> trace the same sequence 0x19e60, 0x1a660, 0x19e60, … but at different times. Neither ever reads the other.</li>
+    <li><b>The second page is used.</b> At t=7030, BRISC is granted page 1 for tile 1 while tile 0 is still in page 0 (the <code>acked</code> it read is 0; in one of four reruns compute's pop landed in the same clock first and BRISC read 1), and at t=7103 the packer reserves page 0 of <code>c_16</code> for tile 2 while the writer is still writing tile 1 from page 1.</li>
+    <li><b>A push on TRISC2 is not visible at once.</b> At t=7030 TRISC2 has pushed tile 0 and its write pointer has moved, but the <code>received</code> register still reads 0. A few clocks later (1 to 6 across reruns) the writer reads 1. The register update is the <code>STOREREG</code> behind <code>STALLWAIT(…, PACK)</code> in <code>llk_push_to_brisc</code>:</li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/hw/ckernels/wormhole_b0/metal/llk_io/llk_io_pack.h:60-70 @7aad8aac (comments trimmed)</div>
+<pre><code>    get_local_cb_interface(output).tiles_received += num_tiles;
+    uint16_t tiles_received_new = get_local_cb_interface(output).tiles_received;
+    TT_SETDMAREG(0, tiles_received_new, 0, LO_16(p_gpr_pack::NUM_MSGS_RECEIVED));
+    TTI_STALLWAIT(p_stall::STALL_THCON, p_stall::PACK);  // wait for pack to finish
+    TT_STOREREG(p_gpr_pack::NUM_MSGS_RECEIVED, tiles_received_addr_tensix);</code></pre>
+  <ul>
+    <li><b>The reader never got far ahead.</b> At each of BRISC's reservations, <code>received − acked</code> was 0 or 1: at most one tile was waiting in <code>c_0</code>, so the second page was used for overlap and never for a backlog. (That is a statement about ttsim's interleaving, not about silicon.)</li>
+    <li><b>Counters end equal.</b> After tile 7, both CBs read received = acked = 8: every page that was pushed was popped.</li>
+  </ul>
+  <div class="callout key">Each CB has one shared pair of counters and up to four private copies of its other state: a write pointer on the producer, a read pointer on the consumer, and local counter copies on the TRISCs. On the compute side, the shared counters are updated by Tensix instructions that wait for the unpacker or packer, so a TRISC's local count runs ahead of the register that other CPUs see. That lag is what makes the protocol safe: nobody is told a page is free or full before the hardware is done with it.</div>
+  <p>Remove the overlay when you are done (<code>rm -rf $LAB_HOME/kernels/tt_metal</code>), or every later run of <code>eltwise_binary</code> will print.</p>
+
+  <h2 id="sem">2. Trace the Dst semaphore inside ttsim</h2>
+  <p>A12 printed <code>MATH_PACK</code> from the TRISCs and got 0 every time, because a TRISC's read is a snapshot of a coprocessor that may be far behind it. To see the semaphore as the hardware model sees it, log it where ttsim changes it.</p>
+  <h3>Where the semaphores live in ttsim</h3>
+  <p>The Sync Unit has eight 4-bit semaphores, each a <code>Value</code> and a <code>Max</code> (<code>tt-isa-documentation WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md:31-41</code>). ttsim keeps them in <code>TensixState::sem[8]</code> and <code>sem_max[8]</code>, and, apart from the reset in <code>tensix_init</code>, touches them in six places: the four instructions in <code>tensix.cpp</code>, and the TRISCs' memory-mapped reads and writes of <code>SemaphoreAccess[i]</code> in <code>tile.cpp</code>. A write with bit 0 set is a get (decrement); with bit 0 clear it is a post (increment) (<code>SyncUnit.md:58-80</code>).</p>
+  <div class="filename">ttsim/src/tensix.cpp:5556-5584 @b3620244 (SEMWAIT, trimmed)</div>
+<pre><code>TENSIX_EXECUTE_SEMWAIT() {
+    ...
+    for (uint32_t sems = sem_sel; sems; sems &amp;= sems - 1) {
+        uint32_t sem_index = __builtin_ctz(sems);
+        if (wait_sem_cond == 2) { // wait while max
+            if (p_tensix-&gt;sem[sem_index] &gt;= p_tensix-&gt;sem_max[sem_index]) {
+                return false;
+            }
+        } else { // wait while zero
+            if (!p_tensix-&gt;sem[sem_index]) {
+                return false;
+            }
+        }
+    }
+    p_tensix-&gt;wait_block[pipe] = block;
+    ...</code></pre>
+  <p>Returning <code>false</code> means "not executed yet": the instruction stays at the head of its thread and ttsim retries it on a later step. So a blocked <code>SEMWAIT</code> shows up as many failed attempts followed by one success. The patch logs the first failed attempt (<code>SEMWAIT-BLOCK</code>) and the success (<code>SEMWAIT-PASS</code>, with the number of tries and clocks spent), plus every <code>SEMINIT</code>, <code>SEMPOST</code> and <code>SEMGET</code>, plus MMIO posts and gets, plus MMIO reads whenever the value a TRISC sees changes (a polling loop would otherwise print thousands of identical lines). Each line has the clock, the thread (T0 unpack, T1 math, T2 pack), the semaphore, and its value before and after. Only one tile is logged, chosen by <code>B06_TILE</code> (default 0, which is logical core (0,0)).</p>
+  <div class="filename">sim-labs/patches/b06-sem-trace.patch (the SEMWAIT hook, against ttsim/src/tensix.cpp @b3620244)</div>
+<pre><code>+        bool blocked = (wait_sem_cond == 2) ? (p_tensix-&gt;sem[sem_index] &gt;= p_tensix-&gt;sem_max[sem_index]) // wait while max
++                                            : !p_tensix-&gt;sem[sem_index];                                 // wait while zero
++        if (s_b06.on(p_tensix-&gt;tile_id)) {
++            if (blocked &amp;&amp; !s_b06.tries[pipe]++) {
++                s_b06.blocked_since[pipe] = g_clock;
++                fprintf(s_b06.f, "%llu T%u SEMWAIT-BLOCK sem%u ...", ...);
++            } else if (!blocked) {
++                fprintf(s_b06.f, "%llu T%u SEMWAIT-PASS sem%u ... tries=%llu waited=%llu\n", ...);
++                s_b06.tries[pipe] = 0;
++            }
++        }
++        if (blocked) {
++            return false;
++        }</code></pre>
+<pre><code>$W/build_ttsim.sh semtrace wh                 # first run copies ttsim to $LAB_HOME/ttsim-semtrace
+(cd $LAB_HOME/ttsim-semtrace &amp;&amp; patch -p1 &lt; $P/b06-sem-trace.patch)
+$W/build_ttsim.sh semtrace wh                 # rebuild with the patch
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-semtrace-wh-release/libttsim.so
+rm -rf $LAB_HOME/kernels/tt_metal             # stock kernels
+B06_SEM_OUT=$LAB_HOME/sem.log $EX/metal_example_eltwise_binary     # Test Passed [7959]
+grep sem1 $LAB_HOME/sem.log | head -20</code></pre>
+  <div class="filename">output: $LAB_HOME/sem.log, MATH_PACK (sem1) only, first two tiles and the start of the third</div>
+<pre><code>2112 T0 SEMINIT sem1 0-&gt;0 max=1
+4272 T1 MMIO-READ sem1 0-&gt;0 max=1
+4275 T1 SEMINIT sem1 0-&gt;0 max=2
+4328 T1 SEMWAIT-PASS sem1 0-&gt;0 max=2 on_max tries=0 waited=0
+4506 T2 SEMWAIT-BLOCK sem1 0-&gt;0 max=2 on_zero
+4523 T1 SEMPOST sem1 0-&gt;1 max=2
+4523 T2 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_zero tries=34 waited=17
+4523 T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=0 waited=0
+4523 T2 SEMGET sem1 1-&gt;0 max=2
+4534 T2 SEMWAIT-BLOCK sem1 0-&gt;0 max=2 on_zero
+4574 T1 SEMPOST sem1 0-&gt;1 max=2
+4574 T2 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_zero tries=57 waited=40
+4574 T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=0 waited=0
+4574 T2 SEMGET sem1 1-&gt;0 max=2
+4574 T2 SEMWAIT-BLOCK sem1 0-&gt;0 max=2 on_zero
+4626 T1 SEMPOST sem1 0-&gt;1 max=2
+...</code></pre>
+  <p>Read it top to bottom; every line has a source:</p>
+  <table class="t">
+    <tr><th>Line</th><th>Who</th><th>Source</th></tr>
+    <tr><td><code>2112 T0 SEMINIT … max=1</code></td><td>BRISC firmware at boot, through thread 0's instruction buffer. It also initialises sems 2, 7 and 4 the same way.</td><td><code>c_tensix_core.h:273-279</code>: "math-&gt;packer semaphore - max set to 1, as double-buffering is disabled by default"; called from <code>brisc.cc:262</code></td></tr>
+    <tr><td><code>4272 T1 MMIO-READ</code></td><td>TRISC1's RISC-V polls the semaphore until it is 0</td><td><code>llk_math_common.h:108</code>, inside <code>_llk_math_pack_sync_init_</code>, called by <code>compute_kernel_hw_startup</code></td></tr>
+    <tr><td><code>4275 T1 SEMINIT … max=2</code></td><td>Half sync: Max becomes 2</td><td><code>llk_math_common.h:120</code></td></tr>
+    <tr><td><code>T1 SEMWAIT-PASS on_max</code></td><td><code>tile_regs_acquire()</code></td><td>A12's table</td></tr>
+    <tr><td><code>T1 SEMPOST</code></td><td><code>tile_regs_commit()</code></td><td>after a STALLWAIT on math and SFPU</td></tr>
+    <tr><td><code>T2 SEMWAIT-BLOCK/PASS on_zero</code></td><td><code>tile_regs_wait()</code></td><td></td></tr>
+    <tr><td><code>T2 SEMGET</code></td><td><code>tile_regs_release()</code></td><td>after ZEROACC of the half</td></tr>
+  </table>
+  <p>The comment in the boot code explains the first surprise: until a compute kernel runs, MATH_PACK has Max 1. Half sync is a property of the <em>kernel</em>, installed by its startup call, and only after MATH has seen the semaphore drain to 0 from any previous program.</p>
+  <p>The second surprise is the per-tile pattern. Look at clock 4523. MATH posts (value 1), the packer's wait passes, and <em>before</em> the packer's <code>SEMGET</code>, MATH's next acquire passes with value 1. For a moment MATH owns one half of Dst and PACK owns the other. That is half-sync double buffering, caught in the act. Many events share one clock because ttsim keeps stepping a tile within a clock as long as its Tensix threads make progress (<code>libttsim.cpp:252</code>), so read the order of lines, not the gaps between clocks.</p>
+  <p>In this run the value never reaches 2. The packer always caught up before MATH finished the next tile: <code>waited=17</code>, <code>40</code>, <code>52</code> are the clocks the <em>packer</em> spent waiting for MATH. To see MATH wait, slow down the end of the pipeline. <code>b06-slow-writer.patch</code> makes the writer spin 300 ttsim clocks before each tile:</p>
+<pre><code>mkdir -p $LAB_HOME/kernels/$R &amp;&amp; cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-slow-writer.patch)
+B06_SEM_OUT=$LAB_HOME/sem-slow.log $EX/metal_example_eltwise_binary     # Test Passed [27702]</code></pre>
+  <div class="filename">output: $LAB_HOME/sem-slow.log, sem1, from the third tile on</div>
+<pre><code>4626 T1 SEMPOST sem1 0-&gt;1 max=2
+4626 T2 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_zero tries=69 waited=52
+4626 T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=0 waited=0
+4686 T1 SEMPOST sem1 1-&gt;2 max=2
+4686 T1 SEMWAIT-BLOCK sem1 2-&gt;2 max=2 on_max
+4898 T2 SEMGET sem1 2-&gt;1 max=2
+4898 T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=234 waited=212
+4898 T2 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_zero tries=0 waited=0
+4898 T1 SEMPOST sem1 1-&gt;2 max=2
+4898 T1 SEMWAIT-BLOCK sem1 2-&gt;2 max=2 on_max
+5261 T2 SEMGET sem1 2-&gt;1 max=2
+5261 T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=381 waited=363
+...</code></pre>
+  <p>Now the value hits Max. Back-pressure travelled three hops upstream: the slow writer leaves <code>c_16</code> full, so TRISC2 spins in <code>cb_reserve_back</code> and cannot issue <code>pack_tile</code> and <code>tile_regs_release</code>; MATH commits a second section (value 2) and its next acquire blocks until the packer's <code>SEMGET</code>. Across the whole run, MATH blocked 60 times out of 64 tiles, against 0 times with the stock writer. Step through both traces:</p>
+
+  <div class="viz" id="semviz"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("semviz");
+    var TR = {
+      stock: [[2112,"T0","SEMINIT",0,0,1,""],[4272,"T1","MMIO-READ",0,0,1,""],[4275,"T1","SEMINIT",0,0,2,""],[4328,"T1","SEMWAIT-PASS",0,0,2,"on_max tries=0 waited=0"],[4506,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4523,"T1","SEMPOST",0,1,2,""],[4523,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=34 waited=17"],[4523,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4523,"T2","SEMGET",1,0,2,""],[4534,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4574,"T1","SEMPOST",0,1,2,""],[4574,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=57 waited=40"],[4574,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4574,"T2","SEMGET",1,0,2,""],[4574,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4626,"T1","SEMPOST",0,1,2,""],[4626,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=69 waited=52"],[4626,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4626,"T2","SEMGET",1,0,2,""],[4626,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4677,"T1","SEMPOST",0,1,2,""],[4677,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=68 waited=51"],[4677,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4677,"T2","SEMGET",1,0,2,""]],
+      slow: [[2112,"T0","SEMINIT",0,0,1,""],[4272,"T1","MMIO-READ",0,0,1,""],[4275,"T1","SEMINIT",0,0,2,""],[4328,"T1","SEMWAIT-PASS",0,0,2,"on_max tries=0 waited=0"],[4506,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4523,"T1","SEMPOST",0,1,2,""],[4523,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=34 waited=17"],[4523,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4523,"T2","SEMGET",1,0,2,""],[4534,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4574,"T1","SEMPOST",0,1,2,""],[4574,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=57 waited=40"],[4574,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4574,"T2","SEMGET",1,0,2,""],[4574,"T2","SEMWAIT-BLOCK",0,0,2,"on_zero"],[4626,"T1","SEMPOST",0,1,2,""],[4626,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=69 waited=52"],[4626,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=0 waited=0"],[4686,"T1","SEMPOST",1,2,2,""],[4686,"T1","SEMWAIT-BLOCK",2,2,2,"on_max"],[4898,"T2","SEMGET",2,1,2,""],[4898,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=234 waited=212"],[4898,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=0 waited=0"],[4898,"T1","SEMPOST",1,2,2,""],[4898,"T1","SEMWAIT-BLOCK",2,2,2,"on_max"],[5261,"T2","SEMGET",2,1,2,""],[5261,"T1","SEMWAIT-PASS",1,1,2,"on_max tries=381 waited=363"],[5261,"T2","SEMWAIT-PASS",1,1,2,"on_zero tries=0 waited=0"],[5261,"T1","SEMPOST",1,2,2,""],[5261,"T1","SEMWAIT-BLOCK",2,2,2,"on_max"],[5619,"T2","SEMGET",2,1,2,""]]
+    };
+    var mode = "stock";
+    function label(e) {
+      if (e[2] === "SEMINIT") return e[1] === "T0" ? "boot SEMINIT, Max 1" : "SEMINIT, Max 2";
+      if (e[2] === "MMIO-READ") return "TRISC1 polls: 0?";
+      if (e[2] === "SEMPOST") return "commit";
+      if (e[2] === "SEMGET") return "release";
+      var acq = e[1] === "T1";
+      if (e[2] === "SEMWAIT-BLOCK") return (acq ? "acquire" : "wait") + " blocks";
+      return (acq ? "acquire" : "wait") + " passes";
+    }
+    function why(e) {
+      var w = { "T0": "BRISC boot code (thread 0)", "T1": "MATH (thread 1)", "T2": "PACK (thread 2)" }[e[1]];
+      var s = "<b>t=" + e[0] + ", " + w + ": " + label(e) + ".</b> ";
+      if (e[2] === "SEMINIT" && e[1] === "T0") s += "Firmware gives MATH_PACK Max 1, Value 0 (c_tensix_core.h:276). Double buffering is off until a kernel turns it on.";
+      else if (e[2] === "MMIO-READ") s += "_llk_math_pack_sync_init_ spins on an MMIO read until Value is 0, so no packer from an earlier program still owns Dst (llk_math_common.h:108).";
+      else if (e[2] === "SEMINIT") s += "Half sync: Max = 2, so MATH may run one Dst half ahead of PACK (llk_math_common.h:120).";
+      else if (e[2] === "SEMPOST") s += "tile_regs_commit: Value " + e[3] + " → " + e[4] + ". One more finished half for the packer." + (e[4] === e[5] ? " <b>Value = Max</b>: both halves are full." : "");
+      else if (e[2] === "SEMGET") s += "tile_regs_release: the packer is done with a half and zeroed it. Value " + e[3] + " → " + e[4] + ".";
+      else if (e[2] === "SEMWAIT-BLOCK") s += (e[1] === "T1" ? "tile_regs_acquire: Value " + e[3] + " = Max, so MATH's thread stops at its wait gate." : "tile_regs_wait: Value is 0, nothing finished to pack yet, so PACK's thread stops.");
+      else s += (e[1] === "T1" ? "tile_regs_acquire: Value " + e[3] + " &lt; Max " + e[5] + ", so MATH may write a half." : "tile_regs_wait: Value " + e[3] + " &gt; 0, a finished half exists.") + (/tries=0/.test(e[6]) ? " No waiting." : " After " + e[6].replace(/on_\w+ /, "").replace("tries=", "").replace(" waited=", " failed tries, ") + " clocks blocked.");
+      return s;
+    }
+    function build() {
+      while (root.firstChild) root.removeChild(root.firstChild);
+      var g = TT.canvas(root, 900, 450), ctx = g.ctx, C = TT.C;
+      var ev = TR[mode];
+      var steps = [{ dur: 0.8, text: "<b>" + (mode === "stock" ? "Stock eltwise_binary." : "Slow writer (300-clock spin per tile).") + "</b> The MATH_PACK semaphore (sem1) of core (0,0), from the patched ttsim's log. x = event order (several events often share a ttsim clock), y = Value. Press Play." }];
+      ev.forEach(function (e) { steps.push({ dur: 0.8, text: why(e) }); });
+      var X0 = 120, X1 = 820, Y0 = 300, H = 70;
+      function xof(j) { return X0 + j * (X1 - X0) / (ev.length - 1); }
+      function yof(v) { return Y0 - v * H; }
+      TT.stepper({
+        root: root, steps: steps,
+        draw: function (k, t) {
+          TT.clear(ctx, g.W, g.H);
+          var n = k; // events shown
+          // axes and Max
+          ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+          for (var v = 0; v <= 2; v++) { ctx.beginPath(); ctx.moveTo(X0 - 10, yof(v)); ctx.lineTo(X1, yof(v)); ctx.stroke(); TT.text(ctx, "Value " + v, X0 - 16, yof(v), { align: "right", font: "12px", color: C.muted }); }
+          // Max line, as a step function over events
+          ctx.strokeStyle = C.red; ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5; ctx.beginPath();
+          for (var j = 0; j < n; j++) { var m = ev[j][5]; var x = xof(j); if (j === 0) ctx.moveTo(x, yof(m)); else { ctx.lineTo(x, yof(ev[j - 1][5])); ctx.lineTo(x, yof(m)); } }
+          ctx.stroke(); ctx.setLineDash([]);
+          if (n > 0) TT.text(ctx, "Max = " + ev[n - 1][5], X1 + 10, yof(ev[n - 1][5]), { font: "12px", color: C.red });
+          // value step line
+          ctx.strokeStyle = C.yellow; ctx.lineWidth = 3; ctx.beginPath();
+          for (j = 0; j < n; j++) {
+            var xa = xof(j), vb = ev[j][3], va = ev[j][4];
+            if (j === 0) ctx.moveTo(xa, yof(vb)); else ctx.lineTo(xa, yof(vb));
+            var frac = (j === n - 1) ? t : 1;
+            ctx.lineTo(xa, yof(TT.lerp(vb, va, frac)));
+            if (j < n - 1) ctx.lineTo(xof(j + 1), yof(va));
+          }
+          ctx.stroke();
+          // markers and labels
+          for (j = 0; j < n; j++) {
+            var e = ev[j], col = e[1] === "T1" ? C.blue : (e[1] === "T2" ? C.orange : C.muted);
+            if (/BLOCK/.test(e[2])) col = C.red;
+            var x2 = xof(j), y2 = yof(e[4]);
+            ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x2, y2, j === n - 1 ? 6 : 4, 0, 7); ctx.fill();
+            {
+              ctx.save(); ctx.translate(x2, yof(2.4)); ctx.rotate(-Math.PI / 4);
+              TT.text(ctx, label(e), 0, 0, { font: (j === n - 1 ? "bold " : "") + "11px", color: col });
+              ctx.restore();
+            }
+          }
+          // thread lanes: blocked intervals
+          var lanes = [["MATH (T1)", "T1", 345], ["PACK (T2)", "T2", 375]];
+          lanes.forEach(function (L) {
+            TT.text(ctx, L[0], X0 - 16, L[2], { align: "right", font: "12px", color: L[1] === "T1" ? C.blue : C.orange });
+            ctx.fillStyle = C.bg2; ctx.fillRect(X0, L[2] - 7, X1 - X0, 14);
+            var from = null;
+            for (var q = 0; q < n; q++) {
+              var e2 = ev[q]; if (e2[1] !== L[1]) continue;
+              if (e2[2] === "SEMWAIT-BLOCK") from = q;
+              if (e2[2] === "SEMWAIT-PASS" && from !== null) { ctx.fillStyle = C.red; ctx.globalAlpha = 0.7; ctx.fillRect(xof(from), L[2] - 7, Math.max(3, xof(q) - xof(from)), 14); ctx.globalAlpha = 1; from = null; }
+            }
+            if (from !== null) { ctx.fillStyle = C.red; ctx.globalAlpha = 0.7; ctx.fillRect(xof(from), L[2] - 7, Math.max(3, xof(n - 1) - xof(from)), 14); ctx.globalAlpha = 1; }
+          });
+          TT.text(ctx, "red = thread stopped at its wait gate on a SEMWAIT", X0, 405, { font: "12px", color: C.muted });
+          if (n > 0) TT.text(ctx, "ttsim clock " + ev[n - 1][0], X1, 428, { font: "12px", color: C.yellow, align: "right" });
+          TT.text(ctx, "event " + n + " of " + ev.length, X0, 428, { font: "12px", color: C.muted });
+        }
+      });
+      var bar = document.createElement("div"); bar.className = "modebar";
+      bar.innerHTML = "<span>Trace:</span>";
+      [["stock", "stock writer"], ["slow", "slow writer"]].forEach(function (m) {
+        var b = document.createElement("button"); b.textContent = m[1]; if (m[0] === mode) b.className = "on";
+        b.onclick = function () { mode = m[0]; build(); };
+        bar.appendChild(b);
+      });
+      root.appendChild(bar);
+    }
+    build();
+  })();
+  </script>
+
+  <p>Two more things in the full log are worth a look. First, sem5 (<code>UNPACK_SYNC</code>) has its own handshake, 64 pairs of <code>T0 MMIO-POST sem5 0-&gt;1</code> followed by <code>T0 SEMGET sem5 1-&gt;0</code>: TRISC0's RISC-V posts through MMIO when it has written a set of unpacker addresses into a configuration context, and the unpack thread gets it back after the unpack MOP has run (<code>llk_unpack_AB.h:264-280</code>). That is a RISC-V-to-Tensix semaphore rather than a Tensix-to-Tensix one; <a href="../chapters/a13-llk-mops-jit.html">A13</a> explains the configuration contexts. Second, the same patch builds for Blackhole (<code>build_ttsim.sh semtrace bh</code>), and the step-3 program below produced the same sequence there, shifted in clocks: boot <code>SEMINIT max=1</code> at 3117, the MMIO read at 6267, <code>SEMINIT max=2</code> at 6270.</p>
+  <div class="callout gpu">The closest GPU idea is a pair of <code>mbarrier</code>s guarding a two-stage shared-memory buffer between a producer warp and a consumer warp. Here the "barrier" is a counter with a ceiling, and the waits are not done by threads but by the coprocessor's wait gate, which holds back instructions the RISC-V has already issued. The TRISC that issued <code>tile_regs_acquire</code> has usually moved on long before its <code>SEMWAIT</code> passes.</div>
+
+  <h2 id="own">3. Write it yourself</h2>
+  <p>Time to build a program from nothing: <b>out = relu(a + b)</b> over N tiles, with your own reader, compute and writer kernels and 2-page CBs. The add runs on the FPU (an <code>ELWADD</code> into Dst); the relu runs on the SFPU in place in Dst. (The file is called <code>b06_scale_add</code> because exercise 2 adds the scale.)</p>
+  <h3>The host program</h3>
+  <div class="filename">sim-labs/workbench/host/b06_scale_add.cpp:18-62 (the part that sets up the device; comment lines trimmed)</div>
+<pre><code>    const uint32_t n_tiles = argc &gt; 1 ? std::atoi(argv[1]) : 8;   // how many 32x32 tiles
+    const uint32_t cb_pages = argc &gt; 2 ? std::atoi(argv[2]) : 2;  // pages (tiles) per circular buffer
+
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(0);  // one device, here ttsim
+    distributed::MeshCommandQueue&amp; cq = mesh_device-&gt;mesh_command_queue();
+    Program program = CreateProgram();
+    constexpr CoreCoord core = {0, 0};  // one Tensix core
+
+    constexpr uint32_t tile_elems = tt::constants::TILE_HW;  // 1024
+    constexpr uint32_t tile_bytes = sizeof(bfloat16) * tile_elems;
+    distributed::DeviceLocalBufferConfig dram{.page_size = tile_bytes, .buffer_type = BufferType::DRAM};
+    distributed::ReplicatedBufferConfig whole{.size = n_tiles * tile_bytes};
+    auto a_buf = distributed::MeshBuffer::create(whole, dram, mesh_device.get());
+    auto b_buf = distributed::MeshBuffer::create(whole, dram, mesh_device.get());
+    auto out_buf = distributed::MeshBuffer::create(whole, dram, mesh_device.get());
+
+    std::mt19937 rng(6);
+    std::uniform_real_distribution&lt;float&gt; dist(-1.0f, 1.0f);
+    std::vector&lt;bfloat16&gt; a(n_tiles * tile_elems), b(n_tiles * tile_elems);
+    for (auto&amp; v : a) v = bfloat16(dist(rng));
+    for (auto&amp; v : b) v = bfloat16(dist(rng));
+    distributed::EnqueueWriteMeshBuffer(cq, a_buf, a, false);
+    distributed::EnqueueWriteMeshBuffer(cq, b_buf, b, false);
+
+    for (tt::CBIndex cb : {tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_16}) {
+        CreateCircularBuffer(program, core,
+            CircularBufferConfig(cb_pages * tile_bytes, {{cb, tt::DataFormat::Float16_b}}).set_page_size(cb, tile_bytes));
+    }
+
+    std::vector&lt;uint32_t&gt; reader_ct, writer_ct;
+    TensorAccessorArgs(*a_buf).append_to(reader_ct);
+    TensorAccessorArgs(*b_buf).append_to(reader_ct);
+    TensorAccessorArgs(*out_buf).append_to(writer_ct);
+    auto reader = CreateKernel(program, "b06/reader.cpp", core,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_ct});
+    auto writer = CreateKernel(program, "b06/writer.cpp", core,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default, .compile_args = writer_ct});
+    auto compute = CreateKernel(program, "b06/compute.cpp", core, ComputeConfig{});
+    SetRuntimeArgs(program, reader, core, {a_buf-&gt;address(), b_buf-&gt;address(), n_tiles});
+    SetRuntimeArgs(program, writer, core, {out_buf-&gt;address(), n_tiles});
+    SetRuntimeArgs(program, compute, core, {n_tiles});</code></pre>
+  <ul>
+    <li><b>Lines 18-19.</b> Two optional arguments, so the break experiments need no rebuild: the tile count and the CB depth.</li>
+    <li><b>21-24.</b> Open device 0 as a 1×1 mesh (ttsim is device 0), get its command queue, make an empty program, and pick the one core everything runs on.</li>
+    <li><b>27-33.</b> Three DRAM buffers, one page per tile. A page of 2048 bytes is one bf16 tile, so "page i" in a kernel means "tile i". DRAM buffers are interleaved page by page across the banks (A09); the kernels never need to know which bank, because the TensorAccessor works it out.</li>
+    <li><b>36-42.</b> Inputs uniform in [−1, 1) from a fixed seed, so every run sees the same numbers and roughly half the sums are negative, which makes the relu visible. The <code>bfloat16(float)</code> constructor rounds to nearest even (<code>bfloat16.hpp:24-28</code>). The writes are non-blocking (<code>false</code>); the queue keeps them in order.</li>
+    <li><b>45-48.</b> Three CBs. Total size <code>cb_pages × 2048</code>, page size 2048, format bf16. The indices <code>c_0</code>, <code>c_1</code>, <code>c_16</code> are the only names the kernels use for them.</li>
+    <li><b>51-54.</b> Describe each buffer into the kernels' compile-time arguments (A11). The reader gets A then B, the writer gets the output.</li>
+    <li><b>55-59.</b> Reader on RISCV_0 (BRISC) with NoC 0, writer on RISCV_1 (NCRISC) with NoC 1, compute with the default <code>ComputeConfig</code>: HiFi4, bf16 Dst, half sync (<code>kernel_types.hpp:106-112</code>). The paths are <em>relative</em>: tt-metal looks in the current directory, then <code>TT_METAL_KERNEL_PATH</code>, then its own trees (<code>kernel.cpp:48-95</code>).</li>
+    <li><b>60-62.</b> Runtime arguments: DRAM addresses and the tile count. All three kernels must get the same count; A11 showed what a mismatch does.</li>
+  </ul>
+  <div class="filename">sim-labs/workbench/host/b06_scale_add.cpp:65-91 (run and check, trimmed)</div>
+<pre><code>    distributed::MeshWorkload workload;
+    workload.add_program(distributed::MeshCoordinateRange(mesh_device-&gt;shape()), std::move(program));
+    distributed::EnqueueMeshWorkload(cq, workload, false);
+    distributed::Finish(cq);
+    std::vector&lt;bfloat16&gt; out;
+    distributed::EnqueueReadMeshBuffer(cq, out, out_buf, true);
+
+    for (uint32_t i = 0; i &lt; out.size(); i++) {
+        const float want = static_cast&lt;float&gt;(bfloat16(std::max(0.0f, static_cast&lt;float&gt;(a[i]) + static_cast&lt;float&gt;(b[i]))));
+        const float got = static_cast&lt;float&gt;(out[i]);
+        const float err = std::fabs(want - got);
+        ...
+        } else if (err &gt; 1.0f / 128 * std::max(std::fabs(want), 1.0f / 64)) {  // more than about one bf16 ulp
+            off++;
+    ...
+    fmt::print("{}\n", off == 0 ? "PASS" : "FAIL");</code></pre>
+  <p>Wrap the program in a workload for the mesh, launch it, wait with <code>Finish</code>, and read the output back. The golden is computed on the host in fp32 and rounded to bf16 like the output format. The check counts exact matches, and fails only on errors bigger than about one bf16 ulp (bf16 has 8 significant bits, so one ulp is about 1/128 of the value; the floor of 1/64 keeps values near zero from demanding the impossible).</p>
+
+  <h3>The reader</h3>
+  <div class="filename">sim-labs/workbench/kernels/b06/reader.cpp:5-28</div>
+<pre><code>void kernel_main() {
+    const uint32_t a_addr = get_arg_val&lt;uint32_t&gt;(0);   // DRAM address of A (runtime arg 0)
+    const uint32_t b_addr = get_arg_val&lt;uint32_t&gt;(1);   // DRAM address of B (runtime arg 1)
+    const uint32_t n_tiles = get_arg_val&lt;uint32_t&gt;(2);  // how many tiles to stream
+
+    constexpr uint32_t cb_a = tt::CBIndex::c_0;
+    constexpr uint32_t cb_b = tt::CBIndex::c_1;
+
+    // Compile-time args 0.. describe A, then B; chain the offsets (A11).
+    constexpr auto a_args = TensorAccessorArgs&lt;0&gt;();
+    const auto a = TensorAccessor(a_args, a_addr);
+    constexpr auto b_args = TensorAccessorArgs&lt;a_args.next_compile_time_args_offset()&gt;();
+    const auto b = TensorAccessor(b_args, b_addr);
+
+    for (uint32_t i = 0; i &lt; n_tiles; i++) {
+        cb_reserve_back(cb_a, 1);                        // block until c_0 has a free page
+        cb_reserve_back(cb_b, 1);                        // ... and c_1 too
+        noc_async_read_page(i, a, get_write_ptr(cb_a));  // start copying tile i of A into that page
+        noc_async_read_page(i, b, get_write_ptr(cb_b));  // both reads are in flight together
+        noc_async_read_barrier();                        // the bytes are in L1 now
+        cb_push_back(cb_a, 1);                           // publish: received += 1, wr advances
+        cb_push_back(cb_b, 1);
+    }
+}</code></pre>
+  <p>The kernel is written in the classic free-function dialect the series uses (A11). The two <code>TensorAccessor</code>s turn "page i" into a 64-bit NoC address; their compile-time blocks are chained with <code>next_compile_time_args_offset()</code> instead of a hard-coded 2. <code>noc_async_read_page</code> takes its size from the accessor's page size (<code>dataflow_api.h:1241-1263</code>). The order inside the loop is the whole protocol: reserve both, read both, <em>one</em> barrier for both reads, then push both. Pushing before the barrier would publish a page that may still be in flight; ttsim would not notice (B05).</p>
+  <h3>The compute kernel</h3>
+  <div class="filename">sim-labs/workbench/kernels/b06/compute.cpp:8-37</div>
+<pre><code>void kernel_main() {
+    const uint32_t n_tiles = get_arg_val&lt;uint32_t&gt;(0);
+
+    constexpr uint32_t cb_a = tt::CBIndex::c_0;
+    constexpr uint32_t cb_b = tt::CBIndex::c_1;
+    constexpr uint32_t cb_out = tt::CBIndex::c_16;
+
+    compute_kernel_hw_startup(cb_a, cb_b, cb_out);  // UNPACK/MATH/PACK configure; MATH SEMINITs MATH_PACK
+    add_init(cb_a, cb_b);                            // load the ELWADD unpack and math programs
+    relu_tile_init();                                // MATH: set up the SFPU relu
+
+    for (uint32_t i = 0; i &lt; n_tiles; i++) {
+        cb_wait_front(cb_a, 1);       // UNPACK: tile i of A is visible
+        cb_wait_front(cb_b, 1);       // UNPACK: tile i of B is visible
+
+        tile_regs_acquire();          // MATH: SEMWAIT until a Dst half is free
+        add_tiles(cb_a, cb_b, 0, 0, 0);  // UNPACK: SrcA &lt;- A, SrcB &lt;- B;  MATH: Dst[0] = SrcA + SrcB (FPU)
+        relu_tile(0);                 // MATH: Dst[0] = max(Dst[0], 0) on the SFPU
+        tile_regs_commit();           // MATH: SEMPOST, the half belongs to PACK now
+
+        cb_pop_front(cb_a, 1);        // UNPACK: free the input pages (acked += 1 once unpack is done)
+        cb_pop_front(cb_b, 1);
+
+        tile_regs_wait();             // PACK: SEMWAIT until MATH has committed
+        cb_reserve_back(cb_out, 1);   // PACK: a free page in c_16
+        pack_tile(0, cb_out);         // PACK: Dst[0] -&gt; L1 page at c_16's write pointer
+        tile_regs_release();          // PACK: ZEROACC the half, SEMGET
+        cb_push_back(cb_out, 1);      // PACK: received += 1 once the packer is done
+    }
+}</code></pre>
+  <p>Every comment names the TRISC that keeps the line (A12). Read the loop once per core:</p>
+  <ul>
+    <li><b>TRISC0</b> sees: wait A, wait B, unpack A and B (the UNPACK half of <code>add_tiles</code>), pop A, pop B. The pops are safe right after the unpack is <em>issued</em> because the <code>acked</code> register is written only once the unpacker is done.</li>
+    <li><b>TRISC1</b> sees: acquire, ELWADD (the MATH half of <code>add_tiles</code>), the relu, commit. <code>relu_tile</code> exists only as <code>MATH(SFPU_UNARY_CALL(…, _relu_min_, …, 0 /*threshold*/))</code>, a "relu with lower limit 0" (<code>relu.h:31-40</code>), and its init <code>relu_tile_init</code> is <code>MATH(SFPU_UNARY_INIT(relu_min))</code> (<code>relu.h:15</code>).</li>
+    <li><b>TRISC2</b> sees: wait, reserve, pack, release, push.</li>
+  </ul>
+  <p>Within each core the order is what matters. On TRISC2, <code>tile_regs_release</code> must follow <code>pack_tile</code> (release zeroes the half it just packed), and on TRISC1 the relu must sit between acquire and commit. Across cores, the source order of, say, the pops and <code>tile_regs_wait</code> is irrelevant: they never share a binary. The Dst index is 0 every time, and yet consecutive tiles use different halves, because indices are relative to the half you currently own (A12).</p>
+  <h3>The writer</h3>
+  <div class="filename">sim-labs/workbench/kernels/b06/writer.cpp:5-19</div>
+<pre><code>void kernel_main() {
+    const uint32_t out_addr = get_arg_val&lt;uint32_t&gt;(0);
+    const uint32_t n_tiles = get_arg_val&lt;uint32_t&gt;(1);
+
+    constexpr uint32_t cb_out = tt::CBIndex::c_16;
+    constexpr auto out_args = TensorAccessorArgs&lt;0&gt;();
+    const auto out = TensorAccessor(out_args, out_addr);
+
+    for (uint32_t i = 0; i &lt; n_tiles; i++) {
+        cb_wait_front(cb_out, 1);                          // a finished tile is visible
+        noc_async_write_page(i, out, get_read_ptr(cb_out)); // start the copy to page i in DRAM
+        noc_async_write_barrier();                         // it has landed (acked)
+        cb_pop_front(cb_out, 1);                           // the page may be reused: acked += 1
+    }
+}</code></pre>
+  <p>The mirror image of the reader: wait, write, barrier, pop. The barrier before the pop matters on silicon, because popping tells the packer it may overwrite the page while the NoC might still be reading it (A11 discusses the cheaper <code>noc_async_writes_flushed</code>).</p>
+  <h3>Build and run</h3>
+<pre><code>source $W/env.sh wh
+cp $W/host/b06_scale_add.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/b06_scale_add.cpp   # about 6 s
+TT_METAL_KERNEL_PATH=$W/kernels $LAB_HOME/b06_scale_add          # kernels found as $W/kernels/b06/*.cpp</code></pre>
+  <div class="filename">output (Wormhole ttsim, then Blackhole ttsim; log lines trimmed)</div>
+<pre><code>compiled /home/user/ttlab/b06/b06_scale_add.o
+[0] 0.1 seconds (0.0 KHz)
+n_tiles=8 cb_pages=2 elements=8192 exact=7704 off_by_more_than_1ulp=0 max_abs_err=0.0078125
+PASS
+[4727] 0.3 seconds (16.2 KHz)
+
+$ source $W/env.sh bh; TT_METAL_KERNEL_PATH=$W/kernels $LAB_HOME/b06_scale_add
+n_tiles=8 cb_pages=2 elements=8192 exact=7704 off_by_more_than_1ulp=0 max_abs_err=0.0078125
+PASS
+[6779] 0.3 seconds (20.5 KHz)
+
+$ TT_METAL_KERNEL_PATH=$W/kernels $LAB_HOME/b06_scale_add 64        # BH, 64 tiles
+n_tiles=64 cb_pages=2 elements=65536 exact=61911 off_by_more_than_1ulp=0 max_abs_err=0.0078125
+PASS</code></pre>
+  <p>The same host binary runs on both chips; the JIT builds each architecture's kernels on first use. 64 tiles on Wormhole also pass, with the same 61,911 exact. Notice the clock counts: 8 tiles took <code>[6779]</code> on Blackhole and 64 tiles <code>[6835]</code>. Eight times the work, 1% more clocks, because ttsim's clock advances when the host polls, not when work is done (honesty banner).</p>
+  <p>About the 488 elements of 8,192 that are not bit-identical: each is off by one bf16 ulp. The device's results match neither a round-to-nearest-even golden exactly (7,704 matches) nor a truncating one (I tried: 6,705 matches), so the FPU path rounds in some third way. ttsim is meant to be bit-exact, so silicon should show the same 488. I did not chase the rounding rule; that belongs with the matrix engine in <a href="b07-matmul-fidelity.html">B07</a>. A11's <code>ttnn.add</code> note found the same kind of 1-ulp differences.</p>
+  <div class="callout sim">For the rest of the lab, put a copy of the kernels in your overlay so you can break them without touching the workbench: <code>cp -r $W/kernels/b06 $LAB_HOME/kernels/</code>. With no <code>TT_METAL_KERNEL_PATH</code> override, <code>env.sh</code>'s <code>$LAB_HOME/kernels</code> is searched, so <code>$LAB_HOME/b06_scale_add</code> now runs <em>your</em> copy.</div>
+
+  <h2 id="break">4. Break it three ways</h2>
+  <p>Each break is a one-line edit of <code>$LAB_HOME/kernels/b06/compute.cpp</code> or a different command-line argument. For each, the table gives what plain ttsim did and what ttsim plus Watcher (<code>TT_METAL_WATCHER=1</code>) did. Watcher runs of this 8-tile program took about 25 s, against 0.3 s without it.</p>
+  <table class="t">
+    <tr><th>Break</th><th>ttsim</th><th>ttsim + Watcher</th></tr>
+    <tr><td>A. One pop of <code>c_0</code> too few</td><td>FAIL, silent: 3,424 elements wrong, tiles 3-7 shifted by one</td><td>Same FAIL; no Watcher message, no assert</td></tr>
+    <tr><td>B1. Second wait not cumulative</td><td>FAIL, silent: 1,681 wrong; the count changes with any instrumentation, and one DPRINT makes it pass</td><td>FAIL, 5,145 wrong; no Watcher message</td></tr>
+    <tr><td>B2. Wait for more than the CB holds</td><td>Hang (killed by <code>timeout</code>, exit 124)</td><td>Hang; 63 identical dumps <code>CRBW,CWFW,UABD,MWDD,K</code></td></tr>
+    <tr><td>C1. 1-page CBs</td><td>PASS</td><td>PASS</td></tr>
+    <tr><td>C2. 1-page CBs, 2-tile blocks</td><td>Hang (exit 124)</td><td>Hang; 65-66 identical dumps <code>CRBW,CWFW,UABD,MWDD,K</code></td></tr>
+  </table>
+
+  <h3>Break A: pop one tile too few</h3>
+<pre><code>        if (i != 2) cb_pop_front(cb_a, 1);  // BREAK A: one pop of c_0 too few</code></pre>
+  <p>Predict first. Does it hang? The reader needs <code>2 − (received − acked) ≥ 1</code> to push. With one pop missing, one stale tile stays in the ring for the rest of the run, which still leaves one free page, so the reader never blocks for good. Compute's waits always pass too. So no hang. But TRISC0's read pointer is now one page behind the reader's write pointer, permanently.</p>
+<pre><code>$LAB_HOME/b06_scale_add 8
+n_tiles=8 cb_pages=2 elements=8192 exact=4559 off_by_more_than_1ulp=3424 max_abs_err=1.90625
+first bad element 3072 (tile 3)
+FAIL</code></pre>
+  <p>Tiles 0-2 are right and everything from tile 3 is wrong. A throw-away variant of the host check (not in the workbench) compared each output tile against two goldens, counting elements within the host check's 1-ulp tolerance:</p>
+<pre><code>tile 2: matches relu(A[t]+B[t]) 1024  matches relu(A[t-1]+B[t]) 355
+tile 3: matches relu(A[t]+B[t]) 342  matches relu(A[t-1]+B[t]) 1024
+tile 4: matches relu(A[t]+B[t]) 312  matches relu(A[t-1]+B[t]) 1024
+...
+tile 7: matches relu(A[t]+B[t]) 355  matches relu(A[t-1]+B[t]) 1024</code></pre>
+  <p>Output tile <i>t</i> ≥ 3 is <code>relu(A[t−1] + B[t])</code> in every element (to the same 1-ulp tolerance): the unpacker paired each B with the <em>previous</em> A. (The ~300-350 chance matches are elements where both sums are negative and relu makes both 0.) Blackhole gave identical numbers. Watcher said nothing: every NoC transaction was in bounds and every push and pop advanced by one page, so no check had anything to catch. The leftover count does not leak into the next program either: TRISC0 zeroes all <code>received</code>/<code>acked</code> registers at each launch (<code>init_sync_registers</code>, <code>trisc.cc:97-106, 138</code>), unlike the leaked semaphore count in A12's double-commit experiment.</p>
+
+  <h3>Break B: wait for cumulative counts wrongly</h3>
+  <p>The CB doc comment says repeated waits are cumulative: "4 calls of cb_wait_front(8) followed by a cb_pop_front(32) would produce incorrect behavior. Instead 4 calls of cb_wait_front() waiting on 8, 16, 24, 32 tiles should be issued" (<code>cb_api.h:25-27</code>, the same text as <code>dataflow_api.h:459-461</code>). To make that mistake possible, change compute to handle tiles in pairs: wait for the first, add it into Dst[0], wait for the second, add it into Dst[1], then pop 2, pack 2, push 2. The second wait must ask for <b>2</b>.</p>
+<pre><code>constexpr uint32_t WAIT2 = 1;   // correct: 2 (cumulative).  BREAK B1: 1
+...
+    for (uint32_t i = 0; i &lt; n_tiles; i += 2) {
+        cb_wait_front(cb_a, 1);
+        cb_wait_front(cb_b, 1);
+        tile_regs_acquire();
+        add_tiles(cb_a, cb_b, 0, 0, 0);   // pages 0 of c_0 and c_1 -&gt; Dst[0]
+        cb_wait_front(cb_a, WAIT2);
+        cb_wait_front(cb_b, WAIT2);
+        add_tiles(cb_a, cb_b, 1, 1, 1);   // pages 1 -&gt; Dst[1]
+        relu_tile(0);
+        relu_tile(1);
+        tile_regs_commit();
+        cb_pop_front(cb_a, 2);
+        cb_pop_front(cb_b, 2);
+        tile_regs_wait();
+        cb_reserve_back(cb_out, 2);
+        pack_tile(0, cb_out);
+        pack_tile(1, cb_out);
+        tile_regs_release();
+        cb_push_back(cb_out, 2);
+    }</code></pre>
+  <p>With <code>WAIT2 = 2</code> this passes (exact=7704, as before). With <code>WAIT2 = 1</code>, the second wait returns at once, because the first tile already satisfies "at least 1 visible". Whether page 1 holds the second tile by then is a race between TRISC0 and BRISC:</p>
+<pre><code>n_tiles=8 cb_pages=2 elements=8192 exact=6174 off_by_more_than_1ulp=1681 max_abs_err=1.9921875
+first bad element 1025 (tile 1)
+FAIL</code></pre>
+  <p>The result was the same on every run and identical on Blackhole. Now try to debug it the obvious way, with a <code>DPRINT_UNPACK</code> of the counters after the second wait:</p>
+<pre><code>0:0-0:TR0: i=0 2nd wait passed: c0 received=2 acked=0 diff(u16)=2
+0:0-0:TR0: i=2 2nd wait passed: c0 received=4 acked=2 diff(u16)=2
+...
+n_tiles=8 cb_pages=2 elements=8192 exact=7704 off_by_more_than_1ulp=0 max_abs_err=0.0078125
+PASS</code></pre>
+  <p>The print slowed TRISC0 so much that the reader always won the race, and the bug vanished. The flight recorder from step 1 disturbs less. It showed the race directly, in every pair:</p>
+<pre><code>0:0-0:TR0: pair 0: 1st wait passed at c0 received=1 acked=0 | 2nd wait passed at received=1 acked=0
+0:0-0:TR0: pair 1: 1st wait passed at c0 received=3 acked=2 | 2nd wait passed at received=3 acked=2
+...
+n_tiles=8 cb_pages=2 elements=8192 exact=7113 off_by_more_than_1ulp=654 max_abs_err=1</code></pre>
+  <p>The second wait passed with only one tile visible every time. But the recorder changed the timing too: 654 wrong elements now, not 1,681. To see <em>which</em> data ended up where, another throw-away host check matched each 256-element face of the output against <code>relu(A[i] + B[j])</code> for every pair of input tiles, and against zeros. The figure shows the result for each way of running the same broken kernel.</p>
+
+  <div class="viz" id="faces"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("faces");
+    var g = TT.canvas(root, 900, 300), ctx = g.ctx, C = TT.C;
+    // Per output tile, per face: the (A,B) source that matched all 256 elements. "z" = zero, "ok" = correct.
+    var RUNS = {
+      bare: { name: "plain run (WH and BH identical)", bad: 1681, f: [["ok","ok","ok","ok"],["0+0","0+0","0+0","0+0"],["A0+B0","A0+B0","ok","ok"],["ok","ok","ok","ok"],["A2+B2","A2+B2","ok","ok"],["ok","ok","ok","ok"],["A4+B4","A4+B4","ok","ok"],["ok","ok","ok","ok"]],
+        text: "<b>Plain run: 1,681 wrong.</b> Tile 1 is all zeros, which is what a never-written page of zeros gives (relu(0 + 0)). Tiles 2, 4 and 6 have their <em>first two faces</em> from the previous pair's first tile and their last two faces right. The likely reading (inferred, see below): the unpacker started reading page 0 before the reader had overwritten it, and finished after." },
+      wrap: { name: "with a wrap check", bad: 1705, f: [["ok","ok","ok","ok"],["0+0","0+0","0+0","A1+0"],["A0+B0","A0+B0","ok","ok"],["ok","ok","ok","ok"],["A2+B2","A2+B2","ok","ok"],["ok","ok","ok","ok"],["A4+B4","A4+B4","ok","ok"],["ok","ok","ok","ok"]],
+        text: "<b>With a check that counts first waits passing while received &lt; acked: 1,705 wrong.</b> Nearly the plain pattern. The check fired twice (first at pair 2): pop(2) after seeing one tile had pushed TRISC0's local acked past the register's received, and the 16-bit difference wrapped to 65535 ≥ 1, so the next <em>first</em> wait passed too. The same mechanism explains pair 1 starting on a stale page 0, though the check, which reads the counter a few instructions after the wait did, did not catch it there." },
+      rec: { name: "with the flight recorder", bad: 654, f: [["ok","ok","ok","ok"],["A1+0","A1+0","A1+0","A1+0"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"]],
+        text: "<b>With the recorder: 654 wrong.</b> Only tile 1, which is relu(A1 + 0): A's page 1 had arrived when it was unpacked, B's had not. The recorder slowed TRISC0 just enough for every later tile to arrive in time." },
+      watch: { name: "under Watcher", bad: 5145, f: [["ok","ok","ok","ok"],["0+0","0+0","0+0","0+0"],["A0+B0","A0+B0","A0+B0","A0+B0"],["A1+0","A1+0","A1+0","A1+0"],["A0+B0","A0+B0","A0+B0","A0+B0"],["A1+B1","A1+B1","A1+B1","A1+B1"],["A0+B0","A0+B0","A2+B0","A2+B0"],["A1+B1","A1+B1","A1+B1","A1+B1"]],
+        text: "<b>Under Watcher: 5,145 wrong, and no Watcher message.</b> Watcher compiles checks and waypoints into every kernel, which moves the race somewhere else: here compute ran far ahead of the reader and, after the first pair, kept finding tiles 0 and 1 (or zeros) in the pages. Every individual transaction was legal, so there was nothing for Watcher to flag." },
+      dprint: { name: "with one DPRINT", bad: 0, f: [["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"],["ok","ok","ok","ok"]],
+        text: "<b>With a DPRINT after the second wait: PASS.</b> The print is slow enough that the reader always wins. A heisenbug: the act of looking removes it." }
+    };
+    var cur = "bare";
+    function col(s) { return s === "ok" ? C.green : (s === "0+0" ? C.muted : (/\+0$/.test(s) ? C.purple : C.orange)); }
+    function draw() {
+      TT.clear(ctx, g.W, g.H);
+      var r = RUNS[cur];
+      TT.text(ctx, "Output tile → faces (each 16×16 = 256 elements), " + r.name + ": " + r.bad + " of 8192 wrong", 30, 22, { font: "bold 14px", color: C.yellow });
+      for (var t = 0; t < 8; t++) {
+        var x = 30 + t * 106, y = 60;
+        TT.text(ctx, "tile " + t + (t % 2 ? " (2nd)" : " (1st)"), x + 48, y - 12, { align: "center", font: "12px", color: C.muted });
+        for (var f = 0; f < 4; f++) {
+          var fx = x + (f % 2) * 48, fy = y + Math.floor(f / 2) * 48, s = r.f[t][f];
+          TT.box(ctx, fx, fy, 46, 46, { fill: col(s), alpha: s === "ok" ? 0.35 : 0.75, stroke: col(s), r: 3 });
+          TT.text(ctx, s === "ok" ? "✓" : s, fx + 23, fy + 23, { align: "center", font: "11px", mono: true, color: C.fg });
+        }
+        TT.text(ctx, "pair " + Math.floor(t / 2), x + 48, y + 112, { align: "center", font: "11px", color: C.muted });
+      }
+      var ly = 210;
+      [[C.green, "correct (relu(A[t]+B[t]))"], [C.muted, "all zeros: page never written"], [C.purple, "A tile + zeros: B page not yet written"], [C.orange, "data from an earlier tile: stale page"]].forEach(function (L, i) {
+        var lx = 30 + (i % 2) * 420, lyy = ly + Math.floor(i / 2) * 22;
+        ctx.fillStyle = L[0]; ctx.fillRect(lx, lyy, 14, 14); TT.text(ctx, L[1], lx + 20, lyy + 7, { font: "12px", color: C.fg });
+      });
+      TT.text(ctx, "Labels: A2+B2 means the face equals relu(A[2] + B[2]) for all 256 elements; '0' stands for a zero tile.", 30, 270, { font: "12px", color: C.muted });
+      narr.innerHTML = r.text;
+    }
+    var bar = document.createElement("div"); bar.className = "modebar"; bar.innerHTML = "<span>Run:</span>";
+    var narr = document.createElement("div"); narr.className = "narration";
+    Object.keys(RUNS).forEach(function (k) {
+      var b = document.createElement("button"); b.textContent = RUNS[k].name; if (k === cur) b.className = "on";
+      b.onclick = function () { cur = k; bar.querySelectorAll("button").forEach(function (x) { x.className = ""; }); b.className = "on"; draw(); };
+      bar.appendChild(b);
+    });
+    root.appendChild(bar); root.appendChild(narr);
+    draw();
+  })();
+  </script>
+
+  <p>So one wrong wait does more than misread one tile. Pair 0's <code>cb_pop_front(cb_a, 2)</code> runs after TRISC0 has seen only one tile. TRISC0's local <code>acked</code> jumps to 2 while the register's <code>received</code> may still be 1, and in <code>llk_wait_tiles</code> the subtraction <code>received − acked</code> is done in <code>uint16_t</code> (<code>llk_io_unpack.h:81</code>): 1 − 2 = 65535, which is "at least 1". The protocol's assumption that <code>acked</code> never overtakes <code>received</code> is broken, so even the correct-looking first waits pass early until the reader catches up. My check caught that wrap twice. In the plain run I could not observe it directly, because any probe I added shifted the race; the half-stale tiles 2, 4 and 6 are what it predicts, and ttsim completes each NoC write inside the instruction that starts it (A08), so a page is never half-written by the NoC, only half-read.</p>
+  <div class="callout warn">A race in ttsim is deterministic for a given binary and a given set of debug options, which makes it look like an ordinary bug. Change anything that affects timing (a DPRINT, Watcher, a recorder) and you get a different wrong answer, or a right one. On silicon the interleaving also varies from run to run. A passing run with a cumulative-wait bug in it proves nothing.</div>
+  <p><b>B2: the opposite mistake.</b> Set <code>WAIT2 = 3</code>, as if counting 1, 2, 3 across loop iterations. A 2-page CB can never show 3 tiles, so the second wait spins forever:</p>
+<pre><code>timeout 30 $LAB_HOME/b06_scale_add 8; echo EXIT=$?          # EXIT=124 after 30 s
+TT_METAL_WATCHER=1 timeout 75 $LAB_HOME/b06_scale_add 8
+grep "x= 0,y= 0)" $LAB_HOME/logs/generated/watcher/watcher.log | grep worker | uniq -c | tail -3
+      1 Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): NRBD,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG
+     63 Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): CRBW,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG</code></pre>
+  <p>This is the signature from A11's quiz: BRISC in <code>cb_reserve_back</code> (<code>CRBW</code>, its input CB is full), NCRISC in <code>cb_wait_front</code> (<code>CWFW</code>, its output CB is empty), the TRISCs parked after their last landmarks. Both data-movement cores point at compute. Watcher cannot tell you <em>which</em> wait inside compute is stuck: the compute side's CB waits have no waypoint.</p>
+
+  <h3>Break C: a 1-page CB</h3>
+  <p>Restore the 1-tile compute kernel and ask for 1-page CBs:</p>
+<pre><code>cp $W/kernels/b06/compute.cpp $LAB_HOME/kernels/b06/
+$LAB_HOME/b06_scale_add 8 1
+n_tiles=8 cb_pages=1 elements=8192 exact=7704 off_by_more_than_1ulp=0 max_abs_err=0.0078125
+PASS
+TT_METAL_WATCHER=1 $LAB_HOME/b06_scale_add 8 1                 # also PASS, nothing in watcher.log</code></pre>
+  <p>Nothing breaks. With chunks of one page, every rule still holds: pushes per lap sum to the CB size (1), and no wait asks for more than 1. What you lose is overlap. With one page, BRISC cannot reserve tile <i>i</i>+1 until TRISC0 has popped tile <i>i</i>, so reading and unpacking strictly take turns, as in A11's ring figure. On silicon that roughly doubles the time per tile when the two stages are similar. ttsim has no timing model, so it cannot show you the cost; the protocol is correct and that is all it checks.</p>
+  <p>The 1-page CB turns into a real failure when a kernel moves more than one page at a time. Run the <em>correct</em> pair kernel from break B (<code>WAIT2 = 2</code>) on 1-page CBs:</p>
+<pre><code>$LAB_HOME/b06_scale_add 8 2       # pair kernel, 2-page CBs: PASS
+timeout 20 $LAB_HOME/b06_scale_add 8 1; echo EXIT=$?          # EXIT=124
+TT_METAL_WATCHER=1 timeout 75 $LAB_HOME/b06_scale_add 8 1      # dump count varies by run (65, 66)
+     65 Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): CRBW,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG</code></pre>
+  <p>Compute waits for 2 tiles in a ring that holds 1. Nothing checks <code>n ≤ fifo_num_pages</code> at run time, in ttsim or under Watcher; the program simply hangs, and the Watcher picture is the same as B2's. The rule of thumb: <b>a CB must hold at least the largest block any one call waits for or reserves</b>, and twice that if you want the two sides to overlap.</p>
+
+  <h2 id="exercises">5. Exercises, with answers</h2>
+  <details class="quiz"><summary>1. Change the CBs to 4 pages (and to 3). What changes, and what does not?</summary>
+  <p>Just pass the depth: <code>$LAB_HOME/b06_scale_add 8 4</code> and <code>… 8 3</code>. Both print <code>exact=7704 … PASS</code>, the same bits as with 2 pages; the protocol is depth-agnostic when every call moves one page. The pointers now cycle through 4 (or 3) pages before wrapping, which you can confirm by applying the recorder idea to <code>reader.cpp</code>. Whether 4 pages is faster than 2 is a timing question ttsim cannot answer: with steady stage times, depth beyond 2 only absorbs variation (A11).</p>
+  <p>Now combine depth 3 with the pair kernel (<code>WAIT2 = 2</code>): <code>$LAB_HOME/b06_scale_add 8 3</code> prints <code>exact=7004 off_by_more_than_1ulp=767 … first bad element 3072 (tile 3) FAIL</code>, silently. Plain Watcher also stays silent (FAIL, no message). With LLK asserts compiled in, it is caught:</p>
+<pre><code>TT_METAL_WATCHER=1 TT_METAL_LLK_ASSERTS=1 $LAB_HOME/b06_scale_add 8 3
+... TRISC0 tripped an assert on line 67. ... Current kernel: b06/compute.cpp.
+TT_THROW: Watcher detected tripped assert and stopped device.</code></pre>
+  <p>Line 67 is <code>LLK_ASSERT(cb_access_within_bounds(operandA_id, tile_index_a, 1), "Indexed tile read exceeds CB boundary")</code> in <code>llk_unpack_AB_api.h</code>. Pair 1 starts at page 2 of a 3-page ring and asks for tile index 1, i.e. page 3, past the limit; the reader, moving one page at a time, wrapped and put tile 3 in page 0. (A 2-page pop from page 2 also wraps TRISC0's pointer with <code>&gt;=</code>, <code>llk_io_unpack.h:113</code>, where the data-movement side wraps only on <code>==</code>, <code>dataflow_api.h:272</code>.) It is A11's rule 1 again: chunk sizes must tile the ring. LLK asserts are a separate switch from Watcher (<code>TT_METAL_LLK_ASSERTS</code>, <code>rtoptions.cpp:1832-1836</code>; with Watcher on they become ordinary Watcher asserts, <code>jit_build/build.cpp:481-488</code>).</p></details>
+  <details class="quiz"><summary>2. Add a second compute op: out = 0.5 · relu(a + b). (Hence "scale_add".)</summary>
+  <p>Add <code>#include "api/compute/eltwise_unary/binop_with_scalar.h"</code> and, between <code>relu_tile(0)</code> and <code>tile_regs_commit()</code>:</p>
+<pre><code>        relu_tile_init();             // re-init relu, because the mul below reprograms the SFPU
+        relu_tile(0);
+        binop_with_scalar_tile_init();
+        mul_unary_tile(0, 0x3F000000u);  // Dst[0] *= 0.5f (the float's bit pattern)</code></pre>
+  <p><code>mul_unary_tile</code> takes the scalar as the raw bits of an fp32 (<code>binop_with_scalar.h:59-72</code>). Change the host golden to <code>0.5f * std::max(…)</code> and rebuild. Output on Wormhole and on Blackhole:</p>
+<pre><code>n_tiles=8 cb_pages=2 elements=8192 exact=7704 off_by_more_than_1ulp=0 max_abs_err=0.00390625
+PASS</code></pre>
+  <p>The unmodified host binary, run against the new kernel, fails with 4,126 elements off, as it should. Halving is exact in floating point, so the 7,704 exact matches are the same elements as before. I also removed the in-loop <code>relu_tile_init()</code> and it still passed; like A12's missing <code>add_binary_tile_init</code>, that is luck about what the two inits program, not a licence to skip it.</p></details>
+  <details class="quiz"><summary>3. Switch the program to full sync and predict the semaphore trace before running it.</summary>
+  <p>Change <code>ComputeConfig{}</code> to <code>ComputeConfig{.dst_full_sync_en = true}</code>, rebuild, and run with the patched ttsim. Prediction: <code>SEMINIT … max=1</code>, and because Max is 1, every acquire after the first must block until the packer's release. The real trace:</p>
+<pre><code>4275 T1 SEMINIT sem1 0-&gt;0 max=1
+4330 T1 SEMWAIT-PASS sem1 0-&gt;0 max=1 on_max tries=0 waited=0
+4496 T2 SEMWAIT-BLOCK sem1 0-&gt;0 max=1 on_zero
+4542 T1 SEMPOST sem1 0-&gt;1 max=1
+4542 T2 SEMWAIT-PASS sem1 1-&gt;1 max=1 on_zero tries=245 waited=46
+4542 T1 SEMWAIT-BLOCK sem1 1-&gt;1 max=1 on_max
+4542 T2 SEMGET sem1 1-&gt;0 max=1
+4542 T1 SEMWAIT-PASS sem1 0-&gt;0 max=1 on_max tries=10 waited=0</code></pre>
+  <p>Compare the half-sync run of the same program, where after the first <code>SEMPOST</code> the line is <code>T1 SEMWAIT-PASS sem1 1-&gt;1 max=2 on_max tries=0</code>: MATH starts the next tile at once. In full sync MATH and PACK strictly alternate on the whole of Dst, in exchange for twice the tiles per acquire (16 instead of 8 in bf16, A12). The output is still PASS.</p></details>
+  <details class="quiz"><summary>4. In the step 2 stock trace, why does the packer wait 40-52 clocks per tile but MATH never waits?</summary>
+  <p>Because in ttsim, the slowest stage of this pipeline is upstream of MATH (unpack and the reader feeding it). MATH finishes a tile, posts, and its next acquire finds Value 1 &lt; Max 2. The packer, downstream of MATH, finishes quickly and then has nothing to do until the next commit, so its <code>tile_regs_wait</code> blocks. The semaphore tells you which side of Dst is starved. With the slow writer the roles flip: MATH blocks 60 times and the packer's wait passes at once. Remember that these are ttsim step counts; on silicon the balance between stages can be different.</p></details>
+  <details class="quiz"><summary>5. Predict what the reader sees at each <code>cb_reserve_back</code> with 1-page CBs, then measure it.</summary>
+  <p>Prediction: the write pointer never moves (with one page, every push reaches the limit and snaps back to the base), and BRISC can reserve tile <i>i</i>+1 only once compute has popped tile <i>i</i>, so it always sees <code>acked = received</code>. With 2 pages it can reserve while one tile is still in the CB, so <code>acked = received − 1</code> is possible. Measure it by recording <code>(clock, get_write_ptr, received, acked)</code> right after the two reserves in your overlay <code>reader.cpp</code>, as in step 1b, and printing after the loop:</p>
+<pre><code>TT_METAL_DPRINT_CORES=0,0 TT_METAL_DPRINT_RISCVS=BR $LAB_HOME/b06_scale_add 8 1
+0:0-0:BR: t=6465 reserved tile 0: wr=0x19e60 received=0 acked=0
+0:0-0:BR: t=6559 reserved tile 1: wr=0x19e60 received=1 acked=1
+0:0-0:BR: t=6559 reserved tile 2: wr=0x19e60 received=2 acked=2
+...
+TT_METAL_DPRINT_CORES=0,0 TT_METAL_DPRINT_RISCVS=BR $LAB_HOME/b06_scale_add 8 2
+0:0-0:BR: t=4779 reserved tile 0: wr=0x19e60 received=0 acked=0
+0:0-0:BR: t=4868 reserved tile 1: wr=0x1a660 received=1 acked=1
+0:0-0:BR: t=4868 reserved tile 2: wr=0x19e60 received=2 acked=1
+0:0-0:BR: t=4868 reserved tile 3: wr=0x1a660 received=3 acked=2
+...</code></pre>
+  <p>Both predictions hold, and both runs PASS. With one page, every reservation waited for compute's pop; with two, from tile 2 on the reader was granted a page while compute still held the previous tile. (Several reservations share a clock because ttsim steps a busy tile many times per clock.)</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A CB's shared state is two stream registers, <code>received</code> and <code>acked</code>. Its other state is private: the producer's write pointer, the consumer's read pointer, and on TRISCs a local copy of the counter that core owns. On TRISCs the pointers are in 16-byte units.</li>
+    <li>TRISC0 initialises only read pointers, TRISC2 only write pointers and the page count, and TRISC1 has no CB interface at all (<code>trisc.cc:79-93, 157-165</code>).</li>
+    <li>On the compute side the shared counters are written by a <code>STOREREG</code> behind a <code>STALLWAIT</code> on the unpacker or packer, so they lag the TRISC's local count. A timestamped recorder shows it: TRISC2 had pushed while the register still read 0.</li>
+    <li>DPRINT perturbs timing and its line order is not time order. Record into an array with the wall clock, print at the end.</li>
+    <li>MATH_PACK starts life with Max 1 from BRISC's boot code; <code>compute_kernel_hw_startup</code> waits for 0 and re-initialises it to Max 2 (half sync) or 1 (full sync). Per tile: acquire = <code>SEMWAIT</code> on max, commit = <code>SEMPOST</code>, wait = <code>SEMWAIT</code> on zero, release = <code>SEMGET</code>. It reaches Max only when the packer falls behind.</li>
+    <li>Your own program is about 90 lines of host code and three ~25-line kernels, and it passed on ttsim WH and BH.</li>
+    <li>One pop too few: silent off-by-one data. A non-cumulative wait: a race whose wrong answer changes with every probe, made worse by a 16-bit wrap of <code>received − acked</code>. Waiting for more than the CB holds: a hang with Watcher's <code>CRBW,CWFW</code> signature. A 1-page CB: correct but serial, and a hang if any call needs 2 pages. Watcher caught none of the silent ones; LLK asserts caught a chunk that did not tile the ring.</li>
+  </ul>
+  <p>Next, <a href="../chapters/a13-llk-mops-jit.html">A13</a> opens the calls you have been treating as black boxes, <code>add_tiles</code> and <code>pack_tile</code>: the MOPs, replay buffers and configuration contexts behind the sem5 handshake you saw in the log.</p>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>TRISC0 printed <code>pages=0</code> for <code>c_0</code>. Why does its <code>cb_wait_front</code> still work?</summary><p>A consumer never needs the capacity. <code>llk_wait_tiles</code> only checks <code>received − acked ≥ n</code>. Free space, <code>fifo_num_pages − (received − acked)</code>, is computed only by producers in <code>cb_reserve_back</code>, so only the write-side initialisation sets the page count, and TRISC0 does only the read side.</p></details>
+  <details class="quiz"><summary>Right after <code>cb_push_back</code> on TRISC2, the <code>received</code> register still read 0. Bug?</summary><p>No, it is the design. TRISC2 increments its local count at once but writes the register with a <code>STOREREG</code> that its Tensix thread executes only after a <code>STALLWAIT</code> for the packer (<code>llk_io_pack.h:68-70</code>). If the RISC-V store went first, the writer could start reading a page the packer had not finished writing. The writer saw 1 two ttsim clocks later.</p></details>
+  <details class="quiz"><summary>In the stock semaphore trace, MATH's acquire passes while Value is 1. Is MATH writing the half the packer is reading?</summary><p>No. With Max 2 there are two halves. Value 1 means one finished half is waiting for or being read by the packer, so the other half is free. The acquire hands MATH that other half (its offset flipped at commit, and the packer's flips at release). This overlap is the point of half sync; in full sync (Max 1) the same acquire blocks.</p></details>
+  <details class="quiz"><summary>Break A did not hang. What change to the same line <em>would</em> make it hang, and what would Watcher show?</summary><p>Stop popping for good, for example <code>if (i &lt; 2) cb_pop_front(cb_a, 1);</code>. One missing pop leaves one page of a 2-page CB permanently used, which the ring survives; a second leaves none. The reader then blocks in <code>cb_reserve_back</code> on <code>c_0</code> and stops feeding <code>c_1</code> too, compute stalls waiting for <code>c_1</code>, and the writer waits for output. I ran it: <code>timeout 30</code> killed it (exit 124), and under Watcher 59 consecutive dumps read <code>CRBW,CWFW,UABD,MWDD,   K</code>, the same signature as B2.</p></details>
+  <details class="quiz"><summary>Why did a single DPRINT make break B pass, and what does that tell you about testing on ttsim?</summary><p>The bug is a race between TRISC0 reaching its second wait and BRISC pushing the second tile. A DPRINT costs TRISC0 many instructions, so BRISC always pushed first. ttsim is deterministic for one binary, but any change in instruction counts moves the interleaving: 1,681 wrong plain, 654 with a recorder, 5,145 under Watcher, 0 with a DPRINT. A pass on ttsim does not show that a protocol is right; read the waits and pops against the rules instead.</p></details>
+  <details class="quiz"><summary>You need compute to consume 4 tiles of A per iteration. What CB depth and which waits?</summary><p>At least 4 pages, and 8 if you want the reader to fill the next block while compute works on this one. Inside the iteration, either one <code>cb_wait_front(cb_a, 4)</code> or cumulative waits for 1, 2, 3, 4 if you want to start on early tiles, then one <code>cb_pop_front(cb_a, 4)</code>. Make the depth a multiple of 4 so pops tile the ring.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html">Circular Buffer APIs</a>: the official reference for the six CB calls.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/inc/api/compute/cb_api.h">cb_api.h</a>: the compute-side CB calls and which TRISC each compiles into, with the cumulative-wait warning.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/ckernels/wormhole_b0/metal/llk_io/llk_io_unpack.h">llk_io_unpack.h</a>: <code>llk_wait_tiles</code> and <code>llk_pop_tiles</code>, the 16-bit counter arithmetic behind break B.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/inc/api/dataflow/dataflow_api.h">dataflow_api.h</a>: the data-movement side of the same protocol, and <code>noc_async_read_page</code>/<code>noc_async_write_page</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SyncUnit.md">Sync Unit (ISA)</a>: the eight semaphores, RISC-V MMIO access, and a load-ordering hardware bug to respect when polling.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SEMWAIT.md">SEMWAIT (ISA)</a>: the wait conditions the patch logs, and how a latched wait holds a thread.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix</a>: the official guide to the tile_regs pattern and Dst capacity.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/watcher.html">Watcher</a>: waypoints, asserts and NoC sanitising, everything used in step 4.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_print.html">Device Debug Print</a>: DPRINT, the per-TRISC variants and the core-selection variables.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/eltwise_binary.html">Eltwise binary example</a>: the official walkthrough of the program traced in steps 1 and 2.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator; <code>src/tensix.cpp</code> and <code>src/tile.cpp</code> hold the semaphore model patched here.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a12-compute-kernels.html">&larr; 12 Compute kernels: one source, three cores</a><a class="next" href="../chapters/a13-llk-mops-jit.html">13 LLK, MOPs and the JIT &rarr;</a></div>
+</main>
+</body>
+</html>
