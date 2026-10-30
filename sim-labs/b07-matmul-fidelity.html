@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B07 · Matmul and math fidelity, bit for bit · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border: 1px solid var(--orange); background: var(--bg2); border-radius: 8px; padding: .7rem 1rem; margin: 1rem 0 1.5rem; }
+  .honesty b { color: var(--orange); }
+  .out { border-color: #3a4a2a; }
+  .modebar { display: flex; flex-wrap: wrap; gap: .5rem; padding: .6rem .8rem; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .modebar span { color: var(--muted); align-self: center; margin-right: .3rem; }
+  .modebar button.on { background: var(--blue); color: #000; border-color: var(--blue); }
+  .readout { padding: .5rem .9rem; font-family: ui-monospace, monospace; font-size: 13px; color: var(--muted); background: var(--bg2); border-top: 1px solid var(--border); min-height: 1.6em; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a07-vector-engine.html">&larr; Prev</a>
+  <a href="b08-formats-and-sfpu.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B07</span><span class="tag">Prerequisites: A06, A07, A15, B04</span>
+  <h1><span class="num">B07.</span> Matmul and math fidelity, bit for bit</h1>
+  <p class="subtitle">Catch the matrix engine in the act: dump the SrcA, SrcB and Dst registers around every MVMUL of one output tile, then predict every Dst bit in 200 lines of Python, at every fidelity.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <em>functional</em> simulator designed to be <em>bit-exact</em>: its README says it aims to compute the same bits silicon would. It is <em>not a timing model</em>. Its clock counts are not silicon performance, and nothing on this page measures speed. What this lab measures is <em>values</em>: which bits land in Dst. "Bit-exact" here means "matches ttsim". ttsim's authors claim ttsim matches silicon; I have no silicon in this orb and did not check that claim.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#setup">Setup</a></li>
+      <li><a href="#sweep">Step 1: Error against fidelity, across seeds</a></li>
+      <li><a href="#source">Step 2: Read the multiplier</a></li>
+      <li><a href="#dump">Step 3: Instrument ttsim and dump the registers</a></li>
+      <li><a href="#python">Step 4: Reproduce Dst in Python</a></li>
+      <li><a href="#tile">Step 5: One tile, element by element</a></li>
+      <li><a href="#useless">Step 6: When extra phases stop doing anything</a></li>
+      <li><a href="#sources">Where the sources disagree</a></li>
+      <li><a href="#exercises">Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>In <a href="../chapters/a06-matrix-engine.html">A06</a> you met the matrix engine's odd multipliers: 5 bits of SrcA by 7 bits of SrcB. A BF16 significand has 8 bits (an implicit 1 plus 7 stored bits), so one pass can't multiply two BF16 numbers exactly. The engine splits each significand into a high slice and a low slice. It multiplies the slices in up to four passes, called <em>fidelity phases</em>, and adds the pieces into Dst. LoFi runs one phase, HiFi2 two, HiFi3 three and HiFi4 four. Lab <a href="b04-tensix-instructions.html">B04</a> (later in the reading order) counts the cost in the instruction stream: a 2×2-tile matmul (8 tile products) executed 128 MVMULs at LoFi, 256 at HiFi2 and 512 at HiFi4.</p>
+  <p>That is the story from the documents and from the instruction counts. This lab checks it at the level of single bits:</p>
+  <p><b>If you could stop the simulator just before and just after one MVMUL and read SrcA, SrcB and Dst, could you predict every bit of the new Dst yourself? And what does each extra phase change?</b></p>
+  <p>We'll do it in four moves. First we measure the end-to-end error of a 640×640×640 matmul at each fidelity. Then we read the 30 lines of ttsim that do the multiplying. Then we add an environment-gated register dump to a copy of ttsim. Finally we write a Python model and score it against every element of every MVMUL of one output tile. All output on this page was produced in this orb with ttsim <code>b3620244</code> (Wormhole build) and tt-metal <code>7aad8aac</code>.</p>
+
+  <h2 id="setup">Setup</h2>
+  <p>We use a lab directory of our own, the workbench's <code>mm_fid</code> host program (<a href="b00-workbench.html">B00</a>), and later an editable copy of ttsim:</p>
+<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+export LAB_HOME=$HOME/ttlab/b07
+source $W/env.sh wh
+cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/mm_fid.cpp</code></pre>
+<pre class="out"><code>ttsim lab env: ARCH=wh SIM=/home/user/sim/wh/libttsim_wh.so cwd=/home/user/ttlab/b07/run
+compiled /home/user/ttlab/b07/mm_fid.o</code></pre>
+  <p><code>mm_fid</code> is tt-metal's single-core matmul example with two knobs. <code>MM_SEED</code> seeds the <code>std::mt19937</code> that fills A (640×640) and B (640×640) with BF16 values drawn uniformly from [0, 1). <code>MM_FIDELITY</code> picks the <code>MathFidelity</code> passed to the compute kernel. Pass the enum's <em>number</em>, not its name: LoFi = 0, HiFi2 = 2, HiFi3 = 3, HiFi4 = 4 (<code>tt_llk_wormhole_b0/llk_lib/llk_defs.h:139-145</code>). The value is parsed with <code>atoi</code>, so <code>MM_FIDELITY=HiFi4</code> silently means LoFi. The program prints the PCC and the mean and max absolute error against a CPU golden, which accumulates in FP32 and rounds once to BF16. It also prints a 64-bit hash of the result bits.</p>
+  <p>The compute kernel is the stock one. For each output tile it acquires Dst once, then accumulates <code>Kt</code> tile products into it:</p>
+  <div class="filename">tt-metal/tt_metal/programming_examples/matmul/matmul_single_core/kernels/compute/mm.cpp:55-71 @7aad8aac (comments removed)</div>
+<pre><code>for (uint32_t mt = 0; mt &lt; Mt; ++mt) {
+    for (uint32_t nt = 0; nt &lt; Nt; ++nt) {
+        tile_regs_acquire();
+        for (uint32_t kt = 0; kt &lt; Kt; kt++) {
+            cb_wait_front(cb_in0, 1);
+            cb_wait_front(cb_in1, 1);
+            matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+            cb_pop_front(cb_in0, 1);
+            cb_pop_front(cb_in1, 1);
+        }</code></pre>
+  <p>With M = N = K = 640, Mt = Nt = Kt = 20. The core therefore computes 20 × 20 output tiles, each the sum of 20 tile products, for 8000 <code>matmul_tiles</code> calls. Each output element is a 640-term dot product that lives in Dst the whole time. In this example Dst holds BF16, because the host leaves <code>fp32_dest_acc_en</code> at its default of <code>false</code> (<code>tt_metal/api/tt-metalium/kernel_types.hpp:106-108</code>). Keep that in mind; it will matter more than fidelity.</p>
+
+  <h2 id="sweep">Step 1: Error against fidelity, across seeds</h2>
+  <p>Five seeds and four fidelities give 20 runs, about 10 s each:</p>
+<pre><code>for s in 1 2 3 42 7; do for f in 0 2 3 4; do
+  echo "== seed=$s fid=$f"; MM_FIDELITY=$f MM_SEED=$s $LAB_HOME/mm_fid | grep -E 'PCC|mean_abs'
+done; done</code></pre>
+  <p>Here is the output for seed 42 (the other seeds look the same apart from the hashes). All 20 runs printed <code>Test Passed</code>:</p>
+<pre class="out"><code>== seed=42 fid=0
+Metalium vs Golden -- PCC = 0.9808531
+mean_abs_err = 2.216311 max_abs_err = 7.000000 result_hash = 213e53fed10c0383
+== seed=42 fid=2
+Metalium vs Golden -- PCC = 0.979993
+mean_abs_err = 1.508125 max_abs_err = 6.000000 result_hash = 31d1b6886b580383
+== seed=42 fid=3
+Metalium vs Golden -- PCC = 0.9801915
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383
+== seed=42 fid=4
+Metalium vs Golden -- PCC = 0.9801915
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383</code></pre>
+  <table>
+    <tr><th>seed</th><th class="num">LoFi</th><th class="num">HiFi2</th><th class="num">HiFi3</th><th class="num">HiFi4</th><th>HiFi3 hash = HiFi4 hash?</th></tr>
+    <tr><td>1</td><td class="num">2.216094</td><td class="num">1.516506</td><td class="num">1.513333</td><td class="num">1.513333</td><td>yes (<code>22da6fa8…</code>)</td></tr>
+    <tr><td>2</td><td class="num">2.200481</td><td class="num">1.507891</td><td class="num">1.504871</td><td class="num">1.504871</td><td>yes (<code>75f9ff79…</code>)</td></tr>
+    <tr><td>3</td><td class="num">2.210181</td><td class="num">1.511970</td><td class="num">1.508911</td><td class="num">1.508911</td><td>yes (<code>e0aa92b2…</code>)</td></tr>
+    <tr><td>42</td><td class="num">2.216311</td><td class="num">1.508125</td><td class="num">1.505054</td><td class="num">1.505054</td><td>yes (<code>ef7abcd1…</code>)</td></tr>
+    <tr><td>7</td><td class="num">2.215269</td><td class="num">1.513865</td><td class="num">1.510723</td><td class="num">1.510723</td><td>yes (<code>f79d5e7a…</code>)</td></tr>
+  </table>
+  <p>Three things stand out, and the rest of the lab explains each one from the bits:</p>
+  <ol>
+    <li><b>LoFi is clearly worse</b>: about 2.21 against 1.51, for every seed.</li>
+    <li><b>Past HiFi2 almost nothing changes.</b> HiFi3 improves the mean error by about 0.003, and HiFi4 produces <em>exactly the same bits</em> as HiFi3: the same hash, for all five seeds. A whole extra phase, 128,000 more MVMULs on this core, changed nothing at all.</li>
+    <li><b>Even HiFi4 is 1.5 away from the golden on average.</b> The outputs are about 160, and one BF16 step (ulp) at 160 is 1.0. So the "best" result is still 1.5 ulps off. Fidelity isn't what limits this matmul.</li>
+  </ol>
+  <p>For contrast I ran two variants of <code>mm_fid</code> as well. <code>mm_fid32</code> adds <code>.fp32_dest_acc_en = true</code> to the <code>ComputeConfig</code>. <code>mm_fid_signed</code> draws inputs from [−1, 1) instead of [0, 1). Both are one-line <code>sed</code> edits, shown in the <a href="#exercises">exercises</a>. The chart below has all three data sets. Use the buttons to switch between them, and Play to add one fidelity at a time.</p>
+
+  <div class="viz" id="fig-err"><div class="modebar" id="err-modes"><span>Data:</span></div><div class="readout" id="err-read">Hover a point for its value.</div></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-err");
+    var g = TT.canvas(root, 900, 420), ctx = g.ctx, C = TT.C;
+    var FID = ["LoFi", "HiFi2", "HiFi3", "HiFi4"], PH = [1, 2, 3, 4];
+    var SETS = {
+      bf16: { name: "BF16 Dst, 5 seeds", series: [
+        { label: "seed 1", v: [2.216094, 1.516506, 1.513333, 1.513333] },
+        { label: "seed 2", v: [2.200481, 1.507891, 1.504871, 1.504871] },
+        { label: "seed 3", v: [2.210181, 1.511970, 1.508911, 1.508911] },
+        { label: "seed 42", v: [2.216311, 1.508125, 1.505054, 1.505054] },
+        { label: "seed 7", v: [2.215269, 1.513865, 1.510723, 1.510723] }],
+        extra: { label: "tile (0,0), 1 tile product, vs exact", v: [0.159058, 0.023189, 0.022671, 0.022671] } },
+      fp32: { name: "FP32 Dst, seed 42", series: [{ label: "seed 42, FP32 Dst", v: [3.321387, 0.405017, 0.003420, 0.010957] }] },
+      signed: { name: "inputs in [-1,1), seed 42", series: [{ label: "seed 42, signed", v: [0.133176, 0.101736, 0.105040, 0.105038] }] }
+    };
+    var mode = "bf16", pts = [];
+    var bar = document.getElementById("err-modes");
+    Object.keys(SETS).forEach(function (k) {
+      var b = document.createElement("button"); b.className = "tt" + (k === mode ? " on" : ""); b.textContent = SETS[k].name;
+      b.onclick = function () { mode = k; bar.querySelectorAll("button").forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); st.render(); };
+      bar.appendChild(b);
+    });
+    var L = 80, R = 560, T = 40, B = 360;
+    function ylog(v) { var a = Math.log10(0.001), b = Math.log10(10); return B - (Math.log10(v) - a) / (b - a) * (B - T); }
+    function xc(i) { return L + 50 + i * (R - L - 100) / 3; }
+    var steps = [
+      { dur: 1, text: "<b>The axes.</b> Left: mean absolute error against the CPU golden, on a log scale, for each fidelity. Right: how many MVMULs core (0,0) executed for the whole 640×640×640 matmul, which is the cost. ttsim's clock counts are not used anywhere: they are not timing." },
+      { dur: 1.2, text: "<b>LoFi, 1 phase.</b> 128,000 MVMULs: 8000 tile products × 16. With a BF16 Dst the mean error is about 2.21 for every seed. With an FP32 Dst it is <i>worse</i>, 3.32: LoFi drops 3 low bits of each SrcA significand and 1 of each SrcB, always rounding magnitudes down, so every product comes out a little small. That bias of about 2% (2% of 160 ≈ 3.3) is no longer hidden by BF16 rounding." },
+      { dur: 1.2, text: "<b>HiFi2, 2 phases.</b> 256,000 MVMULs. Phase 1 adds SrcA's low slice. With a BF16 Dst the error falls to about 1.51 and then stays there. With an FP32 Dst it falls to 0.405, because only SrcB's last bit is still missing." },
+      { dur: 1.2, text: "<b>HiFi3, 3 phases.</b> 384,000 MVMULs. With a BF16 Dst it gains about 0.003. With an FP32 Dst it reaches 0.0034, within one BF16 ulp of the golden almost everywhere." },
+      { dur: 1.2, text: "<b>HiFi4, 4 phases.</b> 512,000 MVMULs, 4× the LoFi cost. With a BF16 Dst the result is bit-identical to HiFi3 for all five seeds. With an FP32 Dst it is slightly <i>worse</i> than HiFi3 (0.011 vs 0.0034), a rounding quirk that A06 traces to ttsim's ties-away alignment. With signed inputs HiFi3 and HiFi4 do differ, by 0.000002. Step 6 shows why phases stop mattering with a BF16 Dst." }
+    ];
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var S = SETS[mode];
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      [0.001, 0.01, 0.1, 1, 10].forEach(function (v) {
+        var y = ylog(v); ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(R, y); ctx.stroke();
+        TT.text(ctx, String(v), L - 8, y, { align: "right", color: C.muted, font: "12px" });
+      });
+      TT.text(ctx, "mean |result − golden|  (log scale)", L, T - 22, { color: C.muted, font: "12px" });
+      FID.forEach(function (f, k) { TT.text(ctx, f, xc(k), B + 18, { align: "center", color: k < i ? C.fg : C.muted, font: "13px" }); });
+      pts = [];
+      var cols = [C.blue, C.teal, C.green, C.yellow, C.orange];
+      var shown = Math.min(i, 4);
+      var list = S.series.slice(); if (S.extra) list.push(S.extra);
+      list.forEach(function (s, si) {
+        var col = s === S.extra ? C.pink : cols[si % cols.length];
+        var off = (S.series.length > 1 && s !== S.extra) ? (si - 2) * 6 : 0;
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.7; ctx.beginPath();
+        for (var k = 0; k < shown; k++) { var x = xc(k) + off, y = ylog(s.v[k]); if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+        ctx.stroke(); ctx.globalAlpha = 1;
+        for (var k2 = 0; k2 < shown; k2++) {
+          var a = (k2 === shown - 1) ? t : 1;
+          var x2 = xc(k2) + off, y2 = ylog(s.v[k2]);
+          ctx.globalAlpha = a; ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x2, y2, 4, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+          pts.push({ x: x2, y: y2, s: s.label + ", " + FID[k2] + ": mean_abs_err " + s.v[k2] });
+        }
+      });
+      // legend
+      var ly = B - 12 - 16 * (list.length - 1);
+      list.forEach(function (s, si) {
+        var col = s === S.extra ? C.pink : cols[si % cols.length];
+        ctx.fillStyle = col; ctx.fillRect(L + 12, ly - 4, 10, 8);
+        TT.text(ctx, s.label, L + 28, ly, { font: "12px", color: C.muted }); ly += 16;
+      });
+      // cost panel
+      var cx = 620, cw = 250, cb = B, ct = T;
+      TT.text(ctx, "MVMULs on core (0,0)", cx, T - 22, { color: C.muted, font: "12px" });
+      for (var k3 = 0; k3 < 4; k3++) {
+        var h = (k3 < shown ? (k3 === shown - 1 ? t : 1) : 0) * PH[k3] / 4 * (cb - ct - 20);
+        var bx = cx + 10 + k3 * 60;
+        TT.box(ctx, bx, cb - h, 44, h, { fill: [C.blue, C.green, C.orange, C.pink][k3], alpha: 0.75, r: 3 });
+        TT.text(ctx, FID[k3], bx + 22, cb + 18, { align: "center", color: k3 < shown ? C.fg : C.muted });
+        if (k3 < shown) TT.text(ctx, (128 * PH[k3]) + "k", bx + 22, cb - h - 10, { align: "center", font: "12px" });
+      }
+      ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(cx, cb); ctx.lineTo(cx + cw, cb); ctx.stroke();
+      TT.text(ctx, "= 8000 tile products × 16 × phases", cx + 5, cb + 42, { color: C.muted, font: "12px" });
+    }
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    root.insertBefore(document.getElementById("err-read"), root.querySelector(".controls"));
+    g.canvas.addEventListener("mousemove", function (e) {
+      var r = g.canvas.getBoundingClientRect(), x = (e.clientX - r.left) * g.W / r.width, y = (e.clientY - r.top) * g.H / r.height;
+      var best = null, bd = 64;
+      pts.forEach(function (p) { var d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y); if (d < bd) { bd = d; best = p; } });
+      document.getElementById("err-read").textContent = best ? best.s : "Hover a point for its value.";
+    });
+  })();
+  </script>
+
+  <div class="callout warn"><b>PCC hides all of this.</b> Every BF16-Dst run has a PCC of about 0.980, whatever the fidelity, and the FP32-Dst LoFi run has a <em>higher</em> PCC (0.9966) than BF16-Dst HiFi4 (0.9802) while having double the mean error. A uniform 2% shrink correlates perfectly with the truth. When you judge fidelity, look at absolute or ulp error, not PCC.</div>
+
+  <h2 id="source">Step 2: Read the multiplier</h2>
+  <p>Before we dump anything, let's find out what ttsim claims to compute. Every MVMUL goes through <code>tensix_matmul_op</code> in <code>src/tensix.cpp</code>. It first decides which phase this MVMUL is in. The phase is a 2-bit counter per thread, plus a base:</p>
+  <div class="filename">ttsim/src/tensix.cpp:1812 and 725-730 @b3620244</div>
+<pre><code>uint32_t fidelity_phase = (p_tensix-&gt;fidelity[pipe] + math_fidelity_base(p_tensix, pipe)) &amp; 3;
+...
+    if (update_fidelity_phase) {               // in math_update_counters, after every MVMUL
+        if (fidelity_clear) {
+            p_tensix-&gt;fidelity[pipe] = 0;
+        } else {
+            p_tensix-&gt;fidelity[pipe] = (p_tensix-&gt;fidelity[pipe] + fidelity_incr) &amp; 3;
+        }
+    }</code></pre>
+  <p>The counter only moves when an MVMUL's address mode says so. The LLK sets that up: <code>ADDR_MOD_5</code> resets the row counters and adds <code>fidelity_increment</code> (1 for any fidelity except LoFi) to the phase (<code>llk_math_matmul.h:80-88</code>). The last of the 16 MVMULs in the replay buffer uses it. The MOP then plays the buffer <code>inner_loops</code> times:</p>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_matmul.h:469-476 @7aad8aac</div>
+<pre><code>constexpr std::uint32_t inner_loops = high_fidelity ? to_underlying(math_fidelity) : 1;
+ckernel_template tmp(1 /* outer loop */, inner_loops, lltt::replay_insn(ckernel::math::replay_buf_offset, replay_buf_len));
+if constexpr (high_fidelity)
+{
+    if (t_dim &gt; 1)
+    {
+        tmp.set_end_op(TT_OP_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_F)); // Reset fidelity phase</code></pre>
+  <p>So HiFi<i>n</i> plays the 16-MVMUL sequence <i>n</i> times, in phases 0, 1, …, <i>n</i>−1, and LoFi plays it once in phase 0. Now the multiply itself. Each Src cell holds 19 meaningful bits: a sign, an 8-bit exponent and a 10-bit mantissa (a TF32 layout; BF16 uses only the top 7 mantissa bits). <code>mvmul</code> receives 16 SrcA values (one column) and 16 SrcB values (one row) for one Dst element, and builds 16 products:</p>
+  <div class="filename">ttsim/src/tensix.cpp:1690-1707 @b3620244</div>
+<pre><code>uint32_t man_a = (a &amp; 0x3FF) | 0x400; // 11 bits
+uint32_t man_b = (b &amp; 0x3FF) | 0x400;
+
+int32_t exp_prod = exp_a + exp_b + exp_prod_adj;
+if (fidelity_phase &amp; 1) {
+    man_a = (man_a &gt;&gt; 1) &amp; 31; // 5 bits
+} else {
+    man_a &gt;&gt;= 6; // 5 bits
+}
+if (fidelity_phase &amp; 2) {
+    man_b = (man_b &amp; 15) &lt;&lt; 3; // 7 bits
+} else {
+    man_b &gt;&gt;= 4; // 7 bits
+}
+
+signs[i] = sign_a ^ sign_b;
+exps[i] = exp_prod;
+mans[i] = man_a * man_b; // up to 12 bits</code></pre>
+  <p>Read it with a BF16 number in mind. The 11-bit significand is the implicit 1, then 7 BF16 mantissa bits, then 3 zeros.</p>
+  <ul>
+    <li><b>Bit 0 of the phase picks SrcA's slice.</b> Phase bit 0 = 0 takes bits 10..6: the implicit 1 and the top 4 mantissa bits. Phase bit 0 = 1 takes bits 5..1: BF16's remaining 3 mantissa bits followed by two zeros. Bit 0 of the significand is never used, which matches the ISA's note that SrcA's last TF32 mantissa bit is ignored.</li>
+    <li><b>Bit 1 of the phase picks SrcB's slice.</b> Phase bit 1 = 0 takes bits 10..4: the implicit 1 and the top 6 mantissa bits. Phase bit 1 = 1 takes bits 3..0, shifted up to fill 7 bits. For BF16 only bit 3, the last mantissa bit, can be non-zero.</li>
+    <li><b>The low slices carry an exponent penalty.</b> <code>fpu_exp_prod_adj</code> subtracts 5 from the product's exponent when bit 0 is set and 7 when bit 1 is set (<code>tensix.cpp:1572-1581</code>). The low slice of SrcA really is worth 2<sup>−5</sup> of the high slice's place value, and likewise 2<sup>−7</sup> for SrcB.</li>
+  </ul>
+  <p>That is exactly the ISA's BF16 table (<code>SrcASrcB.md:119-125</code>): phase 0 is (A high, B high), phase 1 is (A low, B high), phase 2 is (A high, B low) and phase 3 is (A low, B low). Let's watch it on a real pair of numbers taken from the dump in Step 3: SrcB = 0.94921875 and SrcA = 0.83984375. They are the third terms (k = 2) of the dot product that becomes Dst element (0,0).</p>
+
+  <div class="viz" id="fig-split"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-split");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    var PC = [C.blue, C.green, C.orange, C.pink];
+    var Bb = [1, 1, 1, 1, 0, 0, 1, 1];   // SrcB 0.94921875 = 1.1110011b x 2^-1  (significand 243)
+    var Ab = [1, 1, 0, 1, 0, 1, 1, 1];   // SrcA 0.83984375 = 1.1010111b x 2^-1  (significand 215)
+    var PIECE = [50336, 1694, 208, 7], EXACT = 52245;
+    var RUN = [50336, 52030, 52238, 52245];
+    var HIST = [[0, "#0", "phase 0, k 0-15", 0, 3.390625], [1, "#8", "phase 0, k 16-31", 3.390625, 8.25], [2, "#16", "phase 1, k 0-15", 8.25, 8.3125],
+                [3, "#24", "phase 1, k 16-31", 8.3125, 8.375], [4, "#32", "phase 2, k 0-15", 8.375, 8.375], [5, "#40", "phase 2, k 16-31", 8.375, 8.375],
+                [6, "#48", "phase 3, k 0-15", 8.375, 8.375], [7, "#56", "phase 3, k 16-31", 8.375, 8.375]];
+    function phaseOf(r, c) { return (r < 5 ? 0 : 1) + (c < 7 ? 0 : 2); }
+    var steps = [
+      { dur: 1, text: "<b>Two BF16 numbers from the dump.</b> SrcB = 0.94921875 = 1.1110011₂ × 2⁻¹ (significand 243) and SrcA = 0.83984375 = 1.1010111₂ × 2⁻¹ (significand 215). The exact product of the significands is 243 × 215 = <b>52245</b>, an 8×8-bit long multiplication: 64 one-bit partial products, drawn as the grid." },
+      { dur: 1, text: "<b>Split.</b> SrcA's 8 bits become a high slice of 5 (1.1010 → 26) and a low slice of 3 (111 → 7). SrcB's become a high slice of 7 (1.111001 → 121) and a low slice of 1 (→ 1). ttsim stores the low slices left-aligned in the 5- and 7-bit multiplier inputs (28 = 11100₂ and 64 = 1000000₂) and corrects their weight with the exponent: −5 for SrcA, −7 for SrcB. The grid falls into four rectangles of 35 + 21 + 5 + 3 = 64 cells." },
+      { dur: 1.2, text: "<b>Phase 0: A high × B high.</b> 26 × 121 = 3146, worth 3146 × 16 = <b>50336</b> in units of the full product. That's 96.35% of 52245: LoFi is 3.65% low on this product. Every LoFi product is too small or exact, never too big." },
+      { dur: 1.2, text: "<b>Phase 1: A low × B high.</b> ttsim multiplies 28 × 121 = 3388 at exponent −5, so 3388 × 16 / 32 = <b>1694</b> (= 7 × 121 × 2). Running total 52030, 0.41% low. This is the phase that HiFi2 adds." },
+      { dur: 1.2, text: "<b>Phase 2: A high × B low.</b> 26 × 64 = 1664 at exponent −7: 1664 × 16 / 128 = <b>208</b> (= 26 × 1 × 8). Running total 52238, 0.013% low. HiFi3 adds this." },
+      { dur: 1.2, text: "<b>Phase 3: A low × B low.</b> 28 × 64 = 1792 at exponent −12: 1792 × 16 / 4096 = <b>7</b> (= 7 × 1). The total is now 52245, the exact product. Four phases, four rectangles, no cell missing and none counted twice." },
+      { dur: 2.2, text: "<b>Now one Dst element.</b> Dst(0,0) of the first tile product is a 32-term dot product, done by two MVMULs per phase (k 0–15 and k 16–31). Each MVMUL adds its 16 pieces to Dst in two groups of 8 and rounds the new Dst value to BF16. Here is Dst(0,0) after each of the 8 HiFi4 MVMULs that touch it, read from the dump. The exact value is 8.3834. BF16 near 8 has a step of 0.0625, so 8.375 is the correctly rounded answer, and phase 1 gets there. Phase 2 adds 0.0114 and then 0.0101; phase 3 adds 0.0003 and 0.00006. All four are below half a step (0.03125), so they round away to nothing." }
+    ];
+    function bits(x, y, arr, hiN, lab, val, ph, t, vert) {
+      for (var i = 0; i < 8; i++) {
+        var hi = i < hiN, col = ph >= 1 ? (hi ? (vert ? PC[0] : PC[0]) : (vert ? PC[1] : PC[2])) : C.muted;
+        var bx = vert ? x : x + i * 26, by = vert ? y + i * 26 : y;
+        TT.box(ctx, bx, by, 22, 22, { fill: arr[i] ? col : C.bg3, alpha: arr[i] ? 0.85 : 1, stroke: C.border, r: 3, label: String(arr[i]), mono: true, color: arr[i] ? "#000" : C.muted });
+      }
+    }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      if (i < 6) {
+        var gx = 210, gy = 120, cs = 26;
+        TT.text(ctx, "SrcB (in0) = 0.94921875", gx, 52, { font: "bold 13px" });
+        bits(gx, 70, Bb, 7, "", 0, i, t, false);
+        TT.text(ctx, "SrcA (in1)", 14, gy + 92, { font: "bold 13px" });
+        TT.text(ctx, "= 0.83984375", 14, gy + 110, { font: "bold 13px" });
+        bits(gx - 40, gy, Ab, 5, "", 0, i, t, true);
+        if (i >= 1) {
+          TT.text(ctx, "hi 7 → 121", gx + 3 * 26, 104, { align: "center", color: C.blue, font: "12px" });
+          TT.text(ctx, "lo 1", gx + 7 * 26 + 11, 104, { align: "center", color: C.orange, font: "12px" });
+          TT.text(ctx, "hi 5", gx - 66, gy + 2.5 * 26, { align: "center", color: C.blue, font: "12px" });
+          TT.text(ctx, "→ 26", gx - 66, gy + 2.5 * 26 + 15, { align: "center", color: C.blue, font: "12px" });
+          TT.text(ctx, "lo 3", gx - 66, gy + 6.5 * 26, { align: "center", color: C.green, font: "12px" });
+          TT.text(ctx, "→ 7", gx - 66, gy + 6.5 * 26 + 15, { align: "center", color: C.green, font: "12px" });
+        }
+        for (var r = 0; r < 8; r++) for (var c = 0; c < 8; c++) {
+          var p = phaseOf(r, c), on = Ab[r] && Bb[c];
+          var lit = i >= 2 && p <= i - 2, now = i >= 2 && p === i - 2;
+          var col = i >= 1 ? PC[p] : C.muted;
+          var a = lit ? (now ? 0.35 + 0.6 * t : 0.95) : (i >= 1 ? 0.18 : 0.1);
+          TT.box(ctx, gx + c * cs, gy + r * cs, cs - 4, cs - 4, { fill: on ? col : C.bg3, alpha: on ? a : 1, stroke: i >= 1 ? col : C.border, lw: 1, r: 3 });
+        }
+        // right: running sum
+        var rx = 480, ry = 70;
+        TT.text(ctx, "piece (in units of the 16-bit product)", rx, ry, { color: C.muted, font: "12px" });
+        var names = ["phase 0  A hi × B hi", "phase 1  A lo × B hi", "phase 2  A hi × B lo", "phase 3  A lo × B lo"];
+        var mults = ["26 × 121 = 3146, ×16", "28 × 121 = 3388, ×16/2⁵", "26 × 64 = 1664, ×16/2⁷", "28 × 64 = 1792, ×16/2¹²"];
+        for (var k = 0; k < 4; k++) {
+          var y = ry + 30 + k * 44, shown = i >= 2 + k;
+          TT.text(ctx, names[k], rx, y, { color: i >= 1 ? PC[k] : C.muted, font: "bold 13px" });
+          TT.text(ctx, i >= 1 ? mults[k] : "", rx, y + 17, { color: C.muted, font: "12px", mono: true });
+          if (shown) TT.text(ctx, String(PIECE[k]), rx + 380, y, { align: "right", font: "bold 14px", mono: true, color: PC[k] });
+        }
+        var done = i >= 2 ? Math.min(i - 2, 3) : -1;
+        var bw = 390, by = ry + 230;
+        TT.text(ctx, "running total vs exact 52245", rx, by - 14, { color: C.muted, font: "12px" });
+        TT.box(ctx, rx, by, bw, 26, { fill: C.bg3, r: 4 });
+        var acc = 0;
+        for (var k2 = 0; k2 <= done; k2++) {
+          var w = PIECE[k2] / EXACT * bw * (k2 === done ? (k2 === 0 ? t : 1) : 1);
+          var w2 = k2 > 0 ? Math.max(w, 3) : w;
+          if (k2 === done && k2 > 0) w2 = Math.max(PIECE[k2] / EXACT * bw, 3) * t;
+          ctx.fillStyle = PC[k2]; ctx.fillRect(rx + acc, by, w2, 26); acc += PIECE[k2] / EXACT * bw;
+        }
+        if (done >= 0) {
+          var rel = (RUN[done] - EXACT) / EXACT * 100;
+          TT.text(ctx, "total " + RUN[done] + "   error " + (rel === 0 ? "0 (exact)" : rel.toFixed(3) + " %"), rx, by + 46, { font: "bold 14px", mono: true });
+          var bitsOK = rel === 0 ? "all 16 bits" : (-Math.log2(-rel / 100)).toFixed(1) + " correct bits";
+          TT.text(ctx, "≈ " + bitsOK, rx, by + 68, { color: C.muted, font: "13px" });
+        }
+        TT.text(ctx, "Each cell is one bit-product a_r · b_c.", gx, gy + 8 * cs + 16, { color: C.muted, font: "12px" });
+        TT.text(ctx, "Bright cells are 1.", gx, gy + 8 * cs + 32, { color: C.muted, font: "12px" });
+      } else {
+        // Dst(0,0) history
+        var L = 90, Rr = 860, T = 60, Bt = 400, lo = 0, hi = 9;
+        function y(v) { return Bt - (v - lo) / (hi - lo) * (Bt - T); }
+        TT.text(ctx, "Dst(0,0) after each MVMUL that writes it (HiFi4 run, seed 42, from the dump)", L, 30, { font: "bold 13px" });
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+        for (var v = 0; v <= 9; v += 1) { ctx.beginPath(); ctx.moveTo(L, y(v)); ctx.lineTo(Rr, y(v)); ctx.stroke(); TT.text(ctx, String(v), L - 8, y(v), { align: "right", color: C.muted, font: "12px" }); }
+        // zoom inset of the bf16 grid near 8.375
+        var ex = 8.38344931602478;
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = C.yellow; ctx.beginPath(); ctx.moveTo(L, y(ex)); ctx.lineTo(Rr, y(ex)); ctx.stroke(); ctx.setLineDash([]);
+        TT.text(ctx, "exact 8.3834", L + 6, y(ex) + 12, { color: C.yellow, font: "12px" });
+        var n = Math.max(1, Math.floor(t * 8 + 0.999));
+        var px = function (k) { return L + 40 + k * (Rr - L - 80) / 7; };
+        for (var k3 = 0; k3 < n; k3++) {
+          var hrow = HIST[k3], ph = Math.floor(k3 / 2);
+          TT.box(ctx, px(k3) - 18, y(hrow[4]), 36, Bt - y(hrow[4]), { fill: PC[ph], alpha: 0.75, r: 3 });
+          TT.text(ctx, String(hrow[4]), px(k3), y(hrow[4]) - 12, { align: "center", font: "bold 12px", mono: true });
+          TT.text(ctx, "MVMUL " + hrow[1], px(k3), Bt + 16, { align: "center", font: "12px" });
+          TT.text(ctx, hrow[2], px(k3), Bt + 32, { align: "center", font: "11px", color: C.muted });
+        }
+      }
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <div class="callout key">A fidelity phase multiplies one slice of every SrcA significand by one slice of every SrcB significand, and the slices are chosen by the two bits of the phase number. The products of phases 1–3 are tiny but well defined, and whether they <em>survive</em> depends on what they are added to.</div>
+
+  <p>The products are only half of <code>mvmul</code>. The other half adds them, and that is where the bits get lost. ttsim does it in three rounding steps, which we will need in Python:</p>
+  <ol>
+    <li><b>Groups of 8.</b> Products 0–7 and 8–15 form two groups. In each group every product is shifted to the group's largest exponent and rounded to an integer, ties away from zero: <code>man = ((man &lt;&lt; 1) + (1 &lt;&lt; exp_diff)) &gt;&gt; (exp_diff + 1)</code> (<code>tensix.cpp:1729</code>). The 8 integers are then summed with their signs.</li>
+    <li><b>Three terms, aligned and pre-rounded.</b> The two group sums and the old Dst value are aligned to the largest of their exponents. When Dst is not FP32, each term is rounded to a multiple of 2<sup>13</sup> while it is shifted (<code>fpu_align_term</code> with <code>lsb = 13</code>, <code>tensix.cpp:1477-1510</code>). That leaves each term with 11 significant bits relative to the largest exponent.</li>
+    <li><b>Renormalise and round to Dst.</b> The three terms are summed, normalised and rounded half-up to 8 significant bits for BF16 (24 for FP32), then re-encoded (<code>tensix.cpp:1532-1569</code>).</li>
+  </ol>
+  <p>Dst also has its own storage encoding. A BF16 value is stored as sign, then the 7 mantissa bits, then the 8 exponent bits in the low byte: <code>dst_decode_bf16</code> at <code>tensix.cpp:912-916</code>, which matches the ISA's <code>DstDecodeBF16</code> at <code>Dst.md:105-109</code>. You'll see that encoding in the dump.</p>
+
+  <h2 id="dump">Step 3: Instrument ttsim and dump the registers</h2>
+  <p>We want, for each MVMUL on core (0,0): the phase, the formats, the three row addresses, the 16 SrcA rows and 8 SrcB rows it reads, and the 8 Dst rows before and after. That means 41 lines of text per MVMUL. The best place is inside <code>tensix_matmul_op</code>, right after the row addresses and the phase are known and before the arithmetic starts, plus one line after it. We follow the B04 convention of gating everything on environment variables, so the patched simulator behaves exactly like the stock one when they are unset.</p>
+<pre><code>$W/build_ttsim.sh dump wh                 # first run: copy ttsim to $LAB_HOME/ttsim-dump and build it
+(cd $LAB_HOME/ttsim-dump &amp;&amp; patch -p1 &lt; $W/../patches/b07-mvmul-dump.patch)
+$W/build_ttsim.sh dump wh                 # rebuild with the dump (about 4 s)
+export TT_METAL_SIMULATOR=$LAB_HOME/sim-dump-wh-release/libttsim.so</code></pre>
+  <p>The patch is <a href="patches/b07-mvmul-dump.patch"><code>patches/b07-mvmul-dump.patch</code></a> (83 lines, one file). It was produced with <code>diff -ru</code> against pristine <code>b3620244</code> sources, and I checked that <code>patch -p1</code> applies it cleanly to a fresh copy and gives a <code>tensix.cpp</code> byte-identical to the one I built. The heart of it:</p>
+  <div class="filename">sim-labs/patches/b07-mvmul-dump.patch (excerpt, the hook in tensix_matmul_op)</div>
+<pre><code>uint32_t src_b[B_ROWS][16], src_a[ROW_SIZE][16];
+const bool b07 = !is_gapool &amp;&amp; !broadcast &amp;&amp; !is_int8 &amp;&amp; s_b07.want(p_tensix);
+if (b07) {
+    // M &lt;index&gt; &lt;clock&gt; phase srca_fmt srcb_fmt dst32b exp8b srca_row srcb_row dst_row, then 16 A rows, 8 B rows, 8 D rows
+    fprintf(s_b07.f, "M %llu %llu %u %u %u %d %d %u %u %u\n", ..., fidelity_phase, src_a_fmt, src_b_fmt,
+            use_dst32b, fp_exponent_8b, src_a_row, src_b_row, dst_row);
+    for (uint32_t i = 0; i &lt; 16; i++) { ... p_tensix-&gt;src_a[src_a_bank][src_a_row + i][c] ... }   // "A" lines
+    for (uint32_t r = 0; r &lt; 8; r++)  { ... p_tensix-&gt;src_b[src_b_bank][src_b_row + r][i] ... }   // "B" lines
+    s_b07.dst_rows(p_tensix, 'D', dst_row, use_dst32b); // Dst before this MVMUL
+}
+...                                                       // ttsim's unchanged arithmetic
+if (b07) {
+    s_b07.dst_rows(p_tensix, 'R', dst_row, use_dst32b); // Dst after this MVMUL
+}</code></pre>
+  <p>Three details matter. <b>Raw values:</b> Src cells are dumped as stored, before ttsim's format truncation. Dst cells are dumped through <code>read_dst16b</code>/<code>read_dst32b</code>, so a row that was never written reads as 0, exactly as <code>mvmul</code> sees it. <b>Gating:</b> <code>B07_OUT=file</code> turns the dump on, <code>B07_TILE</code> picks the Tensix tile (default 0, the core at logical (0,0) that runs this example, as in B04), and <code>B07_SKIP</code> and <code>B07_COUNT</code> select a window of MVMULs. <b>A total:</b> when the process exits, the dump's last line, <code>T &lt;n&gt;</code>, records how many MVMULs ran on that tile. One output tile is 20 tile products × 16 × phases MVMULs, so we dump exactly that many at each fidelity:</p>
+<pre><code>mkdir -p $LAB_HOME/dumps
+for f in 0 2 3 4; do p=$(( f==0 ? 1 : f ))
+  MM_FIDELITY=$f MM_SEED=42 B07_OUT=$LAB_HOME/dumps/fid$f.txt B07_COUNT=$((320*p)) $LAB_HOME/mm_fid | grep mean_abs
+done
+for f in 0 2 3 4; do echo "fid$f: $(tail -n 1 $LAB_HOME/dumps/fid$f.txt)  M=$(grep -c '^M' $LAB_HOME/dumps/fid$f.txt)"; done</code></pre>
+<pre class="out"><code>mean_abs_err = 2.216311 max_abs_err = 7.000000 result_hash = 213e53fed10c0383
+mean_abs_err = 1.508125 max_abs_err = 6.000000 result_hash = 31d1b6886b580383
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383
+mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383
+fid0: T 128000  M=320
+fid2: T 256000  M=640
+fid3: T 384000  M=960
+fid4: T 512000  M=1280</code></pre>
+  <p>First, the hashes are the same as in Step 1, so the instrumentation changed no result bits. Second, the totals are 128,000 × 1, 2, 3 and 4. LoFi uses one phase, HiFi2 two, HiFi3 three and HiFi4 four, counted straight from the MVMULs the simulator executed. It is B04's 128 / 256 / 512 (for 8 tile products) scaled up to 8000 tile products. The phase field of the M lines confirms it: the HiFi4 dump runs 16 MVMULs in phase 0, 16 in phase 1, 16 in phase 2, 16 in phase 3, then starts over at phase 0 for the next tile product.</p>
+  <p>Here is the start of the HiFi4 dump, trimmed to four values per line:</p>
+<pre class="out"><code>M 0 4583 0 5 5 0 1 0 0 0
+A 3f0d0000 3e320000 3d8b0000 3f2b0000 ...     (16 A lines: SrcA rows 0..15)
+B 3ec00000 3f4c0000 3f730000 3e3c0000 ...     (8 B lines: SrcB rows 0..7)
+D 0000 0000 0000 0000 ...                     (8 D lines: Dst rows 0..7, before)
+R 5980 7280 5b80 2781 ...                     (8 R lines: Dst rows 0..7, after)</code></pre>
+  <p>Decode it. The M line says MVMUL #0, phase 0, SrcA and SrcB in format 5 (Float16_b, i.e. BF16), a 16-bit Dst (<code>dst32b</code> = 0) with 8-bit exponents, and rows 0/0/0. The Src cells are plain FP32 bit patterns with the low 16 bits zero: <code>3f0d0000</code> is 0.55078125 and <code>3ec00000</code> is 0.375. Dst reads as zeros before the first MVMUL of the tile. The first result, <code>5980</code>, is in Dst's encoding: sign 0, mantissa <code>0x59</code> = 1011001₂, exponent <code>0x80</code> = 128. That is 1.1011001₂ × 2¹ = 3.390625, the first bar in the last step of the animation above.</p>
+  <p>The (SrcA row, SrcB row, Dst row) triples of the 16 phase-0 MVMULs show the face schedule that A06 could only infer from comments in the LLK. Here it is, measured:</p>
+  <table>
+    <tr><th>MVMUL</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr>
+    <tr><td>SrcA, SrcB → Dst</td><td>0,0→0</td><td>0,8→8</td><td>16,0→16</td><td>16,8→24</td><td>0,32→32</td><td>0,40→40</td><td>16,32→48</td><td>16,40→56</td></tr>
+    <tr><th>MVMUL</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th></tr>
+    <tr><td>SrcA, SrcB → Dst</td><td>32,16→0</td><td>32,24→8</td><td>48,16→16</td><td>48,24→24</td><td>32,48→32</td><td>32,56→40</td><td>48,48→48</td><td>48,56→56</td></tr>
+  </table>
+  <p>Rows 16<i>f</i> to 16<i>f</i>+15 of each register hold face <i>f</i> of a tile. MVMUL 2, for example, multiplies SrcB rows 0–7 (face 0 of in0) by SrcA face 1 and adds into Dst face 1. In block form that is C₀₁ += A₀₀ · B₀₁, and MVMUL 10 later adds A₀₁ · B₁₁. This is the block-matrix identity from A06, with in0 in SrcB and in1 in SrcA (A15's "in0→SrcB, in1→SrcA"). To make sure I wasn't fooling myself about which operand is which, I re-implemented <code>std::mt19937</code> and libstdc++'s <code>uniform_real_distribution&lt;float&gt;</code> in Python and regenerated <code>mm_fid</code>'s inputs for seed 42. SrcB row 0 above (0.375, 0.796875, 0.94921875, …) is A[0][0..15] rounded to BF16 (0.37454, 0.79654, 0.95071, …). SrcA column 0 (0.55078125, 0.6640625, …) is B[0..15][0] (0.55228, 0.66546, …). The faces are stored untransposed.</p>
+
+  <h2 id="python">Step 4: Reproduce Dst in Python</h2>
+  <p>Now the main event. <a href="workbench/py/b07_mvmul.py"><code>workbench/py/b07_mvmul.py</code></a> parses a dump and recomputes every result element from that MVMUL's own dumped inputs. It is plain Python with no dependencies. Its core is three small functions that follow the three rounding steps above:</p>
+  <div class="filename">sim-labs/workbench/py/b07_mvmul.py (excerpt)</div>
+<pre><code>def phase_pieces(a, b, phase):
+    man_a = (a &amp; 0x3FF) | 0x400
+    man_b = (b &amp; 0x3FF) | 0x400
+    adj = 0
+    if phase &amp; 1:
+        man_a = (man_a &gt;&gt; 1) &amp; 31   # SrcA bits 5..1: the next five bits after the top five
+        adj -= 5
+    else:
+        man_a &gt;&gt;= 6                 # SrcA bits 10..6: implicit 1 + top four mantissa bits
+    if phase &amp; 2:
+        man_b = (man_b &amp; 15) &lt;&lt; 3   # SrcB bits 3..0: the low four bits, placed at the top of 7
+        adj -= 7
+    else:
+        man_b &gt;&gt;= 4                 # SrcB bits 10..4: implicit 1 + top six mantissa bits
+    return man_a, man_b, adj
+
+def group_sums(prods):
+    res = []
+    for g in range(2):
+        grp = prods[8 * g: 8 * g + 8]
+        e = max(p[1] for p in grp)
+        if e &lt;= 0:
+            res.append((0, 0, 0)); continue
+        s = 0
+        for sign, exp, man in grp:
+            d = min(e - exp, 30)
+            m = ((man &lt;&lt; 1) + (1 &lt;&lt; d)) &gt;&gt; (d + 1)   # align to the group's exponent, round ties up
+            s += -m if sign else m
+        res.append((int(s &lt; 0), e, abs(s) &lt;&lt; 13))
+    return res
+# accumulate(): align the two group sums and Dst, pre-round each to 11 bits, add, round to Dst</code></pre>
+  <p>It checks the dump three ways. <b>Independent:</b> each MVMUL's 128 results are computed from its own A, B and D lines. <b>Chained:</b> Python keeps its own copy of Dst. It reads only the first D value each row ever shows and then applies its own results, never looking at later D lines. If the model drifted by one bit anywhere in the 20-tile-product accumulation, that comparison would fail, and the wrong value would be carried into the later ones. <b>Phase effect:</b> for each phase, how many Dst elements actually changed. With <code>--isa</code> it also scores the ISA's float functional model, which we'll come back to.</p>
+<pre><code>for f in 0 2 3 4; do python3 -I $W/py/b07_mvmul.py $LAB_HOME/dumps/fid$f.txt --isa; done</code></pre>
+<pre class="out"><code>fid0.txt: 320 MVMULs dumped (tile total 128000), phases used [0], SrcA fmt 5 SrcB fmt 5 Dst BF16
+  phase 0:  320 MVMULs, 40960/40960 elements match
+independent: 40960/40960 elements match
+chained:     40960/40960 elements match (0 Dst rows changed by something other than these MVMULs)
+elements changed by each phase: phase 0: 40960/40960
+ISA float model (MVMUL.md, taken literally): 18313/40960 elements match (44.7%)
+fid2.txt: 640 MVMULs dumped (tile total 256000), phases used [0, 1], SrcA fmt 5 SrcB fmt 5 Dst BF16
+  ...
+independent: 81920/81920 elements match
+chained:     81920/81920 elements match (0 Dst rows changed by something other than these MVMULs)
+elements changed by each phase: phase 0: 40960/40960, phase 1: 6945/40960
+ISA float model (MVMUL.md, taken literally): 53810/81920 elements match (65.7%)
+fid3.txt: 960 MVMULs dumped (tile total 384000), phases used [0, 1, 2], SrcA fmt 5 SrcB fmt 5 Dst BF16
+  ...
+independent: 122880/122880 elements match
+chained:     122880/122880 elements match (0 Dst rows changed by something other than these MVMULs)
+elements changed by each phase: phase 0: 40960/40960, phase 1: 6942/40960, phase 2: 134/40960
+ISA float model (MVMUL.md, taken literally): 94632/122880 elements match (77.0%)
+fid4.txt: 1280 MVMULs dumped (tile total 512000), phases used [0, 1, 2, 3], SrcA fmt 5 SrcB fmt 5 Dst BF16
+  phase 0:  320 MVMULs, 40960/40960 elements match
+  phase 1:  320 MVMULs, 40960/40960 elements match
+  phase 2:  320 MVMULs, 40960/40960 elements match
+  phase 3:  320 MVMULs, 40960/40960 elements match
+independent: 163840/163840 elements match
+chained:     163840/163840 elements match (0 Dst rows changed by something other than these MVMULs)
+elements changed by each phase: phase 0: 40960/40960, phase 1: 6942/40960, phase 2: 134/40960, phase 3: 0/40960
+ISA float model (MVMUL.md, taken literally): 135592/163840 elements match (82.8%)</code></pre>
+  <p><b>Every element matches, at every fidelity, both independently and chained:</b> 40960/40960, 81920/81920, 122880/122880 and 163840/163840. The last line of each block already answers Step 1's puzzle. In this output tile, phase 3 changed <b>0</b> of 40,960 Dst elements. HiFi4 is bit-identical to HiFi3 because its extra phase never moves a single bit.</p>
+  <p>I also checked the model on two other kinds of data, to make sure it wasn't matching by luck on the easy all-positive, BF16-Dst path. With an FP32 Dst (<code>mm_fid32</code>) it matched 40960/40960 at LoFi and 163840/163840 at HiFi4. There phase 3 changed 40,937 of 40,960 elements. With signed inputs (<code>mm_fid_signed</code>), which exercise the sign handling and cancellation, it matched 100% at all four fidelities, and phase 3 changed 192 elements. No fudge factors were needed. The only Wormhole-specific special case in the model is ttsim's own "renormalisation of −1" quirk (<code>tensix.cpp:1533-1537</code>), copied as is.</p>
+  <p>To see one element up close, ask for a trace. This is Dst(0,0) in MVMUL #0, the same numbers as the split animation:</p>
+<pre><code>python3 -I $W/py/b07_mvmul.py $LAB_HOME/dumps/fid4.txt --trace 0 0 0</code></pre>
+<pre class="out"><code>MVMUL #0: phase 0, SrcA rows 0..15 col 0, SrcB row 0, Dst row 0 col 0
+ k  SrcB (=in0)          SrcA (=in1)          slice_b  slice_a  product  exp
+ 0  1f600 0.375        1f868 0.55078125    96=1100000 17=10001  1632  124
+ 1  1fa60 0.796875     1f950 0.6640625    102=1100110 21=10101  2142  125
+ 2  1fb98 0.94921875   1fab8 0.83984375   121=1111001 26=11010  3146  125
+ ...
+15  1f558 0.33398438   1f740 0.453125      85=1010101 29=11101  2465  123
+group 0: sign 0 exp 125 sum 10078 (x 2^-12 = 2.46044922)
+group 1: sign 0 exp 124 sum 7598 (x 2^-13 = 0.927490234)
+Dst before 0 (raw 0000)  -&gt;  model 3.390625 (raw 5980), ttsim raw 5980
+exact (all bits) dot product of this slab: 3.48496389</code></pre>
+  <p>Line k = 2 is the pair from the animation: slices 121 and 26, product 3146. The two groups add up to 3.3879, which rounds to the BF16 value 3.390625 (raw <code>5980</code>). The exact 16-term dot product with all bits is 3.4850, so LoFi lost 2.7% here. All 16 products are biased downwards, and the bias doesn't cancel.</p>
+
+  <h3>Is this circular?</h3>
+  <p>Partly, and it's worth being precise about how much. I wrote the Python by reading ttsim's code, so "Python matches ttsim" first of all shows that the reading is complete: no rounding step, operand order or encoding was missed. The parts that are <em>not</em> circular are these. The phase slices and their weights agree with the ISA's independent table. The operands agree with the host's random inputs. The face schedule agrees with the LLK. And the chained check would catch any state ttsim keeps outside the dumped rows. The ISA's own functional model is a useful contrast. Taken literally (FP32 products of the fidelity slices, summed in order, then <code>WriteDstBF16</code>, which truncates), it matches only 44.7% of LoFi elements and 82.8% at HiFi4. The ISA warns about this itself: the model is "a rough guide rather than an exact description" (<code>MVMUL.md:223</code>), and <code>WriteDstBF16</code> is marked "Approximate; real hardware rounds" (<code>MatrixUnit.md:186-189</code>). I tracked down the gap with two scratch experiments, which are not kept in the workbench:</p>
+  <ul>
+    <li>Replacing truncation with round-to-nearest-even in the ISA model raises the match to 94.1% (LoFi) and 97.8% (HiFi4). Rounding the <em>exact</em> sum once, half-up or half-even, gives the same 94.1% at LoFi.</li>
+    <li>Removing only the 11-bit pre-rounding of the three terms (step 2 above) from the exact model drops it from 100% to 94.3% at LoFi.</li>
+  </ul>
+  <p>So the hardware, as ttsim models it, does not "sum exactly, then round once". It rounds the products into two group sums, rounds each group sum and the old Dst value separately to 11 significant bits (3 bits finer than BF16), adds, and only then rounds to BF16. In about 6% of LoFi elements that gives a different BF16 result from a single rounding of the exact sum. Any reference implementation that wants to be bit-exact with ttsim has to model those steps.</p>
+
+  <h2 id="tile">Step 5: One tile, element by element</h2>
+  <p>With <code>--json</code> the script rebuilds the 32×32 operand tiles of the first tile product from the phase-0 MVMULs (SrcB rows → in0, SrcA rows → in1), plus the Dst tile after that tile product and after all 20. It also computes the exact reference: the same BF16 operands, multiplied and summed in double precision, which is exact for these values.</p>
+<pre class="out"><code>tile (0,0): after 1 tile product mean |Dst - exact| = 0.159058; after 20 = 2.203112; wrote fid0.json
+tile (0,0): after 1 tile product mean |Dst - exact| = 0.023189; after 20 = 1.529170; wrote fid2.json
+tile (0,0): after 1 tile product mean |Dst - exact| = 0.022671; after 20 = 1.523120; wrote fid3.json
+tile (0,0): after 1 tile product mean |Dst - exact| = 0.022671; after 20 = 1.523120; wrote fid4.json</code></pre>
+  <p>The heatmap below holds the real data from those four files. The difference panel is in BF16 ulps of the exact value: blue means Dst is below the exact value, red above. Hover any cell for its numbers. Press Step to walk through the 16 phase-0 MVMULs of the first tile product in the order the dump recorded. Each step highlights the SrcB slab, the SrcA face and the Dst block that MVMUL uses.</p>
+
+  <div class="viz" id="fig-heat"><div class="modebar" id="heat-modes"></div><div class="readout" id="heat-read">Hover a cell.</div></div>
+  <script>
+  var B07 = {"in0":"3ec03f4c3f733e3c3f3b3f483f193f193e203ee43e203dcd3d6e3eeb3f5e3eab3f1a3e123f353f273ca93d673f783f393f553f703e593a4c3e3a3f7e3e3c3f1e3f0d3dc03f373e3b3f293f6f3e8f3f233f743f043f3d3f283f0e3edf3f1d3f3b3ed73d433e7e3f113eb63e223f423df63c6c3eaf3dee3dbc3d3c3dc13d273e9f3ca43f103ea53f573e593db73ea83f093df53e6f3f643eb03f183ef33f2e3eb63f4a3f263eff3ef63db23f163f093f3d3f163f0f3f3f3f163edd3f113e033ec23daa3db93f1a3f453e7b3d8c3ec73f563e943ee03eb63f6a3f383f393e983f1c3f113f733ef43ecb3f2a3f743f703e0a3f3c3ef83e5c3e8a3cff3f0a3e863e263f1e3e573f343eb13f0f3f473c203f713ea73d943f053f093db43f623eb43da93d083f533da13eb73ecb3ea53e083f7a3f113e4e3f313f313f4d3f523e4d3d293e443ecd3ea63ebc3e683eb03eb63f1e3d8e3ee33f053f553d8a3f2b3f4d3d8f3e6f3f243f0a3e8b3f613f183f273f2e3f083e6c3ea63eea3eaa3e433f2b3d563f323e373b533cee3f1f3e2b3eb63e3a3f4b3ec63dbe3ece3f173f603ef63f033f243f393d853dd53f143e673f103f343f103d583f1a3ef93f2d3f193f4e3f1a3f4b3e923d0e3edc3f153e893f7f3f4a3f5b3f133f053f293d823e813f553e623f193efa3deb3f3d3dc03f063f693d063f2b3f5e3f543d843f613f753f123cce3f4b3e783f353ef53d4e3e153d953f363ece3f2b3e973e583e6e3f5d3e903ecd3f4e3e963f6e3e1c3ecf3e883f683cb43ea53f153ef43f583e673f0d3f243e613eaa3f183f5b3d063e543f233d923ebb3d8d3e973f713f613f023eec3ed23dc33f503f543f563d433eaa3f3a3f323f463f453eb53f283f533e1b3f043f603eed3f0e3f543f013eb33e473f063f5c3f4b3f2d3f623f573eb13f5c3eec3f403ed43ee13c593f1c3e983e243eeb3f2c3ed23e383f393f323ec53e6b3efb3df13edc3e6b3ef33ef03d623e8a3f713dcf3d993e2c3ee03e173f083f793f7c3f423e2a3f783dea3ee13c0f3e8f3e1f3f4c3e543ea73f213e993e613e6e3ca83e053f543f083f1a3d063f703ef43ea03ed13e803e253f273f283f1f3f793eaa3f103f6e3f373f583d8c3e653ed63e753dee3f033f1d3f463f703d343f293f313d9d3f263f043f0e3dae3f503f0d3ec53ec33f2b3f1b3f7d3ec73e673e763ec83dc23ef63ea13e0d3dc63da63e353f543f7d3f7a3ee33ecf3f083db43f603d873f7f3f643e253f283ef23e4c3f0e3ea13f123e663e573d8e3f3e3f543cce3e823eb63ef23f483d313f103f333e863ea93f323f3f3f113ed33f4c3e483f3c3f033f1c3e063dfe3ea73d903caa3f693f433e433d2f3f523f5d3f0b3df33d9f3e303f753ef43e7d3f3d3f5c3e0e3e2d3ee13f5b3ef73c593e593f033ded3f453f563f6f3f013ea33dc43f6d3ed73d663de83ef93e303f6a3f0c3f1c3e293f0c3d833e803ea33eb03e623f5a3f043f0f3dd23f043f403dcc3f683c833f3e3f773f083ec13f5c3eec3e9f3e5f3f703e093f2d3f743df43d953d8d3e4c3ef83eb23e613f1f3e823f0b3f613e013db73e943f373e743e8b3e5b3f433ed33f393f343bf23e5f3f023f433dc93f703ee63f713f713e333f743f603e753f3d3f203e813ef33d8a3f603e893e8b3f6a3b733f223e263f393eb33e843ea23f383f4b3ce63f2e3ec03e993ee53f2c3f773ea83ec13e8e3e843e3d3e793eff3eea3e8d3f423f3b3e533d9d3f363f2a3cad3e733ed63efb3f473e923ead3f393f103f723e523f6b3f3e3f153f2f3f0c3f623f4c3e503f153f603f763d753f293f633f063ea83cc13ea13ed43f033e993f713f403d443e553eb43e523f5b3e423ecb3e013e4c3e9f3ed93f633f463f633d9b3f643f543f3f3edb3d103f193f133db83f493ead3c8e3db83f0d3f763f5c3f4f3ef33eeb3b873e653c343f6f3ed53eb03e1f3e253f2a3f103f353f493f173eca3f013f253c933e1a3f6f3f6f3da03ec43f303f3b3f493ca73f4c3e523e0b3ef93ee53f613f543f073e9b3f6e3eef3ef83e8c3efb3eed3df53f633f343e8a3ee83f283f0a3ec83f593e473ef63f3b3ebf3e1e3efd3f5b3f143f043e423dd83f673f323f2d3f053f223e993dcc3ed83f1b3e993df83e873da13e283f703e313f083f143f1d3f0e3ef73f3d3dc03f003f453e8b3f3f3e2d3ea03f1f3e9d3f383f563f123d943f3d3f623e113e833f623f183f153f703e023f2e3eed3f383e9b3f303eb13dc43f7e3f6c3dd13f123ecf3eba3d803f423f523e843dbd3f323f2d3d233d673f573f2c3ee53f583f233ecc3e633f063f2d3ece3f463e9a3e063e3d3f323eaf3e533f0b3ee23f363d853e583f533f2c3e013f343f673f0f3f5d3f673eee3de33f3f3e353f1f3edb3f4e3e023edd3f113f493ecc3eed3e923f543ec23eda3ed63e8d3f0c3e883f0e3f093efe3ee63e9d3ee13f6d3dbb3f173f383ed13e5b3f273e4a3f453ed33f763e693f003f153de63ebe3ee23ee63ef53e873e453f053f233ee73f283c3f3f743f0f3f463f293f4e3f183f083f3c3e3f3f123eda3d893f0d3dee3f2e3f193f1c3e8d3eca3da33e883edc3e2c3f0e3f323ed63f033f713f533f393f513db43f6f3f593f573f3b3f253f1c3f1c3f523eef3ecf3f203e633f4c3f033f783f0d3eef3f0a3f133f113ee43f733f2b3f673f213c9d3f053f463f4a3e2f3e693d343efb3f273eb73f463f543f503cb93efd3e7a3e523e1c3f3d3f5c3f333eef3e7c3ecf3f673ee63dd63f793f7c3f5a3f5c3f353e8e3f0b3f5f3ca83f1b3f063f1d3f233f083e703dbc3f143ee43f263f803f303f563f473f653e9f3f533f113dd33f7b3e693f663b4d3f743e9b3ec63dde3f49","in1":"3f0d3e323d8b3f2b3e8b3d883ee63f143f6c3f233f1b3f603e5f3e683f2f3dea3ec23e823f233f443c2e3f0c3edc3f633f353e6f3f453f163f723f4a3ef13dec3f2a3f4f3ee83eea3e143f213f633f753f543def3e3f3f5b3f063e423ea53f383dfa3cf33f1a3ea73f1a3ed43e8f3e7d3ec23f023f163f563eda3f5a3ee03d6b3f573f663f523f7b3f703dfe3f163ee13f593f503f753f5e3e9e3f033da03edd3e2c3ee33eb23c0e3ea73e863dc93ee83f643e9c3f1a3f453f5a3f603d083e7c3ce53c8a3f3a3f693e8b3f6a3f0b3f513b673e843f0d3e493f323f653d943f293f223f673e8e3eca3e8c3f143ea13d823f323e7e3dd53ef23eaa3eb73ebb3f713f093e4c3e583f093f753e853f0f3f1f3c333e913f5d3f2e3f323f683ed73f0c3e673e8e3f253eef3ec83f223e5e3ebe3f0a3ecc3e333f563da33f3b3f173f6a3ba93e673e9f3f503f4e3ec53e973d673f763e503f1d3f283f613f793f283f663f3a3f523e973de53f1a3e703f7e3f0c3ec43e2d3e843f4f3eb93f5e3f383ea43e873eb43d1d3f7b3f0d3eb93f2d3f1c3f7a3dcb3f313f793f643f2a3db53ec53f543eba3e7c3eca3e2c3f093f7e3e3c3ea83ec43e9f3f503f503f293f183e453f3e3d8b3edf3f533ed03f083dc33f3b3f793f583f1e3f683f2e3f383f053e153f523ede3f6e3d8a3efc3e903df93f323f673f4d3dcd3f413f1f3e423f623f763e723f3f3ee03e9e3f053dc63f5e3e903ef33e923f523e833f6e3f1b3f503f6c3f2c3f403f2a3ed63f6e3f5d3f403f403e363f173f273e1c3ec83eb33dc03e833d0f3f7e3eb33f0b3f153f043f453f1d3f273f1f3f223f233f763f563e8e3ef43f423f0c3ed03ed53efa3e8d3ef93e3b3f453f713d0f3f603e613f2e3ee13e823f3f3f443f243eb43f753f7e3f503f273e953f283f483e923f0b3f4b3eb83f693f193f423f393d903f4d3f103f663e273df23ef03f243f363f5b3e343f3d3ec63f4a3f7f3e143f803e5a3eb03e3f3e133f6d3f563d043d723de13ec33f7d3e753f383f483f363f3f3e913f563f223e9e3eec3f4b3ea53ed53d903ddd3f7f3f423ebf3f3f3e4b3f7d3da63f043f5c3f373eeb3f753e613f463f373f7c3f1c3f483e7a3ec13e183e8d3f423e9a3e3e3ee43f383d993d0e3e373eaa3e143ebd3f253f163f513ea53df73f393ef13d723ed83ecb3f723e8e3e1d3e693f413f243f063f1d3f0c3ecd3f593f033f063e903f663ee93e8c3f493e4f3e963ed43e923e7a3e9a3ebe3f6f3f643f6b3f553f563f483f5c3f1e3ecc3f403e133d133f4a3f003eaf3dc33d843eea3f483f703e013f463f563f4b3e453ed33eb33f183f213f013ee83f353f233efd3e703e3d3f483d433e313dde3efe3f733edc3e333f113f373f583f573f333f153f333f223f183e543f723f4b3f123e923f643f2f3f2b3e7d3f403e6c3f3b3f1c3f113f283f3f3ef23f543f403e023f1b3ef73f763f763c883f2e3f433f343f743f733f4c3e2f3f2f3efb3d8e3eb13e8e3f513f633f7d3d5e3f113ef23f1b3f623dc13f693f4d3de83f183ef23f083f4f3ec43edf3f703e8b3c633f573e3b3ea13f4f3e093e2c3f593d243cbd3d7d3dba3f3e3f373ec73ebc3db83e883e833d8f3d0b3e8d3e923e4a3f243f7f3f793e933f783f5e3ec33f2f3ebe3ebb3f343dc73d7c3f513efa3f763ef53f403f073f6d3ea23f4e3e9f3de43f5c3f573e463f113f243e3e3f703f1c3f313f673f203f5b3ea73f253eed3ef03d793f323d263f6b3b7e3f523ebe3f683bd53ed73f323d503f403f193f093f113e0c3e213f3f3e363e793dea3f2d3ecb3f653f383ead3f323ebf3ee23f643f3d3f483f643f5c3f5a3f023e753ebd3f0a3f2e3f3a3e7e3f793f133f6f3f2a3dba3f423f553edd3e263f3c3f143f103d9f3f303f543f213e933f683f143c4a3f323d8a3ebc3f0c3f613cdc3f2c3f183f0d3ebc3e1f3f043ea03f073e5e3d403ef53ee13f523f093df73f3c3d2a3f043f283ee93f4d3f7c3f7b3d9b3f7a3f5f3e233e4f3dc13f103f693f143f313efb3ebb3e7b3f6e3f6c3f723b8c3f223f7a3eb83f403f5f3f303edf3e2c3e8b3f683f5e3f0c3f673dd73e2a3f6e3ed23f263f1c3f513f063f0c3f5f3f563f7f3f5c3e1f3f103cb53ef63e013f113ebb3db33f3a3f203e083e213e733f563ebb3f5a3e8c3f2c3ede3e403f123e323f5f3e083f533f473f783f0a3f553ca13f783ea03f523ec93f7e3f0b3eb63f3e3f723f1d3e5e3f643f073f563f003e943ebf3f0d3f5e3ed93f313e463f4c3f733e9f3f103f1f3ec73f723e233efe3f7f3f713e923e7d3f383d513f763f5a3e6d3f073e643e683f703e9b3f1d3e433f6e3f443d883f5b3f473e0b3ee43e603de33f763f693ec63eb33f603f1f3f623ee13cc53df83e3a3f113df43eb63e9c3f373ebc3f673f2f3f243ed13e273c9a3e993d9a3f2f3f2b3f553e183f3f3dea3f6d3ea43f5a3f263ee03ed43f683f6a3ecc3dd53e6e3df13f203eb93f7a3f563f4a3eeb3f263f133e913ec13e123eb73f043f303f343e2f3ead3c163f083e903d833ed03f1d3f103f323f563f0d3ead3f673f693f633f0c3efc3cbf3ecb3f5f3e3e3f383f113f213f3d3e773e893f1e3ed53dd03d8f3da63f5d3f0b3f483eff3ebe3e9c3e893d863f5d3dee3f133f053f2b3b953ed63e6e3e583e1b3e453e583e483f623e833ed73f6c3eee3efb3f303f0d3f413ed43f403f673e483e483e7e3d573dd03ef33f7b3f713f573edd3f193ee13e0f3f603f703f653e853e3d3f3f3f3c3e703f513f773eb83dfe3f343d6a3e353f4b3f703f4c3ebc3f393f473ec53f713ddc3f6e3f303f0b3f623f313f1a3ef33f7d3f213f1b3f653ceb3e843edc3f0e3c7e3f0a3e85","ref1":[8.383449,7.446736,7.246524,8.212954,8.334083,6.079787,8.98424,8.282617,10.060987,9.008619,8.602536,9.89505,8.211077,8.894582,7.87546,7.653975,7.809217,7.861003,7.320653,7.931194,7.85147,9.2765,6.647514,7.767139,8.152553,6.611961,7.091973,8.844547,7.27048,9.847507,7.839006,5.902579,6.320351,7.182491,5.943702,7.37319,7.193253,5.008433,7.67321,6.330872,8.012843,7.709715,7.60817,8.008522,7.077805,8.075455,7.668026,7.038141,6.706423,7.326675,6.63178,6.317035,6.94906,7.504451,6.154353,6.547088,6.938423,6.174651,5.844297,7.231591,6.29699,7.053603,7.204119,5.353126,8.508087,7.505872,7.290109,7.586782,7.428414,7.643932,9.06703,8.185075,8.98712,8.553983,7.555058,7.805018,7.92048,9.017199,8.167806,7.846629,7.372838,8.664009,7.492225,8.224904,8.061873,8.53624,6.228612,6.812606,7.529308,5.589144,6.511034,7.413088,7.711762,7.855345,7.913541,6.784587,8.256823,8.032376,7.00619,8.253264,7.287457,6.684036,8.509569,6.962355,9.497354,9.578128,7.896197,8.69594,7.660684,9.465215,8.212286,7.597657,7.627749,8.957442,7.716506,8.498562,7.306154,8.194349,6.096012,7.694127,7.812925,6.93198,6.323207,7.70909,7.434127,8.137283,8.084836,6.685524,8.217717,6.768709,6.040163,7.465219,7.484202,6.103842,7.345665,6.726643,9.311843,7.717546,7.422628,7.092599,6.778333,8.069642,8.104483,7.214201,7.568195,8.294889,7.564999,7.555546,7.340605,7.023422,6.25118,7.132156,7.125109,4.996635,6.136943,7.231171,7.282464,7.963431,7.172244,6.97884,7.283123,7.056419,6.312504,6.928774,6.865511,6.298491,7.618462,6.881613,9.259094,8.041083,6.633733,7.03078,6.473622,7.636691,7.772791,7.297148,7.225344,7.772639,7.102052,7.696658,6.59881,7.396587,6.223784,7.044056,7.093354,6.311882,5.719792,7.796975,6.655568,7.426254,7.602659,6.190354,7.63786,6.986142,6.110388,6.887648,6.950375,6.20995,8.549858,7.083886,8.979664,7.503772,7.023362,7.431254,6.735032,7.808311,9.214021,7.570019,8.037382,8.467302,7.686789,8.889872,7.937529,7.843614,6.710584,7.734076,7.608064,5.370579,5.956705,6.941846,7.255163,7.879425,7.82563,6.259543,9.181996,7.865883,6.862483,9.09907,9.176875,7.39072,9.1899,8.37147,10.832271,8.377711,8.88639,9.6702,7.704993,9.619798,9.056561,7.848947,8.827926,9.353603,8.089538,9.217954,8.461504,9.482383,7.758021,8.340481,7.909067,7.046157,7.167713,8.943726,7.933862,9.361564,9.422671,7.438745,7.645047,6.885436,6.494288,6.636806,6.901916,5.739358,7.39797,7.296645,9.359257,8.415545,7.994481,7.781131,7.16844,8.406805,8.128354,6.985147,7.443987,7.872212,7.852772,7.91615,7.000785,7.174623,5.643073,7.543619,8.052006,6.223795,6.951965,8.381146,7.320464,8.222701,7.679683,5.573941,9.760639,8.667488,7.626961,8.131023,8.26369,7.665863,9.318004,8.169065,11.246966,9.775635,8.303905,8.237562,8.284101,9.511561,9.501385,8.905144,8.230177,9.461002,8.888829,8.992088,8.321189,8.533135,7.405713,8.325365,8.468688,6.39846,7.346057,9.006894,8.721597,8.918136,9.017824,6.966977,8.267678,8.612922,7.283874,8.579413,8.153689,7.236288,9.49869,9.059947,10.504189,9.156991,8.859007,9.468611,9.397616,9.697839,8.628237,8.652102,8.303731,8.450838,8.152909,7.954594,8.545634,8.837724,7.394471,7.310718,8.716886,6.924162,7.166024,9.219093,7.987188,8.592603,8.420133,6.480252,6.077727,6.501052,5.977618,6.332388,6.333847,5.716387,7.302181,6.596921,7.906015,7.811764,5.953621,7.086409,6.58789,7.737704,8.004552,6.711465,6.135171,7.044104,5.959396,6.83945,7.112563,7.426547,5.239231,6.560579,7.081308,4.804006,5.507713,6.881326,5.436737,6.913027,6.959767,4.48757,8.349992,7.599411,7.585003,8.973699,7.311455,8.269794,9.872597,8.389693,9.251294,8.277894,7.419735,8.99135,8.247251,9.216269,9.187869,8.457941,8.535094,10.106409,7.822112,8.660424,9.056966,8.920342,6.919059,6.995251,8.695501,5.7356,5.974727,7.772682,8.059708,8.7539,8.666976,6.964312,7.786581,7.829019,6.995263,7.219411,7.628867,7.396425,9.27519,8.568298,8.795699,7.841552,7.982059,7.90321,8.433071,8.847287,8.200291,8.710929,8.604778,9.184125,8.16974,8.60757,7.930576,9.022828,8.08746,7.131128,8.66411,6.02321,6.349124,8.745402,7.248521,7.547363,8.133941,7.335681,8.481764,7.481033,6.291227,7.105053,7.681404,6.241446,8.198175,7.291942,9.130813,7.553476,7.123562,7.486022,6.531569,8.30946,7.833087,7.44867,7.592161,8.300435,7.54815,8.165812,7.197686,8.505479,7.037039,6.672167,6.9401,5.838409,6.614609,7.856178,7.197412,8.132976,8.256473,6.315671,6.795116,7.233291,6.613495,6.89012,7.683915,6.709272,8.441169,6.755718,8.640149,7.119063,8.52119,7.607196,7.575858,7.962971,8.346194,8.096504,7.497252,7.803847,7.218421,7.145211,8.238014,7.852252,7.482836,7.400545,7.165804,5.916414,5.53823,8.174444,6.188312,8.236732,7.577578,6.320503,7.12276,7.489374,6.768221,6.908629,6.321333,5.745947,9.388761,7.516461,8.631509,8.243055,8.435904,7.622524,8.623272,7.675017,8.02538,8.219844,7.685272,8.651469,7.391851,7.181688,8.027731,8.661225,7.237073,6.830391,7.839692,5.296463,6.865159,8.387485,7.217633,7.85618,6.58388,5.71523,6.326688,5.673442,5.916761,7.271651,5.903265,6.585897,7.82527,6.554979,8.113678,6.135801,6.360692,6.958081,7.178569,7.00026,7.301678,6.854319,6.340804,7.954566,5.908974,6.969323,6.606181,7.220178,6.044237,5.873292,6.807767,3.945436,5.365721,7.076891,6.712597,6.929398,6.79598,5.548265,8.411245,7.580725,7.175641,8.112886,8.269254,5.937824,8.254324,7.641764,10.20889,8.815033,9.843422,8.817167,8.88745,9.90594,9.328254,8.719218,8.843907,9.287872,9.547135,8.047267,8.028554,7.971126,7.345882,7.759828,8.93801,7.197957,7.388872,9.574265,8.298972,9.133542,8.852069,7.114334,9.076879,8.066806,7.172984,7.79923,7.716205,6.727979,8.906445,8.344014,10.029211,8.633289,8.096657,8.51472,7.831449,8.630078,8.685241,7.949872,7.420374,8.504526,7.76908,8.722856,8.215605,7.252109,6.22324,7.240275,8.190429,5.212747,7.048006,8.404259,7.887039,8.566101,7.854508,6.384708,7.994696,7.114327,6.698109,8.773445,7.734005,7.344339,9.180533,8.20374,10.180602,8.798073,8.826632,9.167662,8.454378,9.389676,7.460391,8.173661,8.214162,9.083444,7.899476,7.211367,6.540656,8.711214,7.236002,7.820915,8.422725,6.883954,6.25034,8.911698,8.705065,8.586787,8.602279,6.454937,7.494503,6.566567,6.438567,8.481606,6.741247,6.904206,9.34001,7.355052,9.706414,7.670349,7.852687,8.821679,8.272774,9.077519,8.702517,8.286823,8.214118,9.611323,7.966504,8.322186,7.369523,8.642757,6.942779,8.046415,7.822998,6.368208,5.930952,8.287517,7.733973,9.596428,8.591106,6.026766,8.799241,7.963688,6.969217,7.46029,7.577847,6.555013,9.510537,8.020108,9.729079,9.560084,8.644739,8.921317,8.580179,9.389235,9.118245,9.080453,8.524824,9.7251,9.379839,9.33291,7.70537,9.694763,7.101276,8.499217,8.894785,7.133949,7.525753,8.45943,8.197291,8.531211,8.329243,6.912024,6.681821,7.37596,6.209274,7.124226,7.339229,5.714005,8.188873,7.481943,8.819911,8.305418,8.274554,8.281384,8.023104,8.946972,7.476297,7.72684,7.046612,7.693134,6.942594,7.834985,6.451862,7.896432,6.414434,7.06191,7.54166,6.288365,6.555055,8.093672,7.067672,8.267429,7.088277,5.614933,8.97405,8.190914,7.266344,8.834808,8.336775,7.826777,9.791517,8.7189,10.183438,9.206173,9.702248,9.831633,8.983782,10.021833,9.162157,9.049726,8.011865,9.837542,8.432196,8.486799,8.255135,9.234285,7.829035,8.502501,9.194253,6.376198,7.584154,10.036976,8.710828,9.052927,9.185258,7.711895,7.926205,7.784827,6.879208,8.337131,7.889315,6.829404,9.565042,7.673758,10.568071,8.384416,7.783828,8.63025,8.430248,9.145892,8.665188,8.908504,8.68461,9.397468,7.631205,8.732674,8.338144,8.130189,7.97114,8.084538,8.163067,5.172609,6.759627,8.53406,8.493715,9.165227,7.715961,6.145879,8.251072,7.292066,7.439236,8.168674,8.194679,7.472023,8.935352,7.259933,10.213038,8.527261,7.894486,8.443448,6.933143,8.919597,9.221567,7.991598,8.617725,9.456153,8.26228,8.256413,8.37769,8.429239,6.913059,8.03758,8.191103,6.749437,6.432831,8.603551,8.28048,9.058905,9.167966,6.576829,8.515179,8.064788,6.816761,7.620384,7.420434,6.61693,8.665518,7.688159,9.350818,8.862977,7.570011,8.110872,8.092348,8.790344,8.406424,7.868374,7.891444,8.910258,7.645312,8.693727,7.768575,8.482354,7.125383,7.672632,7.87443,5.157453,6.821436,7.213174,7.975142,7.961508,7.442902,6.412448,7.98117,8.099465,7.104825,8.420272,7.81056,7.340837,9.007903,7.920232,9.278626,9.148325,7.780776,7.994824,8.154405,8.835301,8.563856,8.115323,7.858856,8.875799,7.470845,7.814043,8.020605,8.790709,6.967848,7.661064,8.243076,6.147015,5.965848,7.843588,7.10108,7.201295,8.087932,7.354945,11.059204,10.627778,9.536667,11.069661,10.964089,9.669176,12.143368,10.383857,12.850131,11.314426,11.1027,11.113438,10.625726,11.764343,11.151336,11.532427,10.632191,12.27929,10.319103,10.669224,10.705878,11.197833,9.438314,10.477808,11.133844,8.188846,8.43469,11.112047,10.101881,10.950971,10.642806,9.768368,9.012556,8.443254,7.333717,8.501106,7.845731,7.466464,10.494379,8.439999,10.626689,9.353761,8.909031,8.253356,8.793389,9.06412,8.857495,10.069028,9.071906,10.26732,8.851466,8.716915,8.335375,9.534502,7.90731,8.332644,8.995547,7.036428,7.204392,9.313015,8.340225,8.845939,8.617261,7.918562,9.069517,8.608739,8.365593,8.93158,7.6661,7.057191,10.683615,8.574028,11.38099,10.257638,8.912177,9.8058,10.316648,8.879818,10.286751,9.248239,8.760962,9.676856,8.988808,9.227951,9.387429,10.148058,7.386227,8.844951,9.725936,6.683529,7.684447,9.367858,8.93203,9.934549,8.373028,6.701017],"refK":[157.0308,161.9725,163.004,158.0123,157.4358,150.6351,154.5218,151.7,173.4,160.0769,159.8238,163.9986,157.1448,146.7789,158.6968,152.0632,151.2596,153.2217,161.6101,163.9406,159.1876,164.7851,161.9203,154.0808,155.6412,160.0495,157.3485,149.0676,158.4544,157.6648,161.6894,148.1194,156.9921,162.1958,168.6954,157.2098,156.8922,151.657,157.6639,152.5264,171.024,163.949,162.7134,166.8251,158.7418,150.6377,158.9006,152.675,156.542,159.1825,163.3736,172.6515,159.0352,170.4217,166.3243,163.1635,154.5093,166.3246,159.2694,152.1981,162.9715,159.7101,160.9485,156.7018,156.6984,165.1923,162.5464,159.3799,158.0101,154.9803,157.0697,153.4144,172.9544,163.053,163.3995,164.5736,160.6323,152.9378,159.8789,154.2156,154.4749,156.0027,162.4192,165.151,163.0548,166.8585,164.5043,158.377,155.2786,160.7399,158.5528,151.625,161.0524,160.1442,162.5535,151.8608,159.346,166.311,172.4314,167.2986,160.6395,152.962,158.2762,153.6438,178.3649,165.0321,167.8248,169.0892,165.5381,156.2635,160.607,156.1837,160.4776,158.7997,166.3846,171.3104,163.6915,170.0053,165.6428,166.0851,161.0642,165.4771,158.9728,155.0077,166.1273,167.1074,165.5363,157.596,161.5663,167.846,160.301,161.4967,156.0751,152.9902,153.9425,155.87,173.2018,163.6966,165.6794,166.1598,158.3862,154.8625,161.2448,151.9761,154.2304,155.1267,164.893,168.4256,161.768,167.1683,164.3046,157.5374,153.1646,161.6169,160.7936,152.8653,163.0684,159.9475,164.1868,154.397,155.1369,163.383,161.8792,159.6029,154.7977,149.065,152.1042,155.6394,174.7041,161.4796,156.7075,161.905,159.5424,149.8178,157.6437,153.4412,154.3916,152.5547,159.0511,165.1883,161.6907,164.6412,159.873,153.1842,154.6405,160.0802,153.6955,156.3823,162.4376,161.1591,161.7313,156.9943,156.6698,160.654,159.2005,156.5971,156.6094,151.5891,158.7919,150.8434,171.8362,160.2718,157.7205,160.8352,159.4298,148.5967,157.4965,149.9105,157.887,157.5141,161.5838,165.9305,154.8898,168.1854,162.9802,157.2958,154.621,160.7439,158.2054,149.959,164.1123,158.3468,159.5617,150.4642,158.1281,164.2265,160.6539,159.6717,158.3832,149.8461,152.8399,154.5291,172.7939,160.5471,160.8422,162.6149,151.5244,152.026,159.9469,154.8804,155.2704,153.0528,162.2811,168.1369,160.9074,162.9175,162.7479,156.7044,155.9345,162.3954,155.3792,153.5617,161.9826,157.3857,161.3377,153.2514,161.1605,169.0596,170.8804,164.4319,162.0734,156.9581,158.2098,155.722,179.383,170.407,167.9475,165.4579,164.5697,155.2157,169.474,156.4944,159.1578,159.8639,168.1628,171.3079,167.8391,172.5963,165.8596,162.7373,162.911,168.3515,161.2659,160.3071,168.6792,167.0518,168.9264,154.0379,153.8927,157.62,162.706,160.2907,158.6641,151.6626,156.768,155.2043,174.3671,162.1139,161.487,161.0742,160.2487,151.4059,157.323,155.3674,157.1596,152.6629,163.216,168.0303,162.6374,165.5408,164.4688,154.7932,156.5415,161.1389,159.7141,150.863,163.7147,158.8547,162.7957,151.4035,164.634,168.2013,169.4643,164.7711,164.0126,156.6697,164.8577,162.2405,178.4422,171.2641,167.8558,168.786,169.6017,156.0447,163.9376,158.2185,161.0412,162.1437,169.2333,173.2761,169.8483,173.8288,172.7546,162.9354,164.2817,168.8394,164.4132,164.4136,168.4662,166.4774,167.1763,154.5192,152.8859,158.6944,163.2552,157.8275,154.2645,148.6373,152.7481,148.9061,169.3046,162.0536,157.0834,160.2353,158.0958,150.6928,158.7449,151.1104,150.8346,151.7935,162.475,165.5472,153.1051,161.6116,163.1346,158.9676,154.1361,157.5508,155.6041,151.3447,160.4806,156.4521,159.1584,148.3656,151.281,157.4471,156.6487,154.5793,152.2927,150.4835,149.7957,150.7764,166.7677,157.607,153.4786,153.1614,154.2632,146.598,154.8873,149.7787,150.9912,152.458,154.9742,160.7679,155.2412,161.4157,156.9115,151.7896,153.0844,149.1523,155.9185,144.4513,157.7175,151.2165,158.6867,146.7891,156.6377,155.6918,158.3673,159.4215,150.5618,148.6195,151.8604,145.6466,169.1314,155.082,156.4405,160.3885,156.0256,149.1512,152.164,148.8534,149.9474,155.3533,160.4389,162.0818,156.3395,161.0748,164.4582,151.6044,151.2779,157.3816,153.1399,153.6444,160.0625,156.1885,159.3266,146.8331,154.4668,161.8942,156.1724,156.8154,153.2666,147.3799,152.4972,151.1615,167.4104,156.9346,155.6475,160.0329,158.3467,147.5618,154.386,153.385,152.639,156.471,158.998,163.4954,154.3943,164.1582,161.0743,150.4195,153.9763,160.5654,158.606,149.4856,165.219,158.783,160.7475,146.6834,157.7091,163.0164,161.6511,156.5431,153.9183,153.3244,156.2137,148.1253,172.7566,161.655,162.7962,163.9582,161.6999,150.0349,155.7479,152.8903,151.4231,153.965,160.2344,168.6406,163.4272,167.1819,165.5823,156.1655,155.0097,162.0517,156.3161,153.1015,158.792,160.8216,158.0912,152.1206,153.5881,158.1784,163.6297,156.0375,157.531,148.3523,153.4276,152.7135,172.4206,160.3911,159.2226,159.2797,158.7621,146.1954,157.8237,153.679,155.8966,154.1806,158.4121,166.95,161.1367,165.2686,163.9368,158.7966,155.4836,158.7008,161.1021,151.1774,161.3364,160.8423,163.6205,148.8556,151.2813,160.4431,160.1694,159.7776,152.0195,154.4276,154.0911,149.1445,165.7885,162.4533,161.8317,159.6821,156.4605,148.8703,153.1588,150.1211,152.544,155.6097,157.3793,163.1628,152.1029,166.8012,158.0647,155.4688,154.4499,159.7262,156.3966,150.3521,159.4805,157.9563,162.6002,151.3372,155.2666,161.3804,164.2187,158.1339,157.8907,148.5543,151.4004,150.4562,177.0918,163.3088,162.4836,163.8332,162.351,153.0115,160.7349,157.699,153.6568,155.6545,161.4398,166.4511,159.6885,168.0152,166.7135,159.5755,155.0005,161.0737,156.164,155.8135,161.1168,160.8541,163.7059,152.3444,157.0549,159.3188,163.7963,156.5762,154.8026,149.5143,149.2521,148.9572,170.0192,159.1814,158.2175,156.342,159.4348,148.9783,160.0271,150.4242,155.8885,155.3055,161.95,165.75,158.168,166.9121,157.1136,154.3366,154.524,155.87,161.5397,150.9173,160.5281,158.7209,157.284,151.7807,155.8205,161.1065,162.9824,164.7248,157.5503,150.337,159.4337,153.5175,176.1577,159.8262,162.9234,163.8912,158.2762,155.4646,159.3845,153.1199,157.0329,154.6179,160.0336,162.2323,158.5115,164.0362,165.4502,156.7838,157.1492,159.7742,155.1273,153.9677,164.5577,159.8321,162.8218,154.1716,153.359,160.9361,160.2921,159.1246,157.3043,155.4412,154.0459,152.3872,171.4968,162.2081,162.0409,158.3305,160.6333,151.8698,159.6255,152.5943,153.022,156.9403,161.0965,167.1779,157.7232,167.6029,160.5528,157.7939,153.5689,163.3116,160.29,148.8326,160.5009,162.0359,161.1956,147.0961,155.121,161.5821,157.7378,160.8574,156.9498,152.8432,155.7442,150.5976,176.0937,161.09,161.5896,163.17,158.3153,151.4154,162.6847,154.0382,152.8261,154.4967,159.4707,166.3647,162.3342,164.7032,164.9221,157.9006,158.6973,160.5473,161.5218,152.3049,162.1658,160.0799,162.2602,150.2674,157.7194,163.8651,164.1999,161.9694,155.5817,153.4237,157.3781,159.0537,176.1148,167.1496,164.5443,162.9202,162.2686,156.6761,162.2822,154.3513,154.3548,159.4505,162.1352,170.1915,162.1176,171.8184,170.1937,158.4938,156.9632,165.8539,159.2259,154.8945,168.9831,163.3357,164.2945,149.1528,156.4241,164.5406,158.8741,157.5382,154.4254,148.4723,151.0478,152.9772,168.7263,160.5042,160.0697,160.3121,157.5173,149.8669,154.374,151.4879,148.6612,150.6185,158.764,166.2706,156.1579,163.9941,161.9605,156.4982,156.51,155.4505,157.6667,151.6194,162.3715,156.9309,161.1659,148.8847,153.7567,156.96,159.4029,152.4364,157.1672,151.0795,153.8218,148.0355,171.3016,160.317,156.5942,160.3489,155.757,150.1388,154.7346,154.3447,154.5582,148.4839,155.8785,164.3454,159.6928,164.5505,158.2606,160.9062,151.5565,155.7552,155.4813,150.5755,159.6492,158.0097,160.4838,145.5482,158.7227,166.5917,166.2828,159.2394,160.6882,156.0195,155.8287,154.2696,178.5963,167.5181,165.1951,163.2454,162.1122,152.9775,160.6081,155.3746,159.4796,153.6491,166.626,170.1401,162.7072,168.7451,162.8588,159.4868,157.819,166.3206,158.7606,157.274,168.1351,165.1371,168.2642,154.6263,151.8854,155.1944,154.0628,151.7725,149.6676,143.9999,151.4541,143.4544,166.9677,158.3364,155.7828,156.2671,152.4127,144.7163,152.6654,147.2246,146.033,151.135,159.1203,161.1709,155.4294,163.8356,154.7158,154.0979,148.718,154.7793,151.5486,147.2707,160.2745,157.1328,158.9486,145.761,161.3823,167.9179,166.7038,163.5423,157.9554,155.8688,158.1932,155.6031,170.5073,165.8193,162.7798,161.7981,163.8669,154.2392,161.1599,156.4028,155.9867,161.6517,162.1473,169.608,162.5743,169.0918,167.474,156.6282,157.3821,164.8625,160.1598,153.601,167.211,161.2821,162.8263,155.7238,151.7828,157.5085,158.9105,157.2605,151.5908,147.3277,154.724,147.6527,169.5143,156.817,158.1017,155.0782,153.1759,145.7727,155.1545,149.5854,147.4396,151.7119,159.197,162.1465,158.2836,159.6059,161.0873,153.9256,152.8761,155.3359,153.086,150.1287,155.6223,158.1799,153.4386,148.915,157.2324,163.0322,158.9473,162.0024,157.8975,153.9306,159.0386,156.9126,171.3945,164.3573,157.4824,163.0388,164.6303,152.5824,160.8486,154.6457,156.3882,157.7663,161.4037,163.4009,161.7955,168.2757,164.7545,158.5044,156.2218,160.884,160.6691,154.7341,163.8414,161.6954,159.7055,150.8095,156.9571,162.6716,167.2999,159.2505,156.9813,151.6623,161.7201,154.8015,174.044,170.7237,164.2286,164.6361,165.1646,154.249,160.7048,155.4584,155.2976,158.992,162.7936,168.6238,160.1583,171.2997,165.0169,164.7113,159.6358,162.41,158.233,159.7667,164.3693,166.2418,167.9195,153.9051],"d1_0":"410440e840e34101410240bf410c4102411e410d4107411c4101410b40f640f040f440f740e540f940f6411240d140f3410040cf40dd410a40e4411b40f740b940c640df40ba40e840e1409d40ef40c640fb40f240ee40fc40dd40fe40f040dc40d340e640cf40c640da40eb40c140cd40da40c140b640e240c640dc40e340a8410640ea40e440ee40e940f0410e4100410d410640ed40f540f8410d410040f640e7410840ea410140fd410640c340d540ed40af40cb40e840f140f640f840d5410240fb40dc410240e540d3410540db4116411740f9410940f04115410140ee40f0410d40f2410640e5410140c040f140f640d940c640f340e940ff40fe40d2410140d340bd40ea40ea40c040e540d2411240f340e840df40d440fe40fe40e140ee410240ec40ed40e540dc40c440df40e0409c40c040e140e440fa40e040db40e540dc40c540db40d740c640ee40d8411140fc40d040dd40cb40f040f440e540e440f340de40f240cf40e940c440dc40de40c640b240f440d040e940ee40c240f040da40c040d840d940c4410640de410d40ec40dd40ea40d340f6411040ed40fd410540f1410b40f940f640d440f340ef40a840ba40d940e440f840f640c4411040f540d7410f410f40e8410f4103412a4103410c411840f14117410e40f6410a411340fc41104105411540f3410340f840dc40df410c40f94113411440e940f040d740cc40d140d840b540e640e54113410440fb40f540e1410440ff40da40ea40f740f740f940db40e140b240ed40fd40c340d9410340e5410140f140ae4119410840ef4100410140f1411241004130411a41034101410241154115410b41014115410b410d4102410640e94102410540c940e5410d4109410c410d40da4102410640e4410740ff40e34115410e41254110410b411541134118410741084102410540ff40f94106410b40e940e5410940da40df411140fb4107410440cb40bf40cb40bb40c740c740b440e440cf40f840f640bb40df40cf40f340fb40d240c040de40bb40d740e040ea40a540cd40df409740ac40d740ab40d940db408d410440ec40ee410d40e54102411b41034111410240e9410d41014110411041054106411f40f54108410e410c40da40db410940b440ba40f340fd4109410840da40f540f440dc40e340ee40e941124106410a40f640fa40f94104410b41004109410841104100410740f8410e40ff40e0410840bc40c6410940e340ed410040e6410540e940c640e040f040c5410140e5410f40ed40e140ec40cc410340f640ea40ef410240ec410040e2410640dd40d140db40b740cf40f640e34100410240c640d640e140cf40d840f040d2410440d3410740df410640ef40ee40fa410340fd40eb40f440e240e0410140f740ec40e840e040b940ac40ff40c1410140ee40c640df40ea40d540d940c640b5411340ec41074102410540f0410740f140fc410140f2410840e840e140fb410840e440d740f740a640d6410440e440f640cf40b340c740b140b940e540b840cf40f440cd40ff40c140c740db40e140db40e540d740c740f940b940db40cf40e340be40b740d6407740a740dd40d240d940d540ae410440ed40e140ff410140ba410140f04120410b411a410b410b411c41124108410b4112411640fc40fb40fb40e740f3410d40e240e641164102410f410a40df410e40fc40e140f540f240d4410b4103411d410840fe410540f54107410840f940e9410640f44109410140e340c440e3410140a340dc410340f7410740f640c840fa40de40d2410a40f240e7411041004120410a410b41104104411340ea41004101410f40f840e240cd410940e440f5410440d840c2410c41084107410740ca40ec40cc40ca410640d240da411240e6411840f140f6410a4101410e410841024101411740f9410240e7410840da40fc40f640c740b8410140f34116410740bd410a40f840da40eb40ed40ce411540fa411941164107410c41064113410e410e410641194113411240f1411840e04105410c40df40eb410441004106410240d940d140e640c240e040e640b3410040ea410b41024102410340fb410d40ea40f140dd40f240d940f640ca40f940ca40dd40ed40c540cc40fe40de410240df40b0410d40ff40e3410b410240f641194108412041114118411b410d411d4110410e40fc411a410441054101411240f64106411040c840ed411d4108410e411040f240f940f340d8410340f740d7411640f14126410440f44108410441104108410c4109411340ef4109410340ff40fb40fe410040a240d341054106411040f340c1410240e440e84101410140ec410b40e44120410640f8410540d9410c411140fa41084114410141014103410540d940fc410140d440c941064102410e411040ce410640fc40d640f040e840d0410840f14113410b40ed410040fd410a410340f640f8410c40ef410840f3410540e040f140f840a140d540e240fa40f940ea40c940fb40fc40df410540f540e7410d40f84112411040f440fc40ff410b410640ff40f7410b40ea40f540fc410a40dc40f0410240c040ba40f640df40e240fe40e8412d41254115412e412b4118413e412241494131412e412e41264139412e413541274140412141274128413041154124412e41004103412e411e412b41274119410d410440e6410640f540eb4124410441274113410c41024109410e410b411f410f4121410b41094102411640f94103410e40dc40e141114103410b410740f8410e41064103410d40f040de4127410641324121410c411a4122410b41224110410a4118410d41114113411f40e8410b411940d240f04113410c411c410340d2","dK_0":"431a43204322431b431a431543184314432b431d431e4322431c4311431c43154315431643204322431d4323431f43184319431c431a4313431d431d43204310431b43204328431c431b4315431b4317432a431f43224325431b4316431d4318431c431d4322432a431e43274324432243184324431d43164322431f431e431c431b43244321431d431b4319431a4318432b432143214322431d4317431e431a4318431a43224321432343284322431c4319431f431d4315431f431d43214316431b43234329432743204317431d43174331432343254326432443194320431d431f431d432343294320432943224323431f4322431d4318432343254322431c431e4324431f43204319431743194319432a432343234323431c4318431f43174317431943244328431f43244321431a4318431f431f43164321431c4322431a431943214320431e431843144315431b432c4321431c4320431d4313431c431843184318431c432343204322431d4318431843204318431b431f43204320431b431a431e431c431b431d4315431d4315432a431d431b4320431d4314431c4314431a431a43204325431a43284321431b4319431d431a43144321431d431c4315431e4322431c431c431e431443184317432b431f431d432043164316431d43184319431643204327431f43214320431a4319432043184317431f431a431f4317431f432643284323431f431a431b43174330432943264323432243194329431a431c431e432643284324432a43234320432143284320431c43244324432743174317431a4320431f431b4316431a4319432b431f4320431e431d4313431c4319431a4316432143274321432343234319431a431e431c43164320431e431e431643234327432843224321431b4323431f432f432943264327432643184323431c431e43224328432a4328432c432b4322432343264323432143264324432443194318431c4321431c431843124315431343284321431a431f431c4316431c43144316431743214325431643204320431d4316431c431a4318431e431c431f43124315431b431b431843154314431443154324431b43174316431943104318431243144317431a431c431a431f431b431443184311431a430f431a4315431c4311431a4319431d431e431343104316430f43274319431b431d431843134315431343154318431c431f4319431e432143154316431c43174316431d431a431d43124318431f4319431b43154311431843154325431b4319431e431c4312431943194315431c431d432243194322432143154317431d431b43144322431c43204311431c43214320431943174319431a4312432b432043224324431f4314431a431743144317431f4326432243244325431c43184320431a4317431d431e431a43164318431c4321431a431d431243184315432b431f431d431d431f4310431b431943194318431b4326431f43234321431c4319431d431d4316431e431f432443114314431f431f43204314431943184313432243204320431d431a43134317431343164317431a432043174325431c431a4318431f431a4315431c431e43214314431a431d4322431c431b431343184314432f432143204321431f4316431f431c4318431b431f4324431f43254324431d4319431f431a43194320431e43224316431b431c4321431c43164315431443134328431d431c4319431d4312431d43144318431a43204325431b4325431c4317431a4319431f4314431e431e431a43174319431e43204323431b4314431e4316432f431f43214322431d4317431d4318431b4318431e4320431c432243234319431b431d431843194324431b432143184318431e431d431c431b4319431843164327431f431f431d431e4317431d43184319431a43204324431b4325431e431c43174321431e4314431e431f431f431043174320431b431e431c4316431a4316432d431e43204321431c4315432343184317431743204323432043224323431a431d431f431e4316431f431e431f4315431c43244322432043194318431a431e432f432443234322431e431c432143194319431e43214328432143294328431b431a4322431d43184327432243234314431b4322431d431b43184312431743174326431f431f431e431b43144319431643144315431d4326431b43224320431a431b4319431b4316431e431b432043104317431b431e431543194314431a43134328431f431b431e431a43144318431943194313431a4322431e4324431c431d4315431943194313431e431b431e4310431c43264323431e431f431a4318431843304325432143204320431843204318431d431743244328432143264320431d431a4325431d431a432643244326431943154319431743164313430f4316430e4324431d4319431c4317430e4316431043114314431d431d431a4321431843184314431943144312431d431c431b43104321432743234322431c4319431b4319432a432543234320431f4317431f431b4319432043214328432243284326431a431a4323431e431743254320432243194315431c431c431b43164313431743134326431b431c43194316430f431a431543124315431f4320431d431d431f43194317431943174313431a431b43174313431c4320431d431f431d431a431b431a43294322431a432143244315431d4317431a431b431e4321432143254323431f431a431e4321431943234320431d4314431a43214327431e431b431543214318432c4329431f432243234319431d43194319431b431f4327431d432b43214324431f4321431d431d4321432443274316","d1_2":"410640ee40e74103410440c2410f410441214110410a411e4103410e40fb40f540f940fb40e940fe40fb411440d540f7410240d340e2410d40e8411d40fa40bd40ca40e440be40ec40e540a040f440ca40ff40f640f240ff40e2410140f540e040d640ea40d340ca40de40ef40c440d140de40c540ba40e740c940e040e640ab410840f040e840f240ee40f4411041024110410840f140f940fd4110410240fb40ec410a40ef41044101410840c740da40f040b340d040ec40f640fb40fd40d94105410140e1410440ea40d6410740df4118411940fd410b40f54118410340f340f4410f40f7410840ea410340c240f540fa40dd40cb40f740ee4102410140d6410440d740c140ee40ee40c240ea40d6411540f640ec40e240d84101410140e540f2410440f240f240ea40e040c840e340e4409f40c440e640e940fe40e440df40e940e140c940de40db40c940f340dc4114410040d440e040cf40f440f840ea40e840f840e240f640d340ed40c740e040e240ca40b740f840d440ee40f240c540f340df40c340dc40de40c6410940e2411040f040e140ee40d740fa411340f14101410840f6410d40fe40fa40d740f740f340ac40be40de40e840fc40fb40c8411240fb40db4111411340ec41124106412d4105410e411a40f6411a411040fa410c4115410141124108411740f7410540fc40e140e5410e40fe4115411640ed40f540dc40d040d540dc40b740eb40e941164106410040f940e64107410240df40ee40fb40fb40fd40df40e440b440f1410140c740de410640e9410440f540b1411c410b40f44102410440f5411541024133411d41054103410441184118410e41034118410e41104105410840ed4105410740cd40ea4111410c410f411040df4105410940e9410a410240e84118411141284112410e41174116411a410a410a41044107410240fe4108410d40ed40ea410c40de40e5411440ff4109410640d040c240cf40bf40ca40cb40b740e940d340fd40fa40bf40e340d240f7410040d640c440e240bf40db40e440ee40a840d240e2409a40b040dc40ae40dd40de4090410640f240f3410f40ea4104411e41064114410440ed410f41044113411241074108412140fb410a4111410e40de40df410b40b740be40f84101410c410a40de40f840fa40e040e640f440ed41154109410d40fa40ff40fd4107410d4103410b410a41134102410940fd4110410140e4410a40c040cb410b40e840f2410240eb410740ef40c940e340f540c8410340e9411240f140e440f040d0410640fb40ee40f3410440f1410340e7410840e140d540de40bb40d440fc40e64102410440c940d940e640d340dc40f640d5410740d7410a40e4410840f340f340ff4105410140ef40f940e740e4410440fb40f040ec40e440bc40b1410340c5410340f240c940e340f040d940dd40ca40b9411740f1410a4104410740f4410a40f64100410440f6410b40ec40e64100410a40e740db40fb40a940db410740e740fb40d240b640ca40b540be40e840bc40d240fa40d1410240c440cb40de40e540df40e940db40cb40fe40bd40df40d340e740c140bb40d9407c40ab40e140d640de40d840b1410740f240e54102410440bd410440f54123410d411d410d410e411e4114410c410d411541194101410040ff40ea40f7411040e640ec411941044112410c40e34111410140e540f940f740d8410f41054120410a4101410740fa410a410a40fe40ed410940f8410b410440e740c840e7410340a740e1410540fb410940fb40cc40ff40e440d6410c40f740eb411341034123410c410e41124107411640ef41024103411140fd40e640d1410b40e840f9410740dc40c7410f410a4109410940ce40ef40d240ce410840d740dd411640eb411b40f540fa410c41034111410a41044103411940fe410440eb410a40dd410040fa40cb40bd410440f7411a410a40c0410d40fe40df40ef40f240d2411840ff411c4118410a410e41094116411141104108411b4116411440f6411b40e24107410e40e440f1410741034108410440dd40d540eb40c640e340eb40b6410340ef410d4104410441054100410f40ee40f740e040f740dd40fa40ce40fd40cd40e140f140c840d1410140e2410440e340b34110410240e8410d410540fa411d410b41234113411b411d41104120411241114100411d410641074104411440f94108411240cc40f24121410b4111411240f640fe40f840dc410540fd40da411a40f64129410640f9410a41074112410b410e410b411640f4410b4106410240ff4101410240a640d741084109411240f740c5410540e940ed4103410340ef410e40e84123410840fd410740dd410f411440ff410a4117410441034106410740dd4100410340d840cd410941054111411340d24109410140da40f440ed40d4410a40f64115410d40f141024101410d410540fb40fc410e40f4410a40f8410740e440f540fb40a440d940e740ff40fe40ee40cd40ff410140e4410740fa40ea411040fd4115411240f841004102410d4108410240fb410d40ef40f94100410c40df40f5410540c440be40fb40e340e6410140ec4130412a41194131412f411a41424125414d4135413141304129413c41324139412941444125412a412c41334117412741314103410741324121412e4129411c410f410740eb410840fa40ef41284106412a4116410e4104410c4111410e412241114124410e410c4104411840fd4105411040e040e641144106410d410a40fd411141094106410f40f440e2412b410841354123410f411c4126410e41254113410c411b410f41144116412140ec410e411b40d640f54116410f411f410540d6","dK_2":"431b43214323431c431a431543184315432c431e431f4322431c4312431d43164315431743214323431e4323431f4318431a431d431a4313431d431d43204311431c43224328431c431c4316431b4317432b432043234326431c4316431e4318431c431e4323432b431f43284325432343194326431e43164323431f431f431d431c43254322431d431c431a431a4318432c432243224323431d4317431f431a4319431b43234322432443284322431d431a431f431e4316431f431e43224316431c4324432a432743204318431d43184332432443264326432543194321431d4320431e4325432b4321432a43224324431f4323431e4319432543264324431d431f4325431f4320431a431843194319432b432443244324431d4319431f43184317431943254329432043254322431b43194320432043184323431d4323431b431a43224320431f431943154316431b432c4321431d4321431f4314431c431943184319431d432443214323431e4319431943214318431b432143204321431b431a431f431d431c431d4315431e4316432c431e431c4320431e4315431d4315431b431b43214325431b43284322431c4319431d431b43144322431d431c4315431f4322431d431d431f431543194318432c4320431e432043174317431d43194319431743214328432043224321431b431a4320431943184320431b4320431743204327432843234320431b431c431843314329432743244322431a432a431b431c43204327432a4325432b43244321432143294320431c43254325432843184317431a43214320431c4317431b431a432d43204321431f431d4314431d431a431a4317432243284322432343254319431b431f431d43164321431f4320431643244327432843234322431b432443204330432a43274328432643194324431d431f43234328432b4328432c432c4322432443274324432243274325432543194319431d4322431d431943124316431443294321431b4320431e4317431d43154317431843224326431743214320431e4317431d431b4318431f431d432043134315431c431c431943164314431443154324431b43184317431a43114319431343154318431b431d431b4320431c431543184312431b430f431c4316431c4311431b431a431e431f431443114317430f43284319431c431e431943144316431343154319431d431f431a431f432243164317431d43194317431e431b431d4313431943204319431b43164312431943164326431c4319431f431d4312431a43194316431c431d4322431a4324432143164318431f431c43154324431c43214311431d43224321431a43184319431a4313432d43204322432443204314431b43174315431843214326432343244326431d43194321431a4318431e431f431b43164319431d4322431a431e431243184316432c4320431d431e43204311431c4319431a4319431c4328432043244322431d431a431e431f4317431f43204324431343144320432143204315431a43184313432343214320431e431b43144318431343174318431a432143174326431d431c43194320431b4315431d431f43224314431b431e4323431c431c431343184314433143224321432243204316431f431d4319431c43204325431f43254324431e43194321431b43194320431f43234317431c431d4322431c4317431543154313432a431d431c4319431e4313431d43154319431a43214325431c4325431d4318431a431a43204315431e431f431b4318431a431f43214324431c4316431e43174330431f43234323431e4318431d4319431c4319431f4321431d43234324431a431c431e431a431a4325431c432143184318431e431e431d431c431a431943164327431f4320431e431f4317431d43194319431b43214325431d4326431f431d43184321431f4314431f4320431f431143184320431c431f431c4317431a4316432e431e43204322431d4316432343194318431843214324432143224323431b431e4320432043164320431f43204316431d432443234321431a4319431b431e432f432543244322431f431d4323431a431a431f432143294322432a4329431b431b4323431e43194327432343234315431c4323431e431c431a431343184318432643204320431f431c4315431a431743154315431d4327431c43234320431b431c431a431c43174320431b432043104318431c431e4316431a4315431a43144329431f431b431e431b431443194319431a4314431b4323431f4324431c431e43154319431b43144320431b431f4311431c43264324431f4320431a4319431943304325432243214320431943204319431d431843254328432243274321431d431b4326431e431b432743244326431a4315431a431843164314430f4316430e4325431d431a431d4318430f4317431143124314431e431e431a4322431943194314431a43154313431f431c431d43114322432843244322431c431a431b4319432c432543234320432043184320431c431a432243224329432343284326431b431b4324431f431843264322432243194317431d431d431c43174313431743134327431c431c43194317430f431a43154312431543204321431d431e4320431a4317431943184314431a431c43184313431c4321431e431f431d431b431c431a432a4322431b432243244315431d4317431b431c431f43224322432543234320431a431f4321431943234321431d4314431b43234328431f431c431643224319432d4329432043224324431a431d431a431a431c43204329431e432c43224325431f4322431e431e4322432543274317","d1_3":"410640ee40e74103410440c2410f410441214110410a411e4103410e40fb40f540f940fb40e940fe40fb411440d540f7410240d340e2410d40e8411d40fa40bd40cb40e540bf40ed40e640a140f540cb410040f740f3410040e3410140f640e140d740eb40d440cb40df40f040c540d240df40c640bb40e840ca40e140e740ac410840f040e840f240ee40f4411041024110410840f240f940fd4110410240fb40ec410a40ef41044101410840c740da40f040b340d140ed40f640fb40fd40d94105410140e1410440ea40d6410740df4118411940fd410b40f54118410340f340f4410f40f7410840ea410340c240f540fa40dd40cb40f740ee4102410140d6410440d740c140ef40ef40c240eb40d6411540f640ec40e340d94101410140e740f3410440f440f340eb40e140c940e440e440a040c440e840ea40ff40e640e040e940e140c940de40db40c940f340dc4114410040d440e040cf40f440f840ea40e840f840e240f640d340ed40c740e040e240ca40b740f840d440ee40f240c540f340df40c340dc40de40c6410940e2411040f040e140ee40d740fa411340f14101410840f6410d40fe40fa40d740f740f340ac40be40de40e840fc40fb40c8411240fc40db4111411340ed41124106412d4105410e411a40f7411a411040fb410c4115410141124108411740f8410540fd40e240e5410e40ff4115411640ed40f540dd40d040d540dd40b740eb40e941164106410040f940e64107410240df40ee40fb40fb40fd40df40e440b440f1410140c740de410640e9410440f540b1411c410b40f44102410440f5411541024133411d41054103410441184118410e41034118410e41104105410840ed4105410740cd40ea4111410c410f411040df4105410940e9410a410240e84118411141284112410e41174116411a410a410a41044107410240fe4108410d40ed40ea410c40de40e5411440ff4109410640d040c240cf40bf40ca40cb40b740e940d340fd40fa40bf40e340d240f7410040d640c440e240bf40db40e440ee40a840d240e2409a40b040dc40ae40dd40de4090410640f240f3410f40ea4104411e41064114410440ed410f41044113411241074108412140fb410a4111410e40de40df410b40b740be40f84101410c410a40de40f840fa40e040e640f540ed41154109410d40fa410040fd4107410d4103410b410a41134102410940fd4110410140e4410a40c040cb410b40e840f2410240eb410740ef40c940e340f540c8410340e9411240f140e440f040d0410640fb40ee40f3410440f1410340e7410840e140d540de40bb40d440fc40e64102410440c940da40e640d440dd40f740d6410740d8410a40e4410840f440f541004105410140f040fa40e840e5410440fc40f240ed40e540bc40b2410340c6410340f440ca40e340f040d940dd40ca40b9411740f1410a4104410740f4410a40f64100410440f6410b40ec40e64100410a40e740db40fb40a940db410740e740fb40d240b640cb40b540be40e840bc40d240fb40d1410240c540cb40de40e640df40ea40db40cb40ff40be40e040d440e740c140bb40d9407c40ab40e140d740de40d940b1410740f240e54102410440bd410440f54123410d411d410d410e411e4114410c410d411541194101410040ff40ea40f7411040e640ec411941044112410c40e34111410140e540f940f740d8410f41054120410a4101410740fa410a410a40fe40ed410940f8410b410440e740c840e7410340a740e1410540fb410940fb40cc40ff40e440d6410c40f740ec411341034123410c410e41124107411640f041024103411140fe40e740d1410b40e840fa410740dc40c7410f410a4109410940ce40ef40d340ce410840d740dd411640eb411b40f640fa410c41034111410a41044103411940ff410440ec410a40de410040fb40cc40bd410440f7411a410a40c0410d40fe40df40f040f240d241184100411c4118410a410e41094116411141104108411b4116411440f8411b40e34107410e40e440f1410741034108410440de40d540eb40c640e340eb40b6410340ef410d4104410441054100410f40ef40f740e040f740dd40fb40ce40fd40cd40e140f140c840d1410140e2410440e340b34110410240e8410d410540fa411d410b41234113411b411d41104120411241114100411d410641074104411440f94108411240cc40f24121410b4111411240f740fe40f840dc410540fd40da411a40f64129410640f9410a41074112410b410e410b411640f4410b4106410240ff4101410240a640d741084109411240f740c5410540e940ee4103410340f0410e40e94123410840fe410740dd410f41144100410a4117410441034106410740de4100410340d840ce410941054111411340d24109410140da40f440ed40d4410a40f64115410d40f141024101410d410540fb40fc410e40f4410a40f8410740e440f540fb40a440d940e740ff40fe40ee40cd40ff410140e4410740fa40ea411040fd4115411240f941004102410d4108410240fb410d40ef40f94100410c40df40f5410540c440be40fb40e340e6410140ec4130412a41194131412f411a41424125414d4135413141304129413c41324139412941444125412a412c41334117412741314103410741324121412e4129411c410f410740eb410840fa40ef41284106412a4116410e4104410c4111410e412241114124410e410c4104411840fd4105411040e040e641144106410d410a40fd411141094106410f40f440e2412b410841354123410f411c4126410e41254113410c411b410f41144116412140ed410e411b40d640f54116410f411f410540d6","dK_3":"431b43214323431c431a431543184315432c431e431f4322431c4312431d43164315431743214323431e4323431f4318431a431d431a4313431d431d43204311431c43224328431c431c4316431b4317432b432043234326431c4316431e4318431c431e4323432b431f43284325432343194326431e43164323431f431f431d431c43254322431d431c431a431a4318432c432243224323431d4317431f431a4319431b43234322432443284322431d431a431f431e4316431f431e43224316431c4324432a432743204318431d43184332432443264326432543194321431d4320431e4325432b4321432a43224324431f4323431e4319432543264324431d431f4325431f4320431a431843194319432b432443244324431d4319431f43184317431943254329432043254322431b43194320432043184323431d4324431b431a43224320431f431943154316431b432c4321431d4321431f4314431c431943184319431d432443214323431e4319431943214318431b432143204321431b431a431f431d431c431d4315431e4316432c431e431c4320431e4315431d4315431b431b43214325431b43284322431c4319431d431b43144322431d431c4315431f4323431d431d431f431543194318432c4320431e432043174317431d43194319431743214328432043224321431b431a4320431943184321431b4320431743204327432843234320431b431c431843314329432743244322431a432a431b431c43204327432a4325432b43244321432143294320431c43254325432843184317431a43214320431c4317431b431a432d43204321431f431d4314431d431a431a4317432243284322432343254319431b431f431d43164321431f4320431643244327432843234322431b432443204330432a43274328432643194324431d431f43234328432b4328432c432c4322432443274324432243274325432543194319431d4322431d431943124316431443294321431b4320431e4317431d43154317431843224326431743214320431e4317431d431b4318431f431d432043134315431c431c431943164314431443154324431b43184317431a43114319431343154318431b431d431b4320431c431543184312431b430f431c4316431c4311431b431a431e431f431443114317430f43284319431c431e431943144316431343154319431d431f431a431f432243164317431d43194317431e431b431d4313431943204319431b43164312431943164326431c4319431f431d4312431a43194316431c431d4322431a4324432143164318431f431c43154324431c43214311431d43224321431a43184319431a4313432d43204322432443204314431b43174315431843214326432343244326431d43194321431a4318431e431f431b43174319431d4322431a431e431243184316432c4320431d431e43204311431c4319431a4319431c4328432043244322431d431a431e431f4317431f43204324431343144320432143204315431a43194313432343214320431e431b43144318431343174318431a432143174326431d431c43194320431b4315431d431f43224314431b431e4323431c431c431343184314433143224321432243204316431f431d4319431c43204325431f43254324431e43194321431b43194320431f43234317431c431d4322431c4317431543154313432a431d431c4319431e4313431d43154319431a43214325431c4325431d4318431a431a43204315431e431f431b4318431a431f43214324431c4316431e43174330431f43234323431e4318431d4319431c4319431f4321431d43234324431a431c431e431a431a4325431c432143184318431e431e431d431c431a431943164327431f4320431e431f4317431d43194319431b43214325431d4326431f431d43184321431f4314431f4320431f431143184320431c431f431c4317431a4317432e431e43204322431d4316432343194318431843214324432143224323431b431e4320432043164320431f43204316431d432443234321431a4319431b431e432f432543244322431f431d4323431a431a431f432143294322432a4329431b431b4323431e43194327432343234315431c4323431e431c431a431343184318432643204320431f431c4315431a431743154315431d4327431c43234320431b431c431a431c43174320431b432043104318431c431e4316431a4315431a43144329431f431b431e431b431443194319431a4314431b4323431f4324431c431e43154319431b43144320431b431f4311431c43264324431f4320431b4319431943304325432243214320431943204319431d431843254328432243274321431d431b4326431e431b432743244326431a4315431a431843164314430f4316430e4325431d431a431d4318430f4317431143124314431e431e431a4322431943194314431a43154313431f431c431d43114322432843244322431c431a431b4319432c432543234320432043184320431c431a432243224329432343284326431b431b4324431f431843264322432243194317431d431d431c43174313431743134327431c431c43194317430f431a43154312431543204321431d431e4320431a4317431943184314431a431c43184313431c4321431e431f431d431b431c431a432a4322431b432243244315431d4317431b431c431f43224322432543234320431a431f4321431943234321431d4314431b43234328431f431c431643224319432d4329432043224324431a431d431a431a431c43204329431e432c43224325431f4322431e431e4322432543274317","d1_4":"410640ee40e74103410440c2410f410441214110410a411e4103410e40fb40f540f940fb40e940fe40fb411440d540f7410240d340e2410d40e8411d40fa40bd40cb40e540bf40ed40e640a140f540cb410040f740f3410040e3410140f640e140d740eb40d440cb40df40f040c540d240df40c640bb40e840ca40e140e740ac410840f040e840f240ee40f4411041024110410840f240f940fd4110410240fb40ec410a40ef41044101410840c740da40f040b340d140ed40f640fb40fd40d94105410140e1410440ea40d6410740df4118411940fd410b40f54118410340f340f4410f40f7410840ea410340c240f540fa40dd40cb40f740ee4102410140d6410440d740c140ef40ef40c240eb40d6411540f640ec40e340d94101410140e740f3410440f440f340eb40e140c940e440e440a040c440e840ea40ff40e640e040e940e140c940de40db40c940f340dc4114410040d440e040cf40f440f840ea40e840f840e240f640d340ed40c740e040e240ca40b740f840d440ee40f240c540f340df40c340dc40de40c6410940e2411040f040e140ee40d740fa411340f14101410840f6410d40fe40fa40d740f740f340ac40be40de40e840fc40fb40c8411240fc40db4111411340ed41124106412d4105410e411a40f7411a411040fb410c4115410141124108411740f8410540fd40e240e5410e40ff4115411640ed40f540dd40d040d540dd40b740eb40e941164106410040f940e64107410240df40ee40fb40fb40fd40df40e440b440f1410140c740de410640e9410440f540b1411c410b40f44102410440f5411541024133411d41054103410441184118410e41034118410e41104105410840ed4105410740cd40ea4111410c410f411040df4105410940e9410a410240e84118411141284112410e41174116411a410a410a41044107410240fe4108410d40ed40ea410c40de40e5411440ff4109410640d040c240cf40bf40ca40cb40b740e940d340fd40fa40bf40e340d240f7410040d640c440e240bf40db40e440ee40a840d240e2409a40b040dc40ae40dd40de4090410640f240f3410f40ea4104411e41064114410440ed410f41044113411241074108412140fb410a4111410e40de40df410b40b740be40f84101410c410a40de40f840fa40e040e640f540ed41154109410d40fa410040fd4107410d4103410b410a41134102410940fd4110410140e4410a40c040cb410b40e840f2410240eb410740ef40c940e340f540c8410340e9411240f140e440f040d0410640fb40ee40f3410440f1410340e7410840e140d540de40bb40d440fc40e64102410440c940da40e640d440dd40f740d6410740d8410a40e4410840f440f541004105410140f040fa40e840e5410440fc40f240ed40e540bc40b2410340c6410340f440ca40e340f040d940dd40ca40b9411740f1410a4104410740f4410a40f64100410440f6410b40ec40e64100410a40e740db40fb40a940db410740e740fb40d240b640cb40b540be40e840bc40d240fb40d1410240c540cb40de40e640df40ea40db40cb40ff40be40e040d440e740c140bb40d9407c40ab40e140d740de40d940b1410740f240e54102410440bd410440f54123410d411d410d410e411e4114410c410d411541194101410040ff40ea40f7411040e640ec411941044112410c40e34111410140e540f940f740d8410f41054120410a4101410740fa410a410a40fe40ed410940f8410b410440e740c840e7410340a740e1410540fb410940fb40cc40ff40e440d6410c40f740ec411341034123410c410e41124107411640f041024103411140fe40e740d1410b40e840fa410740dc40c7410f410a4109410940ce40ef40d340ce410840d740dd411640eb411b40f640fa410c41034111410a41044103411940ff410440ec410a40de410040fb40cc40bd410440f7411a410a40c0410d40fe40df40f040f240d241184100411c4118410a410e41094116411141104108411b4116411440f8411b40e34107410e40e440f1410741034108410440de40d540eb40c640e340eb40b6410340ef410d4104410441054100410f40ef40f740e040f740dd40fb40ce40fd40cd40e140f140c840d1410140e2410440e340b34110410240e8410d410540fa411d410b41234113411b411d41104120411241114100411d410641074104411440f94108411240cc40f24121410b4111411240f740fe40f840dc410540fd40da411a40f64129410640f9410a41074112410b410e410b411640f4410b4106410240ff4101410240a640d741084109411240f740c5410540e940ee4103410340f0410e40e94123410840fe410740dd410f41144100410a4117410441034106410740de4100410340d840ce410941054111411340d24109410140da40f440ed40d4410a40f64115410d40f141024101410d410540fb40fc410e40f4410a40f8410740e440f540fb40a440d940e740ff40fe40ee40cd40ff410140e4410740fa40ea411040fd4115411240f941004102410d4108410240fb410d40ef40f94100410c40df40f5410540c440be40fb40e340e6410140ec4130412a41194131412f411a41424125414d4135413141304129413c41324139412941444125412a412c41334117412741314103410741324121412e4129411c410f410740eb410840fa40ef41284106412a4116410e4104410c4111410e412241114124410e410c4104411840fd4105411040e040e641144106410d410a40fd411141094106410f40f440e2412b410841354123410f411c4126410e41254113410c411b410f41144116412140ed410e411b40d640f54116410f411f410540d6","dK_4":"431b43214323431c431a431543184315432c431e431f4322431c4312431d43164315431743214323431e4323431f4318431a431d431a4313431d431d43204311431c43224328431c431c4316431b4317432b432043234326431c4316431e4318431c431e4323432b431f43284325432343194326431e43164323431f431f431d431c43254322431d431c431a431a4318432c432243224323431d4317431f431a4319431b43234322432443284322431d431a431f431e4316431f431e43224316431c4324432a432743204318431d43184332432443264326432543194321431d4320431e4325432b4321432a43224324431f4323431e4319432543264324431d431f4325431f4320431a431843194319432b432443244324431d4319431f43184317431943254329432043254322431b43194320432043184323431d4324431b431a43224320431f431943154316431b432c4321431d4321431f4314431c431943184319431d432443214323431e4319431943214318431b432143204321431b431a431f431d431c431d4315431e4316432c431e431c4320431e4315431d4315431b431b43214325431b43284322431c4319431d431b43144322431d431c4315431f4323431d431d431f431543194318432c4320431e432043174317431d43194319431743214328432043224321431b431a4320431943184321431b4320431743204327432843234320431b431c431843314329432743244322431a432a431b431c43204327432a4325432b43244321432143294320431c43254325432843184317431a43214320431c4317431b431a432d43204321431f431d4314431d431a431a4317432243284322432343254319431b431f431d43164321431f4320431643244327432843234322431b432443204330432a43274328432643194324431d431f43234328432b4328432c432c4322432443274324432243274325432543194319431d4322431d431943124316431443294321431b4320431e4317431d43154317431843224326431743214320431e4317431d431b4318431f431d432043134315431c431c431943164314431443154324431b43184317431a43114319431343154318431b431d431b4320431c431543184312431b430f431c4316431c4311431b431a431e431f431443114317430f43284319431c431e431943144316431343154319431d431f431a431f432243164317431d43194317431e431b431d4313431943204319431b43164312431943164326431c4319431f431d4312431a43194316431c431d4322431a4324432143164318431f431c43154324431c43214311431d43224321431a43184319431a4313432d43204322432443204314431b43174315431843214326432343244326431d43194321431a4318431e431f431b43174319431d4322431a431e431243184316432c4320431d431e43204311431c4319431a4319431c4328432043244322431d431a431e431f4317431f43204324431343144320432143204315431a43194313432343214320431e431b43144318431343174318431a432143174326431d431c43194320431b4315431d431f43224314431b431e4323431c431c431343184314433143224321432243204316431f431d4319431c43204325431f43254324431e43194321431b43194320431f43234317431c431d4322431c4317431543154313432a431d431c4319431e4313431d43154319431a43214325431c4325431d4318431a431a43204315431e431f431b4318431a431f43214324431c4316431e43174330431f43234323431e4318431d4319431c4319431f4321431d43234324431a431c431e431a431a4325431c432143184318431e431e431d431c431a431943164327431f4320431e431f4317431d43194319431b43214325431d4326431f431d43184321431f4314431f4320431f431143184320431c431f431c4317431a4317432e431e43204322431d4316432343194318431843214324432143224323431b431e4320432043164320431f43204316431d432443234321431a4319431b431e432f432543244322431f431d4323431a431a431f432143294322432a4329431b431b4323431e43194327432343234315431c4323431e431c431a431343184318432643204320431f431c4315431a431743154315431d4327431c43234320431b431c431a431c43174320431b432043104318431c431e4316431a4315431a43144329431f431b431e431b431443194319431a4314431b4323431f4324431c431e43154319431b43144320431b431f4311431c43264324431f4320431b4319431943304325432243214320431943204319431d431843254328432243274321431d431b4326431e431b432743244326431a4315431a431843164314430f4316430e4325431d431a431d4318430f4317431143124314431e431e431a4322431943194314431a43154313431f431c431d43114322432843244322431c431a431b4319432c432543234320432043184320431c431a432243224329432343284326431b431b4324431f431843264322432243194317431d431d431c43174313431743134327431c431c43194317430f431a43154312431543204321431d431e4320431a4317431943184314431a431c43184313431c4321431e431f431d431b431c431a432a4322431b432243244315431d4317431b431c431f43224322432543234320431a431f4321431943234321431d4314431b43234328431f431c431643224319432d4329432043224324431a431d431a431a431c43204329431e432c43224325431f4322431e431e4322432543274317","order":[[0,0,0,0],[0,8,8,0],[16,0,16,0],[16,8,24,0],[0,32,32,0],[0,40,40,0],[16,32,48,0],[16,40,56,0],[32,16,0,0],[32,24,8,0],[48,16,16,0],[48,24,24,0],[32,48,32,0],[32,56,40,0],[48,48,48,0],[48,56,56,0],[0,0,0,1],[0,8,8,1],[16,0,16,1],[16,8,24,1],[0,32,32,1],[0,40,40,1],[16,32,48,1],[16,40,56,1],[32,16,0,1],[32,24,8,1],[48,16,16,1],[48,24,24,1],[32,48,32,1],[32,56,40,1],[48,48,48,1],[48,56,56,1],[0,0,0,2],[0,8,8,2],[16,0,16,2],[16,8,24,2],[0,32,32,2],[0,40,40,2],[16,32,48,2],[16,40,56,2],[32,16,0,2],[32,24,8,2],[48,16,16,2],[48,24,24,2],[32,48,32,2],[32,56,40,2],[48,48,48,2],[48,56,56,2],[0,0,0,3],[0,8,8,3],[16,0,16,3],[16,8,24,3],[0,32,32,3],[0,40,40,3],[16,32,48,3],[16,40,56,3],[32,16,0,3],[32,24,8,3],[48,16,16,3],[48,24,24,3],[32,48,32,3],[32,56,40,3],[48,48,48,3],[48,56,56,3]],"hist":{"0":[[0,0,0,0,0.0,3.390625],[8,0,16,32,3.390625,8.25]],"2":[[0,0,0,0,0.0,3.390625],[8,0,16,32,3.390625,8.25],[16,1,0,0,8.25,8.3125],[24,1,16,32,8.3125,8.375]],"3":[[0,0,0,0,0.0,3.390625],[8,0,16,32,3.390625,8.25],[16,1,0,0,8.25,8.3125],[24,1,16,32,8.3125,8.375],[32,2,0,0,8.375,8.375],[40,2,16,32,8.375,8.375]],"4":[[0,0,0,0,0.0,3.390625],[8,0,16,32,3.390625,8.25],[16,1,0,0,8.25,8.3125],[24,1,16,32,8.3125,8.375],[32,2,0,0,8.375,8.375],[40,2,16,32,8.375,8.375],[48,3,0,0,8.375,8.375],[56,3,16,32,8.375,8.375]]}};
+  (function () {
+    var root = document.getElementById("fig-heat");
+    var g = TT.canvas(root, 900, 330), ctx = g.ctx, C = TT.C;
+    function bf(h, i) { var u = parseInt(h.substr(i * 4, 4), 16) << 16; var b = new DataView(new ArrayBuffer(4)); b.setUint32(0, u >>> 0); return b.getFloat32(0); }
+    var in0 = [], in1 = [];
+    for (var i = 0; i < 1024; i++) { in0.push(bf(B07.in0, i)); in1.push(bf(B07.in1, i)); }
+    var fid = 0, kv = "1";
+    var FN = { 0: "LoFi", 2: "HiFi2", 3: "HiFi3", 4: "HiFi4" };
+    var bar = document.getElementById("heat-modes");
+    function mk(lbl, on, fn) { var b = document.createElement("button"); b.className = "tt" + (on ? " on" : ""); b.textContent = lbl; b.onclick = function () { fn(b); }; bar.appendChild(b); return b; }
+    var s1 = document.createElement("span"); s1.textContent = "Fidelity:"; bar.appendChild(s1);
+    var fb = [0, 2, 3, 4].map(function (f) { return mk(FN[f], f === fid, function (b) { fid = f; fb.forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); st.render(); }); });
+    var s2 = document.createElement("span"); s2.textContent = " Dst after:"; bar.appendChild(s2);
+    var kb = [["1", "1 tile product (K=32)"], ["K", "all 20 (K=640)"]].map(function (k) { return mk(k[1], k[0] === kv, function (b) { kv = k[0]; kb.forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); st.render(); }); });
+    function dst() { var h = B07[(kv === "1" ? "d1_" : "dK_") + fid], o = []; for (var i = 0; i < 1024; i++) o.push(bf(h, i)); return o; }
+    function ref() { return kv === "1" ? B07.ref1 : B07.refK; }
+    function ulp(v) { v = Math.abs(v); if (v === 0) return 1; return Math.pow(2, Math.floor(Math.log2(v)) - 7); }
+    var P = [{ x: 20, t: "in0 tile (from SrcB)" }, { x: 240, t: "in1 tile (from SrcA)" }, { x: 460, t: "Dst" }, { x: 680, t: "Dst − exact (BF16 ulps)" }], Y = 40, CS = 6;
+    function ramp(v, lo, hi) { var t = Math.max(0, Math.min(1, (v - lo) / (hi - lo))); var r = Math.round(20 + 60 * t), gg = Math.round(30 + 200 * t), b = Math.round(60 + 160 * t); return "rgb(" + r + "," + gg + "," + b + ")"; }
+    function div(v) { var t = Math.max(-1, Math.min(1, v / 4)); if (t < 0) return "rgb(" + Math.round(30 + 20 * (1 + t)) + "," + Math.round(60 + 80 * (1 + t)) + "," + Math.round(120 + 130 * -t) + ")"; return "rgb(" + Math.round(120 + 130 * t) + "," + Math.round(60 + 60 * (1 - t)) + "," + Math.round(50 + 30 * (1 - t)) + ")"; }
+    var ORDER = B07.order.slice(0, 16);
+    var steps = [{ dur: 1, text: "" }];
+    ORDER.forEach(function (o, k) { steps.push({ dur: 0.6, text: "", o: o, k: k }); });
+    steps.push({ dur: 1, text: "" });
+    function faceRect(row64, nrows) { var f = Math.floor(row64 / 16); return { r: Math.floor(f / 2) * 16 + row64 % 16, c: (f % 2) * 16, h: nrows, w: 16 }; }
+    var cur = null;
+    function draw(i, t, s) {
+      TT.clear(ctx, g.W, g.H);
+      var D = dst(), Rf = ref(), dmax = 0;
+      for (var q = 0; q < 1024; q++) dmax = Math.max(dmax, Rf[q]);
+      var sumAbs = 0, below = 0, exactCnt = 0;
+      P.forEach(function (p, pi) {
+        TT.text(ctx, p.t, p.x, Y - 14, { font: "bold 12px" });
+        for (var r = 0; r < 32; r++) for (var c = 0; c < 32; c++) {
+          var n = r * 32 + c, col;
+          if (pi === 0) col = ramp(in0[n], 0, 1);
+          else if (pi === 1) col = ramp(in1[n], 0, 1);
+          else if (pi === 2) col = ramp(D[n], 0, dmax);
+          else { var u = (D[n] - Rf[n]) / ulp(Rf[n]); col = div(u); }
+          ctx.fillStyle = col; ctx.fillRect(p.x + c * CS, Y + r * CS, CS - 0.5, CS - 0.5);
+        }
+        ctx.strokeStyle = C.border; ctx.strokeRect(p.x - 0.5, Y - 0.5, 32 * CS + 1, 32 * CS + 1);
+        ctx.strokeStyle = "#555"; ctx.beginPath(); ctx.moveTo(p.x + 16 * CS, Y); ctx.lineTo(p.x + 16 * CS, Y + 32 * CS); ctx.moveTo(p.x, Y + 16 * CS); ctx.lineTo(p.x + 32 * CS, Y + 16 * CS); ctx.stroke();
+      });
+      for (var q2 = 0; q2 < 1024; q2++) { var dd = D[q2] - Rf[q2]; sumAbs += Math.abs(dd); if (dd < 0) below++; }
+      // highlight current MVMUL
+      if (s && s.o) {
+        var o = s.o, a = faceRect(o[0], 16), b = faceRect(o[1], 8), d = faceRect(o[2], 8);
+        function hl(px, rc, col) { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.strokeRect(px + rc.c * CS - 1, Y + rc.r * CS - 1, rc.w * CS + 2, rc.h * CS + 2); ctx.lineWidth = 1; }
+        hl(P[0].x, b, C.yellow); hl(P[1].x, a, C.yellow); hl(P[2].x, d, C.yellow); hl(P[3].x, d, C.yellow);
+      }
+      var yb = Y + 32 * CS + 22;
+      TT.text(ctx, "0", 20, yb, { font: "11px", color: C.muted }); for (var z = 0; z < 60; z++) { ctx.fillStyle = ramp(z / 59, 0, 1); ctx.fillRect(34 + z * 3, yb - 5, 3, 10); } TT.text(ctx, "1  (operands)", 220, yb, { font: "11px", color: C.muted });
+      TT.text(ctx, "Dst 0 … " + dmax.toFixed(1), 460, yb, { font: "11px", color: C.muted });
+      for (var z2 = -40; z2 <= 40; z2++) { ctx.fillStyle = div(z2 / 10); ctx.fillRect(760 + (z2 + 40) * 1.2, yb - 5, 1.3, 10); }
+      TT.text(ctx, "−4", 740, yb, { font: "11px", color: C.muted, align: "right" }); TT.text(ctx, "+4 ulp", 862, yb, { font: "11px", color: C.muted });
+      TT.text(ctx, FN[fid] + ", after " + (kv === "1" ? "1 tile product" : "20 tile products") + ":  mean |Dst − exact| = " + (sumAbs / 1024).toFixed(6) + ",  " + below + " / 1024 elements below exact", 20, yb + 26, { font: "13px" });
+      var txt;
+      if (i === 0) txt = "<b>The first tile product of output tile (0,0), seed 42.</b> Pick a fidelity and a K. With LoFi after one tile product, every one of the 1024 elements is below the exact value (the difference map is all blue): truncated slices only ever make products smaller. From HiFi2 on the map turns mostly grey, with 569–583 of 1024 elements exactly equal to the correctly rounded BF16 value. Press Step to walk the 16 MVMULs.";
+      else if (i === steps.length - 1) txt = "<b>That was phase 0.</b> At HiFi2/3/4 the dump repeats these 16 MVMULs with phase 1, 2, 3 (the M lines' phase field), with the same rows. Now switch K to 640. After 20 tile products every fidelity is about 1.5–2.2 off, and from HiFi2 on mostly <i>below</i> exact (928 of 1024 at HiFi4): the BF16 accumulator, not the multiplier, dominates. Step 6 explains the blue.";
+      else { var o2 = s.o; txt = "<b>MVMUL " + s.k + " (phase 0).</b> SrcB rows " + o2[1] + "–" + (o2[1] + 7) + " (8 rows of in0 face " + Math.floor(o2[1] / 16) + ") × SrcA rows " + o2[0] + "–" + (o2[0] + 15) + " (in1 face " + Math.floor(o2[0] / 16) + ") → Dst rows " + o2[2] + "–" + (o2[2] + 7) + " (face " + Math.floor(o2[2] / 16) + "). 8 × 16 outputs, each a 16-term dot product: 2048 multiplies in one instruction."; }
+      s.text = txt;
+    }
+    var st = TT.stepper({ root: root, steps: steps, draw: draw });
+    root.insertBefore(document.getElementById("heat-read"), root.querySelector(".controls"));
+    st.render();
+    g.canvas.addEventListener("mousemove", function (e) {
+      var rr = g.canvas.getBoundingClientRect(), x = (e.clientX - rr.left) * g.W / rr.width, y = (e.clientY - rr.top) * g.H / rr.height;
+      var out = "Hover a cell.";
+      P.forEach(function (p) {
+        var c = Math.floor((x - p.x) / CS), r = Math.floor((y - Y) / CS);
+        if (c >= 0 && c < 32 && r >= 0 && r < 32) {
+          var n = r * 32 + c, D = dst(), Rf = ref();
+          out = "C[" + r + "][" + c + "]  in0=" + in0[n] + "  in1=" + in1[n] + "  Dst(" + FN[fid] + ")=" + D[n] + "  exact=" + Rf[n].toFixed(6) + "  diff=" + ((D[n] - Rf[n]) / ulp(Rf[n])).toFixed(2) + " ulp";
+        }
+      });
+      document.getElementById("heat-read").textContent = out;
+    });
+  })();
+  </script>
+
+  <p>Some numbers from these tiles (from the JSON files, against the exact reference, counting elements whose Dst equals the exact value rounded to nearest BF16):</p>
+  <table>
+    <tr><th>Fidelity</th><th class="num">K = 32: mean |err|</th><th class="num">K = 32: correctly rounded</th><th class="num">K = 32: below exact</th><th class="num">K = 640: mean |err|</th><th class="num">K = 640: below exact</th></tr>
+    <tr><td>LoFi</td><td class="num">0.1591</td><td class="num">0 / 1024</td><td class="num">1024</td><td class="num">2.2031</td><td class="num">1006</td></tr>
+    <tr><td>HiFi2</td><td class="num">0.0232</td><td class="num">569 / 1024</td><td class="num">744</td><td class="num">1.5292</td><td class="num">929</td></tr>
+    <tr><td>HiFi3</td><td class="num">0.0227</td><td class="num">583 / 1024</td><td class="num">660</td><td class="num">1.5231</td><td class="num">928</td></tr>
+    <tr><td>HiFi4</td><td class="num">0.0227</td><td class="num">583 / 1024</td><td class="num">660</td><td class="num">1.5231</td><td class="num">928</td></tr>
+  </table>
+  <p>Even after a single tile product, HiFi4 is correctly rounded in only 57% of elements. That isn't the multiplier's fault, since at HiFi4 the four pieces of every product add up exactly. It is the adds. Each element of one tile product is written by 8 MVMULs (2 K-halves × 4 phases), and every one of them rounds Dst back to 8 significant bits, after the group alignment and the 11-bit pre-rounding. In this data, phases 2 and 3 are then rounded away almost entirely, as Step 6 shows.</p>
+
+  <h2 id="useless">Step 6: When extra phases stop doing anything</h2>
+  <p>Why did phase 3 change nothing, and phase 2 almost nothing? Look at the sizes. For element (0,0), phase 1 adds 0.085 and 0.050 to its two 16-term slabs (1–2.5% of the slab values 3.48 and 4.90). Phase 2 adds 0.011 and 0.010 (0.2–0.3%), and phase 3 adds 0.0003 and 0.00006 (below 0.01%). Each is <em>added to Dst</em> and rounded to BF16. A BF16 value in [2<sup><i>e</i></sup>, 2<sup><i>e</i>+1</sup>) has a step of 2<sup><i>e</i>−7</sup>. If the term is less than half a step, round-to-nearest gives back the old Dst exactly. As the dot product accumulates, Dst grows (about 8 per tile product here) and its step grows with it. One by one the phases fall below the threshold. The dump lets us count it exactly: for each of the 20 tile products of output tile (0,0), how many of the 2048 Dst element-updates (1024 elements × 2 MVMULs) did phase 1, 2 or 3 actually change?</p>
+
+  <div class="viz" id="fig-use"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-use");
+    var g = TT.canvas(root, 900, 360), ctx = g.ctx, C = TT.C;
+    var P1 = [2048, 1871, 1672, 895, 168, 110, 106, 71, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var P2 = [134, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var L = 80, R = 870, T = 50, B = 290;
+    var steps = [
+      { dur: 1, text: "<b>The setup.</b> HiFi4 dump, output tile (0,0), seed 42. One group of bars per tile product k = 0…19 (K-step). Bar height: Dst updates (out of 2048) that the phase changed. The scale is logarithmic so a single change still shows. Phase 0 changes all 2048 in every tile product, so it is not drawn." },
+      { dur: 2.5, text: "<b>Phase 1 (green).</b> All 2048 updates change in the first tile product, while Dst is below about 8. Then the count collapses: 1871, 1672, 895, 168 … and after the 9th tile product (Dst ≈ 64–80, step 0.5, half-step 0.25), phase 1 never changes another bit. For the last 11 of 20 tile products HiFi2's second phase is wasted work." },
+      { dur: 1.5, text: "<b>Phases 2 and 3 (orange, pink).</b> Phase 2 changes 134 updates, all in the very first tile product, and none after. Phase 3 changes none at all. Counted per instruction: 816 of the 1280 MVMULs for this output tile at HiFi4 left all 128 of their Dst elements unchanged (all 320 in phase 3, 304 of 320 in phase 2, 192 of 320 in phase 1). They are pure cost, and that is with the default BF16 Dst. With an FP32 Dst (24-bit significand) phase 3 changed 40,937 of 40,960 elements in the same tile." }
+    ];
+    function y(v) { if (v <= 0) return B; return B - Math.log10(v + 1) / Math.log10(2049) * (B - T); }
+    function draw(i, t) {
+      TT.clear(ctx, g.W, g.H);
+      ctx.strokeStyle = C.border;
+      [1, 10, 100, 1000, 2048].forEach(function (v) { var yy = y(v); ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(R, yy); ctx.stroke(); TT.text(ctx, String(v), L - 8, yy, { align: "right", color: C.muted, font: "12px" }); });
+      TT.text(ctx, "Dst updates changed by the phase (of 2048 per tile product)", L, T - 26, { color: C.muted, font: "12px" });
+      var gw = (R - L) / 20;
+      for (var k = 0; k < 20; k++) {
+        var x0 = L + k * gw + 6;
+        TT.text(ctx, String(k), x0 + gw / 2 - 6, B + 16, { align: "center", color: C.muted, font: "12px" });
+        if (i >= 1) {
+          var f = i === 1 ? Math.max(0, Math.min(1, t * 20 - k)) : 1;
+          var h1 = B - y(P1[k]);
+          TT.box(ctx, x0, B - h1 * f, gw / 3 - 3, h1 * f, { fill: C.green, alpha: 0.85, r: 2 });
+          if (P1[k] > 0 && f >= 1) TT.text(ctx, String(P1[k]), x0 + (gw / 3 - 3) / 2, B - h1 - 9, { align: "center", font: "10px" });
+        }
+        if (i >= 2) {
+          var h2 = (B - y(P2[k])) * t;
+          TT.box(ctx, x0 + gw / 3, B - h2, gw / 3 - 3, h2, { fill: C.orange, alpha: 0.85, r: 2 });
+          if (P2[k] > 0) TT.text(ctx, String(P2[k]), x0 + gw / 3 + 8, B - h2 - 9, { align: "center", font: "10px", color: C.orange });
+          TT.box(ctx, x0 + 2 * gw / 3, B - 2, gw / 3 - 3, 2, { fill: C.pink, r: 0 });
+        }
+      }
+      TT.text(ctx, "tile product k (each adds 32 more terms; Dst grows by about 8)", L, B + 34, { color: C.muted, font: "12px" });
+      TT.box(ctx, L, 337, 10, 10, { fill: C.green, r: 2 }); TT.text(ctx, "phase 1", L + 16, 342, { font: "12px" });
+      TT.box(ctx, L + 90, 337, 10, 10, { fill: C.orange, r: 2 }); TT.text(ctx, "phase 2", L + 106, 342, { font: "12px" });
+      TT.box(ctx, L + 180, 337, 10, 10, { fill: C.pink, r: 2 }); TT.text(ctx, "phase 3 (always 0)", L + 196, 342, { font: "12px" });
+    }
+    TT.stepper({ root: root, steps: steps, draw: draw });
+  })();
+  </script>
+
+  <p>This also explains why the BF16-Dst errors in Step 1 are mostly <em>below</em> the golden even at HiFi4 (928 of 1024 elements). Once Dst is large, each MVMUL effectively adds only phase 0's truncated products, and the small positive corrections are rounded away every time. The defect is in the accumulator, not the multiplier. So the cheapest accuracy win for this matmul isn't a higher fidelity. It's an FP32 Dst. With <code>fp32_dest_acc_en = true</code> HiFi2 already reaches 0.405 and HiFi3 0.0034, against 1.51 for BF16-Dst HiFi4.</p>
+  <div class="callout gpu">GPU tensor cores normally accumulate BF16 products in FP32, so this trap rarely appears there. On Tensix the accumulator format is your choice, and the default in this example is BF16. Before raising fidelity, ask what Dst can hold. Fidelity buys bits in the <em>products</em>; it can't buy bits that Dst's format will round away.</div>
+  <div class="callout warn"><b>This is data-dependent.</b> All-positive inputs make Dst grow monotonically, which is the worst case for late phases. With signed inputs in [−1, 1) the sums cancel, Dst stays small relative to the products, and phase 3 changed 192 of 40,960 elements. HiFi3 and HiFi4 then give different hashes (<code>ba04a3c8…</code> vs <code>41219683…</code>). Measure on your own data.</div>
+  <div class="callout sim">This lab checks <a href="../chapters/a06-matrix-engine.html">A06</a>'s bit tables and its "phase 3 always rounds to zero for this data" argument against ttsim's register contents. It also measures the MVMUL face order that A06 inferred from LLK comments, and confirms <a href="../chapters/a15-matmul-one-to-many.html">A15</a>'s in0→SrcB / in1→SrcA. <a href="b08-formats-and-sfpu.html">B08</a> continues with the other number formats (BFP8, FP32 in Dst) and the SFPU's numerics.</div>
+
+  <h2 id="sources">Where the sources disagree</h2>
+  <table>
+    <tr><th>Topic</th><th>Source 1</th><th>Source 2</th><th>What the dump says</th></tr>
+    <tr><td>Bits used per fidelity</td><td>tt-metal <code>tech_reports/matrix_engine/matrix_engine.md:68-71</code> attaches one slice pair to each fidelity <em>name</em> (e.g. "HiFi2 → SrcA: 1 hidden bit + next 4 bits of LSBs") and gives every slice a hidden bit.</td><td>ISA <code>SrcASrcB.md:119-133</code>: the slices belong to <em>phases</em>. HiFi<i>n</i> runs phases 0…<i>n</i>−1. The low slices are "remaining three mantissa bits" (SrcA) and "remaining mantissa bit" (SrcB) for BF16, with no hidden bit.</td><td>ttsim sides with the ISA (silicon not checked here). The M lines show HiFi2 running phases 0 and 1. ttsim's slices (<code>tensix.cpp:1694-1703</code>) match the ISA, and Python using them matches 100%.</td></tr>
+    <tr><td>Src cell bit layout</td><td>ISA <code>MatrixUnit.md:215-216</code>: "Src holds TF32 as Sign(1),Man(10),Exp(8)", i.e. the exponent in the low 8 bits.</td><td>ttsim stores Src cells in FP32 order, sign, exponent, mantissa (<code>exp_a = (a &gt;&gt; 10) &amp; 255</code>, <code>tensix.cpp:1688</code>), and the dump shows <code>3f0d0000</code>-style cells.</td><td>It's an internal representation, and it only matters if software bit-casts Src contents. Arithmetic is unaffected. Don't read a ttsim Src dump with the ISA's layout.</td></tr>
+    <tr><td>Rounding in Dst</td><td>ISA MVMUL functional model: FP32 sum of products, then <code>WriteDstBF16</code> truncation, flagged "approximate" (<code>MVMUL.md:223</code>, <code>MatrixUnit.md:186-189</code>).</td><td>ttsim: group-of-8 alignment with ties away, 11-bit pre-rounding of each term, then round half-up (<code>tensix.cpp:1477-1569, 1711-1740</code>).</td><td>The literal ISA model matches 44.7–82.8% of elements; ttsim's model 100%. Don't use the ISA pseudocode as a bit-exact golden.</td></tr>
+    <tr><td>Fidelity as a divisor</td><td><code>matrix_engine.md:22</code>: "TFLOPS are calculated by dividing by the MATH_FIDELITY value".</td><td><code>llk_defs.h:141</code>: LoFi = 0.</td><td>Read it as "dividing by the number of phases" (1 for LoFi), which is what the MVMUL totals show.</td></tr>
+  </table>
+
+  <h2 id="exercises">Exercises, with answers</h2>
+  <details class="quiz"><summary>1. Predict, then measure: how many MVMULs does core (0,0) run for this 640×640×640 matmul at HiFi2? Check it with the dump's T line.</summary>
+  <p>20 × 20 output tiles × 20 tile products × 16 MVMULs × 2 phases = 256,000. Run <code>MM_FIDELITY=2 MM_SEED=42 B07_OUT=$LAB_HOME/dumps/x.txt B07_COUNT=0 $LAB_HOME/mm_fid</code>. With <code>B07_COUNT=0</code> nothing is dumped, but the T line is still written: <code>T 256000</code>. The count doesn't depend on the seed, because fidelity is a loop count in the MOP, not a data-dependent decision.</p></details>
+  <details class="quiz"><summary>2. Give Dst 32 bits: build <code>mm_fid32</code> and predict how many elements phase 3 changes in output tile (0,0) at HiFi4. Then check that the Python still matches.</summary>
+<pre><code>sed 's/ComputeConfig{.math_fidelity = math_fidelity, .compile_args/ComputeConfig{.math_fidelity = math_fidelity, .fp32_dest_acc_en = true, .compile_args/' \
+    $LAB_HOME/mm_fid.cpp &gt; $LAB_HOME/mm_fid32.cpp &amp;&amp; $W/build_host.sh $LAB_HOME/mm_fid32.cpp
+MM_FIDELITY=4 MM_SEED=42 B07_OUT=$LAB_HOME/dumps/fp32_fid4.txt B07_COUNT=1280 $LAB_HOME/mm_fid32
+python3 -I $W/py/b07_mvmul.py $LAB_HOME/dumps/fp32_fid4.txt</code></pre>
+<pre class="out"><code>mean_abs_err = 0.010957 max_abs_err = 1.000000 result_hash = 43b0a305bcb60383
+fp32_fid4.txt: 1280 MVMULs dumped (tile total 512000), phases used [0, 1, 2, 3], SrcA fmt 5 SrcB fmt 5 Dst FP32
+independent: 163840/163840 elements match
+chained:     163840/163840 elements match (0 Dst rows changed by something other than these MVMULs)
+elements changed by each phase: phase 0: 40960/40960, phase 1: 40960/40960, phase 2: 40960/40960, phase 3: 40937/40960</code></pre>
+  <p>With 24 significant bits, Dst's step at 160 is about 2<sup>−16</sup>. Phase 3's terms (around 10<sup>−4</sup>) are far above half of that, so nearly every update changes. The M lines now show <code>dst32b</code> = 1, and the script takes the FP32 path (no 13-bit pre-rounding, 24-bit final rounding). Nothing else in the model changes. I did not analyse the 23 elements that phase 3 left unchanged. Only 2 of them had both phase-3 group sums equal to zero, so for the other 21 the term was rounded away somewhere in the add.</p></details>
+  <details class="quiz"><summary>3. Make the data signed (<code>dist(-1.0f, 1.0f)</code>) and rerun all four fidelities. Do HiFi3 and HiFi4 still agree?</summary>
+<pre><code>sed 's/dist(0.f, 1.0f)/dist(-1.0f, 1.0f)/' $LAB_HOME/mm_fid.cpp &gt; $LAB_HOME/mm_fid_signed.cpp
+$W/build_host.sh $LAB_HOME/mm_fid_signed.cpp
+for f in 0 2 3 4; do MM_FIDELITY=$f MM_SEED=42 $LAB_HOME/mm_fid_signed | grep mean_abs; done</code></pre>
+<pre class="out"><code>mean_abs_err = 0.133176 max_abs_err = 1.125000 result_hash = fed12143c0720383
+mean_abs_err = 0.101736 max_abs_err = 1.000000 result_hash = 78c6c11348150383
+mean_abs_err = 0.105040 max_abs_err = 1.000000 result_hash = ba04a3c8bbc70383
+mean_abs_err = 0.105038 max_abs_err = 1.000000 result_hash = 41219683c0250383</code></pre>
+  <p>No: the hashes differ, and in the dumped tile phase 3 changed 192 elements. With cancellation, Dst stays small (a 640-term sum of products uniform in [−1, 1) has a standard deviation of about 8.4), so late phases can cross the half-step threshold. The Python matched 100% at all four fidelities. Note that HiFi2 scores slightly <em>better</em> than HiFi3/4 here (0.1017 vs 0.1050). I haven't traced the cause. The golden is itself BF16-rounded, so differences of a few thousandths of an ulp-scale error aren't a reliable ranking. Treat it as an open question, not a result.</p></details>
+  <details class="quiz"><summary>4. Use <code>B07_SKIP</code> to dump the last output tile instead of the first. How many MVMULs must you skip at LoFi?</summary>
+  <p>The core computes output tiles in order (mt outer, nt inner), each 20 × 16 × phases MVMULs. The last of 400 tiles therefore starts after 399 × 320 = 127,680 MVMULs at LoFi: <code>B07_SKIP=127680 B07_COUNT=320</code>. At HiFi4 multiply both by 4. The Python needs no change, because the chained check starts from whatever Dst the first record shows. I ran it: <code>MM_FIDELITY=0 MM_SEED=42 B07_OUT=$LAB_HOME/dumps/last0.txt B07_SKIP=127680 B07_COUNT=320 $LAB_HOME/mm_fid</code>, then the script reported 40960/40960 independent and chained. The first M line is <code>M 127680 697510 0 5 5 0 1 0 0 512</code>: the last tile's Dst rows start at 512, the other half of Dst. Dumping the first MVMUL of output tiles 1, 2 and 3 the same way gives Dst rows 512, 0 and 512: MATH alternates between the two halves of Dst from one output tile to the next, which is what lets PACK drain one half while MATH fills the other (the Dst handshake of <a href="../chapters/a12-compute-kernels.html">A12</a>). The rows read as zero again at the start.</p></details>
+  <details class="quiz"><summary>5. In the trace of MVMUL #0, product k = 3 has exponent 118 while the group maximum is 125. What does the group-of-8 alignment do to its mantissa 2632?</summary>
+  <p>exp_diff = 7, so <code>m = ((2632 &lt;&lt; 1) + (1 &lt;&lt; 7)) &gt;&gt; 8 = (5264 + 128) &gt;&gt; 8 = 21</code>. 2632 / 128 = 20.56 rounds to 21. The product (0.18359375 × 0.027954102 ≈ 0.00513) keeps only about 5 significant bits once it is aligned to the group's largest product. Small terms next to large ones lose precision before any Dst rounding happens. This is one reason even HiFi4 isn't "exact then round".</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>Phases are visible in the simulator.</b> Core (0,0) executed exactly 128,000 × {1, 2, 3, 4} MVMULs at LoFi/HiFi2/HiFi3/HiFi4, and the dump's phase field shows each tile product's 16-MVMUL sequence repeated in phases 0, 1, …</li>
+    <li><b>Each phase multiplies one slice pair.</b> Phase bit 0 picks SrcA's high 5 or low bits; bit 1 picks SrcB's high 7 or low bits. Exponent corrections of −5 and −7 restore their place value. For one real product, the four pieces 50336 + 1694 + 208 + 7 add up exactly to 243 × 215 = 52245.</li>
+    <li><b>The adds are where bits are lost.</b> Two groups of 8 with ties-away alignment, each term pre-rounded to 11 bits, then rounding to the Dst format. A 200-line Python model of that matched ttsim on 100% of elements: 40,960 to 163,840 per run, independent and chained, for BF16 and FP32 Dst and for signed data. The ISA's float pseudocode matched 44.7–82.8%.</li>
+    <li><b>With a BF16 Dst, fidelity hits a wall.</b> Phase 3 changed 0 of 40,960 elements, so HiFi3 and HiFi4 are bit-identical. Phase 1 stopped changing anything after the 9th of 20 tile products. The accumulator dominates the error (≈1.5 BF16 ulps). An FP32 Dst is the bigger lever.</li>
+    <li><b>Don't trust PCC</b> for fidelity decisions. Look at ulp error, the direction of the bias, and the hashes.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>An MVMUL runs with fidelity phase 2 on BF16 data. Which bits of each SrcB significand reach the multiplier?</summary><p>Phase 2 has bit 1 set, so SrcB's low slice: bits 3..0 of the 11-bit significand, shifted left by 3. For BF16 only bit 3 (the last stored mantissa bit) can be 1, so the 7-bit input is 64 or 0. SrcA uses its high slice (bit 0 clear): the implicit 1 and top 4 bits. The product's exponent is reduced by 7.</p></details>
+  <details class="quiz"><summary>Why can the chained check catch errors the independent check cannot?</summary><p>The independent check gives the model ttsim's own Dst-before values for every MVMUL, so an error can't propagate, and any state ttsim keeps outside the dumped rows would go unnoticed. The chained check feeds the model its own previous outputs across all 20 tile products. A single wrong bit would then fail that comparison and be carried forward into the later updates of that element. It also flags (via the "Dst rows changed by something else" counter) any write to these Dst rows that isn't one of the dumped MVMULs. That counter was 0.</p></details>
+  <details class="quiz"><summary>HiFi4 costs 4× LoFi in MVMULs. In this lab's default configuration, what did the last 2× of that cost buy?</summary><p>Going from HiFi2 to HiFi4 changed the mean error from 1.508 to 1.505 (seed 42). Phase 2 changed 134 Dst updates, all in the first tile product, and phase 3 changed none. With a BF16 Dst those phases fall below half a BF16 step once Dst exceeds a few units. Almost nothing, then. The same phases are valuable with an FP32 Dst (0.405 → 0.011).</p></details>
+  <details class="quiz"><summary>Why is LoFi's error always in the same direction for these inputs?</summary><p>LoFi keeps only the high slices, which is truncation of each significand's magnitude toward zero. With all-positive operands every product is then too small or exact, never too large, so errors accumulate instead of cancelling. After one tile product all 1024 elements of tile (0,0) were below the exact value. With signed data the bias per product still points toward zero, but products of both signs partly cancel in the sum.</p></details>
+  <details class="quiz"><summary>The dump shows SrcA cell <code>3f0d0000</code>. Someone decodes it using the ISA's Src layout (exponent in the low 8 bits). What goes wrong, and why does it not matter for MVMUL results?</summary><p>They would read exponent 0 and garbage mantissa bits, because ttsim keeps Src cells in FP32 order (sign, exponent, mantissa), not the ISA's documented physical layout. It doesn't affect results: ttsim's arithmetic decodes its own layout consistently, and software can only see the difference through bit-casts. Read a ttsim dump with ttsim's layout: <code>3f0d0000</code> is 0.55078125.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MVMUL.md">tt-isa-documentation: MVMUL</a>: the instruction's functional model and the "rough guide" caveat this lab measured (44.7–82.8% literal match).</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/SrcASrcB.md">tt-isa-documentation: SrcA and SrcB</a>: data types and the per-phase bit tables for BF16, TF32/FP16 and integers.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/MatrixUnit.md">tt-isa-documentation: Matrix Unit (FPU)</a>: <code>SrcAFidelityBits</code>, <code>SrcBFidelityBits</code>, the Dst read/write helpers, and per-phase throughput.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/Dst.md">tt-isa-documentation: Dst</a>: the 16/32-bit views and the storage encoding seen in the R lines.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the simulator; <code>src/tensix.cpp</code> holds <code>tensix_matmul_op</code>, <code>mvmul</code> and <code>fpu_accum_normalize_encode</code>.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_matmul.h">tt-llk: llk_math_matmul.h (Wormhole)</a>: the 16-MVMUL replay sequence, <code>ADDR_MOD_5</code> and the phase loop.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/matrix_engine/matrix_engine.md">tt-metal tech report: Matrix Engine</a>: the official overview, including the fidelity description that disagrees with the ISA (see the table above).</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md">tt-metal tech report: Matrix Multiply FLOPS</a>: measured silicon throughput by fidelity, the cost side this lab cannot measure.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/matmul_single_core.html">TT-Metalium docs: Matmul (Single Core)</a>: the official walkthrough of the example <code>mm_fid</code> is built from.</li>
+    <li><a href="https://arxiv.org/abs/2203.03341">Ootomo &amp; Yokota, "Recovering single precision accuracy from Tensor Cores…"</a>: split-significand products and which cross terms you can skip, the GPU counterpart of fidelity phases.</li>
+    <li><a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html">Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic"</a>: rounding, ulps and why "round each term, then add" differs from "add exactly, then round".</li>
+    <li><a href="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format">bfloat16 floating-point format</a>: the 1-8-7 layout and its precision near the values seen here.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a07-vector-engine.html">&larr; 07 The vector engine (SFPU)</a><a class="next" href="b08-formats-and-sfpu.html">B08 Data formats and SFPU numerics &rarr;</a></div>
+</main>
+</body>
+</html>

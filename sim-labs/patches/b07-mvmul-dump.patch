@@ -1,0 +1,83 @@
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -9,6 +9,8 @@
+ #include "sim.h"
+ #include "tensix_decode.h" // generated
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #define IS_TENSIX_NOP(inst) (bits<31,24>(inst) == TENSIX_OPCODE_NOP)
+ 
+@@ -1751,6 +1753,37 @@
+     }
+ }
+ 
++// B07 lab: dump the operands and Dst rows of MVMULs on ONE tile, gated by environment variables.
++//   B07_OUT=file enables it;  B07_TILE=n (default 0);  B07_SKIP=k MVMULs to skip first (default 0);
++//   B07_COUNT=n MVMULs to dump after that (default 64). Values are raw: Src cells as stored (32-bit, low 13 bits
++//   zero), Dst cells as read_dst16b/read_dst32b return them (still in Dst's storage encoding).
++struct B07Dump {
++    FILE *f = nullptr;
++    uint32_t tile = 0;
++    uint64_t skip = 0, count = 64, seen = 0;
++    B07Dump() {
++        if (const char *p = getenv("B07_OUT")) f = fopen(p, "w");
++        if (const char *p = getenv("B07_TILE")) tile = atoi(p);
++        if (const char *p = getenv("B07_SKIP")) skip = strtoull(p, nullptr, 0);
++        if (const char *p = getenv("B07_COUNT")) count = strtoull(p, nullptr, 0);
++    }
++    ~B07Dump() { if (f) { fprintf(f, "T %llu\n", (unsigned long long)seen); fclose(f); } } // total MVMULs on the tile
++    bool want(const TensixState *p_tensix) { // call once per MVMUL that executes on any tile
++        if (!f || p_tensix->tile_id != tile) return false;
++        uint64_t n = seen++;
++        return n >= skip && n < skip + count;
++    }
++    void dst_rows(TensixState *p_tensix, char tag, uint32_t dst_row, bool d32) {
++        for (uint32_t r = 0; r < 8; r++) {
++            fputc(tag, f);
++            for (uint32_t c = 0; c < ROW_SIZE; c++)
++                fprintf(f, d32 ? " %08x" : " %04x", d32 ? read_dst32b(p_tensix, dst_row + r, c) : read_dst16b(p_tensix, dst_row + r, c));
++            fputc('\n', f);
++        }
++    }
++};
++static B07Dump s_b07;
++
+ template<bool is_gapool, bool broadcast = false>
+ static bool tensix_matmul_op(TensixState *p_tensix, uint32_t pipe, uint32_t dst, uint32_t addr_mode, uint32_t clear_dvalid,
+     uint32_t src_a_offset = 0, uint32_t src_b_offset = 0) {
+@@ -1827,6 +1860,23 @@
+         }
+     }
+     uint32_t src_b[B_ROWS][16], src_a[ROW_SIZE][16];
++    const bool b07 = !is_gapool && !broadcast && !is_int8 && s_b07.want(p_tensix);
++    if (b07) {
++        // M <index> <clock> phase srca_fmt srcb_fmt dst32b exp8b srca_row srcb_row dst_row, then 16 A rows, 8 B rows, 8 D rows
++        fprintf(s_b07.f, "M %llu %llu %u %u %u %d %d %u %u %u\n", (unsigned long long)(s_b07.seen - 1), (unsigned long long)g_clock,
++                fidelity_phase, src_a_fmt, src_b_fmt, use_dst32b, fp_exponent_8b, src_a_row, src_b_row, dst_row);
++        for (uint32_t i = 0; i < 16; i++) {
++            fputc('A', s_b07.f);
++            for (uint32_t c = 0; c < ROW_SIZE; c++) fprintf(s_b07.f, " %08x", p_tensix->src_a[src_a_bank][src_a_row + i][c]);
++            fputc('\n', s_b07.f);
++        }
++        for (uint32_t r = 0; r < 8; r++) {
++            fputc('B', s_b07.f);
++            for (uint32_t i = 0; i < 16; i++) fprintf(s_b07.f, " %08x", p_tensix->src_b[src_b_bank][src_b_row + r][i]);
++            fputc('\n', s_b07.f);
++        }
++        s_b07.dst_rows(p_tensix, 'D', dst_row, use_dst32b); // Dst before this MVMUL
++    }
+     if (is_int8) {
+         for (uint32_t row = 0; row < B_ROWS; row++) {
+             for (uint32_t i = 0; i < 16; i++) {
+@@ -1910,6 +1960,9 @@
+             }
+         }
+     }
++    if (b07) {
++        s_b07.dst_rows(p_tensix, 'R', dst_row, use_dst32b); // Dst after this MVMUL
++    }
+     if (broadcast) {
+         p_tensix->dst_row_valid[unflagged_row] = unflagged_row_valid;
+         p_tensix->dst_row_valid[dst_valid_row(p_tensix, (dst_row ^ 1) + 4, use_dst32b)] = true;

@@ -72,6 +72,10 @@ that flavour (about 3.5 s), packages `libttsim.so` with the matching `soc_descri
   prints `mean_abs_err` and `result_hash`.
 - `host/run_twice.cpp` (chapter A12): the stock `add_2_integers_in_compute` host program with the enqueue run twice on the same core;
   prints `run 1 finished`, `run 2 finished`, then the usual result check. Pair it with a kernel overlay.
+- `host/b06_scale_add.cpp` + `kernels/b06/{reader,compute,writer}.cpp` (lab B06): out = relu(a + b) over N bf16 tiles
+  with your own three kernels; `b06_scale_add [n_tiles=8] [cb_pages=2]` prints `exact=`, `off_by_more_than_1ulp=` and
+  PASS/FAIL. The host finds the kernels as `b06/*.cpp`, so run it with `TT_METAL_KERNEL_PATH=$W/kernels`, or copy
+  `kernels/b06` into `$LAB_HOME/kernels/` to edit them.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
   `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
