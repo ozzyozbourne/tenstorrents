@@ -1,0 +1,39 @@
+--- a/src/riscv_impl.h
++++ b/src/riscv_impl.h
+@@ -1481,6 +1481,7 @@
+     }
+ }
+ static B03Hart s_b03[NUM_T_TILES][RV32_CORES_PER_T_TILE];
++static uint32_t s_b03_hot[RV32_CORES_PER_T_TILE][1024]; // tile 0 only: kernel steps by (pc - entry_pc) / 4
+ static B03Hart *b03_before(RiscvHartState *p_hart, uint32_t pc) {
+     if (p_hart->tile_type != 'T') return nullptr;
+     B03Hart *h = &s_b03[p_hart->tile_id][p_hart->riscv_id];
+@@ -1494,6 +1495,7 @@
+     }
+     h->k_steps += h->in_kernel;
+     h->k_below += h->in_kernel && pc < B03_KERNEL_LO;
++    if (h->in_kernel && p_hart->tile_id == 0 && pc - h->entry_pc < 4096) s_b03_hot[p_hart->riscv_id][(pc - h->entry_pc) / 4]++;
+     return h;
+ }
+ void b03_report() {
+@@ -1513,6 +1515,20 @@
+                     (unsigned long long)h.steps, (unsigned long long)h.replays);
+                 ttsim_printf("B03 tile %u %-6s .ttinsn pushes=%llu  in kernel=%llu  fifo-full retries=%llu\n", t, names[r],
+                     (unsigned long long)h.tti, (unsigned long long)h.k_tti, (unsigned long long)h.tti_retries);
++                if (t == 0) { // the four hottest kernel pcs, with the instruction word stored there
++                    uint32_t *hot = s_b03_hot[r];
++                    printf("B03   hottest:");
++                    for (uint32_t k = 0; k < 4; k++) {
++                        uint32_t best = uint32_t(std::max_element(hot, hot + 1024) - hot);
++                        if (!hot[best]) break;
++                        uint32_t pc = h.entry_pc + 4 * best;
++                        uint32_t word = pc >= RV32_IRAM_BASE ? mem_rd<uint32_t>(&g_t_tiles[0].ncrisc_iram[pc - RV32_IRAM_BASE])
++                                                             : mem_rd<uint32_t>(&g_t_tiles[0].sram[pc]);
++                        printf(" pc=0x%x(entry+0x%x) x%u [%08x]", pc, 4 * best, hot[best], word);
++                        hot[best] = 0;
++                    }
++                    printf("\n");
++                }
+                 if (h.n_first) {
+                     printf("B03   first %u in kernel:", h.n_first);
+                     for (uint32_t i = 0; i < h.n_first; i++) printf(" %s", b03_opcode_name(h.first[i] >> 24));

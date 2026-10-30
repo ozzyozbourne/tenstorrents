@@ -1,0 +1,72 @@
+--- a/src/riscv_impl.h
++++ b/src/riscv_impl.h
+@@ -1461,6 +1461,8 @@
+ // The kernel window opens when the pc first reaches the kernel area (at or above MEM_MAP_END
+ // on Wormhole, which also covers NCRISC IRAM) and closes when the pc returns to the
+ // address that was in ra when the window opened.
++#include "tensix_decode.h" // generated from data/<chip>/tensix_isa.json; B03 uses TENSIX_OPCODE_NAME_CASES
++#define B03_FIRST 40 // how many kernel pushes to remember per hart
+ #define B03_KERNEL_LO 0x8a60 // MEM_MAP_END in tt-metal wormhole/dev_mem_map.h: kernel config space starts here
+ static_assert(TT_ARCH_VERSION == 0, "B03 lab instrumentation is Wormhole-only (B03_KERNEL_LO, NCRISC IRAM)");
+ struct B03Hart {
+@@ -1469,7 +1471,15 @@
+     uint64_t k_below;                     // kernel-window steps with pc below B03_KERNEL_LO
+     uint32_t entry_pc, ret_pc;
+     bool in_kernel;
++    uint64_t tti, k_tti, tti_retries;     // .ttinsn pushes: all, inside the kernel window, FIFO-full retries
++    uint32_t first[B03_FIRST], n_first;   // the first Tensix instructions pushed inside the kernel window
+ };
++static const char *b03_opcode_name(uint32_t opcode) {
++    switch (opcode) {
++        TENSIX_OPCODE_NAME_CASES()
++        default: return "?";
++    }
++}
+ static B03Hart s_b03[NUM_T_TILES][RV32_CORES_PER_T_TILE];
+ static B03Hart *b03_before(RiscvHartState *p_hart, uint32_t pc) {
+     if (p_hart->tile_type != 'T') return nullptr;
+@@ -1501,6 +1511,13 @@
+                     t, names[r], h.entry_pc, h.ret_pc, (unsigned long long)h.k_calls, (unsigned long long)h.k_steps,
+                     (unsigned long long)h.k_replays, B03_KERNEL_LO, (unsigned long long)h.k_below,
+                     (unsigned long long)h.steps, (unsigned long long)h.replays);
++                ttsim_printf("B03 tile %u %-6s .ttinsn pushes=%llu  in kernel=%llu  fifo-full retries=%llu\n", t, names[r],
++                    (unsigned long long)h.tti, (unsigned long long)h.k_tti, (unsigned long long)h.tti_retries);
++                if (h.n_first) {
++                    printf("B03   first %u in kernel:", h.n_first);
++                    for (uint32_t i = 0; i < h.n_first; i++) printf(" %s", b03_opcode_name(h.first[i] >> 24));
++                    printf("\n");
++                }
+             }
+         }
+     }
+@@ -1531,10 +1548,17 @@
+     tensix_id = 0;
+ 
+     TensixState *p_tensix = &g_t_tiles[p_hart->tile_id].tensix[tensix_id];
++    B03Hart *b03 = &s_b03[p_hart->tile_id][riscv_id];
+     if (tensix_can_push_inst(p_tensix, pipe)) {
+         uint32_t tensix_inst = (inst << 30) | (inst >> 2);
++        b03->tti++;
++        if (b03->in_kernel) {
++            b03->k_tti++;
++            if (b03->n_first < B03_FIRST) b03->first[b03->n_first++] = tensix_inst;
++        }
+         tensix_push_inst(p_tensix, pipe, tensix_inst, bypass_mop_expander);
+     } else {
++        b03->tti_retries++;
+         p_hart->pc -= 4; // replay TTI instruction
+     }
+ }
+--- a/src/tensix_gen_decode.py
++++ b/src/tensix_gen_decode.py
+@@ -78,5 +78,10 @@
+             f.write(f'#define TENSIX_OPCODE_{name} 0x{opcode:02X}\n')
+         f.write('\n')
+ 
++        f.write('#define TENSIX_OPCODE_NAME_CASES() \\\n') # B03 lab: opcode -> name, for printing
++        for (name, info) in opcodes.items():
++            f.write(f'    case 0x{info["opcode"]:02X}: return "{name}"; \\\n')
++        f.write('\n')
++
+ if __name__ == '__main__':
+     main()

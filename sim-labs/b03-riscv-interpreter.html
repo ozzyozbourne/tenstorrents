@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B03 · The RISC-V interpreter · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+<style>
+  .honesty { border:2px solid var(--red); background:#2a1414; border-radius:8px; padding:.8rem 1.2rem; margin:1.2rem 0 1.8rem; }
+  .honesty b { color:var(--red); }
+  td.num, th.num { text-align:right; font-family:var(--mono); font-size:14px; }
+  .modebar { display:flex; gap:.5rem; flex-wrap:wrap; padding:.6rem .8rem; background:var(--bg2); border-top:1px solid var(--border); font-size:14px; align-items:center; }
+  .modebar select { background:var(--bg3); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:.2rem; font:inherit; font-size:14px; }
+  .modebar span { color:var(--muted); }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../chapters/a04-inside-tensix.html">&larr; Prev</a>
+  <a href="../chapters/a05-tiles-and-formats.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">ttsim Labs · B03</span><span class="tag">Prerequisites: A04, B00</span>
+  <h1><span class="num">B03.</span> The RISC-V interpreter</h1>
+  <p class="subtitle">Open up the loop that runs every baby RISC-V in ttsim: read its 256-entry decode table, watch two bits turn a RISC-V word into a Tensix instruction, and count exactly how many instructions each of the five cores runs inside your kernel.</p>
+
+  <div class="honesty"><b>Honesty banner.</b> ttsim is a <b>functional, bit-exact</b> model of the chip. It is <b>not a timing model</b>. Its clock counts are not silicon cycles, and the instruction counts in this lab are counts of <em>simulator steps</em>, not cycles on a real Wormhole. On silicon, stalls, caches and NoC latency change how long each instruction takes; ttsim models none of that.</div>
+
+  <nav class="toc"><b>In this lab</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#step">One step of a baby core</a></li>
+      <li><a href="#decode">Lab step 1: read the generated decode table</a></li>
+      <li><a href="#count">Lab step 2: count instructions per core, inside the kernel</a></li>
+      <li><a href="#tti">Lab step 3: instrument the TTI escape</a></li>
+      <li><a href="#pcs">Lab step 4: from a hot PC back to your source line</a></li>
+      <li><a href="#exercises">Exercises, with answers</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Run <code>add_2_integers_in_compute</code> on a simulated Wormhole. It adds two 32×32 bfloat16 tiles on one Tensix core. Five baby RISC-V cores take part: a reader on NCRISC, a writer on BRISC, and the three compute threads on TRISC0, TRISC1 and TRISC2. While it runs, ttsim's RISC-V interpreter executes <b>1,029,531</b> instruction steps across the chip. We measured that number in this orb with the instrumented simulator you will build below.</p>
+  <p>How many of those million steps belong to the five kernels you actually wrote?</p>
+  <p>Make a guess before reading on. Half? A tenth? The answer is <b>1,103</b>, about one step in a thousand. The rest is firmware: 72 Tensix tiles, each with five cores, spinning in loops that wait for a "go" message that, for 71 of them, never comes. By the end of this lab you will have counted those 1,103 steps yourself, split them by core, seen which ones pushed Tensix instructions, and traced the hottest loop back to a line of C++ in the kernel source.</p>
+  <p>On the way you will read the heart of ttsim's CPU model, a function of about forty lines in <code>src/riscv_impl.h</code>. It does three things: fetch a 32-bit word, look at its low two bits, then either decode it as RISC-V through a 256-entry table or rotate it by two bits and push it into the Tensix coprocessor. <a href="../chapters/a04-inside-tensix.html">A04</a> explained <em>why</em> that two-bit escape exists. Here you will instrument it.</p>
+  <p>Every command below was run in this orb against ttsim <code>b3620244</code> and tt-metal <code>7aad8aac</code>, and every output block is pasted from those runs, trimmed with <code>…</code>.</p>
+
+  <h2 id="step">1. One step of a baby core</h2>
+  <p>Picture the simplest CPU emulator you could write. It has a program counter, 32 registers and a pointer to memory. In a loop, it reads the word at the program counter, works out which instruction it is, and does what that instruction says. ttsim's model of a baby RISC-V is exactly that, and its whole state fits in one small struct:</p>
+  <div class="filename">ttsim/src/sim.h:11-27 @b3620244</div>
+<pre><code>struct Rv32HartState {
+    char tile_type;
+    uint32_t tile_id;
+    uint32_t riscv_id;
+    uint32_t pc;
+    uint32_t x_regs[32];
+#if TT_ARCH_VERSION &gt;= 1
+    uint32_t f_regs[32];
+    uint32_t chicken_bits;
+#endif
+
+    uint8_t *p_sram;
+    uint8_t *p_local_mem;
+    uint32_t sram_size;
+    uint32_t local_mem_base;
+    uint32_t local_mem_size;
+};</code></pre>
+  <p>A <em>hart</em> is RISC-V's word for a hardware thread, which here means one baby core. <code>tile_type</code> is <code>'T'</code> for a Tensix tile or <code>'E'</code> for an Ethernet tile, and <code>riscv_id</code> says which of the five cores this is: BRISC is 0, TRISC0–2 are 1–3 and NCRISC is 4 (<code>config.h:18-22</code>). <code>p_sram</code> points at the tile's L1, and <code>p_local_mem</code> at the core's private data RAM, which is mapped at <code>0xFFB00000</code>. Floating-point registers exist only for Blackhole (<code>TT_ARCH_VERSION &gt;= 1</code>), because Wormhole's baby cores have no FPU. There is no instruction cache, no pipeline and no cycle counter in this struct. That tells you what kind of model this is before you read a single line of logic.</p>
+
+  <p>Each clock, ttsim's clock loop makes a pass over every busy tile and calls <code>rv32_step</code> once for every active hart. If the tile's coprocessor executed an instruction in that pass, it repeats the pass within the same clock (<code>libttsim.cpp:253-284</code>; <a href="b01-meet-ttsim.html#clock">B01</a> takes that loop apart). So a step is one pass, and a clock can contain several. Here is the function it calls, with the 64-bit branches trimmed:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:1938-1975 @b3620244 (64-bit-only lines elided)</div>
+<pre><code>void RV_XLEN_PREFIX(step)(RiscvHartState *p_hart) {
+    uint_xlen_t pc = p_hart-&gt;pc;
+    uint32_t inst;
+    if (pc &gt;= p_hart-&gt;sram_size) [[unlikely]]
+    {
+#if TT_ARCH_VERSION == 0
+        if ((pc &gt;= RV32_IRAM_BASE) &amp;&amp; (pc &lt; RV32_IRAM_BASE + RV32_IRAM_SIZE)) {
+            if (p_hart-&gt;riscv_id == RV32_ID_NCRISC) {
+                inst = mem_rd&lt;uint32_t&gt;(&amp;g_t_tiles[p_hart-&gt;tile_id].ncrisc_iram[pc - RV32_IRAM_BASE]);
+            } else if (p_hart-&gt;tile_type == 'E') {
+                inst = mem_rd&lt;uint32_t&gt;(&amp;g_e_tiles[p_hart-&gt;tile_id].erisc_iram[pc - RV32_IRAM_BASE]);
+            } else {
+                TTSIM_ERROR(UndefinedBehavior, "invalid pc=0x%llx", uint64_t(pc));
+            }
+        } else {
+            TTSIM_ERROR(UndefinedBehavior, "invalid pc=0x%llx", uint64_t(pc));
+        }
+        …
+    } else {
+        inst = mem_rd&lt;uint32_t&gt;(&amp;p_hart-&gt;p_sram[pc]);
+    }
+    p_hart-&gt;pc = pc + 4; // faster to do this here; requires some fixes downstream for instructions that reference PC
+
+    if ((inst &amp; 3) == 3) [[likely]] { // RISCV
+        uint32_t opcode = ((inst &gt;&gt; 2) &amp; 31) | ((inst &amp; 0x7000) &gt;&gt; 7);
+        s_decode_table[opcode](p_hart, inst);
+    } else {
+#if XLEN == 32
+        RV_XLEN_PREFIX(tti)(p_hart, inst);
+        …</code></pre>
+  <p>Read it in four beats.</p>
+  <ul>
+    <li><b>Fetch.</b> A program counter below the L1 size is an index into L1, so fetching is a plain 4-byte read from the tile's L1 array. There is no instruction cache in the model, even though the hardware has one per core (<code>BabyRISCV/InstructionCache.md</code>). The only exception is NCRISC on Wormhole, which also has a private 16 KiB instruction RAM at <code>0xFFC00000</code>. Anything else outside L1 is <code>UndefinedBehavior</code>, and ttsim stops.</li>
+    <li><b>Advance the PC early.</b> <code>pc + 4</code> is written <em>before</em> the instruction runs. The comment admits the cost: instructions that use the PC must correct for it. For example, <code>jalr</code> notes "pc is really pc_plus_4 here" (<code>riscv_impl.h:988</code>). It also creates the trick this whole lab relies on: an instruction that cannot finish in this step sets <code>pc -= 4</code>, and the same instruction runs again on the next pass. That is a <b>replay</b>.</li>
+    <li><b>The two-bit check.</b> Every standard 32-bit RISC-V instruction ends in binary <code>11</code>. If the word does, it is RISC-V.</li>
+    <li><b>Dispatch.</b> RISC-V words are decoded by indexing a 256-entry table of function pointers and calling the handler. Every other word goes to <code>tti()</code>, which rotates it right by two bits and pushes it into the coprocessor's instruction FIFO. A04 showed that function line by line.</li>
+  </ul>
+  <p>Step through it with real words. Each one below was fetched by a real core during <code>add_2_integers_in_compute</code>, at the PC shown: three from BRISC's writer kernel and three from TRISC1's math kernel. You will dig these exact words out of the ELF files in <a href="#pcs">lab step 4</a>.</p>
+
+  <div class="viz" id="fig-fdd">
+    <div class="modebar"><label>Word fetched: <select id="fdd-sel">
+      <option value="0">BRISC pc 0x8c98: 0x0106a783 (lw a5,16(a3))</option>
+      <option value="1">BRISC pc 0x8c9c: 0x01079793 (slli a5,a5,0x10)</option>
+      <option value="2">BRISC pc 0x8ca4: 0xfee78ae3 (beq a5,a4,0x8c98)</option>
+      <option value="3">TRISC1 pc 0x9674: 0x00e6a023 (sw a4,0(a3))</option>
+      <option value="4" selected>TRISC1 pc 0x9678: 0x06000000 (.ttinsn MOP)</option>
+      <option value="5">TRISC1 pc 0x9684: 0x90000022 (.ttinsn SEMPOST)</option>
+    </select></label><span>Grid colours: green = integer RV32IM handler, orange = fence / ecall, red = stops on Wormhole (F, V, CSR, atomics), dark = unimplemented.</span></div>
+  </div>
+  <script>
+  (function () {
+    var NAMES = ["load<int8_t, int_xlen_t>","v_load<uint8_t>","unimplemented","fence","alu_imm<0>","auipc","unimplemented","unimplemented","store<uint8_t>","v_store<uint8_t>","unimplemented","unimplemented","alu<0>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_beq>","jalr","unimplemented","jal","ecall_ebreak","unimplemented","unimplemented","unimplemented","load<int16_t, int_xlen_t>","f_load<uint16_t>","unimplemented","fence_i","alu_imm<1>","auipc","unimplemented","unimplemented","store<uint16_t>","f_store<uint16_t>","unimplemented","unimplemented","alu<1>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_bne>","unimplemented","unimplemented","jal","csrrw","unimplemented","unimplemented","unimplemented","load<int32_t, int_xlen_t>","f_load<uint32_t>","unimplemented","unimplemented","alu_imm<2>","auipc","unimplemented","unimplemented","store<uint32_t>","f_store<uint32_t>","unimplemented","atomic<uint32_t>","alu<2>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","unimplemented","unimplemented","unimplemented","jal","csrrs","unimplemented","unimplemented","unimplemented","unimplemented","f_load<uint64_t>","unimplemented","unimplemented","alu_imm<3>","auipc","unimplemented","unimplemented","unimplemented","f_store<uint64_t>","unimplemented","unimplemented","alu<3>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","unimplemented","unimplemented","unimplemented","jal","csrrc","unimplemented","unimplemented","unimplemented","load<uint8_t, uint_xlen_t>","f_load<unsigned __int128>","unimplemented","unimplemented","alu_imm<4>","auipc","unimplemented","unimplemented","unimplemented","f_store<unsigned __int128>","unimplemented","unimplemented","alu<4>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_blt>","unimplemented","unimplemented","jal","unimplemented","unimplemented","unimplemented","unimplemented","load<uint16_t, uint_xlen_t>","v_load<uint16_t>","unimplemented","unimplemented","alu_imm<5>","auipc","unimplemented","unimplemented","unimplemented","v_store<uint16_t>","unimplemented","unimplemented","alu<5>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_bge>","unimplemented","unimplemented","jal","csrrwi","unimplemented","unimplemented","unimplemented","unimplemented","v_load<uint32_t>","unimplemented","unimplemented","alu_imm<6>","auipc","unimplemented","unimplemented","unimplemented","v_store<uint32_t>","unimplemented","unimplemented","alu<6>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_bltu>","unimplemented","unimplemented","jal","csrrsi","unimplemented","unimplemented","unimplemented","unimplemented","v_load<uint64_t>","unimplemented","unimplemented","alu_imm<7>","auipc","unimplemented","unimplemented","unimplemented","v_store<uint64_t>","unimplemented","unimplemented","alu<7>","lui","unimplemented","unimplemented","f_fma<false, false>","f_fma<false, true>","f_fma<true, false>","f_fma<true, true>","f_alu","v_alu","unimplemented","unimplemented","branch<branch_op_bgeu>","unimplemented","unimplemented","jal","csrrci","unimplemented","unimplemented","unimplemented"];
+    var root = document.getElementById("fig-fdd");
+    var g = TT.canvas(root, 900, 470), ctx = g.ctx, C = TT.C;
+    var sel = document.getElementById("fdd-sel");
+    var WORDS = [
+      { hart: "BRISC", rid: 0, pc: 0x8c98, w: 0x0106a783, asm: "lw a5,16(a3)", mem: [[0x8c98, 0x0106a783], [0x8c9c, 0x01079793], [0x8ca0, 0x0107d793], [0x8ca4, 0xfee78ae3]] },
+      { hart: "BRISC", rid: 0, pc: 0x8c9c, w: 0x01079793, asm: "slli a5,a5,0x10", mem: [[0x8c98, 0x0106a783], [0x8c9c, 0x01079793], [0x8ca0, 0x0107d793], [0x8ca4, 0xfee78ae3]] },
+      { hart: "BRISC", rid: 0, pc: 0x8ca4, w: 0xfee78ae3, asm: "beq a5,a4,0x8c98", mem: [[0x8c98, 0x0106a783], [0x8c9c, 0x01079793], [0x8ca0, 0x0107d793], [0x8ca4, 0xfee78ae3]] },
+      { hart: "TRISC1", rid: 2, pc: 0x9674, w: 0x00e6a023, asm: "sw a4,0(a3)", mem: [[0x9674, 0x00e6a023], [0x9678, 0x06000000], [0x967c, 0xdc000010], [0x9680, 0x88050202], [0x9684, 0x90000022]] },
+      { hart: "TRISC1", rid: 2, pc: 0x9678, w: 0x06000000, asm: ".ttinsn", mem: [[0x9674, 0x00e6a023], [0x9678, 0x06000000], [0x967c, 0xdc000010], [0x9680, 0x88050202], [0x9684, 0x90000022]] },
+      { hart: "TRISC1", rid: 2, pc: 0x9684, w: 0x90000022, asm: ".ttinsn", mem: [[0x9674, 0x00e6a023], [0x9678, 0x06000000], [0x967c, 0xdc000010], [0x9680, 0x88050202], [0x9684, 0x90000022]] }
+    ];
+    var OPN = { 0x01: "MOP", 0xa4: "SEMPOST", 0x37: "SETRWC", 0xa2: "STALLWAIT" };
+    function hex(x) { return "0x" + (x >>> 0).toString(16).padStart(8, "0"); }
+    function rotr2(x) { return ((x >>> 2) | (x << 30)) >>> 0; }
+    function cls(n) {
+      if (n === "unimplemented") return C.bg3;
+      if (/^(f_|v_|csr|atomic)/.test(n)) return C.red;
+      if (/^(fence|ecall)/.test(n)) return C.orange;
+      return C.green;
+    }
+    var BX = 206, BW = 18, BY = 44; // bit strip
+    function bitX(b) { return BX + (31 - b) * BW; }
+    function drawBits(val, y, hl, alpha) {
+      ctx.globalAlpha = alpha == null ? 1 : alpha;
+      for (var b = 31; b >= 0; b--) {
+        var bit = (val >>> b) & 1, col = hl(b);
+        TT.box(ctx, bitX(b), y, BW - 2, 24, { r: 3, fill: col || C.bg3, alpha: col ? 0.35 : 1, stroke: col || C.border, lw: 1, label: String(bit), font: "13px", mono: true });
+        if (b % 4 === 0) TT.text(ctx, String(b), bitX(b) + BW / 2 - 1, y + 34, { color: C.muted, font: "10px", align: "center", mono: true });
+      }
+      ctx.globalAlpha = 1;
+    }
+    var steps = [
+      { dur: 1.2, text: "" }, { dur: 1.0, text: "" }, { dur: 1.2, text: "" }, { dur: 1.6, text: "" }, { dur: 1.4, text: "" }
+    ];
+    function texts(W) {
+      var isRV = (W.w & 3) === 3;
+      var idx = ((W.w >>> 2) & 31) | ((W.w & 0x7000) >>> 7);
+      var t = rotr2(W.w), op = t >>> 24;
+      return [
+        "<b>Fetch.</b> " + W.hart + "'s pc is <code>" + hex(W.pc) + "</code>, below the 1464 KiB L1 size, so ttsim reads 4 bytes straight out of L1: <code>inst = " + hex(W.w) + "</code>. No instruction cache is modelled.",
+        "<b>pc += 4, early.</b> Before anything else runs, <code>p_hart-&gt;pc</code> becomes <code>" + hex(W.pc + 4) + "</code>. If this instruction has to stall, its handler will set <code>pc -= 4</code> and the same word will be fetched again on the next pass: a replay.",
+        "<b>Check the low two bits.</b> They are <code>" + (W.w & 3).toString(2).padStart(2, "0") + "</code>. " + (isRV ? "That is <code>11</code>, so this is a standard 32-bit RISC-V instruction (<code>" + W.asm + "</code>)." : "That is not <code>11</code>. On a 64-bit core this would be a compressed instruction; on a baby core it means <b>Tensix instruction</b>, so the word goes to <code>tti()</code>."),
+        isRV ? "<b>Build the index.</b> Take <code>inst[6:2]</code> = " + ((W.w >>> 2) & 31).toString(2).padStart(5, "0") + " (the major opcode without its <code>11</code>) and put <code>funct3 = inst[14:12]</code> = " + ((W.w >>> 12) & 7).toString(2).padStart(3, "0") + " above it. The 8-bit result is <b>" + idx + "</b>." : "<b>Rotate right by 2.</b> <code>(inst &lt;&lt; 30) | (inst &gt;&gt; 2)</code> undoes the assembler's rotate-left. The Tensix instruction is <code>" + hex(t) + "</code>; its top byte <code>0x" + op.toString(16).padStart(2, "0") + "</code> is the opcode, <b>" + (OPN[op] || "?") + "</b> in <code>tensix_isa.json</code>.",
+        isRV ? "<b>Call the handler.</b> <code>s_decode_table[" + idx + "]</code> is <code>" + NAMES[idx].replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</code>. One array load and one indirect call: no <code>switch</code> over opcodes. " + (idx === 72 ? "This <code>sw</code> targets <code>0xFFE40000</code>, so it is the <em>other</em> way to push a Tensix instruction (the <code>TT_</code> macros): it reaches the coprocessor through <code>mem_wr</code> and MMIO, not through <code>tti()</code>." : "") : "<b>Push.</b> TRISC" + (W.rid - 1) + " pushes to thread " + (W.rid - 1) + "'s FIFO (<code>pipe = riscv_id - RV32_ID_TRISC0</code>). If <code>tensix_can_push_inst</code> says the FIFO is full, <code>tti()</code> sets <code>pc -= 4</code> instead and this word is replayed on the next pass. A BRISC <code>.ttinsn</code> would go to thread 0, bypassing the MOP expander; an NCRISC one is <code>UndefinedBehavior</code>."
+      ];
+    }
+    var cur = 4;
+    var st = TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        var W = WORDS[cur], isRV = (W.w & 3) === 3, tx = texts(W);
+        steps.forEach(function (s, k) { s.text = tx[k]; });
+        var idx = ((W.w >>> 2) & 31) | ((W.w & 0x7000) >>> 7);
+        TT.clear(ctx, g.W, g.H);
+        // hart and memory column
+        TT.text(ctx, W.hart, 20, 22, { color: C.yellow, font: "bold 15px" });
+        var pcv = (i >= 1) ? W.pc + 4 : W.pc;
+        TT.text(ctx, "pc = " + hex(pcv), 90, 22, { color: i === 1 ? C.yellow : C.fg, font: "14px", mono: true });
+        TT.text(ctx, "L1 (kernel text)", 20, 94, { color: C.muted, font: "12px" });
+        W.mem.forEach(function (m, k) {
+          var y = 104 + k * 30, on = m[0] === W.pc;
+          TT.box(ctx, 20, y, 168, 24, { r: 4, fill: on ? C.blue : C.bg2, alpha: on ? 0.3 : 1, stroke: on ? C.blue : C.border, lw: 1 });
+          TT.text(ctx, m[0].toString(16) + ":", 28, y + 12, { color: C.muted, font: "12px", mono: true });
+          TT.text(ctx, m[1].toString(16).padStart(8, "0"), 82, y + 12, { color: on ? C.fg : C.muted, font: "13px", mono: true });
+          var lb = (m[1] & 3) === 3 ? "RV" : "TT";
+          TT.text(ctx, lb, 178, y + 12, { color: lb === "TT" ? C.pink : C.green, font: "11px", align: "right" });
+        });
+        // bit strip
+        TT.text(ctx, "inst", 166, BY + 12, { color: C.muted, font: "13px" });
+        var fa = i === 0 ? t : 1;
+        drawBits(W.w, BY, function (b) {
+          if (i >= 2 && b <= 1) return C.yellow;
+          if (i >= 3 && isRV && b >= 2 && b <= 6) return C.blue;
+          if (i >= 3 && isRV && b >= 12 && b <= 14) return C.purple;
+          return null;
+        }, fa);
+        TT.text(ctx, hex(W.w), 870, BY + 12, { color: C.fg, font: "14px", mono: true, align: "right" });
+        if (i === 0 && t < 1) TT.arrow(ctx, 190, 116, TT.lerp(190, 205, t), TT.lerp(116, 70, t), { color: C.blue });
+        // decision box
+        var dx = 360, dy = 112;
+        var dA = i >= 2 ? 1 : 0.25;
+        ctx.globalAlpha = dA;
+        TT.box(ctx, dx, dy, 180, 40, { fill: C.bg2, stroke: C.yellow, label: "(inst & 3) == 3 ?", font: "14px", mono: true });
+        ctx.globalAlpha = 1;
+        TT.text(ctx, "yes: RISC-V", 600, 112, { color: (i >= 2 && isRV) ? C.green : C.muted, font: "13px" });
+        TT.text(ctx, "no: Tensix (tti)", dx + 80, 186, { align: "right", color: (i >= 2 && !isRV) ? C.pink : C.muted, font: "13px" });
+        if (i >= 2) {
+          var k = i === 2 ? t : 1;
+          if (isRV) TT.arrow(ctx, dx + 180, dy + 20, TT.lerp(dx + 180, 600, k), dy + 20 + TT.lerp(0, 40, k), { color: C.green });
+          else TT.arrow(ctx, dx + 90, dy + 40, dx + 90, TT.lerp(dy + 40, 280, k), { color: C.pink });
+        }
+        // RISC-V branch: index + 256 grid
+        var GX = 662, GY = 222, CS = 13;
+        TT.text(ctx, "s_decode_table[256]", GX, GY - 14, { color: C.muted, font: "12px", mono: true });
+        for (var n = 0; n < 256; n++) {
+          var gx = GX + (n % 16) * CS, gy = GY + Math.floor(n / 16) * CS;
+          ctx.fillStyle = cls(NAMES[n]); ctx.globalAlpha = NAMES[n] === "unimplemented" ? 1 : 0.55;
+          ctx.fillRect(gx, gy, CS - 2, CS - 2);
+        }
+        ctx.globalAlpha = 1;
+        if (isRV && i >= 3) {
+          // index bits
+          var ix = 600, iy = 168;
+          TT.text(ctx, "index =", ix - 4, iy - 16, { color: C.muted, font: "12px" });
+          var ib = idx.toString(2).padStart(8, "0");
+          for (var q = 0; q < 8; q++) {
+            var col = q < 3 ? C.purple : C.blue;
+            ctx.globalAlpha = i === 3 ? t : 1;
+            TT.box(ctx, ix + 46 + q * 15, iy - 26, 13, 20, { r: 2, fill: col, alpha: 0.35, stroke: col, lw: 1, label: ib[q], font: "12px", mono: true });
+            ctx.globalAlpha = 1;
+          }
+          TT.text(ctx, "= " + idx, ix + 170, iy - 16, { color: C.fg, font: "13px", mono: true });
+          TT.text(ctx, "funct3", ix + 46, iy + 4, { color: C.purple, font: "10px" });
+          TT.text(ctx, "inst[6:2]", ix + 94, iy + 4, { color: C.blue, font: "10px" });
+          if (i >= 4) {
+            var hx = GX + (idx % 16) * CS, hy = GY + Math.floor(idx / 16) * CS;
+            ctx.strokeStyle = C.yellow; ctx.lineWidth = 2.5; ctx.strokeRect(hx - 2, hy - 2, CS + 2, CS + 2);
+            TT.text(ctx, "[" + idx + "] " + NAMES[idx], GX + 104, GY + 16 * CS + 20, { color: C.yellow, font: "13px", mono: true, align: "center" });
+          }
+        }
+        // TTI branch: rotation + FIFOs
+        if (!isRV && i >= 3) {
+          var RX = 40, RY = 300, RW = 14;
+          var sh = i === 3 ? t : 1, tv = rotr2(W.w);
+          TT.text(ctx, "rotate right by 2", RX, RY - 14, { color: C.pink, font: "12px" });
+          for (var b2 = 31; b2 >= 0; b2--) {
+            // position of original bit b2 after rotating right by 2*sh
+            var bit = (W.w >>> b2) & 1;
+            var pos = (31 - b2) + 2 * sh; // shift right on screen
+            var px = RX + (pos % 32) * RW;
+            if (pos >= 32) px = RX + (pos - 32) * RW;
+            var low = b2 <= 1;
+            TT.box(ctx, px, RY, RW - 2, 20, { r: 2, fill: low ? C.yellow : (b2 >= 26 ? C.pink : C.bg3), alpha: low || b2 >= 26 ? 0.35 : 1, stroke: C.border, lw: 1, label: String(bit), font: "11px", mono: true });
+          }
+          if (sh >= 1) {
+            TT.text(ctx, "Tensix inst = " + hex(tv) + "  opcode 0x" + (tv >>> 24).toString(16).padStart(2, "0") + " = " + (OPN[tv >>> 24] || "?"), RX, RY + 40, { color: C.fg, font: "14px", mono: true });
+          }
+          // FIFOs
+          var FX = 40, FY = 372;
+          for (var p = 0; p < 3; p++) {
+            var fy = FY + p * 30, mine = p === W.rid - 1;
+            TT.text(ctx, "T" + p + " FIFO", FX, fy + 11, { color: mine ? C.pink : C.muted, font: "12px" });
+            TT.box(ctx, FX + 64, fy, 300, 22, { r: 4, fill: C.bg2, stroke: mine ? C.pink : C.border, lw: 1 });
+          }
+          if (i >= 4) {
+            var fyy = FY + (W.rid - 1) * 30;
+            var tx0 = TT.lerp(RX + 200, FX + 64 + 300 - 96, t);
+            var ty0 = TT.lerp(RY + 40, fyy + 2, t);
+            TT.box(ctx, tx0, ty0, 92, 18, { r: 3, fill: C.pink, alpha: 0.4, stroke: C.pink, lw: 1, label: OPN[tv >>> 24] || "?", font: "11px", mono: true });
+            TT.text(ctx, "\u2192 MOP / replay expanders \u2192 backend", FX + 372, fyy + 11, { color: C.muted, font: "12px" });
+          }
+        }
+        if (isRV && i >= 4 && idx === 72) {
+          TT.text(ctx, "sw to 0xFFE40000 \u2192 mem_wr \u2192 MMIO \u2192 the same T1 FIFO", 40, 330, { color: C.pink, font: "13px" });
+        }
+      }
+    });
+    sel.onchange = function () { cur = +sel.value; st.render(); };
+  })();
+  </script>
+
+  <div class="callout key">ttsim's baby core is a <em>dispatch loop</em>, not a pipeline: fetch from L1, set <code>pc += 4</code>, look at two bits, then call one of 256 handlers or push to the coprocessor. "Stall" means "rewind the PC and try again on the next pass".</div>
+
+  <h3>Memory: where the stalls come from</h3>
+  <p>Loads and stores go through <code>mem_rd</code> and <code>mem_wr</code>. The order of the checks tells you what is fast in the simulator:</p>
+  <div class="filename">ttsim/src/riscv_impl.h:627-648 and 722-737 @b3620244 (trimmed)</div>
+<pre><code>template&lt;class T&gt; static bool RV_XLEN_PREFIX(mem_rd)(RiscvHartState *p_hart, uint_xlen_t addr, T *p_data) {
+    …
+    TTSIM_VERIFY(!(addr &amp; (size - 1)), NonContractualBehavior, "unaligned addr=0x%llx size=%d", uint64_t(addr), size);
+    if (addr &lt; p_hart-&gt;sram_size) {
+        dcache_access(p_hart, addr, false);
+        *p_data = mem_rd&lt;T&gt;(&amp;p_hart-&gt;p_sram[addr]);
+        return true;
+    }
+    if (uint8_t *p_mem = get_local_mem_ptr(p_hart, addr)) {
+        *p_data = mem_rd&lt;T&gt;(p_mem);
+        return true;
+    }
+    … // otherwise: an MMIO register, via tile_mmio_rd32(), which may answer "not done yet"
+}
+
+template&lt;class T, class T_SEXT&gt; static void RV_XLEN_PREFIX(load)(RiscvHartState *p_hart, uint32_t inst) {
+    …
+    if (!RV_XLEN_PREFIX(mem_rd)&lt;T&gt;(p_hart, addr, &amp;value)) [[unlikely]] {
+        p_hart-&gt;pc -= 4; // replay load to handle stall
+        return;
+    }</code></pre>
+  <ul>
+    <li><b>Misalignment is caught.</b> The ISA docs say an unaligned access is "silently rounded down to the nearest aligned address", and they classify relying on that as <code>NonContractualBehavior</code> (<code>BabyRISCV/README.md:111</code>). ttsim doesn't round: it stops with that category.</li>
+    <li><b>L1, then local RAM, then MMIO.</b> L1 and the private RAM are plain array accesses that always succeed. <code>dcache_access</code> is an empty function (<code>riscv_impl.h:613-615</code>), so caches cost nothing. Every other address is a device register, handled in <code>tile.cpp</code>, and that is the only place a load can stall. For example, reading the <code>TENSIX_SYNC</code> register returns "not done" until the hart's coprocessor thread is idle (<code>tile.cpp:1900-1903</code>). You will see that stall at work in step 2.</li>
+    <li><b>Narrow MMIO is refused on Wormhole.</b> 8- and 16-bit loads and stores to device registers stop with <code>UnsupportedFunctionality</code> (<code>riscv_impl.h:651, 660, 703, 709</code>). The messages explain why: on real hardware an 8-bit MMIO store writes the whole 32-bit register.</li>
+  </ul>
+
+  <h3>The Wormhole restrictions</h3>
+  <p>The baby cores implement RV32IM and nothing else (<code>BabyRISCV/README.md:17</code>). ttsim enforces that boundary by stopping at the first instruction outside it, using the error categories from A04:</p>
+  <table>
+    <tr><th>Instruction class</th><th>What ttsim does on Wormhole</th><th>Source</th></tr>
+    <tr><td>F/D/Q/Zfh floating point</td><td><code>UndefinedBehavior</code>: "Wormhole does not support Zfh/F/D/Q"</td><td><code>riscv_impl.h:454-455</code></td></tr>
+    <tr><td>Vector (V)</td><td><code>UndefinedBehavior</code></td><td><code>riscv_impl.h:603-604</code></td></tr>
+    <tr><td>Atomics (Zaamo)</td><td><code>UndefinedBehavior</code></td><td><code>riscv_impl.h:753-754</code></td></tr>
+    <tr><td>CSR instructions (Zicsr)</td><td><code>UndefinedBehavior</code></td><td><code>riscv_impl.h:1316-1317</code></td></tr>
+    <tr><td><code>fence</code></td><td><code>UnsupportedFunctionality</code>: "fence instructions do not enforce memory ordering on Wormhole and should not be used". The one exception is <code>PAUSE</code> (<code>0x0100000F</code>), which parks the core until the next multiple of 256 clocks.</td><td><code>riscv_impl.h:1078-1084</code>, <code>libttsim.cpp:230</code></td></tr>
+    <tr><td><code>fence.i</code></td><td><code>UnsupportedFunctionality</code>: "does not flush the instruction cache on babyrisc"</td><td><code>riscv_impl.h:1128</code></td></tr>
+    <tr><td><code>ecall</code></td><td><code>UnimplementedFunctionality</code></td><td><code>riscv_impl.h:1166</code></td></tr>
+    <tr><td>Anything that hits an empty table slot</td><td><code>UndefinedBehavior</code>: "could not decode instruction"</td><td><code>riscv_impl.h:1488-1491</code></td></tr>
+  </table>
+  <div class="callout warn">The ISA docs and ttsim describe <code>fence</code> differently. The docs say <code>fence</code> "is executed as if it were <code>nop</code>, and hence cannot be used to enforce memory ordering" (<code>BabyRISCV/README.md:18</code>). ttsim refuses to run it at all. These two descriptions don't contradict each other: a <code>fence</code> in Wormhole code is almost certainly a bug, because whoever wrote it expected ordering they won't get, so the simulator turns a silent no-op into a loud error. Wormhole code orders memory by other means. The kernel you'll run in step 2 uses <code>load_blocking</code> for that (<code>reader_writer_add_in_riscv.cpp:45-49</code>).</div>
+
+  <h2 id="decode">2. Lab step 1: read the generated decode table</h2>
+  <p>Set up the lab and make an editable copy of ttsim. You need one extra variable compared with B00: <code>TT_METAL_CACHE</code>. It gives this lab its own JIT cache, so the kernel ELFs you disassemble in step 4 are definitely the ones that ran. The shared cache in <code>~/.cache/tt-metal-cache</code> fills up with builds from other labs.</p>
+<pre><code>export LAB_HOME=$HOME/ttlab/b03
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs
+source $W/workbench/env.sh wh
+export TT_METAL_CACHE=$LAB_HOME/cache
+$W/workbench/build_ttsim.sh count wh      # first use copies pristine ttsim to $LAB_HOME/ttsim-count
+copied ttsim source to /home/user/ttlab/b03/ttsim-count (edit files in /home/user/ttlab/b03/ttsim-count/src/)
+export TT_METAL_SIMULATOR=/home/user/ttlab/b03/sim-count-wh-release/libttsim.so</code></pre>
+  <p>The build generated <code>src/_out/riscv_decode.h</code>. Open it and you'll see why it is unreadable as is:</p>
+<pre><code>$ head -12 $LAB_HOME/ttsim-count/src/_out/riscv_decode.h
+RV_XLEN_PREFIX(load)&lt;int8_t, int_xlen_t&gt;,
+RV_XLEN_PREFIX(v_load)&lt;uint8_t&gt;,
+#if XLEN == 64
+RV_XLEN_PREFIX(custom_0),
+#else
+RV_XLEN_PREFIX(unimplemented),
+#endif
+RV_XLEN_PREFIX(fence),
+RV_XLEN_PREFIX(alu_imm)&lt;0&gt;,
+RV_XLEN_PREFIX(auipc),
+#if XLEN == 64
+RV_XLEN_PREFIX(alu_imm_32)&lt;0&gt;,</code></pre>
+  <p>It is a list of initialisers for <code>static DecodeAndExecuteFunc s_decode_table[256]</code>, which <code>#include</code>s it (<code>riscv_impl.h:1889-1891</code>). The <code>#if XLEN == 64</code> blocks are there because the same header also builds the 64-bit decoder for Blackhole's x280 cores. Let the C preprocessor resolve them as a 32-bit build would, and number the lines from zero. Each line number is now the table index:</p>
+<pre><code>$ cd $LAB_HOME/ttsim-count/src
+$ cpp -P -DXLEN=32 '-DRV_XLEN_PREFIX(x)=x' _out/riscv_decode.h | nl -v0 | sed -n '1,14p;25,26p;29p;37p;65p;73p'
+     0	load&lt;int8_t, int_xlen_t&gt;,
+     1	v_load&lt;uint8_t&gt;,
+     2	unimplemented,
+     3	fence,
+     4	alu_imm&lt;0&gt;,
+     5	auipc,
+     6	unimplemented,
+     7	unimplemented,
+     8	store&lt;uint8_t&gt;,
+     9	v_store&lt;uint8_t&gt;,
+    10	unimplemented,
+    11	unimplemented,
+    12	alu&lt;0&gt;,
+    13	lui,
+    24	branch&lt;branch_op_beq&gt;,
+    25	jalr,
+    28	ecall_ebreak,
+    36	alu_imm&lt;1&gt;,
+    64	load&lt;int32_t, int_xlen_t&gt;,
+    72	store&lt;uint32_t&gt;,
+$ cpp -P -DXLEN=32 '-DRV_XLEN_PREFIX(x)=x' _out/riscv_decode.h | wc -l
+256
+$ cpp -P -DXLEN=32 '-DRV_XLEN_PREFIX(x)=x' _out/riscv_decode.h | sort | uniq -c | sort -rn | head -5
+    127 unimplemented,
+      8 v_alu,
+      8 lui,
+      8 jal,
+      8 f_fma&lt;true, true&gt;,</code></pre>
+
+  <h3>Why 256, and why this index</h3>
+  <p>Every 32-bit RISC-V instruction keeps its <em>major opcode</em> in bits 6:0. Bits 1:0 are always <code>11</code>, so only bits 6:2 carry information: 5 bits, 32 major opcodes. Many instruction formats keep a 3-bit <code>funct3</code> field in bits 14:12, which picks the variant: <code>lb</code>, <code>lh</code>, <code>lw</code> and so on all share the LOAD opcode. Glue the two together and you get 5 + 3 = 8 bits, or 256 possibilities. That's the line in <code>step()</code>:</p>
+<pre><code>uint32_t opcode = ((inst &gt;&gt; 2) &amp; 31) | ((inst &amp; 0x7000) &gt;&gt; 7);   // inst[6:2] | inst[14:12] &lt;&lt; 5</code></pre>
+  <p>(<code>(inst &amp; 0x7000) &gt;&gt; 7</code> moves bits 14:12 down to bits 7:5.) The generator builds the same index from a table of <code>(isa, match, mask, handler)</code> rows:</p>
+  <div class="filename">ttsim/src/riscv_gen_decode.py:113-128 @b3620244</div>
+<pre><code>table: list = [None] * 256
+for (isa, inst, mask, name) in riscv_decode_table:
+    assert isa in {32, 64}, isa
+    assert inst &amp; ~mask == 0, (inst, mask)
+    assert (inst &amp; 3) == 3, inst
+    if mask == 0x007F:
+        for funct3 in range(8):
+            opcode = (inst &gt;&gt; 2) | (funct3 &lt;&lt; 5)
+            assert table[opcode] is None
+            table[opcode] = (isa, name)
+    elif mask == 0x707F:
+        opcode = ((inst &gt;&gt; 2) &amp; 31) | ((inst &amp; 0x7000) &gt;&gt; 7)
+        assert table[opcode] is None
+        table[opcode] = (isa, name)
+    else:
+        assert False, mask</code></pre>
+  <p>Two kinds of rows go in:</p>
+  <ul>
+    <li><b>Mask <code>0x707F</code></b>: the instruction is identified by opcode <em>and</em> funct3, so it fills exactly one slot. <code>lw</code> is <code>0x2003</code>: opcode bits 6:2 = 0 and funct3 = 2, so it goes to index 0 + 2×32 = <b>64</b>, the <code>load&lt;int32_t, int_xlen_t&gt;</code> you saw above. The template arguments say "read 32 bits, sign-extend to XLEN", so <code>lb</code>, <code>lh</code>, <code>lbu</code> and <code>lhu</code> all share one function body, specialised by the compiler.</li>
+    <li><b>Mask <code>0x007F</code></b>: formats with no funct3 field, such as <code>lui</code>, <code>auipc</code> and <code>jal</code>, where bits 14:12 belong to an immediate. The instruction must work whatever those bits are, so the generator copies it into all 8 slots. That's why <code>lui</code>, <code>jal</code> and <code>auipc</code> each appear 8 times.</li>
+  </ul>
+  <p>What doesn't fit in 8 bits is decided <em>inside</em> the handler. <code>alu&lt;0&gt;</code> (index 12) handles <code>add</code>, <code>sub</code> and also <code>mul</code>: it switches on <code>funct7</code>, the top 7 bits (<code>riscv_impl.h:182-212</code>). That's how the M extension gets in without its own table slots. The <code>funct3</code> value is a template parameter, so each of the eight <code>alu&lt;N&gt;</code> copies only switches over the cases for its own <code>funct3</code>.</p>
+  <p>Of the 256 slots, 127 are <code>unimplemented</code> in a 32-bit build. The other 129 split into three colours in the figure above:</p>
+  <ul>
+    <li><b>71 red.</b> 48 floating point (32 of them are the four fused multiply-adds, which have no <code>funct3</code> and so fill 8 slots each), 16 vector, 6 CSR and 1 atomic. They exist so that Blackhole's baby cores, or the 64-bit build, can use them. On Wormhole every one stops the simulation, as the table in section 1 shows.</li>
+    <li><b>55 green.</b> The integer RV32IM handlers: loads, stores, ALU, <code>lui</code>, <code>auipc</code>, branches and jumps.</li>
+    <li><b>3 orange.</b> <code>fence</code> (only its <code>PAUSE</code> form works on Wormhole), <code>fence.i</code> and <code>ecall</code>/<code>ebreak</code>.</li>
+  </ul>
+  <p>So a Wormhole program lives in 55 slots, plus <code>PAUSE</code>.</p>
+
+  <div class="callout gpu">A GPU's SASS decoder is hardware, and you never see it. The nearest software analogue is a functional simulator such as the one inside GPGPU-Sim, which also decodes each warp instruction once and dispatches on opcode. ttsim's table is the textbook "computed goto" interpreter: indexing an array of function pointers turns decoding into one load and one indirect branch. It's cheap enough that the simulator spends its time in memory accesses and in the Tensix model, not in decode.</div>
+
+  <h2 id="count">3. Lab step 2: count instructions per core, inside the kernel</h2>
+  <p>Now instrument <code>step()</code>. Counting every step is easy, but B01 already did it chip-wide (963,752 hart-steps for <code>add_2_integers_in_riscv</code>), and it doesn't answer our question. We want the steps that belong to <em>the kernel</em>. So we need to know, for each hart, when the kernel starts and when it ends.</p>
+
+  <h3>Finding the kernel window</h3>
+  <p>Every core runs firmware that tt-metal loads at boot. When a program arrives, the firmware computes the kernel's address in the kernel config area of L1 and calls it like a C function pointer. Here is BRISC's version; TRISC (<code>trisc.cc:215-216</code>) and NCRISC do the same:</p>
+  <div class="filename">tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisc.cc:526-528 @7aad8aac</div>
+<pre><code>uint32_t kernel_lma =
+    (kernel_config_base + launch_msg_address-&gt;kernel_config.kernel_text_offset[index]);
+auto stack_free = reinterpret_cast&lt;uint32_t (*)()&gt;(kernel_lma)();</code></pre>
+  <p>In machine code, a call through a function pointer is <code>jalr</code>, which puts the return address in <code>ra</code> (register <code>x1</code>). Disassemble the firmware ELF, which tt-metal built into our private cache, and the call site is easy to find:</p>
+<pre><code>$ OD=$TT_METAL_HOME/runtime/sfpi/compiler/bin/riscv-tt-elf-objdump
+$ C=$(ls -d $LAB_HOME/cache/tt-metal-cache1*); echo $C
+/home/user/ttlab/b03/cache/tt-metal-cache13101861097061555864
+$ $OD -d --no-show-raw-insn $C/firmware/brisc/brisc.elf | grep -B3 -A1 ' 4258:'
+    424c:	jal	4a38 &lt;_Z23start_ncrisc_kernel_runm.part.0&gt;
+    4250:	lw	a5,52(s1)
+    4254:	add	a5,a5,s3
+    4258:	jalr	a5
+    425c:	jal	4574 &lt;_Z17wait_ncrisc_triscv&gt;</code></pre>
+  <div class="callout warn">tt-metal appends the build hash to <code>TT_METAL_CACHE</code> <em>without a slash</em> (<code>rtoptions.cpp:503-505</code> normalises the path to end in <code>tt-metal-cache</code>), so your firmware lands in <code>$LAB_HOME/cache/tt-metal-cache13101861097061555864/</code>, next to an unrelated <code>tt-metal-cache/</code> directory that holds only precompiled headers. Hence the <code>tt-metal-cache1*</code> glob. A DPRINT build (exercise E2) gets a second hash directory, and so does a Blackhole build. After that, set <code>C</code> to the right directory by hand.</div>
+  <p>That gives a clean rule for the kernel window:</p>
+  <ol>
+    <li>Firmware text sits low in L1 (BRISC's runs from <code>0x3b20</code> to <code>0x4b30</code>, TRISC2's ends at <code>0x711c</code>). Kernels are loaded above <code>MEM_MAP_END</code>, which is <code>0x8a60</code> on Wormhole (computed from <code>wormhole/dev_mem_map.h:58-163</code>). NCRISC kernels run from IRAM at <code>0xFFC00000</code>, which is higher still.</li>
+    <li>The window <b>opens</b> at the first step whose PC is ≥ <code>0x8a60</code>. At that moment <code>ra</code> holds the firmware return address, so save it.</li>
+    <li>The window <b>closes</b> when the PC equals that saved address, which is the first firmware instruction after the kernel returns.</li>
+  </ol>
+  <p>As a safety check we also count kernel-window steps whose PC is <em>below</em> <code>0x8a60</code>. If a kernel called back into firmware code, this number would show it. It came out as zero for every core.</p>
+
+  <h3>The patch</h3>
+  <p>The full change is <a href="patches/b03-count.patch"><code>patches/b03-count.patch</code></a>, a <code>diff -u</code> against pristine ttsim (106 lines, three files). Here is its core, in <code>riscv_impl.h</code>:</p>
+  <div class="filename">sim-labs/patches/b03-count.patch (excerpt)</div>
+<pre><code>+#define B03_KERNEL_LO 0x8a60 // MEM_MAP_END in tt-metal wormhole/dev_mem_map.h: kernel config space starts here
++static_assert(TT_ARCH_VERSION == 0, "B03 lab instrumentation is Wormhole-only (B03_KERNEL_LO, NCRISC IRAM)");
++struct B03Hart {
++    uint64_t steps, replays;              // all step() calls; calls that left pc unchanged
++    uint64_t k_steps, k_replays, k_calls; // the same, inside the kernel window
++    uint64_t k_below;                     // kernel-window steps with pc below B03_KERNEL_LO
++    uint32_t entry_pc, ret_pc;
++    bool in_kernel;
++};
++static B03Hart s_b03[NUM_T_TILES][RV32_CORES_PER_T_TILE];
++static B03Hart *b03_before(RiscvHartState *p_hart, uint32_t pc) {
++    if (p_hart-&gt;tile_type != 'T') return nullptr;
++    B03Hart *h = &amp;s_b03[p_hart-&gt;tile_id][p_hart-&gt;riscv_id];
++    h-&gt;steps++;
++    if (h-&gt;in_kernel &amp;&amp; pc == h-&gt;ret_pc) h-&gt;in_kernel = false; // returned to firmware
++    if (!h-&gt;in_kernel &amp;&amp; pc &gt;= B03_KERNEL_LO) {                 // entered a kernel
++        h-&gt;in_kernel = true;
++        h-&gt;entry_pc = pc;
++        h-&gt;ret_pc = p_hart-&gt;x_regs[1];
++        h-&gt;k_calls++;
++    }
++    h-&gt;k_steps += h-&gt;in_kernel;
++    h-&gt;k_below += h-&gt;in_kernel &amp;&amp; pc &lt; B03_KERNEL_LO;
++    return h;
++}
+ …
+ void RV_XLEN_PREFIX(step)(RiscvHartState *p_hart) {
+     uint_xlen_t pc = p_hart-&gt;pc;
++#if XLEN == 32
++    B03Hart *b03 = b03_before(p_hart, pc);
++#endif
+ …
++#if XLEN == 32
++    if (b03 &amp;&amp; p_hart-&gt;pc == pc) { // pc unchanged: a stall rewound pc to retry, or a jump to itself
++        b03-&gt;replays++;
++        b03-&gt;k_replays += b03-&gt;in_kernel;
++    }
++#endif
+ }</code></pre>
+  <p>Some notes on the design:</p>
+  <ul>
+    <li><b>Counters, not prints.</b> One million steps with a <code>printf</code> each would swamp the run. The counters cost a few additions per step, and the run time didn't change measurably (0.2 s of CPU either way). <code>b03_report()</code> prints them once, called from <code>ttsim_exit()</code> in <code>sim.cpp</code>, which runs when tt-metal closes the device.</li>
+    <li><b>Replays are detected from outside.</b> Rather than patching every <code>pc -= 4</code>, the hook compares the PC before and after the step. If it hasn't moved, the step did no forward work. That catches stalled loads and stores, stalled <code>.ttinsn</code>s, and also a jump to itself, which you'll meet below.</li>
+    <li><b>Wormhole only.</b> <code>0x8a60</code> is Wormhole's <code>MEM_MAP_END</code>. Blackhole has a different memory map and no NCRISC IRAM, so a <code>static_assert</code> stops a Blackhole build of the patched copy instead of letting it print wrong numbers.</li>
+  </ul>
+  <p>Apply, rebuild, run both examples:</p>
+<pre><code>$ patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/patches/b03-count.patch
+patching file src/riscv_impl.h
+patching file src/sim.h
+patching file src/sim.cpp
+$ $W/workbench/build_ttsim.sh count wh
+export TT_METAL_SIMULATOR=/home/user/ttlab/b03/sim-count-wh-release/libttsim.so
+$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
+$ $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep -E 'Success|^\[[1-9]|B03'
+Success: Result is 21
+[4501] 0.2 seconds (25.9 KHz)
+[4501] B03 tile 0 BRISC  entry=0x8a80 ret=0x425c calls=1  kernel steps=116 (replays 0, below 0x8a60 0)  all steps=4173 (replays 0)
+[4501] B03 all 72 stepped tiles BRISC  steps=301096  in kernels=116
+[4501] B03 all 72 stepped tiles TRISC0 steps=165664  in kernels=0
+[4501] B03 all 72 stepped tiles TRISC1 steps=165664  in kernels=0
+[4501] B03 all 72 stepped tiles TRISC2 steps=165664  in kernels=0
+[4501] B03 all 72 stepped tiles NCRISC steps=165664  in kernels=0
+$ $EX/metal_example_add_2_integers_in_compute 2&gt;&amp;1 | grep -E 'Success|^\[[1-9]|B03'
+Success: Result matches expected value!
+[4682] 0.2 seconds (26.3 KHz)
+[4682] B03 tile 0 BRISC  entry=0x8b80 ret=0x425c calls=1  kernel steps=246 (replays 0, below 0x8a60 0)  all steps=4482 (replays 0)
+[4682] B03 tile 0 TRISC0 entry=0x9040 ret=0x6504 calls=1  kernel steps=303 (replays 0, below 0x8a60 0)  all steps=2601 (replays 0)
+[4682] B03 tile 0 TRISC1 entry=0x9440 ret=0x6958 calls=1  kernel steps=155 (replays 0, below 0x8a60 0)  all steps=2601 (replays 266)
+[4682] B03 tile 0 TRISC2 entry=0x9700 ret=0x70f8 calls=1  kernel steps=246 (replays 0, below 0x8a60 0)  all steps=2601 (replays 23)
+[4682] B03 tile 0 NCRISC entry=0xffc00000 ret=0x5cd0 calls=1  kernel steps=153 (replays 0, below 0x8a60 0)  all steps=2580 (replays 77)
+[4682] B03 all 72 stepped tiles BRISC  steps=314256  in kernels=246
+[4682] B03 all 72 stepped tiles TRISC0 steps=178824  in kernels=303
+[4682] B03 all 72 stepped tiles TRISC1 steps=178824  in kernels=155
+[4682] B03 all 72 stepped tiles TRISC2 steps=178824  in kernels=246
+[4682] B03 all 72 stepped tiles NCRISC steps=178803  in kernels=153</code></pre>
+  <p>(Each run also prints a block of all-zero <code>[0] B03</code> lines first. tt-metal opens and closes the simulator once during topology discovery, before the real run, and that first instance never steps a core.) A second run gave identical numbers, as it should for a deterministic simulator. Before we read them, check that the window logic did what we claimed: every <code>ret=</code> address should be the instruction right after a <code>jalr</code> in that core's firmware. <code>0x425c</code> is the one we found above for BRISC. For TRISC0, <code>trisc0.elf</code> has <code>6500: jalr a5</code> followed by <code>6504: li a5,0</code>. For NCRISC, <code>ncrisc.elf</code> has <code>5ccc: jal 5e88 &lt;wh_iram_trampoline&gt;</code> followed by <code>5cd0</code>. All five match, and every core's kernel ran exactly once (<code>calls=1</code>).</p>
+
+  <h3>Reading the numbers</h3>
+  <p>Here are the counts as bars. Step through the four views. The bars are real counts from the two runs above.</p>
+  <div class="viz" id="fig-bars"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-bars");
+    var g = TT.canvas(root, 880, 420), ctx = g.ctx, C = TT.C;
+    var H = ["BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"];
+    var COL = [TT.C.orange, TT.C.blue, TT.C.teal, TT.C.purple, TT.C.yellow];
+    var V = [
+      { title: "add_2_integers_in_compute: steps inside each kernel (tile 0)", v: [246, 303, 155, 246, 153], inner: [0, 23, 34, 57, 0], innerLabel: ".ttinsn pushes", total: "1,103 kernel steps in all" },
+      { title: "add_2_integers_in_riscv: steps inside each kernel (tile 0)", v: [116, 0, 0, 0, 0], inner: [0, 0, 0, 0, 0], innerLabel: "", total: "only BRISC has a kernel: 116 steps" },
+      { title: "add_2_integers_in_compute: every step on tile 0", v: [4482, 2601, 2601, 2601, 2580], inner: [246, 303, 155, 246, 153], innerLabel: "of which inside the kernel", total: "1,103 of 14,865 steps (7.4%) are kernel" },
+      { title: "add_2_integers_in_compute: every step on all 72 stepped tiles", v: [314256, 178824, 178824, 178824, 178803], inner: [246, 303, 155, 246, 153], innerLabel: "of which inside a kernel", total: "1,103 of 1,029,531 steps (0.107%) are kernel" }
+    ];
+    var steps = [
+      { dur: 1.4, text: "<b>Inside the kernels.</b> In the compute example, TRISC0 (unpack) ran the most kernel steps, 303, and TRISC1 (math) the fewest of the three compute cores, 155. The pink part of each bar is the number of those steps that were <code>.ttinsn</code> pushes (lab step 3): 23, 34 and 57. A TRISC kernel is mostly RISC-V bookkeeping around a few dozen Tensix instructions." },
+      { dur: 1.4, text: "<b>The pure-RISC-V example.</b> <code>add_2_integers_in_riscv</code> runs one kernel on BRISC: 116 steps to read two integers over the NoC, add them, and write the result back. The other four cores have no kernel, so their bars are empty." },
+      { dur: 1.4, text: "<b>All steps on the one busy tile.</b> Put the kernel steps (dark inner bars) next to everything tile 0 did. Firmware boot and wait loops dominate even here. BRISC has the most steps because it leaves reset first and then releases the other four cores (<code>brisc.cc:274-279</code>). The TRISCs are stepped in lockstep from then on, so they tie at 2,601." },
+      { dur: 1.6, text: "<b>The whole chip.</b> The 71 other Tensix tiles also boot firmware and spin waiting for a go message that never arrives. Kernel steps are now 0.107% of the total, too thin to see. That is the opening question's answer: <b>1,103 of 1,029,531</b>." }
+    ];
+    function fmt(n) { return n.toLocaleString("en-US"); }
+    var prevI = 0;
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var from = V[i > 0 ? i - 1 : 0], to = V[i];
+        var k = (i === 0) ? t : t;
+        var max = Math.max.apply(null, to.v), maxF = Math.max.apply(null, from.v);
+        var m = TT.lerp(maxF, max, k) || 1;
+        var X0 = 120, Y0 = 340, PH = 260, BWID = 90, GAP = 56;
+        TT.text(ctx, to.title, 440, 24, { align: "center", font: "15px", color: C.fg });
+        // axis
+        ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(X0 - 10, Y0); ctx.lineTo(X0 + 5 * (BWID + GAP), Y0); ctx.stroke();
+        for (var q = 0; q <= 4; q++) {
+          var yv = m * q / 4, y = Y0 - PH * q / 4;
+          ctx.strokeStyle = "#1a1f27"; ctx.beginPath(); ctx.moveTo(X0 - 10, y); ctx.lineTo(X0 + 5 * (BWID + GAP), y); ctx.stroke();
+          TT.text(ctx, fmt(Math.round(yv)), X0 - 16, y, { align: "right", color: C.muted, font: "11px", mono: true });
+        }
+        for (var h = 0; h < 5; h++) {
+          var val = TT.lerp(i === 0 ? 0 : from.v[h], to.v[h], k);
+          var inn = TT.lerp(i === 0 ? 0 : from.inner[h], to.inner[h], k);
+          var x = X0 + h * (BWID + GAP), bh = PH * val / m, ih = PH * inn / m;
+          if (bh > 0.5) TT.box(ctx, x, Y0 - bh, BWID, bh, { r: 3, fill: COL[h], alpha: 0.45, stroke: COL[h], lw: 1.5 });
+          if (ih > 0.5) {
+            var ic = i === 0 ? C.pink : "#000";
+            ctx.globalAlpha = i === 0 ? 0.6 : 0.8; ctx.fillStyle = ic;
+            ctx.fillRect(x + 14, Y0 - ih, BWID - 28, ih); ctx.globalAlpha = 1;
+          }
+          TT.text(ctx, H[h], x + BWID / 2, Y0 + 16, { align: "center", font: "13px", color: COL[h] });
+          if (k > 0.98) {
+            TT.text(ctx, fmt(to.v[h]), x + BWID / 2, Math.min(Y0 - bh - 10, Y0 - 12), { align: "center", font: "13px", mono: true });
+            if (to.inner[h] && i !== 1) TT.text(ctx, (i === 0 ? "pushes " : "kernel ") + fmt(to.inner[h]), x + BWID / 2, Y0 + 32, { align: "center", font: "11px", color: i === 0 ? C.pink : C.muted, mono: true });
+          }
+        }
+        if (to.innerLabel) {
+          ctx.fillStyle = i === 0 ? C.pink : "#000"; ctx.globalAlpha = i === 0 ? 0.6 : 1;
+          ctx.fillRect(640, 44, 14, 12); ctx.globalAlpha = 1;
+          ctx.strokeStyle = C.muted; ctx.strokeRect(640, 44, 14, 12);
+          TT.text(ctx, to.innerLabel, 660, 50, { font: "12px", color: C.muted });
+        }
+        TT.text(ctx, to.total, 440, 402, { align: "center", font: "14px", color: C.yellow });
+      }
+    });
+  })();
+  </script>
+  <p>Four things to notice.</p>
+  <ul>
+    <li><b>The kernel is a rounding error.</b> On the whole chip, kernel steps are 0.107% of the total for the compute example and 0.012% (116 of 963,752) for the RISC-V one. In ttsim, an idle firmware loop costs exactly what a kernel instruction costs: one step. Every one of the 72 tiles that ran (ttsim models 80 Tensix tiles on Wormhole; the other 8 were never stepped in these runs) polls its mailbox every clock, and the host decides how many clocks there are (B01). If you want to know what <em>your</em> code did, you have to filter by window, as we did. Counting everything gives you the firmware's profile.</li>
+    <li><b>The kernels are straight-line.</b> No core had a single replay inside its kernel window. The compute kernel's waits <em>between</em> cores show up as loop iterations (a polling loop is ordinary instructions), not as replays. Step 4 finds them.</li>
+    <li><b>The replays are all in firmware, and each has a story.</b> We added a temporary print of the PC of each replay on tile 0 (not part of the published patches) and disassembled the firmware at those addresses:
+      <ul>
+        <li><b>TRISC1, 266 replays at <code>0x6960</code>:</b> <code>lw a5,0(s0)</code> right after the kernel returns. This is <code>tensix_sync()</code> (<code>trisc.cc:222</code>), a read of the <code>TENSIX_SYNC</code> register that stalls until the thread's Tensix instructions have all finished (<code>tile.cpp:1900-1903</code>). The math core returned from its kernel after 155 steps and then spent 266 steps waiting for the coprocessor to catch up, which in turn was waiting on data from the other cores. This is A04's "the RISC-V runs ahead", measured. TRISC2's 23 replays are the same <code>lw</code> at <code>0x7100</code>.</li>
+        <li><b>NCRISC, 77 replays at <code>0x5ecc</code>:</b> the word there is <code>0x0000006f</code>, <code>j .</code>, a jump to itself. It's the end of <code>wh_iram_trampoline</code>. On Wormhole, the NCRISC can't safely jump from L1 into its IRAM, so it saves its registers, tells BRISC it's ready, and spins on itself until BRISC resets it with its reset PC pointed at the IRAM kernel:</li>
+      </ul>
+    </li>
+  </ul>
+  <div class="filename">tt-metal/tt_metal/hw/toolchain/wh-iram-trampoline.S:39-43 @7aad8aac</div>
+<pre><code>	sw sp, MEM_NCRISC_HALT_STACK_MAILBOX_ADDRESS( zero )
+	sb a0, MEM_SUBORDINATE_RUN_MAILBOX_ADDRESS( zero )   /* Tell brisc we're done */
+
+	/*Program flow will end here as ncrisc will go into reset*/
+0:	j 0b</code></pre>
+  <p>BRISC's side is <code>start_ncrisc_kernel_run</code> (<code>brisc.cc:306-322</code>): it writes the resume address into <code>NCRISC_RESET_PC</code>, asserts NCRISC's reset, waits 5 cycles, and deasserts. In ttsim, leaving reset sets <em>only</em> the PC (<code>tile.cpp:1096-1124</code>). The registers keep their values, so <code>ra</code> still held <code>0x5cd0</code> when the NCRISC reached <code>0xFFC00000</code>, and our window logic worked by luck of that detail. The kernel's start-up code restores the saved registers and returns to the same address, so the result is right, but the method depends on registers surviving reset. The NCRISC's total of 2,580 steps, 21 fewer than the TRISCs' 2,601, is presumably the time it spent held in reset.</p>
+  <ul>
+    <li><b>Why does the math core run the fewest instructions?</b> TRISC1 has the smallest instruction cache of the five, ½ KiB (<code>BabyRISCV/README.md:10</code>), and it runs the fewest kernel steps here. The math work isn't in RISC-V code. It's in one <code>MOP</code> that the coprocessor expands into 8 <code>ELWADD</code>s (A04). The next step shows that <code>MOP</code> leaving the core.</li>
+  </ul>
+
+  <p>Here is the kernel window for TRISC1 as a timeline. The addresses are real; the horizontal axis is not to scale.</p>
+  <div class="viz" id="fig-window"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-window");
+    var g = TT.canvas(root, 880, 330), ctx = g.ctx, C = TT.C;
+    // y bands
+    var YK = 90, YF = 230; // kernel band centre, firmware band centre
+    var X = [40, 210, 250, 520, 560, 720, 840];
+    var steps = [
+      { dur: 1.3, text: "<b>Waiting.</b> TRISC1's firmware spins in <code>while (*trisc_run != RUN_SYNC_MSG_GO)</code> (<code>trisc.cc:135-147</code>). Its PC stays in firmware text (<code>0x6740</code>–<code>0x697c</code>). These steps count in <code>all steps</code> but not in the kernel window." },
+      { dur: 1.1, text: "<b>The call.</b> BRISC sets the go flag. TRISC1 computes <code>kernel_lma</code> and executes <code>jalr a5</code> at <code>0x6954</code>. The next step's PC is <code>0x9440</code>, which is ≥ <code>0x8a60</code>, so the window <b>opens</b>, and the hook saves <code>ra = 0x6958</code>." },
+      { dur: 1.8, text: "<b>The kernel.</b> 155 steps of RISC-V, 34 of which are <code>.ttinsn</code> pushes into the T1 FIFO, including the <code>MOP</code> that becomes 8 <code>ELWADD</code>s. No replays: the FIFO never fills, because ttsim drains it in the same clock whenever it can." },
+      { dur: 1.1, text: "<b>The return.</b> <code>ret</code> jumps to <code>0x6958</code>, the saved <code>ra</code>. The window <b>closes</b>. Kernel steps: 155." },
+      { dur: 1.6, text: "<b>tensix_sync().</b> The firmware stores to <code>TENSIX_SYNC</code> (<code>0x695c</code>) and reads it back (<code>0x6960</code>). The read stalls until thread T1 is idle, so <code>lw</code> is replayed <b>266</b> times with the PC stuck at <code>0x6960</code>. The RISC-V finished long before the coprocessor did." },
+      { dur: 1.2, text: "<b>Done.</b> <code>*trisc_run = RUN_SYNC_MSG_DONE</code>, and TRISC1 goes back to waiting. Out of 2,601 steps on this hart: 155 in the kernel, 266 replays, and the rest are firmware." }
+    ];
+    function px(i, t) { // dot position for each step
+      if (i === 0) return [TT.lerp(X[0], X[1], t), YF + 18 * Math.sin(t * 18)];
+      if (i === 1) return [TT.lerp(X[1], X[2], t), TT.lerp(YF, YK, t)];
+      if (i === 2) return [TT.lerp(X[2], X[3], t), YK + 10 * Math.sin(t * 30)];
+      if (i === 3) return [TT.lerp(X[3], X[4], t), TT.lerp(YK, YF, t)];
+      if (i === 4) return [TT.lerp(X[4], X[5], t), YF + 30];
+      return [TT.lerp(X[5], X[6], t), YF + 18 * Math.sin(t * 12)];
+    }
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        // bands
+        TT.box(ctx, 30, YK - 34, 820, 68, { r: 6, fill: C.blue, alpha: 0.08, stroke: C.border });
+        TT.box(ctx, 30, YF - 34, 820, 92, { r: 6, fill: C.green, alpha: 0.06, stroke: C.border });
+        TT.text(ctx, "kernel text  0x9440 \u2013 0x96ec  (\u2265 0x8a60)", 40, YK - 24, { color: C.blue, font: "12px", mono: true });
+        TT.text(ctx, "TRISC1 firmware text  0x6740 \u2013 0x697c", 40, YF + 46, { color: C.green, font: "12px", mono: true });
+        TT.text(ctx, "time (not to scale) \u2192", 840, 318, { color: C.muted, font: "11px", align: "right" });
+        // window shading
+        var open = (i === 2) || (i === 1 && t > 0.5) || (i === 3 && t < 0.99);
+        if (i >= 1) {
+          var x1 = X[2], x2 = (i >= 3) ? X[4] : (i === 2 ? TT.lerp(X[2], X[3], t) : X[2]);
+          if (i === 1) x2 = TT.lerp(X[1], X[2], t);
+          ctx.fillStyle = C.yellow; ctx.globalAlpha = 0.08; ctx.fillRect(Math.min(x1, x2), 30, Math.abs(x2 - x1), 260); ctx.globalAlpha = 1;
+          if (i >= 3) TT.text(ctx, "kernel window", (X[2] + X[4]) / 2, 40, { color: C.yellow, font: "12px", align: "center" });
+        }
+        // trail
+        ctx.strokeStyle = C.fg; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.5; ctx.beginPath();
+        for (var s = 0; s <= i; s++) {
+          var n = s < i ? 20 : Math.max(1, Math.round(20 * t));
+          for (var q = 0; q <= n; q++) {
+            var p = px(s, q / 20);
+            if (s === 0 && q === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+          }
+        }
+        ctx.stroke(); ctx.globalAlpha = 1;
+        var d = px(i, t);
+        ctx.fillStyle = C.yellow; ctx.beginPath(); ctx.arc(d[0], d[1], 6, 0, 7); ctx.fill();
+        // labels
+        if (i >= 1) TT.text(ctx, "jalr a5 @0x6954", X[1] + 14, YF + 22, { color: C.muted, font: "11px", mono: true });
+        if (i >= 1) TT.text(ctx, "entry 0x9440, ra = 0x6958", X[2] + 4, YK + 26, { color: C.fg, font: "11px", mono: true });
+        if (i >= 3) TT.text(ctx, "ret \u2192 0x6958", X[4] + 4, YF - 8, { color: C.fg, font: "11px", mono: true });
+        if (i >= 4) {
+          var rep = i === 4 ? Math.round(266 * t) : 266;
+          TT.text(ctx, "lw @0x6960 replayed: " + rep, X[4] + 20, YF + 50, { color: C.red, font: "12px", mono: true });
+        }
+        // counters
+        var ks = i < 2 ? 0 : (i === 2 ? Math.round(155 * t) : 155);
+        var tp = i < 2 ? 0 : (i === 2 ? Math.round(34 * t) : 34);
+        var win = (i === 1 && t > 0.5) || i === 2 || (i === 3 && t < 0.99);
+        TT.text(ctx, "window: " + (win ? "OPEN" : "closed"), 600, YK - 14, { color: win ? C.yellow : C.muted, font: "13px", mono: true });
+        TT.text(ctx, "kernel steps: " + ks, 600, YK + 4, { color: C.fg, font: "13px", mono: true });
+        TT.text(ctx, ".ttinsn pushes: " + tp, 600, YK + 22, { color: C.pink, font: "13px", mono: true });
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout warn">A step is not a cycle. A real baby core needs at least 8 cycles for an L1 load, has instruction caches that miss, and stalls on NoC traffic, and ttsim models none of this. The NoC reads in <code>add_2_integers_in_riscv</code> complete instantly, so <code>noc_async_read_barrier()</code> never loops: lab step 4 shows that no instruction in that kernel ran twice. On silicon, that barrier spins until the DRAM data arrives. Use these counts to understand <em>what code runs</em>, never <em>how long it takes</em>.</div>
+
+  <h2 id="tti">4. Lab step 3: instrument the TTI escape</h2>
+  <p>A04 counted pushes per pipe. Here we tie them to the kernel window and look at <em>which</em> Tensix instructions each TRISC pushes, in order. The opcode names come from the same file ttsim's Tensix decoder is generated from, <code>data/wh/tensix_isa.json</code>, which maps 128 Wormhole instruction names to opcodes and argument bit fields:</p>
+<pre><code>$ python3 -c "import json; d=json.load(open('$LAB_HOME/ttsim-count/data/wh/tensix_isa.json')); print(len(d), d['SEMPOST'], d['MOP'])"
+128 {'opcode': 164, 'args': {'sem_sel': '9:2'}} {'opcode': 1, 'args': {'zmask_lo16': '0:0', 'loop_count': '16:16', 'mop_type': '23:23'}}</code></pre>
+  <p>Rather than copy names by hand, let the generator emit them. <code>tensix_gen_decode.py</code> already writes <code>#define TENSIX_OPCODE_&lt;NAME&gt;</code> for each entry, so we add one more macro containing a <code>case</code> per opcode, and include the generated header in <code>riscv_impl.h</code>. Then <code>tti()</code> records each push. The full diff, applied on top of the count patch, is <a href="patches/b03-tti.patch"><code>patches/b03-tti.patch</code></a>:</p>
+  <div class="filename">sim-labs/patches/b03-tti.patch (excerpt)</div>
+<pre><code>--- a/src/tensix_gen_decode.py
++++ b/src/tensix_gen_decode.py
++        f.write('#define TENSIX_OPCODE_NAME_CASES() \\\n') # B03 lab: opcode -&gt; name, for printing
++        for (name, info) in opcodes.items():
++            f.write(f'    case 0x{info["opcode"]:02X}: return "{name}"; \\\n')
++        f.write('\n')
+--- a/src/riscv_impl.h
++++ b/src/riscv_impl.h
++static const char *b03_opcode_name(uint32_t opcode) {
++    switch (opcode) {
++        TENSIX_OPCODE_NAME_CASES()
++        default: return "?";
++    }
++}
+ …
+     TensixState *p_tensix = &amp;g_t_tiles[p_hart-&gt;tile_id].tensix[tensix_id];
++    B03Hart *b03 = &amp;s_b03[p_hart-&gt;tile_id][riscv_id];
+     if (tensix_can_push_inst(p_tensix, pipe)) {
+         uint32_t tensix_inst = (inst &lt;&lt; 30) | (inst &gt;&gt; 2);
++        b03-&gt;tti++;
++        if (b03-&gt;in_kernel) {
++            b03-&gt;k_tti++;
++            if (b03-&gt;n_first &lt; B03_FIRST) b03-&gt;first[b03-&gt;n_first++] = tensix_inst;
++        }
+         tensix_push_inst(p_tensix, pipe, tensix_inst, bypass_mop_expander);
+     } else {
++        b03-&gt;tti_retries++;
+         p_hart-&gt;pc -= 4; // replay TTI instruction
+     }</code></pre>
+  <p><code>B03_FIRST</code> is 40. The opcode is the top byte of the rotated word, since <code>TT_OP(opcode, params)</code> is <code>(opcode &lt;&lt; 24) + params</code> (<code>ckernel_ops.h:24</code>). This patch only sees the <code>.ttinsn</code> path. Pushes made with a plain <code>sw</code> to <code>0xFFE40000</code> (the <code>TT_</code> macros with runtime operands) go through <code>mem_wr</code> and <code>tile.cpp</code> instead. A04 counted those too: 4, 3 and 6 for the three TRISCs in this example. Build it as a second copy, with both patches:</p>
+<pre><code>$ $W/workbench/build_ttsim.sh tti wh &gt;/dev/null      # a fresh pristine copy in $LAB_HOME/ttsim-tti
+$ for p in count tti; do patch -p1 -d $LAB_HOME/ttsim-tti &lt; $W/patches/b03-$p.patch; done
+$ $W/workbench/build_ttsim.sh tti wh
+$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-tti-wh-release/libttsim.so
+$ $EX/metal_example_add_2_integers_in_compute 2&gt;&amp;1 | grep -E 'ttinsn|first'
+[4682] B03 tile 0 BRISC  .ttinsn pushes=0  in kernel=0  fifo-full retries=0
+[4682] B03 tile 0 TRISC0 .ttinsn pushes=23  in kernel=23  fifo-full retries=0
+B03   first 23 in kernel: ZEROSRC SETADCXY SETADCZW RMWCIB1 RMWCIB2 ATGETM RMWCIB0 RMWCIB1 RMWCIB2 ATRELM SETC16 SETC16 RMWCIB1 SETADCXX SETADCZW STALLWAIT MOP SEMGET SETC16 STALLWAIT STOREREG STALLWAIT STOREREG
+[4682] B03 tile 0 TRISC1 .ttinsn pushes=34  in kernel=34  fifo-full retries=0
+B03   first 34 in kernel: SETC16 SETC16 SETC16 ZEROACC SEMINIT SETC16 STALLWAIT RMWCIB2 RMWCIB3 RMWCIB0 RMWCIB1 RMWCIB3 RMWCIB3 STALLWAIT SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETC16 SETRWC SEMWAIT MOP SETRWC STALLWAIT SEMPOST STALLWAIT
+[4682] B03 tile 0 TRISC2 .ttinsn pushes=57  in kernel=57  fifo-full retries=0
+B03   first 40 in kernel: STALLWAIT SETGPR SETGPR WRCFG SETGPR SETGPR WRCFG NOP NOP ATGETM RMWCIB3 RMWCIB1 RMWCIB1 ATRELM SETGPR REG2FLOP SETGPR REG2FLOP SETGPR REG2FLOP SETC16 SETC16 SETC16 SETGPR REG2FLOP SETGPR REG2FLOP SETGPR REG2FLOP SETADCXX STALLWAIT SETGPR SETGPR SETGPR SETGPR SETGPR SETGPR SETGPR SETGPR WRCFG
+[4682] B03 tile 0 NCRISC .ttinsn pushes=0  in kernel=0  fifo-full retries=0</code></pre>
+  <p>What this tells you:</p>
+  <ul>
+    <li><b>Every <code>.ttinsn</code> came from inside a kernel.</b> Pushed equals "in kernel" for all three TRISCs, so the firmware itself never uses the escape. BRISC and NCRISC pushed nothing this way: BRISC's 9 boot-time pushes per tile, which A04 found, all use plain <code>sw</code>.</li>
+    <li><b>The totals match A04 exactly</b> (23, 34, 57), measured through a different hook. That's a good sign that both instruments are right.</li>
+    <li><b>Zero FIFO-full retries.</b> ttsim refuses a push only when more than 52 instructions are queued or the expanders are busy (<code>tensix.cpp:284-293</code>), and its clock loop drains the FIFOs in the same clock whenever it can (<code>libttsim.cpp:253-282</code>). On silicon, back-pressure is real, so don't conclude from this that the FIFO never fills on hardware.</li>
+    <li><b>Read TRISC1's list as a story.</b> It's almost all configuration: <code>SETC16</code> (17 of them) and <code>RMWCIB*</code> write thread configuration registers. Then <code>SEMINIT</code> sets up the semaphore that MATH and PACK share. Near the end comes the actual work: <code>SEMWAIT</code> (wait on the MATH/PACK semaphore until Dst has room), <code>MOP</code> (expands to 8 <code>ELWADD</code>s), <code>SETRWC</code> (set the register-window counters), <code>STALLWAIT</code>, and <code>SEMPOST</code> (tell PACK the result is ready). That's <code>tile_regs_acquire</code> → <code>add_tiles</code> → <code>tile_regs_commit</code> from <code>add_2_tiles.cpp:27-36</code>, at instruction level. One push out of 34 does the arithmetic.</li>
+    <li><b>Pushes are a small part of the RISC-V work.</b> 34 of TRISC1's 155 kernel steps (22%), 57 of TRISC2's 246 (23%), and 23 of TRISC0's 303 (8%). The rest is address arithmetic, CB pointer updates, and loops that wait on other cores.</li>
+  </ul>
+  <div class="callout sim"><a href="b04-tensix-instructions.html">B04</a> follows these instructions <em>after</em> the push: through the MOP and replay expanders, onto each pipe, and through the stalls on Src-valid that make the <code>STALLWAIT</code>s above matter.</div>
+
+  <h2 id="pcs">5. Lab step 4: from a hot PC back to your source line</h2>
+  <p>The counters say how much each core ran. Next, which instructions? We add one more small patch, <a href="patches/b03-hotpc.patch"><code>patches/b03-hotpc.patch</code></a> (applied after the other two). It keeps a histogram of kernel-window PCs on tile 0 and prints the four hottest per core, with the 32-bit word stored at each. The word is what lets us check our mapping to the ELF later.</p>
+  <div class="filename">sim-labs/patches/b03-hotpc.patch (excerpt)</div>
+<pre><code>+static uint32_t s_b03_hot[RV32_CORES_PER_T_TILE][1024]; // tile 0 only: kernel steps by (pc - entry_pc) / 4
+ …
++    if (h-&gt;in_kernel &amp;&amp; p_hart-&gt;tile_id == 0 &amp;&amp; pc - h-&gt;entry_pc &lt; 4096) s_b03_hot[p_hart-&gt;riscv_id][(pc - h-&gt;entry_pc) / 4]++;</code></pre>
+<pre><code>$ $W/workbench/build_ttsim.sh hot wh &gt;/dev/null
+$ for p in count tti hotpc; do patch -p1 -d $LAB_HOME/ttsim-hot &lt; $W/patches/b03-$p.patch; done
+$ $W/workbench/build_ttsim.sh hot wh
+$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-hot-wh-release/libttsim.so
+$ $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep hottest
+B03   hottest: pc=0x8a80(entry+0x0) x1 [ffb007b7] pc=0x8a84(entry+0x4) x1 [6f078793] pc=0x8a88(entry+0x8) x1 [ef018713] pc=0x8a8c(entry+0xc) x1 [00f76e63]
+$ $EX/metal_example_add_2_integers_in_compute 2&gt;&amp;1 | grep -E 'ttinsn|hottest'
+[4682] B03 tile 0 BRISC  .ttinsn pushes=0  in kernel=0  fifo-full retries=0
+B03   hottest: pc=0x8c98(entry+0x118) x39 [0106a783] pc=0x8c9c(entry+0x11c) x39 [01079793] pc=0x8ca0(entry+0x120) x39 [0107d793] pc=0x8ca4(entry+0x124) x39 [fee78ae3]
+[4682] B03 tile 0 TRISC0 .ttinsn pushes=23  in kernel=23  fifo-full retries=0
+B03   hottest: pc=0x92c8(entry+0x288) x14 [01062783] pc=0x92cc(entry+0x28c) x14 [01079793] pc=0x92d0(entry+0x290) x14 [0107d793] pc=0x92d4(entry+0x294) x14 [fed78ae3]
+[4682] B03 tile 0 TRISC1 .ttinsn pushes=34  in kernel=34  fifo-full retries=0
+B03   hottest: pc=0x9440(entry+0x0) x1 [ff010113] pc=0x9444(entry+0x4) x1 [00112623] pc=0x9448(entry+0x8) x1 [00812423] pc=0x944c(entry+0xc) x1 [ffb007b7]
+[4682] B03 tile 0 TRISC2 .ttinsn pushes=57  in kernel=57  fifo-full retries=0
+B03   hottest: pc=0x9700(entry+0x0) x1 [fd010113] pc=0x9704(entry+0x4) x1 [02112623] pc=0x9708(entry+0x8) x1 [ffb007b7] pc=0x970c(entry+0xc) x1 [ffb00737]
+[4682] B03 tile 0 NCRISC .ttinsn pushes=0  in kernel=0  fifo-full retries=0
+B03   hottest: pc=0xffc00000(entry+0x0) x1 [ffb001b7] pc=0xffc00004(entry+0x4) x1 [7f018193] pc=0xffc00008(entry+0x8) x1 [01402103] pc=0xffc0000c(entry+0xc) x1 [00012083]</code></pre>
+  <p>When the "hottest" instruction ran once (<code>x1</code>), the kernel has no loop that iterated, and the histogram falls back to the first addresses. That holds for the whole of <code>add_2_integers_in_riscv</code>, and for TRISC1, TRISC2 and NCRISC in the compute example. Two cores do loop: BRISC repeats a 4-instruction loop at <code>entry+0x118</code> 39 times, and TRISC0 repeats a very similar one at <code>entry+0x288</code> 14 times. Let's find out what they are.</p>
+
+  <h3>Find the ELF, and the address to look up</h3>
+  <p>The kernel ELFs are in the JIT cache under <code>kernels/&lt;kernel name&gt;/&lt;build hash&gt;/&lt;core&gt;/</code>. Each data-movement and TRISC kernel has two files: <code>brisc.elf</code> as linked, and <code>brisc.elf.xip.elf</code>, which tt-metal writes after making the code <em>execute-in-place</em>, so that it runs at whatever address the firmware loads it (<code>tt_memory.cpp:33-41</code>). Compare them and you'll see the difference is a rewrite of absolute addresses into PC-relative ones:</p>
+<pre><code>$ K=$(ls -d $C/kernels/reader_writer_add_in_riscv/*/brisc)      # $C from lab step 2
+$ diff &lt;($OD -d $K/brisc.elf | tail -n +4) &lt;($OD -d $K/brisc.elf.xip.elf | tail -n +4)
+54,55c54,55
+&lt;     4b74:	00005737          	lui	a4,0x5
+&lt;     4b78:	d6870713          	addi	a4,a4,-664 # 4d68 &lt;__kernel_data_lma&gt;
+---
+&gt;     4b74:	00000717          	auipc	a4,0x0
+&gt;     4b78:	1f470713          	addi	a4,a4,500 # 4d68 &lt;__kernel_data_lma&gt;</code></pre>
+  <p>So disassemble the <code>.xip.elf</code>. It's still linked at <code>_start = 0x4b30</code>, while the code actually ran from <code>entry = 0x8b80</code> (the compute example's writer). The mapping is a constant offset:</p>
+  <p style="text-align:center"><code>ELF address = runtime pc − entry + _start</code> = <code>0x8c98 − 0x8b80 + 0x4b30</code> = <code>0x4c48</code></p>
+<pre><code>$ WK=$(ls $C/kernels/writer_1_tile/*/brisc/brisc.elf.xip.elf)
+$ $OD -d --no-show-raw-insn $WK | sed -n '/4c30:/,/4c58:/p' | grep -v '^$\|^0000'
+    4c30:	lw	a5,-2012(gp) # ffb00014 &lt;rta_l1_base&gt;
+    4c34:	lui	a3,0xffb50
+    4c38:	lw	a6,0(a5)
+    4c3c:	lw	a4,12(a3) # ffb5000c &lt;__global_pointer$+0x4f81c&gt;
+    4c40:	slli	a4,a4,0x10
+    4c44:	srli	a4,a4,0x10
+    4c48:	lw	a5,16(a3)
+    4c4c:	slli	a5,a5,0x10
+    4c50:	srli	a5,a5,0x10
+    4c54:	beq	a5,a4,4c48 &lt;.L12&gt;
+    4c58:	lui	a2,0xffb00</code></pre>
+  <p>The four hot words ttsim printed, <code>0106a783 01079793 0107d793 fee78ae3</code>, are exactly the instructions at <code>4c48</code>–<code>4c54</code>, so the mapping is right. (In the same way, the first four words of the RISC-V example's kernel, <code>ffb007b7 6f078793 ef018713 00f76e63</code>, match its <code>.xip.elf</code> at <code>_start</code>.) Ask <code>addr2line</code> which source line it is. <code>-i</code> unwinds the inlining:</p>
+<pre><code>$ ${OD%objdump}addr2line -f -i -e $WK 0x4c48
+_Z8reg_readm
+/home/user/workspace/refs/tt-metal/tt_metal/hw/inc/internal/tt-1xx/risc_common.h:112
+_Z13cb_wait_frontll
+/home/user/workspace/refs/tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:489
+_Z11kernel_mainv
+/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/dataflow/writer_1_tile.cpp:22
+_start
+/home/user/workspace/refs/tt-metal/tt_metal/hw/firmware/src/tt-1xx/brisck.cc:80</code></pre>
+  <p>Line 22 of the writer is <code>cb_wait_front(cb_out0, 1);</code>, "make sure there is a tile in the circular buffer". The loop itself:</p>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/dataflow/dataflow_api.h:479-493 @7aad8aac (WAYPOINT and SYNC_WAIT lines elided)</div>
+<pre><code>void cb_wait_front(int32_t operand, int32_t num_pages) {
+    uint32_t pages_acked = get_cb_tiles_acked_ptr(operand)[0];
+    uintptr_t pages_received_ptr = (uintptr_t)get_cb_tiles_received_ptr(operand);
+    uint16_t pages_received;
+    …
+        do {
+            pages_received = ((uint16_t)reg_read(pages_received_ptr)) - pages_acked;
+        } while (pages_received &lt; num_pages);
+    …
+}</code></pre>
+  <p>Now each instruction makes sense. <code>lw a5,16(a3)</code> reads <code>0xFFB50010</code>, the "tiles received" register of stream 16, which is CB 16 (<code>c_16</code>, the output CB). That address is <code>NOC_OVERLAY_START_ADDR 0xFFB40000</code> plus 16 × the stream register space (<code>noc_overlay_parameters.h:38-42</code>, <code>stream_io_map.h:13-26</code>). The <code>slli</code>/<code>srli</code> pair is the <code>(uint16_t)</code> cast. The <code>beq</code> loops while received equals acked. The writer polled 39 times before PACK pushed the result tile. TRISC0's loop maps the same way: <code>0x92c8 − 0x9040 + 0x6550 = 0x67d8</code> in <code>trisc0.elf.xip.elf</code>, which <code>addr2line</code> resolves through <code>llk_wait_tiles</code> (<code>llk_io_unpack.h:80</code>) to <code>add_2_tiles.cpp:23</code>, <code>cb_wait_front(cb_in0, 1)</code>. Its <code>lw</code> reads <code>0xFFB40010</code>, stream 0, CB <code>c_0</code>: unpack waited 14 iterations for the reader on NCRISC to deliver the first input tile.</p>
+  <p>Even in a simulator with an instant NoC, the kernels do wait for <em>each other</em>. All five harts on a tile advance one step per pass of the clock loop, so a consumer that starts before its producer has finished spins, and you can count the spins. Those counts tell you the order things happened in ttsim. They don't tell you how long anything took on silicon.</p>
+  <div class="callout gpu">This is the poor man's version of GPU PC sampling: Nsight Compute samples warp program counters and attributes them to SASS and source lines. The workflow is the same: collect PCs, map them to the binary, then use line info to get back to source. The difference is that ttsim gives you an exact count of every step instead of a statistical sample, but counts of simulator steps, not time.</div>
+
+  <h2 id="exercises">6. Exercises, with answers</h2>
+  <p>Each answer below comes from running or reading the code in this orb. Try each one before you open the answer.</p>
+
+  <details class="quiz"><summary>E1. Which table slot executes <code>mul a0,a0,a1</code> (encoding <code>0x02b50533</code>), and how does it avoid being an <code>add</code>?</summary>
+  <p>The low bits are <code>11</code>, so it's RISC-V. <code>inst[6:2]</code> = <code>0x33 &gt;&gt; 2</code> = <code>01100</code> = 12, and <code>funct3 = inst[14:12]</code> = 0, so the index is 12 + 0×32 = <b>12</b>: <code>alu&lt;0&gt;</code>, the same slot as <code>add</code> and <code>sub</code>. Inside, <code>alu</code> switches on <code>(funct7 &lt;&lt; 3) | funct3</code>. <code>funct7 = inst[31:25]</code> = 1, which selects <code>case ( 1 &lt;&lt; 3) | 0: value = src0 * src1; // MUL</code> (<code>riscv_impl.h:182-202</code>). The M extension never needed table slots of its own.</p></details>
+
+  <details class="quiz"><summary>E2. Turn DPRINT on (<code>TT_METAL_DPRINT_CORES=0,0</code>) and rerun <code>add_2_integers_in_riscv</code> on the count build. Predict what changes in the B03 lines, then check.</summary>
+  <p>Real output:</p>
+<pre><code>0:0-0:BR: Adding integers: 14 + 7
+Success: Result is 21
+[6014] 0.4 seconds (14.6 KHz)
+[6014] B03 tile 0 BRISC  entry=0x8a80 ret=0x42b8 calls=1  kernel steps=270 (replays 0, below 0x8a60 0)  all steps=5405 (replays 0)
+[6014] B03 all 72 stepped tiles BRISC  steps=389800  in kernels=270</code></pre>
+  <p>Kernel steps go from 116 to <b>270</b>. The <code>DPRINT</code> on line 41 of the kernel compiles to nothing without DPRINT, and to buffer-writing code with it. The return address also moved, from <code>0x425c</code> to <code>0x42b8</code>: DPRINT rebuilds the <em>firmware</em> too, into a different cache directory (<code>tt-metal-cache17637…</code>), so the call site shifted. The window logic didn't care, because it reads <code>ra</code> at run time instead of hard-coding the address. The clock count (6014) also changed, for the host-polling reasons B01 explains. With DPRINT on it also varies from run to run (reruns gave 5063, 5066 and 6160, and <code>all steps</code> moved with it), presumably because DPRINT's host-side polling changes how often the host clocks the simulator. The kernel steps (270) and <code>ret</code> stayed the same every time.</p></details>
+
+  <details class="quiz"><summary>E3. Why does TRISC2 report 23 replays outside its kernel, and why can't BRISC ever have that particular kind?</summary>
+  <p>TRISC2's replays are at <code>0x7100</code>: the same <code>lw a5,0(s0)</code> pattern as TRISC1's at <code>0x6960</code>, just after the kernel returns (ret <code>0x70f8</code>). It's <code>tensix_sync()</code> again, waiting for the PACK thread's last instructions to finish. (We printed the PCs with a temporary debug build. Why PACK needed 23 steps and MATH 266 isn't something these counters can tell you; B04 follows the instructions themselves.) BRISC can't have this kind of replay. Its firmware never calls <code>tensix_sync</code>, and in ttsim the <code>TENSIX_SYNC</code> register handler maps the reading core to a thread with <code>trisc_pipe(riscv_id)</code>, which accepts only TRISC0–2 and stops with <code>UnimplementedFunctionality</code> for anything else (<code>tile.cpp:1818-1823</code>, <code>1890-1891</code>). BRISC waits for the other cores in <code>wait_ncrisc_trisc()</code>, which is ordinary polling. That shows up as loop iterations, not replays. BRISC's replay count was 0 in every run.</p></details>
+
+  <details class="quiz"><summary>E4. What happens if an NCRISC kernel contains a <code>.ttinsn</code>? Answer from the code, then say whether that matches the hardware.</summary>
+  <p><code>tti()</code> checks <code>riscv_id</code>: BRISC goes to pipe 0, and anything else must be TRISC0–2, enforced by <code>TTSIM_VERIFY((riscv_id &gt;= RV32_ID_TRISC0) &amp;&amp; (riscv_id &lt;= RV32_ID_TRISC2), UndefinedBehavior, "riscv_id=%d", riscv_id)</code> (<code>riscv_impl.h:1472-1474</code>). NCRISC has id 4, so ttsim stops with <code>UndefinedBehavior: … riscv_id=4</code>. That matches the ISA: "RISCV NC cannot push instructions" (<code>PushTensixInstruction.md:3</code>). The docs don't say what an NCRISC does with a word whose low bits aren't <code>11</code>. If it treats it as an invalid instruction, that is <code>UndefinedBehavior</code> (<code>BabyRISCV/README.md:25-26</code>). ttsim stops loudly where the hardware would quietly do <em>something</em>.</p></details>
+
+  <details class="quiz"><summary>E5. Our window rule is "PC ≥ 0x8a60 opens, PC == saved ra closes". Name two ways it could silently give wrong numbers, and the evidence that it didn't here.</summary>
+  <p>(1) A kernel that calls a function in firmware text: the PC drops below <code>0x8a60</code> while still logically in the kernel. The rule keeps the window open, which is correct, and <code>k_below</code> counts such steps. It was 0 everywhere, so it never happened. (2) An entry where <code>ra</code> isn't the return address. NCRISC on Wormhole doesn't enter by <code>jalr</code> at all: it enters by reset into IRAM. The rule only worked because ttsim keeps registers across reset, so <code>ra</code> was still <code>0x5cd0</code>, the address after <code>jal wh_iram_trampoline</code>. The evidence that every window was right is that each <code>ret=</code> matched a call site in the disassembled firmware, and every core reported <code>calls=1</code>. Other failure modes: a Blackhole run (a different <code>MEM_MAP_END</code>), or firmware that placed code above <code>0x8a60</code>.</p></details>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li>A baby core in ttsim is a 32-register struct plus a dispatch loop: fetch 4 bytes from L1 (or NCRISC IRAM), set <code>pc += 4</code> early, check the low two bits, then call a handler or push to the coprocessor. Stalls are replays: the handler sets <code>pc -= 4</code>.</li>
+    <li>The decode table has 256 entries indexed by <code>inst[6:2] | funct3 &lt;&lt; 5</code>. Formats without <code>funct3</code> fill 8 slots each. <code>funct7</code> (for example, <code>mul</code> vs <code>add</code>) is decided inside the handler. 127 slots are empty, and FP, V, CSR and atomic slots stop a Wormhole run.</li>
+    <li>A word whose low bits aren't <code>11</code> is a <code>.ttinsn</code>. <code>tti()</code> rotates it right by 2 and pushes it to the TRISC's own thread (or thread 0 for BRISC). NCRISC is refused.</li>
+    <li>Counting only between the firmware's <code>jalr</code> into the kernel and the return to <code>ra</code>, <code>add_2_integers_in_compute</code> runs 246 / 303 / 155 / 246 / 153 steps on BRISC / TRISC0 / TRISC1 / TRISC2 / NCRISC. That's 1,103 of the chip's 1,029,531 steps: firmware wait loops dominate.</li>
+    <li>The TRISCs pushed 23 / 34 / 57 Tensix instructions, all inside their kernels. TRISC1's 34 contain one <code>MOP</code> that carries all the arithmetic.</li>
+    <li>Replays reveal synchronisation: TRISC1 waited 266 steps in <code>tensix_sync()</code> after its kernel, and NCRISC waited in a <code>j .</code> until BRISC reset it into IRAM.</li>
+    <li>To map a hot PC to source: <code>pc − entry + _start</code> in the <code>.xip.elf</code>, then <code>objdump</code> and <code>addr2line -i</code>. Here, the hot loops were two <code>cb_wait_front</code> polls of CB stream registers.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. The word at <code>0x9680</code> in TRISC1's kernel is <code>0x88050202</code>. Without running anything, what does ttsim do with it?</summary>
+  <p>Its low two bits are <code>10</code>, not <code>11</code>, so <code>step()</code> calls <code>tti()</code>. Rotating right by 2 gives <code>(0x88050202 &gt;&gt; 2) | (0b10 &lt;&lt; 30)</code> = <code>0x22014080 | 0x80000000</code> = <code>0xA2014080</code>. Opcode <code>0xA2</code> is <code>STALLWAIT</code> in <code>tensix_isa.json</code>. It is pushed into thread T1's FIFO, unless the FIFO is refusing pushes, in which case the PC goes back to <code>0x9680</code>. The SFPI objdump agrees: it disassembles that word as <code>ttstallwait</code>.</p></details>
+  <details class="quiz"><summary>2. Why do <code>lui</code>, <code>auipc</code> and <code>jal</code> each occupy 8 slots of the table, while <code>lw</code> occupies one?</summary>
+  <p>The index includes bits 14:12. For <code>lw</code> those bits are <code>funct3</code>, which tells <code>lw</code> apart from <code>lb</code>, <code>lh</code> and the rest, so only one value of them means <code>lw</code>. In U-type and J-type formats, bits 14:12 belong to the immediate and can be anything. The generator (mask <code>0x007F</code>) copies the handler into all 8 slots so that every immediate value lands on it.</p></details>
+  <details class="quiz"><summary>3. A colleague counts all <code>rv32_step</code> calls and says "add_2_integers_in_riscv ran 963,752 instructions, so the kernel is slow". What's wrong?</summary>
+  <p>Two things. Almost all of those steps are firmware on 72 tiles polling for a go message (the kernel was 116 steps, 0.012%), and the number of polls is set by how often the host clocks the simulator (B01), not by the kernel. Also, a step isn't a cycle: ttsim has no timing model, NoC transfers are instant, and caches are free. Count inside the kernel window, and treat even that as "what ran", not "how long it took".</p></details>
+  <details class="quiz"><summary>4. Why is it safe for the patch to detect replays as "PC unchanged after <code>step()</code>", and what else does that test catch?</summary>
+  <p><code>step()</code> always writes <code>pc + 4</code> before executing, so the PC can only end where it started if the handler wound it back (<code>pc -= 4</code>, a stall replay) or jumped to its own address. The second case is a <code>j .</code> self-loop, such as the end of <code>wh_iram_trampoline</code>. Both mean "no forward progress this step", which is what we wanted to count. Then we told the two apart by disassembling the PCs.</p></details>
+  <details class="quiz"><summary>5. TRISC1, the math core, executed the fewest kernel steps of the three TRISCs (155) and has the smallest instruction cache (½ KiB). Why is that consistent with it doing all the arithmetic?</summary>
+  <p>The arithmetic doesn't run as RISC-V code. TRISC1 pushes one <code>MOP</code>, and the coprocessor's MOP expander turns it into 8 <code>ELWADD</code>s, each covering 8 rows × 16 columns, which adds up to one 32×32 tile. The RISC-V side only configures registers, does the semaphore handshake (<code>SEMWAIT</code>/<code>SEMPOST</code>) and issues that <code>MOP</code>. That takes little code and few steps, so a small instruction cache is enough.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/README.md">Baby RISC-V cores (Wormhole)</a>: the authoritative spec for what this lab simulates: RV32IM, the <code>fence</code> caveat, local memories, pipeline and memory map.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/PushTensixInstruction.md">Push Tensix Instruction</a>: the <code>sw</code> addresses per core, the <code>.ttinsn</code> rotate-by-two encoding, and FIFO back-pressure.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/InstructionRAM.md">Instruction RAM</a>: NCRISC's 16 KiB IRAM, and why the firmware has to reset into it.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/InstructionCache.md">Instruction cache</a>: the per-core instruction caches that ttsim does not model.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/TTSync.md">TTSync</a>: how a RISC-V core waits for its Tensix instructions to finish, the mechanism behind TRISC1's 266 replays.</li>
+    <li><a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/MemoryOrdering.md">Memory ordering</a>: why Wormhole code can't rely on <code>fence</code>, and what it uses instead.</li>
+    <li><a href="https://github.com/tenstorrent/ttsim/blob/main/src/riscv_impl.h">ttsim <code>src/riscv_impl.h</code></a>: the interpreter itself, shared by the 32-bit baby cores and Blackhole's 64-bit cores.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/hw/firmware/src/tt-1xx/brisc.cc">tt-metal <code>brisc.cc</code></a>: BRISC firmware: the go-message loop, the kernel call, and the NCRISC reset dance.</li>
+    <li><a href="https://github.com/tenstorrent/sfpi">tenstorrent/sfpi</a>: the RISC-V GCC toolchain that emits <code>.ttinsn</code> and whose <code>objdump</code> prints <code>ttmop</code>, <code>ttsempost</code> and friends.</li>
+    <li><a href="https://github.com/riscv/riscv-isa-manual">RISC-V ISA manual</a>: the base opcode map (why bits 1:0 = <code>11</code> mark 32-bit instructions) and the instruction formats the decode table indexes.</li>
+    <li><a href="https://www.corsix.org/content/tt-wh-part5">corsix: Tenstorrent Wormhole Series Part 5, Taking apart T tiles</a>: a hands-on tour of the five cores, the instruction pipes and the "T6 as RVC" trick from someone poking real hardware.</li>
+    <li><a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tools/device_print.html">DPRINT documentation</a>: the kernel print facility whose code doubled the kernel's step count in exercise E2.</li>
+  </ul>
+
+  <div class="pager"><a href="../chapters/a04-inside-tensix.html">&larr; A04 Inside a Tensix core</a><a class="next" href="../chapters/a05-tiles-and-formats.html">A05 Tiles, faces and number formats &rarr;</a></div>
+</main>
+</body>
+</html>

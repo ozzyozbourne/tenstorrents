@@ -1,0 +1,106 @@
+--- a/src/riscv_impl.h
++++ b/src/riscv_impl.h
+@@ -1456,6 +1456,61 @@
+ }
+ #endif
+ 
++#if XLEN == 32 && !TTSIM_RV64_SYSTEM
++// B03 lab: count step() calls per Tensix-tile hart, and separately inside the kernel window.
++// The kernel window opens when the pc first reaches the kernel area (at or above MEM_MAP_END
++// on Wormhole, which also covers NCRISC IRAM) and closes when the pc returns to the
++// address that was in ra when the window opened.
++#define B03_KERNEL_LO 0x8a60 // MEM_MAP_END in tt-metal wormhole/dev_mem_map.h: kernel config space starts here
++static_assert(TT_ARCH_VERSION == 0, "B03 lab instrumentation is Wormhole-only (B03_KERNEL_LO, NCRISC IRAM)");
++struct B03Hart {
++    uint64_t steps, replays;              // all step() calls; calls that left pc unchanged
++    uint64_t k_steps, k_replays, k_calls; // the same, inside the kernel window
++    uint64_t k_below;                     // kernel-window steps with pc below B03_KERNEL_LO
++    uint32_t entry_pc, ret_pc;
++    bool in_kernel;
++};
++static B03Hart s_b03[NUM_T_TILES][RV32_CORES_PER_T_TILE];
++static B03Hart *b03_before(RiscvHartState *p_hart, uint32_t pc) {
++    if (p_hart->tile_type != 'T') return nullptr;
++    B03Hart *h = &s_b03[p_hart->tile_id][p_hart->riscv_id];
++    h->steps++;
++    if (h->in_kernel && pc == h->ret_pc) h->in_kernel = false; // returned to firmware
++    if (!h->in_kernel && pc >= B03_KERNEL_LO) {                 // entered a kernel
++        h->in_kernel = true;
++        h->entry_pc = pc;
++        h->ret_pc = p_hart->x_regs[1];
++        h->k_calls++;
++    }
++    h->k_steps += h->in_kernel;
++    h->k_below += h->in_kernel && pc < B03_KERNEL_LO;
++    return h;
++}
++void b03_report() {
++    static const char *names[] = {"BRISC", "TRISC0", "TRISC1", "TRISC2", "NCRISC"};
++    B03Hart all[RV32_CORES_PER_T_TILE] = {};
++    uint32_t tiles_stepped = 0;
++    for (uint32_t t = 0; t < NUM_T_TILES; t++) {
++        tiles_stepped += s_b03[t][0].steps != 0;
++        for (uint32_t r = 0; r < RV32_CORES_PER_T_TILE; r++) {
++            const B03Hart &h = s_b03[t][r];
++            all[r].steps += h.steps;
++            all[r].k_steps += h.k_steps;
++            if (h.k_calls) {
++                ttsim_printf("B03 tile %u %-6s entry=0x%x ret=0x%x calls=%llu  kernel steps=%llu (replays %llu, below 0x%x %llu)  all steps=%llu (replays %llu)\n",
++                    t, names[r], h.entry_pc, h.ret_pc, (unsigned long long)h.k_calls, (unsigned long long)h.k_steps,
++                    (unsigned long long)h.k_replays, B03_KERNEL_LO, (unsigned long long)h.k_below,
++                    (unsigned long long)h.steps, (unsigned long long)h.replays);
++            }
++        }
++    }
++    for (uint32_t r = 0; r < RV32_CORES_PER_T_TILE; r++) {
++        ttsim_printf("B03 all %u stepped tiles %-6s steps=%llu  in kernels=%llu\n", tiles_stepped, names[r],
++            (unsigned long long)all[r].steps, (unsigned long long)all[r].k_steps);
++    }
++}
++#endif
++
+ #if XLEN == 32
+ 
+ static void RV_XLEN_PREFIX(tti)(RiscvHartState *p_hart, uint32_t inst) {
+@@ -1937,6 +1992,9 @@
+ #if !TTSIM_RV64_SYSTEM
+ void RV_XLEN_PREFIX(step)(RiscvHartState *p_hart) {
+     uint_xlen_t pc = p_hart->pc;
++#if XLEN == 32
++    B03Hart *b03 = b03_before(p_hart, pc);
++#endif
+     uint32_t inst;
+ #if XLEN == 32
+     if (pc >= p_hart->sram_size) [[unlikely]]
+@@ -1976,5 +2034,11 @@
+         s_rv64c_decode_table[opcode](p_hart, inst);
+ #endif
+     }
++#if XLEN == 32
++    if (b03 && p_hart->pc == pc) { // pc unchanged: a stall rewound pc to retry, or a jump to itself
++        b03->replays++;
++        b03->k_replays += b03->in_kernel;
++    }
++#endif
+ }
+ #endif
+--- a/src/sim.h
++++ b/src/sim.h
+@@ -624,6 +624,7 @@
+ void rv32_init(Rv32HartState *p_hart, char tile_type, uint32_t tile_id, uint32_t riscv_id);
+ void rv32_icache_invalidate(Rv32HartState *p_hart);
+ void rv32_step(Rv32HartState *p_hart);
++void b03_report(); // B03 lab instrumentation
+ 
+ void rv64_init(Rv64HartState *p_hart, char tile_type, uint32_t tile_id, uint32_t riscv_id);
+ void rv64_step(Rv64HartState *p_hart);
+--- a/src/sim.cpp
++++ b/src/sim.cpp
+@@ -53,6 +53,7 @@
+ 
+ void ttsim_exit() {
+     ttsim_heartbeat();
++    b03_report();
+     for (uint32_t chip_id = 0; chip_id < g_num_chips; chip_id++) {
+         ttsim_select_chip(chip_id);
+         for (uint32_t i = 0; i < std::size(g_dram); i++) {
