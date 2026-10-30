@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A00 · Chapter title · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="a00-prev.html">&larr; Prev</a>
+  <a href="a00-next.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 00</span><span class="tag">Prerequisites: A0x</span>
+  <h1><span class="num">00.</span> Chapter title</h1>
+  <p class="subtitle">One-sentence promise of what the reader will understand by the end.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol><li><a href="#question">The question</a></li><li><a href="#s1">Section</a></li><li><a href="#recap">Recap</a></li><li><a href="#quiz">Check yourself</a></li><li><a href="#reading">Further reading</a></li></ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>Open with a concrete puzzle. Build intuition with a picture before formalizing.</p>
+
+  <!-- Interactive figure pattern: a .viz container + TT.canvas + TT.stepper -->
+  <div class="viz" id="fig1"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig1");
+    var g = TT.canvas(root, 800, 300), ctx = g.ctx, C = TT.C;
+    var steps = [
+      { dur: 1.2, text: "<b>Step 1.</b> Narration for this step." },
+      { dur: 1.2, text: "<b>Step 2.</b> The box moves to the right." }
+    ];
+    TT.stepper({
+      root: root, steps: steps,
+      draw: function (i, t) {
+        TT.clear(ctx, g.W, g.H);
+        var x = i === 0 ? TT.lerp(40, 200, t) : TT.lerp(200, 600, t);
+        TT.box(ctx, x, 120, 120, 60, { fill: C.blue, alpha: 0.25, stroke: C.blue, label: "tile", color: C.fg });
+      }
+    });
+  })();
+  </script>
+
+  <div class="callout key">The one sentence the reader must remember.</div>
+  <div class="callout gpu">How this compares with a GPU.</div>
+  <div class="callout warn">A common misconception or trap.</div>
+  <div class="callout sim">Run this in the simulator: see <a href="../sim-labs/b01-meet-ttsim.html">B01</a>.</div>
+
+  <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:18-20 @7aad8aac</div>
+<pre><code>// a short, real excerpt with its source path above it</code></pre>
+
+  <h2 id="recap">Recap</h2>
+  <ul><li>Bullet recap.</li></ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>Question?</summary><p>Answer with the reasoning.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs"><li><a href="https://github.com/tenstorrent/tt-isa-documentation">tt-isa-documentation</a>, the authoritative ISA reference.</li></ul>
+
+  <div class="pager"><a href="a00-prev.html">&larr; 00 Previous</a><a class="next" href="a00-next.html">00 Next &rarr;</a></div>
+</main>
+</body>
+</html>

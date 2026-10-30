@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenstorrent From Zero</title><link rel="stylesheet" href="assets/style.css"><script src="assets/tt.js"></script></head>
+<body><header class="top"><a class="brand" href="index.html">Tenstorrent From Zero</a><a href="#series-a">Series A</a><a href="#series-b">ttsim Labs</a><a href="#order">Reading order</a><span class="spacer"></span><a href="https://github.com/tenstorrent/tt-metal">tt-metal</a><a href="https://github.com/tenstorrent/ttsim">ttsim</a></header>
+<main>
+<h1>Tenstorrent From Zero</h1>
+<p class="subtitle">A novice-to-expert series on Tenstorrent AI accelerators. It covers why they exist, how the hardware works, how to program it, and how to verify every idea on the <code>ttsim</code> simulator.</p>
+<div class="callout key">Every concept chapter has interactive animations, real code from <a href="https://github.com/tenstorrent/tt-metal">tt-metal</a> and <a href="https://github.com/tenstorrent/ttsim">ttsim</a>, a self-check quiz, and further reading. Every lab was run on the simulator, and the output it shows is the real output.</div>
+<p>Pinned sources: tt-metal <code>7aad8aac</code>, ttsim <code>b3620244</code> (v1.15.0), tt-isa-documentation <code>be833101</code>. The content was checked against these commits in October 2026.</p>
+<h2 id="series-a">Series A: Tenstorrent From Zero</h2>
+<div class="cards"><a class="card" href="chapters/a01-why-new-hardware.html"><span class="n">01</span><h4>Why AI needs new hardware</h4><p>Matmul dominates, the roofline, and why moving data costs more energy than computing.</p></a>
+<a class="card" href="chapters/a02-gpu-vs-tenstorrent.html"><span class="n">02</span><h4>GPU vs Tenstorrent</h4><p>SIMT and caches vs a grid of independent cores with software-managed SRAM.</p></a>
+<a class="card" href="chapters/a03-chip-tour.html"><span class="n">03</span><h4>A tour of the chip</h4><p>Wormhole and Blackhole grids, tile types, harvesting and coordinates.</p></a>
+<a class="card" href="chapters/a04-inside-tensix.html"><span class="n">04</span><h4>Inside a Tensix core</h4><p>Five baby RISC-Vs, L1, and a coprocessor fed by pushed instructions.</p></a>
+<a class="card" href="chapters/a05-tiles-and-formats.html"><span class="n">05</span><h4>Tiles, faces and number formats</h4><p>32x32 tiles, BF16/TF32, and block floating point with shared exponents.</p></a>
+<a class="card" href="chapters/a06-matrix-engine.html"><span class="n">06</span><h4>The matrix engine and math fidelity</h4><p>MVMUL, 5x7-bit multipliers, fidelity phases, and where TFLOPS come from.</p></a>
+<a class="card" href="chapters/a07-vector-engine.html"><span class="n">07</span><h4>The vector engine (SFPU)</h4><p>32 lanes, LRegs, predication, and why exp() is slower than matmul.</p></a>
+<a class="card" href="chapters/a08-noc.html"><span class="n">08</span><h4>The Network-on-Chip</h4><p>Two opposite tori, routing, multicast, and ordering.</p></a>
+<a class="card" href="chapters/a09-memory.html"><span class="n">09</span><h4>Memory: L1, DRAM, interleaving and sharding</h4><p>No caches: who decides where each byte lives.</p></a>
+<a class="card" href="chapters/a10-first-program.html"><span class="n">10</span><h4>Your first TT-Metalium program</h4><p>Mesh devices, buffers, programs, kernels, and DPRINT.</p></a>
+<a class="card" href="chapters/a11-dataflow-and-cbs.html"><span class="n">11</span><h4>Data movement kernels and circular buffers</h4><p>NoC reads and writes, barriers, and the exact CB protocol.</p></a>
+<a class="card" href="chapters/a12-compute-kernels.html"><span class="n">12</span><h4>Compute kernels: one source, three cores</h4><p>UNPACK/MATH/PACK, and the Dst handshake.</p></a>
+<a class="card" href="chapters/a13-llk-mops-jit.html"><span class="n">13</span><h4>Under the hood: LLK, MOPs and the JIT</h4><p>From add_tiles to a stream of Tensix instructions.</p></a>
+<a class="card" href="chapters/a14-one-tiles-journey.html"><span class="n">14</span><h4>One tile's journey</h4><p>Follow one tile from DRAM to the FPU and back, at three zoom levels.</p></a>
+<a class="card" href="chapters/a15-matmul-one-to-many.html"><span class="n">15</span><h4>Matmul on one core, then many</h4><p>Tilize, blocking, subblocks, and work splitting.</p></a>
+<a class="card" href="chapters/a16-multicast-sync.html"><span class="n">16</span><h4>Multicast and cross-core sync</h4><p>Semaphores, NoC ordering, and the multicast matmul.</p></a>
+<a class="card" href="chapters/a17-dispatch-host.html"><span class="n">17</span><h4>Dispatch, command queues and the host</h4><p>Fast vs slow dispatch, prefetcher and dispatcher, UMD/KMD.</p></a>
+<a class="card" href="chapters/a18-ttnn-user.html"><span class="n">18</span><h4>TT-NN as a user</h4><p>Tensors, layouts, memory configs, sharding, and program configs.</p></a>
+<a class="card" href="chapters/a19-op-anatomy-compilers.html"><span class="n">19</span><h4>How an op is built, and the compiler stack</h4><p>Program factories, the program cache, Forge/MLIR/XLA.</p></a>
+<a class="card" href="chapters/a20-performance.html"><span class="n">20</span><h4>Thinking like a performance engineer</h4><p>Which wall your op hits, and how to move it.</p></a>
+<a class="card" href="chapters/a21-many-chips.html"><span class="n">21</span><h4>Many chips: Ethernet, meshes and TT-Fabric</h4><p>CCLs, tensor parallelism, and Galaxy.</p></a>
+<a class="card" href="chapters/a22-llm-capstone.html"><span class="n">22</span><h4>Capstone: running an LLM</h4><p>Prefill vs decode, the KV cache, and why decode is DRAM-bound.</p></a></div>
+<h2 id="series-b">Series B: ttsim Labs</h2>
+<div class="callout warn">ttsim is a functional, bit-exact model of the hardware. It is not a timing model, so its clock counts tell you nothing about silicon performance.</div>
+<div class="cards"><a class="card" href="sim-labs/b00-workbench.html"><span class="n">B00</span><h4>Setting up the workbench</h4><p>Build ttsim, the env script, kernel overlays, and custom host programs.</p></a>
+<a class="card" href="sim-labs/b01-meet-ttsim.html"><span class="n">B01</span><h4>Meet ttsim</h4><p>Run real programs, check determinism, and learn what the clock does and doesn't mean.</p></a>
+<a class="card" href="sim-labs/b02-map-and-boot.html"><span class="n">B02</span><h4>Map the chip and watch it boot</h4><p>Instrument reset and see the cores wake up.</p></a>
+<a class="card" href="sim-labs/b03-riscv-interpreter.html"><span class="n">B03</span><h4>The RISC-V interpreter</h4><p>The decode table and the escape into Tensix instructions.</p></a>
+<a class="card" href="sim-labs/b04-tensix-instructions.html"><span class="n">B04</span><h4>Following Tensix instructions</h4><p>Trace opcodes, MOP expansion, and stalls.</p></a>
+<a class="card" href="sim-labs/b05-noc-and-dram.html"><span class="n">B05</span><h4>NoC transactions, DRAM and the alignment trap</h4><p>Log every transfer, then break one.</p></a>
+<a class="card" href="sim-labs/b06-cbs-and-semaphores.html"><span class="n">B06</span><h4>Circular buffers and semaphores</h4><p>Watch the handshake, then write your own kernel.</p></a>
+<a class="card" href="sim-labs/b07-matmul-fidelity.html"><span class="n">B07</span><h4>Matmul and math fidelity, bit for bit</h4><p>Reproduce one MVMUL in Python.</p></a>
+<a class="card" href="sim-labs/b08-formats-and-sfpu.html"><span class="n">B08</span><h4>Data formats and SFPU numerics</h4><p>BFP8, the Dst encoding, and a custom SFPI kernel.</p></a>
+<a class="card" href="sim-labs/b09-breaking-things.html"><span class="n">B09</span><h4>Breaking things on purpose</h4><p>The error taxonomy, lldb, and driving libttsim by hand.</p></a>
+<a class="card" href="sim-labs/b10-two-chips.html"><span class="n">B10</span><h4>Two chips</h4><p>A two-device mesh on the simulated n300.</p></a>
+<a class="card" href="sim-labs/b11-ttnn-on-sim.html"><span class="n">B11</span><h4>TT-NN on the simulator</h4><p>Tensors, sharding and matmul configs, run for real.</p></a></div>
+<h2 id="order">Suggested reading order</h2>
+<p>A01–A03 &rarr; B00–B02 &rarr; A04 &rarr; B03 &rarr; A05–A07 &rarr; B07–B08 &rarr; A08–A09 &rarr; B05 &rarr; A10–A12 &rarr; B06 &rarr; A13–A14 &rarr; B04 &rarr; A15–A17 &rarr; B09 &rarr; A18–A19 &rarr; B11 &rarr; A20–A21 &rarr; B10 &rarr; A22.</p>
+<p>Prefer to just get your hands dirty? Do B00 and B01 first, then come back.</p>
+</main></body></html>

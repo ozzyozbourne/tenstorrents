@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A01 · Why AI needs new hardware · Tenstorrent From Zero</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/tt.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="../index.html">Tenstorrent From Zero</a>
+  <a href="../index.html#series-a">Series A</a>
+  <a href="../index.html#series-b">ttsim Labs</a>
+  <span class="spacer"></span>
+  <a href="../index.html">&larr; Prev</a>
+  <a href="a02-gpu-vs-tenstorrent.html">Next &rarr;</a>
+</header>
+<main>
+  <span class="tag">Series A · Chapter 01</span><span class="tag">Prerequisites: none</span>
+  <h1><span class="num">01.</span> Why AI needs new hardware</h1>
+  <p class="subtitle">By the end you will be able to predict, with pencil and paper, whether a piece of AI work will be limited by arithmetic or by moving data. You will also see why that question shapes everything about Tenstorrent's chips.</p>
+
+  <nav class="toc"><b>In this chapter</b>
+    <ol>
+      <li><a href="#question">The question</a></li>
+      <li><a href="#work">Where the work is: matrix multiplication</a></li>
+      <li><a href="#intensity">Counting work per byte: arithmetic intensity</a></li>
+      <li><a href="#roofline">The roofline</a></li>
+      <li><a href="#energy">The energy bill: the carrot and the basement freezer</a></li>
+      <li><a href="#wall">The memory wall</a></li>
+      <li><a href="#dennard">The end of Dennard scaling, and why specialization won</a></li>
+      <li><a href="#next">Where we're going</a></li>
+      <li><a href="#recap">Recap</a></li>
+      <li><a href="#quiz">Check yourself</a></li>
+      <li><a href="#reading">Further reading</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="question">The question</h2>
+  <p>An NVIDIA H100 SXM is rated at about <b>989 trillion</b> bfloat16 floating-point operations per second (989 TFLOPS) for dense matrix math. Suppose you ask it to add two large bfloat16 tensors, element by element. That is one addition per element, and a modern chip is built for exactly this kind of simple, parallel work.</p>
+  <p>Yet the add will run at <b>about 0.06%</b> of that peak. That is not 60%, and not 6%, but six hundredths of a percent. The chip is not broken, and the code is not badly written. It is physics plus accounting, and by the end of this chapter you will be able to work out that number yourself in one line.</p>
+  <p>The same accounting explains why AI chips are designed the way they are, and Tenstorrent's in particular. It explains the large SRAM next to every core, the networks that move data between cores, the 32×32 tiles, and the block-floating-point number formats. We will build that accounting from small numbers you can check by hand.</p>
+
+  <h2 id="work">Where the work is: matrix multiplication</h2>
+  <p>Start by asking what a neural network actually spends its arithmetic on. Ivanov et al. took a BERT encoder layer, the building block of a classic transformer, and sorted every operator into three classes. Then they measured the share of floating-point operations (FLOPs) and the share of runtime for each class, training in PyTorch on V100 GPUs:</p>
+
+  <table>
+    <tr><th>Operator class</th><th>Examples</th><th>% of FLOPs</th><th>% of runtime</th></tr>
+    <tr><td>Tensor contraction</td><td>matrix multiplies and batched matrix multiplies (linear layers, parts of multi-head attention)</td><td><b>99.80</b></td><td>61.0</td></tr>
+    <tr><td>Statistical normalization</td><td>softmax, layer norm</td><td>0.17</td><td>25.5</td></tr>
+    <tr><td>Element-wise</td><td>biases, dropout, activations, residual connections</td><td>0.03</td><td>13.5</td></tr>
+  </table>
+  <p style="font-size:14px;color:var(--muted)">Source: Ivanov, Dryden, Ben-Nun, Li, Hoefler, "Data Movement Is All You Need", MLSys 2021, Table 1 (<a href="https://arxiv.org/abs/2007.00072">arXiv:2007.00072</a>).</p>
+
+  <p>Look at both columns. The left one says that <b>essentially all of the arithmetic is matrix multiplication</b>, so a chip for AI should be very good at matmul. The right one is stranger. The operators that do 0.2% of the arithmetic take 39% of the time. Something other than arithmetic is costing time. Keep that in mind, because the roofline below explains it.</p>
+
+  <h3>6N: a rule you can do in your head</h3>
+  <p>Why is it all matmul? Look at what a layer does with its weights. In a linear layer <code>y = W·x</code>, every weight is used in exactly one multiply and one add for each token that passes through. So a model with <i>N</i> parameters does about <b>2N FLOPs per token</b> in the forward pass. The backward pass costs about twice the forward pass, because it computes gradients for both the activations and the weights. That gives Kaplan et al.'s rule of thumb:</p>
+  <div class="callout key">Training costs about <b>6N FLOPs per token</b>, where N is the number of non-embedding parameters (2N forward + about 4N backward). Inference costs about <b>2N per token</b>. Nearly all of these FLOPs are matrix multiplies.</div>
+  <p>For a 7-billion-parameter model, that is roughly 14 GFLOP to run one token forward and 42 GFLOP to train on it <i>(derived from 2N and 6N)</i>. Kaplan also gives the extra cost of attention scores, which grows with context length. Relative to the 2N term it is <i>n</i><sub>ctx</sub> / (12·<i>d</i><sub>model</sub>) <i>(derived from Kaplan Eq. 2.1–2.2)</i>. With <i>d</i><sub>model</sub> = 4096 and 2048 tokens of context it adds about 4%. For very long contexts it stops being negligible.</p>
+
+  <p>So matrix multiply is the workload. The next question is what makes a matmul easy or hard for a chip.</p>
+
+  <h2 id="intensity">Counting work per byte: arithmetic intensity</h2>
+  <p>Every operation has two costs: the arithmetic, and bringing the operands in and sending the result out. Let us count both for the smallest interesting case, two 2×2 matrices stored in bfloat16 (2 bytes per number), and compare an element-wise add with a matrix multiply.</p>
+
+  <div class="viz" id="fig-count"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-count");
+    var g = TT.canvas(root, 800, 360), ctx = g.ctx, C = TT.C;
+    var steps = [
+      { dur: 1.4, text: "<b>Element-wise add, 2×2.</b> Read A (4 numbers × 2 B = 8 B) and B (8 B), write C (8 B): 24 bytes moved. Four additions: 4 FLOPs. That is 4 / 24 ≈ <b>0.17 FLOP per byte</b>. Each input is used exactly once." },
+      { dur: 1.4, text: "<b>Matrix multiply, 2×2.</b> Same 24 bytes. Output c<sub>00</sub> = a<sub>00</sub>·b<sub>00</sub> + a<sub>01</sub>·b<sub>10</sub>, which is row 0 of A times column 0 of B: 2 multiplies + 1 add = 3 FLOPs." },
+      { dur: 1.2, text: "<b>c<sub>01</sub></b> = row 0 of A times column 1 of B. Row 0 of A is <i>reused</i>: it was already on chip. Total so far: 6 FLOPs, still 24 bytes." },
+      { dur: 1.2, text: "<b>c<sub>10</sub></b> = row 1 of A times column 0 of B. Column 0 of B is reused this time. 9 FLOPs." },
+      { dur: 1.2, text: "<b>c<sub>11</sub></b>. Done: 12 FLOPs for 24 bytes = <b>0.5 FLOP/byte</b>, 3× the add. Every input number took part in 2 multiplies, because each row (or column) is used N = 2 times." },
+      { dur: 2.2, text: "<b>Now let N grow.</b> An N×N matmul does N multiply-adds for each of N² outputs, so about 2N³ FLOPs. It moves 3N² numbers, or 6N² bytes in bf16. The ratio is <b>2N³ / 6N² = N/3</b> FLOP per byte. Work grows like a cube and traffic like a square, so a big enough matmul eventually has more than enough work per byte." }
+    ];
+    function grid(x, y, name, col, hiRow, hiCol, vals) {
+      TT.text(ctx, name, x + 40, y - 14, { color: col, align: "center", font: "bold 15px" });
+      for (var r = 0; r < 2; r++) for (var c = 0; c < 2; c++) {
+        var on = (hiRow === r) || (hiCol === c);
+        TT.box(ctx, x + c * 42, y + r * 42, 38, 38, { fill: col, alpha: on ? 0.55 : 0.15, stroke: col, label: vals ? vals[r][c] : name.toLowerCase() + r + c, font: "13px", mono: true });
+      }
+    }
+    function counters(flops, bytes, label) {
+      TT.box(ctx, 560, 60, 210, 150, { fill: C.bg2, stroke: C.border });
+      TT.text(ctx, label, 575, 82, { color: C.muted });
+      TT.text(ctx, "FLOPs:  " + flops, 575, 112, { color: C.yellow, font: "bold 16px", mono: true });
+      TT.text(ctx, "bytes:  " + bytes, 575, 140, { color: C.blue, font: "bold 16px", mono: true });
+      TT.text(ctx, "FLOP/B: " + (flops / bytes).toFixed(2), 575, 172, { color: C.green, font: "bold 16px", mono: true });
+    }
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      if (i === 0) {
+        grid(40, 90, "A", C.blue, null, null);
+        TT.text(ctx, "+", 150, 132, { font: "bold 26px", align: "center" });
+        grid(180, 90, "B", C.teal, null, null);
+        TT.text(ctx, "=", 290, 132, { font: "bold 26px", align: "center" });
+        var k = Math.floor(t * 4.999);
+        for (var q = 0; q < 4; q++) {
+          var r = q >> 1, c = q & 1;
+          TT.box(ctx, 320 + c * 42, 90 + r * 42, 38, 38, { fill: C.yellow, alpha: q < k ? 0.5 : 0.08, stroke: C.yellow, label: "c" + r + c, mono: true });
+        }
+        TT.text(ctx, "C", 360, 76, { color: C.yellow, align: "center", font: "bold 15px" });
+        counters(Math.min(4, k), 24, "element-wise add (bf16)");
+        TT.text(ctx, "each input used once", 230, 230, { color: C.muted, align: "center" });
+      } else if (i <= 4) {
+        var o = i - 1, rr = o >> 1, cc = o & 1;
+        grid(40, 90, "A", C.blue, rr, null);
+        TT.text(ctx, "×", 150, 132, { font: "bold 26px", align: "center" });
+        grid(180, 90, "B", C.teal, null, cc);
+        TT.text(ctx, "=", 290, 132, { font: "bold 26px", align: "center" });
+        for (var q2 = 0; q2 < 4; q2++) {
+          var r2 = q2 >> 1, c2 = q2 & 1, done = q2 < o || (q2 === o && t > 0.5);
+          TT.box(ctx, 320 + c2 * 42, 90 + r2 * 42, 38, 38, { fill: C.yellow, alpha: q2 === o ? 0.25 + 0.4 * t : (done ? 0.5 : 0.08), stroke: q2 === o ? C.fg : C.yellow, lw: q2 === o ? 2.5 : 1.5, label: "c" + r2 + c2, mono: true });
+        }
+        TT.text(ctx, "C", 360, 76, { color: C.yellow, align: "center", font: "bold 15px" });
+        var fl = 3 * o + Math.round(3 * t);
+        counters(fl, 24, "matrix multiply (bf16)");
+        TT.text(ctx, "c" + rr + cc + " = a" + rr + "0·b0" + cc + " + a" + rr + "1·b1" + cc, 230, 230, { color: C.fg, align: "center", mono: true, font: "15px" });
+        TT.text(ctx, "row " + rr + " of A used so far: " + ((o & 1) + 1) + "×", 230, 262, { color: C.blue, align: "center" });
+        TT.text(ctx, "2N³ = 16 is the usual approximation; the exact count is N²(2N−1) = 12", 400, 330, { color: C.muted, align: "center", font: "12px" });
+      } else {
+        // N table growing
+        var rows = [[2, 16, 24], [32, 65536, 6144], [256, 33554432, 393216], [1024, 2147483648, 6291456], [4096, 137438953472, 100663296]];
+        var show = Math.min(rows.length, 1 + Math.floor(t * rows.length));
+        var x0 = 70, y0 = 50;
+        var hdr = ["N", "FLOPs ≈ 2N³", "bytes = 6N²", "FLOP/B ≈ N/3"];
+        var xs = [x0, x0 + 110, x0 + 330, x0 + 520];
+        hdr.forEach(function (h, k2) { TT.text(ctx, h, xs[k2], y0, { color: C.yellow, font: "bold 14px" }); });
+        for (var j = 0; j < show; j++) {
+          var R = rows[j], y = y0 + 34 + j * 34;
+          TT.text(ctx, String(R[0]), xs[0], y, { mono: true });
+          TT.text(ctx, R[1].toExponential(2).replace("e+", "e"), xs[1], y, { mono: true, color: C.yellow });
+          TT.text(ctx, R[2].toExponential(2).replace("e+", "e"), xs[2], y, { mono: true, color: C.blue });
+          TT.text(ctx, (R[1] / R[2]).toFixed(1), xs[3], y, { mono: true, color: C.green, font: "bold 13px" });
+          // bar for intensity on log scale
+          var w = Math.max(2, 90 * Math.log10(1 + R[1] / R[2]) / Math.log10(1400));
+          TT.box(ctx, xs[3] + 60, y - 7, w, 14, { fill: C.green, alpha: 0.5, r: 3 });
+        }
+        TT.text(ctx, "N = 32 is exactly one Tenstorrent tile (32×32), which already gives about 11 FLOP/B.", 400, 300, { color: C.muted, align: "center" });
+        TT.text(ctx, "Assumes each number crosses the memory boundary once; how to make that true is chapter A15.", 400, 326, { color: C.muted, align: "center", font: "12px" });
+      }
+    }});
+  })();
+  </script>
+
+  <p>That ratio, <b>FLOPs performed per byte moved to or from memory</b>, has a name: <b>arithmetic intensity</b> (AI). We needed a name because it is the one number that tells you whether a piece of work can keep a fast chip busy.</p>
+  <ul>
+    <li><b>Element-wise add:</b> 1 FLOP for 3 numbers moved. That is 1/6 ≈ 0.17 FLOP/B in bf16, and it stays 0.17 however big the tensor is. There is no reuse to exploit.</li>
+    <li><b>N×N matmul:</b> about N/3 FLOP/B in bf16. Each input number takes part in N multiplies, so intensity grows with size.</li>
+  </ul>
+  <p>tt-metal's own matmul benchmark report opens with the same argument:</p>
+  <div class="filename">tt-metal/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md:10 @7aad8aac</div>
+<pre><code>Thankfully, matrix multiplication requires more compute operations (2N^3) than memory
+operations (3N^2). As such, for a given device, there will always be points at which a
+device is limited by the underlying compute units, not the underlying memory system.
+We call this point the roofline.</code></pre>
+  <div class="callout warn">Arithmetic intensity is not a property of the math alone. It depends on <b>how many times each byte actually crosses the memory boundary</b>. A naive matmul that re-reads a row of A from DRAM for every output has an intensity close to the element-wise add. N/3 is the best case, where each input is read once. Getting close to it needs on-chip memory big enough to hold the reused data, which is exactly why Tenstorrent puts about 1.5 MB of SRAM next to every core. Blocking is chapter <a href="a15-matmul-one-to-many.html">A15</a>.</div>
+
+  <h2 id="roofline">The roofline</h2>
+  <p>Now combine the work with the chip. A chip has two speed limits:</p>
+  <ul>
+    <li>a <b>compute roof</b>: peak FLOPs per second, the "factory" in Horace He's analogy;</li>
+    <li>a <b>bandwidth roof</b>: bytes per second from off-chip memory (DRAM), the shipping between Horace He's warehouse and factory. If every byte carries <i>AI</i> FLOPs of work, shipping can feed at most <i>bandwidth × AI</i> FLOPs per second.</li>
+  </ul>
+  <p>You get whichever is lower. That single line is the <b>roofline model</b> of Williams, Waterman and Patterson (2009):</p>
+  <p style="text-align:center;font-size:1.15rem"><code>attainable FLOP/s = min( peak FLOP/s , DRAM bandwidth × arithmetic intensity )</code></p>
+  <p>On a log-log plot, the bandwidth limit is a diagonal line and the compute limit is a flat line. They meet at the <b>ridge point</b>, at intensity <code>peak / bandwidth</code>. Work to the left of the ridge is <b>memory-bound</b>: a faster ALU would not help at all. Work to the right is <b>compute-bound</b>. Move the slider and watch a matmul climb the slope.</p>
+
+  <div class="viz" id="fig-roof">
+    <div class="controls">
+      <label>Chip <select id="roof-chip">
+        <option value="h100">NVIDIA H100 SXM (BF16)</option>
+        <option value="n150">Tenstorrent Wormhole n150 (FP16)</option>
+        <option value="p150" selected>Tenstorrent Blackhole p150 (BLOCKFP8)</option>
+      </select></label>
+      <label style="flex:1">matmul N = <b id="roof-nv" style="color:var(--yellow);min-width:3.5em">64</b>
+        <input type="range" id="roof-n" min="0" max="14" step="0.05" value="6"></label>
+      <button id="roof-play">Sweep N</button>
+    </div>
+    <div class="narration" id="roof-read"></div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-roof");
+    var g = TT.canvas(root, 800, 430), ctx = g.ctx, C = TT.C;
+    // Sourced numbers: peak TFLOPS and DRAM GB/s; bytes per element from the format.
+    var chips = {
+      h100: { name: "H100 SXM", peak: 989, bw: 3350, fmt: "BF16", bpe: 2, col: C.purple,
+              src: "989 TF = 1,979 TF 'with sparsity' ÷ 2; 3.35 TB/s (nvidia.com H100 spec table)" },
+      n150: { name: "Wormhole n150", peak: 74, bw: 288, fmt: "FP16", bpe: 2, col: C.teal,
+              src: "74 TF FP16, 288 GB/s (docs.tenstorrent.com Wormhole spec table)" },
+      p150: { name: "Blackhole p150", peak: 664, bw: 512, fmt: "BLOCKFP8", bpe: 1088 / 1024, col: C.orange,
+              src: "664 TF BLOCKFP8, 512 GB/s (docs.tenstorrent.com Blackhole spec table); 1088 B per 1024-element tile" }
+    };
+    var sel = document.getElementById("roof-chip"), sl = document.getElementById("roof-n");
+    var nv = document.getElementById("roof-nv"), rd = document.getElementById("roof-read");
+    var X0 = 80, X1 = 770, Y0 = 395, Y1 = 25;          // plot box
+    var lxMin = -2, lxMax = 4, lyMin = -2, lyMax = 3.3;  // log10 ranges: FLOP/B and TFLOP/s
+    function px(ai) { return X0 + (Math.log10(ai) - lxMin) / (lxMax - lxMin) * (X1 - X0); }
+    function py(tf) { return Y0 - (Math.log10(tf) - lyMin) / (lyMax - lyMin) * (Y0 - Y1); }
+    function att(c, ai) { return Math.min(c.peak, c.bw / 1000 * ai); }
+    function fmt(x) { return x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x >= 1 ? x.toFixed(2) : x.toFixed(3); }
+    function roof(c, bold) {
+      ctx.save(); ctx.beginPath(); ctx.rect(X0, Y1 - 10, X1 - X0, Y0 - Y1 + 10); ctx.clip();
+      ctx.strokeStyle = c.col; ctx.lineWidth = bold ? 3 : 1.2; ctx.globalAlpha = bold ? 1 : 0.35;
+      ctx.beginPath();
+      for (var k = 0; k <= 300; k++) {
+        var l = lxMin + (lxMax - lxMin) * k / 300, ai = Math.pow(10, l), y = py(att(c, ai));
+        if (k === 0) ctx.moveTo(px(ai), y); else ctx.lineTo(px(ai), y);
+      }
+      ctx.stroke(); ctx.globalAlpha = 1; ctx.restore();
+    }
+    function draw() {
+      var c = chips[sel.value], N = Math.round(Math.pow(2, +sl.value));
+      nv.textContent = N;
+      TT.clear(ctx, g.W, g.H);
+      // grid + axes
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      for (var lx = lxMin; lx <= lxMax; lx++) { ctx.beginPath(); ctx.moveTo(px(Math.pow(10, lx)), Y0); ctx.lineTo(px(Math.pow(10, lx)), Y1); ctx.stroke();
+        TT.text(ctx, String(+Math.pow(10, lx).toPrecision(1)), px(Math.pow(10, lx)), Y0 + 14, { color: C.muted, align: "center", font: "11px" }); }
+      for (var ly = lyMin; ly <= 3; ly++) { ctx.beginPath(); ctx.moveTo(X0, py(Math.pow(10, ly))); ctx.lineTo(X1, py(Math.pow(10, ly))); ctx.stroke();
+        TT.text(ctx, String(Math.pow(10, ly)), X0 - 6, py(Math.pow(10, ly)), { color: C.muted, align: "right", font: "11px" }); }
+      TT.text(ctx, "arithmetic intensity (FLOP per DRAM byte, log scale)", (X0 + X1) / 2, Y0 + 30, { color: C.muted, align: "center", font: "12px" });
+      ctx.save(); ctx.translate(18, (Y0 + Y1) / 2); ctx.rotate(-Math.PI / 2);
+      TT.text(ctx, "attainable TFLOP/s (log)", 0, 0, { color: C.muted, align: "center", font: "12px" }); ctx.restore();
+      Object.keys(chips).forEach(function (k) { if (k !== sel.value) roof(chips[k], false); });
+      roof(c, true);
+      var ridge = c.peak * 1000 / c.bw;
+      // ridge marker
+      ctx.setLineDash([4, 4]); ctx.strokeStyle = c.col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px(ridge), py(c.peak)); ctx.lineTo(px(ridge), Y0); ctx.stroke(); ctx.setLineDash([]);
+      var rl = px(ridge) + 150 > X1;
+      TT.text(ctx, "ridge ≈ " + ridge.toFixed(0) + " FLOP/B", px(ridge) + (rl ? -6 : 6), Y0 - 40, { color: c.col, font: "12px", align: rl ? "right" : "left" });
+      TT.text(ctx, "peak " + c.peak + " TF", X1 - 4, py(c.peak) - 10, { color: c.col, align: "right", font: "12px" });
+      TT.text(ctx, "← memory-bound", px(ridge) - 8, Y0 - 16, { color: C.blue, font: "bold 13px", align: "right" });
+      var tight = px(ridge) + 140 > g.W;
+      TT.text(ctx, tight ? "compute-bound" : "compute-bound →", tight ? g.W - 4 : px(ridge) + 8, Y0 - 16, { color: C.yellow, font: "bold 13px", align: tight ? "right" : "left" });
+      // element-wise add point
+      var aiAdd = 1 / (3 * c.bpe), tAdd = att(c, aiAdd);
+      ctx.fillStyle = C.red; ctx.beginPath(); ctx.arc(px(aiAdd), py(tAdd), 6, 0, 7); ctx.fill();
+      TT.text(ctx, "element-wise add", px(aiAdd) + 9, py(tAdd) + 12, { color: C.red, font: "12px" });
+      // matmul point
+      var ai = 2 * N / (3 * c.bpe), t = att(c, ai);
+      ctx.fillStyle = C.yellow; ctx.beginPath(); ctx.arc(px(ai), py(t), 8, 0, 7); ctx.fill();
+      ctx.strokeStyle = C.bg; ctx.lineWidth = 2; ctx.stroke();
+      TT.text(ctx, "matmul N=" + N, px(ai) + (ai > 2000 ? -12 : 12), py(t) + (t >= c.peak ? 24 : -14), { color: C.yellow, font: "bold 13px", align: ai > 2000 ? "right" : "left" });
+      var nRidge = Math.ceil(ridge * 3 * c.bpe / 2);
+      rd.innerHTML =
+        "<b>" + c.name + "</b>: peak " + c.peak + " TF " + c.fmt + ", DRAM " + c.bw + " GB/s <span style='color:var(--muted)'>[sourced: " + c.src + "]</span><br>" +
+        "<span style='color:var(--muted)'>[derived]</span> ridge = " + c.peak + "e12 / " + c.bw + "e9 = <b>" + ridge.toFixed(0) + " FLOP/B</b>; " +
+        "matmul AI = 2N/(3×" + c.bpe.toFixed(4).replace(/0+$/, "").replace(/\.$/, "") + " B) = " + fmt(ai) + " FLOP/B → attainable <b>" + fmt(t) + " TF</b> = " + (100 * t / c.peak).toFixed(t < c.peak ? 2 : 0) + "% of peak " +
+        (t < c.peak ? "<span style='color:var(--blue)'>(memory-bound)</span>" : "<span style='color:var(--yellow)'>(compute-bound)</span>") +
+        "; reaches the ridge at N ≈ " + nRidge + ". Element-wise add: " + fmt(aiAdd) + " FLOP/B → " + (100 * tAdd / c.peak).toFixed(3) + "% of peak.";
+    }
+    sel.onchange = draw; sl.oninput = draw;
+    var playing = false, bp = document.getElementById("roof-play");
+    bp.onclick = function () {
+      playing = !playing; bp.textContent = playing ? "Pause" : "Sweep N";
+      if (+sl.value >= 14) sl.value = 0;
+      var last = performance.now();
+      (function tick(now) {
+        if (!playing) return;
+        sl.value = Math.min(14, +sl.value + (now - last) / 1000 * 2); last = now; draw();
+        if (+sl.value >= 14) { playing = false; bp.textContent = "Sweep N"; return; }
+        requestAnimationFrame(tick);
+      })(last);
+    };
+    draw();
+  })();
+  </script>
+
+  <p>Now the opening puzzle takes one line. On the H100 an element-wise bf16 add has intensity 1/6 FLOP/B, so it is limited to 3.35 TB/s × 1/6 ≈ 0.56 TFLOP/s. That is <b>0.056% of 989</b>. A Wormhole n150 behaves the same way: 288 GB/s × 1/6 = 48 GFLOP/s, 0.065% of its 74 TF. Element-wise operations sit far down the left slope on every chip. That is the 39% of BERT runtime spent on 0.2% of the FLOPs.</p>
+
+  <p>The ridge points tell you how much reuse a chip demands <i>(all derived from the sourced peaks and bandwidths)</i>:</p>
+  <table>
+    <tr><th>Chip</th><th>Peak (sourced)</th><th>DRAM BW (sourced)</th><th>Ridge (derived)</th><th>Square matmul at the ridge (derived)</th></tr>
+    <tr><td>H100 SXM</td><td>989 TF BF16 dense</td><td>3.35 TB/s HBM3</td><td>≈ 295 FLOP/B</td><td>N ≈ 886 (bf16)</td></tr>
+    <tr><td>Wormhole n150</td><td>74 TF FP16</td><td>288 GB/s GDDR6</td><td>≈ 257 FLOP/B</td><td>N ≈ 771 (16-bit)</td></tr>
+    <tr><td>Blackhole p150</td><td>664 TF BLOCKFP8</td><td>512 GB/s GDDR6</td><td>≈ 1,297 FLOP/B</td><td>N ≈ 2,067 (BFP8, 1.0625 B/element)</td></tr>
+  </table>
+  <p>Blackhole's ridge is more than four times further right than the H100's. It has a lot of compute per DRAM byte, because Tenstorrent chose cheaper GDDR6 over HBM. The design only works if data, once fetched, is reused many times from on-chip SRAM, and the chip is built for that. Tenstorrent's Hot Chips 2024 talk lists Blackhole's local SRAM bandwidth at <b>94 TB/s</b>, against 512 GB/s for DRAM (slide 14). That is about 180 times more <i>(derived)</i>. Note that the slide describes the 140-core chip as presented; shipped p150 cards enable 120 cores.</p>
+
+  <p>Where do Blackhole's bytes per element come from? Block floating point stores 16 values that share one exponent. A 32×32 tile in <code>Bfp8_b</code> takes 1,024 mantissa bytes plus 64 exponent bytes:</p>
+  <div class="filename">tt-metal/tt_metal/api/tt-metalium/tt_backend_api_types.hpp:122-129 @7aad8aac</div>
+<pre><code>constexpr static uint32_t tile_size(const DataFormat&amp; format) {
+    switch (format) {
+        case DataFormat::Bfp2:
+        case DataFormat::Bfp2_b: return (64 * 4) + (16 * 4);
+        case DataFormat::Bfp4:
+        case DataFormat::Bfp4_b: return (128 * 4) + (16 * 4);
+        case DataFormat::Bfp8:
+        case DataFormat::Bfp8_b: return (256 * 4) + (16 * 4);</code></pre>
+  <p>Read the <code>Bfp8_b</code> line as 256×4 = 1,024 one-byte mantissas plus 16×4 = 64 shared exponents, 1,088 bytes per tile. So one element costs 1088/1024 = 1.0625 bytes, about half of bf16. Halving the bytes doubles the intensity of the same matmul. Formats are themselves a weapon against the memory wall, and chapter <a href="a05-tiles-and-formats.html">A05</a> covers them in detail.</p>
+
+  <div class="callout warn">The three peaks are <b>not the same kind of number</b>. NVIDIA lists 1,979 TF BF16 "with sparsity", and the dense 989 TF is half of that. Tenstorrent lists 74 TF FP16 for the n150, and 664 TF <b>BLOCKFP8</b> as the only figure for the p150. On Tenstorrent, peak also depends on <i>math fidelity</i>: tt-metal's GEMM report gives 4 TF per core at LoFi and 1 TF at HiFi4 on Wormhole. Compare ridge points as shapes, not as a benchmark. Fidelity is chapter <a href="a06-matrix-engine.html">A06</a>.</div>
+
+  <div class="callout gpu">Every chip, GPU or not, has this roofline. What differs is <b>who arranges the reuse</b> that moves your work rightwards. On a GPU, hardware caches (L1/L2) catch some reuse automatically, and programmers add the rest with shared-memory tiling. On Tenstorrent no hardware-managed cache sits between the compute engines and DRAM. Each core's SRAM is a scratchpad that your program fills on purpose. Chapter <a href="a02-gpu-vs-tenstorrent.html">A02</a> runs the same blocked matmul on both styles of machine.</div>
+
+  <h2 id="energy">The energy bill: the carrot and the basement freezer</h2>
+  <p>The roofline is about <i>time</i>. There is a second, deeper reason data movement matters: <i>energy</i>. Power, not transistor count, now limits every chip (see the next sections), so every joule spent moving data is a joule not spent on math.</p>
+  <p>Picture cooking. Chopping a carrot on the counter is quick and cheap: that is an arithmetic operation on numbers already in registers. Getting the carrot from the fridge next to you costs a little more: that is an on-chip SRAM read. Getting it from the chest freezer in the basement means stairs, a door, and the walk back: that is a DRAM read. Mark Horowitz measured the actual prices in a 45 nm process. Step through them:</p>
+
+  <div class="viz" id="fig-energy"></div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-energy");
+    var g = TT.canvas(root, 800, 450), ctx = g.ctx, C = TT.C;
+    var bars = [
+      { n: "8-bit int add", e: 0.03, c: C.green, s: 0 },
+      { n: "32-bit int add", e: 0.1, c: C.green, s: 0 },
+      { n: "8-bit int mult", e: 0.2, c: C.teal, s: 1 },
+      { n: "32-bit int mult", e: 3.1, c: C.teal, s: 1 },
+      { n: "FP16 add", e: 0.4, c: C.blue, s: 2 },
+      { n: "FP32 add", e: 0.9, c: C.blue, s: 2 },
+      { n: "FP16 mult", e: 1.1, c: C.blue, s: 2 },
+      { n: "FP32 mult", e: 3.7, c: C.yellow, s: 2 },
+      { n: "32-bit SRAM read (8 KB)", e: 5, c: C.purple, s: 3 },
+      { n: "32-bit DRAM read", e: 640, c: C.red, s: 4 }
+    ];
+    var steps = [
+      { dur: 1.2, text: "<b>The counter: integer adds.</b> 0.03 pJ for 8 bits, 0.1 pJ for 32 bits. Chopping a carrot." },
+      { dur: 1.2, text: "<b>Integer multiplies.</b> 0.2 pJ (8-bit) and 3.1 pJ (32-bit). Multiplier cost grows roughly with the square of the width, which is one reason narrow formats are attractive." },
+      { dur: 1.2, text: "<b>Floating point.</b> FP16 add 0.4, FP32 add 0.9, FP16 mult 1.1, <b>FP32 mult 3.7 pJ</b>. Keep that yellow bar in mind: it is our unit." },
+      { dur: 1.2, text: "<b>The fridge: on-chip SRAM.</b> Reading 32 bits from a small 8 KB SRAM costs about 5 pJ, already more than the multiply it feeds. (Horowitz's own figure gives 10 pJ per 64 bits for an 8 KB cache, which is the same per bit.)" },
+      { dur: 2.4, text: "<b>The basement freezer: DRAM.</b> One 32-bit read from off-chip DRAM costs about <b>640 pJ</b>. The scale has to zoom out by a factor of 100 to fit it, and every arithmetic bar shrinks to a sliver." },
+      { dur: 3.0, text: "<b>One DRAM read ≈ 173 FP32 multiplies</b> (640 / 3.7 = 173). Each yellow square is one FP32 multiply's worth of energy. A number fetched from DRAM must be used in about a hundred operations before arithmetic, not travel, dominates the bill." }
+    ];
+    var LX = 210, RX = 760, top = 30, bh = 26, gap = 9;
+    TT.stepper({ root: root, steps: steps, draw: function (i, t) {
+      TT.clear(ctx, g.W, g.H);
+      var scale = i < 4 ? 6 : (i === 4 ? Math.exp(TT.lerp(Math.log(6), Math.log(680), t)) : 680);
+      if (i < 5) {
+        bars.forEach(function (b, k) {
+          if (b.s > i) return;
+          var y = top + k * (bh + gap), grow = (b.s === i) ? t : 1;
+          TT.text(ctx, b.n, LX - 10, y + bh / 2, { align: "right", color: C.fg });
+          var w = Math.min(RX - LX, (RX - LX) * b.e / scale) * grow;
+          TT.box(ctx, LX, y, Math.max(1.5, w), bh, { fill: b.c, alpha: 0.75, r: 3 });
+          var over = b.e / scale > 1.0001;
+          var inside = LX + w + 8 > RX - 140;
+          TT.text(ctx, b.e + " pJ" + (over ? "  → off the scale" : ""), inside ? LX + w - 8 : LX + w + 8, y + bh / 2,
+                  { color: inside ? C.fg : C.muted, font: inside ? "bold 13px" : "12px", align: inside ? "right" : "left" });
+        });
+        // axis
+        var ay = top + bars.length * (bh + gap) + 6;
+        ctx.strokeStyle = C.border; ctx.beginPath(); ctx.moveTo(LX, ay); ctx.lineTo(RX, ay); ctx.stroke();
+        TT.text(ctx, "0", LX, ay + 12, { color: C.muted, align: "center", font: "11px" });
+        TT.text(ctx, scale.toFixed(scale < 10 ? 0 : 0) + " pJ", RX, ay + 12, { color: C.muted, align: "right", font: "11px" });
+        TT.text(ctx, "linear scale", (LX + RX) / 2, ay + 12, { color: C.muted, align: "center", font: "11px" });
+      } else {
+        // 173 squares filling: unit = one FP32 multiply
+        TT.text(ctx, "one 32-bit DRAM read  =", 400, 28, { align: "center", color: C.red, font: "bold 16px" });
+        var cols = 20, sz = 22, sp = 4, gx = 400 - (cols * (sz + sp)) / 2, gy = 52;
+        var n = Math.floor(t * 173 + 0.0001);
+        if (t >= 1) n = 173;
+        for (var q = 0; q < 173; q++) {
+          var r = Math.floor(q / cols), c = q % cols;
+          TT.box(ctx, gx + c * (sz + sp), gy + r * (sz + sp), sz, sz, { fill: q < n ? C.yellow : C.bg3, alpha: q < n ? 0.85 : 1, r: 3 });
+        }
+        TT.text(ctx, n + " × FP32 multiply (3.7 pJ each)", 400, gy + 9 * (sz + sp) + 22, { align: "center", color: C.yellow, font: "bold 18px", mono: true });
+        TT.text(ctx, "640 pJ ÷ 3.7 pJ ≈ 173", 400, gy + 9 * (sz + sp) + 50, { align: "center", color: C.muted });
+      }
+      TT.text(ctx, "45 nm, 0.9 V. Sources: Horowitz ISSCC 2014 Fig. 1.1.9; 32-bit SRAM/DRAM rows as tabulated by Han et al. 2015 Fig. 1", 400, g.H - 10, { align: "center", color: C.muted, font: "11px" });
+    }});
+  })();
+  </script>
+
+  <p>The table behind the bars is worth having in text form:</p>
+  <table>
+    <tr><th>Operation (45 nm)</th><th>Energy</th><th>In FP32 multiplies</th></tr>
+    <tr><td>8-bit int add / 32-bit int add</td><td>0.03 / 0.1 pJ</td><td>0.008 / 0.03</td></tr>
+    <tr><td>8-bit int mult / 32-bit int mult</td><td>0.2 / 3.1 pJ</td><td>0.05 / 0.84</td></tr>
+    <tr><td>FP16 add / mult</td><td>0.4 / 1.1 pJ</td><td>0.11 / 0.30</td></tr>
+    <tr><td>FP32 add / mult</td><td>0.9 / 3.7 pJ</td><td>0.24 / 1</td></tr>
+    <tr><td>32-bit SRAM read (8 KB)</td><td>5 pJ</td><td>1.4</td></tr>
+    <tr><td>32-bit DRAM read</td><td>640 pJ</td><td><b>≈ 173</b></td></tr>
+  </table>
+  <div class="callout warn"><b>Where the numbers come from, and where the sources differ.</b> Horowitz's ISSCC 2014 paper, Figure 1.1.9, gives the arithmetic rows exactly as above. For memory, it lists <i>64-bit</i> accesses: 8 KB cache 10 pJ, 32 KB 20 pJ, 1 MB 100 pJ, and DRAM <b>1.3–2.6 nJ</b>. The widely copied 32-bit rows (5 pJ SRAM, 640 pJ DRAM) come from Han et al. 2015, Figure 1, which cites a Horowitz energy table on the Stanford VLSI wiki rather than the ISSCC paper. Han gives no SRAM size; the "8 KB" label here is inferred from Horowitz's 10 pJ per 64-bit 8 KB cache. Halving the 64-bit DRAM range gives 650–1300 pJ per 32 bits, so 640 pJ is the optimistic end, and "173×" is a lower bound. These are 45 nm numbers. Newer processes make arithmetic cheaper faster than they make off-chip wires cheaper, so the ratio has not shrunk in the direction that would help.</div>
+
+  <p><b>Where the analogy breaks.</b> A trip to the basement costs the same whether you carry one carrot or twenty, so the obvious fix is to carry more per trip. DRAM energy does not work like that. Horowitz notes that DRAM I/O alone takes over 20 pJ <i>per bit</i>, and 32 bits × 20 pJ = 640 pJ. Bigger transfers help bandwidth and latency, but each byte still pays its own toll. The only real fix is to <b>fetch each value once and use it many times</b> while it sits in the fridge. That is arithmetic intensity again, measured in joules instead of seconds. Horowitz draws the same conclusion: peak efficiency needs "tens of data operations … for each local memory fetch, and roughly a thousand operations … for each DRAM fetch", which he notes "is very similar to what is needed to implement convolution".</p>
+
+  <p>There is one more line item in his paper. A simple in-order processor spends about <b>70 pJ per instruction</b>: 25 pJ on instruction-cache access, 6 pJ on the register file, and most of the rest on control. The add itself is a tiny sliver at the end. A general-purpose core wastes most of its energy on deciding what to do. Hold onto both facts, because the next section shows why they decide the shape of the chip.</p>
+
+  <h2 id="wall">The memory wall</h2>
+  <p>In 1995 Wulf and McKee published a short note called "Hitting the Memory Wall: Implications of the Obvious". Processor speed was growing faster than memory speed, and they pointed out that compounding the two rates means memory eventually dominates everything. Nearly thirty years later, Gholami et al. measured the same trend for AI hardware over 20 years. Peak FLOPS grew <b>3.0× every two years</b>, DRAM bandwidth <b>1.6×</b>, and interconnect bandwidth <b>1.4×</b>. Drag the slider to compound those rates:</p>
+
+  <div class="viz" id="fig-wall">
+    <div class="controls">
+      <button id="wall-play">Play</button>
+      <label style="flex:1">years elapsed: <b id="wall-yv" style="color:var(--yellow)">0</b>
+        <input type="range" id="wall-y" min="0" max="20" step="0.1" value="20"></label>
+    </div>
+    <div class="narration" id="wall-read"></div>
+  </div>
+  <script>
+  (function () {
+    var root = document.getElementById("fig-wall");
+    var g = TT.canvas(root, 800, 330), ctx = g.ctx, C = TT.C;
+    var sl = document.getElementById("wall-y"), yv = document.getElementById("wall-yv"), rd = document.getElementById("wall-read");
+    var X0 = 80, X1 = 560, Y0 = 290, Y1 = 25, maxL = 5;
+    var series = [
+      { n: "peak FLOPS (3.0×/2 yr)", r: 3.0, c: C.yellow },
+      { n: "DRAM bandwidth (1.6×/2 yr)", r: 1.6, c: C.blue },
+      { n: "interconnect BW (1.4×/2 yr)", r: 1.4, c: C.purple }
+    ];
+    function px(y) { return X0 + y / 20 * (X1 - X0); }
+    function py(v) { return Y0 - Math.log10(v) / maxL * (Y0 - Y1); }
+    function draw() {
+      var Y = +sl.value; yv.textContent = Y.toFixed(1);
+      TT.clear(ctx, g.W, g.H);
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+      for (var l = 0; l <= maxL; l++) { ctx.beginPath(); ctx.moveTo(X0, py(Math.pow(10, l))); ctx.lineTo(X1, py(Math.pow(10, l))); ctx.stroke();
+        TT.text(ctx, "×" + Math.pow(10, l).toLocaleString("en-US"), X0 - 6, py(Math.pow(10, l)), { color: C.muted, align: "right", font: "11px" }); }
+      for (var yy = 0; yy <= 20; yy += 4) TT.text(ctx, yy + " yr", px(yy), Y0 + 14, { color: C.muted, align: "center", font: "11px" });
+      series.forEach(function (s, k) {
+        ctx.strokeStyle = s.c; ctx.lineWidth = 2.5; ctx.beginPath();
+        for (var q = 0; q <= 100; q++) { var yr = Y * q / 100, v = Math.pow(s.r, yr / 2); if (q === 0) ctx.moveTo(px(yr), py(v)); else ctx.lineTo(px(yr), py(v)); }
+        ctx.stroke();
+        var v = Math.pow(s.r, Y / 2);
+        ctx.fillStyle = s.c; ctx.beginPath(); ctx.arc(px(Y), py(v), 4, 0, 7); ctx.fill();
+        TT.text(ctx, s.n, 585, 60 + k * 34, { color: s.c, font: "12px" });
+        TT.text(ctx, "×" + (v < 100 ? v.toFixed(1) : Math.round(v).toLocaleString("en-US")), 585, 60 + k * 34 + 15, { color: s.c, font: "bold 12px", mono: true });
+      });
+      var gap = Math.pow(3.0 / 1.6, Y / 2);
+      // gap bracket
+      var yF = py(Math.pow(3, Y / 2)), yD = py(Math.pow(1.6, Y / 2));
+      ctx.strokeStyle = C.red; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(px(Y) + 10, yF); ctx.lineTo(px(Y) + 10, yD); ctx.stroke(); ctx.setLineDash([]);
+      TT.text(ctx, "gap ×" + (gap < 100 ? gap.toFixed(1) : Math.round(gap)), 585, 190, { color: C.red, font: "bold 14px" });
+      TT.text(ctx, "= FLOPS growth ÷ DRAM BW growth", 585, 208, { color: C.red, font: "11px" });
+      rd.innerHTML = "After <b>" + Y.toFixed(1) + " years</b> on these trends, compute has grown ×" + Math.round(Math.pow(3, Y / 2)).toLocaleString("en-US") +
+        " but DRAM bandwidth only ×" + Math.pow(1.6, Y / 2).toFixed(1) + ". <span style='color:var(--muted)'>[derived]</span> The ridge point, and with it the arithmetic intensity a workload needs to stay compute-bound, has moved right by <b>×" + gap.toFixed(1) + "</b>." +
+        (Y >= 19.9 ? " (Gholami et al. report ≈60,000×, 100× and 30× over 20 years; 3.0<sup>10</sup> ≈ 59,000, 1.6<sup>10</sup> ≈ 110, 1.4<sup>10</sup> ≈ 29.)" : "");
+    }
+    sl.oninput = draw;
+    var playing = false, bp = document.getElementById("wall-play");
+    bp.onclick = function () {
+      playing = !playing; bp.textContent = playing ? "Pause" : "Play";
+      if (+sl.value >= 20) sl.value = 0;
+      var last = performance.now();
+      (function tick(now) {
+        if (!playing) return;
+        sl.value = Math.min(20, +sl.value + (now - last) / 1000 * 4); last = now; draw();
+        if (+sl.value >= 20) { playing = false; bp.textContent = "Play"; return; }
+        requestAnimationFrame(tick);
+      })(last);
+    };
+    draw();
+  })();
+  </script>
+
+  <p>On the roofline, this trend means the flat roof keeps rising faster than the slope, so the ridge drifts right every generation. Workloads that were compute-bound on yesterday's chip become memory-bound on today's. Over 20 years the drift is about 500× <i>(derived: (3.0/1.6)<sup>10</sup>)</i>. It is the same pattern you saw in the table: Blackhole's ridge sits at 1,297 FLOP/B.</p>
+  <p>Designers can respond in two ways, and AI chips do both:</p>
+  <ol>
+    <li><b>Buy more bandwidth</b>: HBM stacks, wider buses. This is expensive, and it only slows the drift.</li>
+    <li><b>Need less bandwidth</b>: put a lot of SRAM on chip, keep data there, reuse it, and pass it directly between cores instead of round-tripping through DRAM. Use narrower number formats so each byte carries more values.</li>
+  </ol>
+  <p>Tenstorrent leans hard on option 2: 1.5 MB of SRAM per Tensix core (180 MB on a p150), two on-chip networks for core-to-core traffic, and block-floating-point formats. That is also why "where does each byte live?" will be a recurring question in this series.</p>
+
+  <h2 id="dennard">The end of Dennard scaling, and why specialization won</h2>
+  <p>Why not just build a faster general-purpose processor? For about thirty years you could. In 1974 Robert Dennard and colleagues showed how to shrink a MOSFET while keeping the electric field constant. If every dimension and the supply voltage shrink by a factor <i>k</i>, then:</p>
+  <ul>
+    <li>capacitance <i>C</i> falls by <i>k</i>, voltage <i>V</i> falls by <i>k</i>, and frequency <i>f</i> can rise by <i>k</i>;</li>
+    <li>dynamic power per transistor, <i>C·V²·f</i>, falls by <i>k</i>²;</li>
+    <li>and you fit <i>k</i>² more transistors in the same area.</li>
+  </ul>
+  <p>So <b>power per square millimetre stayed constant</b> while you got more, faster transistors for free. That is Dennard scaling.</p>
+  <p>It broke because the voltage stopped shrinking. The threshold voltage could not keep falling with it, because transistors with a lower threshold leak more current even when "off". Horowitz describes the result: clock-frequency scaling "stopped in the early 2000s" as processors hit the <b>roughly 100 W power wall</b> for air cooling, and "voltage scaling also slowed down, since it was no longer possible to scale the threshold voltage due to rising leakage currents". Without the <i>V</i>² term falling, each new process gives you more transistors than you can afford to switch at once. Esmaeilzadeh et al. (ISCA 2011) called the unpowered fraction <b>dark silicon</b>.</p>
+
+  <p>Once power is fixed, the arithmetic of performance changes:</p>
+  <p style="text-align:center;font-size:1.1rem"><code>performance (ops/s) = power (J/s) × efficiency (ops/J)</code></p>
+  <p>If power cannot grow, the only way to go faster is to spend <b>fewer joules per operation</b>. Now recall the energy table. A general-purpose core spends about 70 pJ deciding what to do and well under 1 pJ doing a 32-bit add. Every DRAM read costs over a hundred multiplies' worth of energy. The big wins therefore come from:</p>
+  <ul>
+    <li><b>amortizing control</b>: one instruction should drive many operations. GPUs do this with SIMT warps. Tenstorrent's matrix engine executes an 8×16 × 16×16 multiply as a single operation, and its compute kernels work on whole 32×32 tiles;</li>
+    <li><b>keeping data close</b>: large local SRAM, explicit reuse, and core-to-core networks;</li>
+    <li><b>cheaper arithmetic</b>: 8- and 16-bit formats instead of 32-bit.</li>
+  </ul>
+  <p>Horowitz's Figure 1.1.8 summarizes the outcome across 20 published chips: dedicated designs reach about <b>1000×</b> the energy efficiency (MOPS/mW) of general-purpose CPUs. That is the case for specialization, and every AI accelerator, including TPUs, GPUs' tensor cores and Tenstorrent's Tensix cores, is a version of it.</p>
+  <div class="callout key">Since the mid-2000s, chips have been limited by power rather than transistors. Under a fixed power budget, speed equals operations per joule. In AI the joules go to <b>moving data</b> and <b>instruction overhead</b>, not to arithmetic, so an AI chip is designed above all to move less data and decode fewer instructions per FLOP.</div>
+
+  <div class="callout gpu">A GPU attacks instruction overhead with SIMT: one instruction is issued for a warp of 32 threads, and tensor cores do a whole small matrix multiply per instruction. It attacks data movement with large register files, shared memory and big caches. Tenstorrent makes the same two bets in a different form: a grid of independent cores, each with its own software-managed SRAM and its own small RISC-V controllers, connected by on-chip networks. Chapter <a href="a02-gpu-vs-tenstorrent.html">A02</a> compares the two philosophies side by side.</div>
+
+  <div class="callout sim">The ideas in this chapter are about speed and energy, and ttsim does not model either. It is a functional, bit-exact simulator, so its clock counts are not silicon performance, and you cannot measure a roofline in it. What you <i>can</i> do in the simulator is watch exactly where every byte goes. Start with <a href="../sim-labs/b00-workbench.html">B00, Setting up the workbench</a> and <a href="../sim-labs/b01-meet-ttsim.html">B01, Meet ttsim</a>.</div>
+
+  <h2 id="next">Where we're going</h2>
+  <p>Here is the destination. These are the five lines that matter in tt-metal's own TT-NN tutorial for adding two tensors on a Tenstorrent device. The arguments to <code>ttnn.full</code> are joined onto one line, and the logging and the <code>ttnn.close_device(device)</code> call on line 39 are left out:</p>
+  <div class="filename">tt-metal/ttnn/tutorials/basic_python/ttnn_add_tensors.py:5,11,14-20,21-27,33 @7aad8aac (condensed)</div>
+<pre><code>import ttnn
+device = ttnn.open_device(device_id=0)
+tt_tensor1 = ttnn.full(shape=(32, 32), fill_value=1.0, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+tt_tensor2 = ttnn.full(shape=(32, 32), fill_value=2.0, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+tt_result = ttnn.add(tt_tensor1, tt_tensor2)</code></pre>
+  <ul>
+    <li><code>ttnn.open_device(device_id=0)</code> opens the first Tenstorrent chip that the host can see.</li>
+    <li><code>shape=(32, 32)</code> is no accident: it is exactly <b>one tile</b>, the native unit of data on Tensix hardware (<a href="a05-tiles-and-formats.html">A05</a>).</li>
+    <li><code>layout=ttnn.TILE_LAYOUT</code> asks for the data to be stored tile by tile, the way the matrix engine wants to read it (<a href="a18-ttnn-user.html">A18</a>).</li>
+    <li><code>ttnn.add</code> launches real kernels on the chip. Behind this one call are reader and writer kernels moving tiles over the network-on-chip, circular buffers in SRAM, and a compute kernel that splits itself across three tiny RISC-V cores. Chapter <a href="a19-op-anatomy-compilers.html">A19</a> follows the call all the way down.</li>
+  </ul>
+  <p>Using this chapter's accounting, this program is about as memory-bound as a program can be. In float32 it does 1,024 additions while moving 12 KB <i>(derived: 3 × 1024 × 4 B)</i>, which is 0.083 FLOP/B. By the end of the series you will know where each of those 12 KB lives at every moment, and how to write programs whose dots sit at the far right of the roofline.</p>
+
+  <h3>A map of the series</h3>
+  <div class="cards">
+    <a class="card" href="a02-gpu-vs-tenstorrent.html"><span class="n">A01–A03 · Why</span><h4>Motivation and the big picture</h4><p>This chapter; GPU vs Tenstorrent; a tour of the Wormhole and Blackhole grids, harvesting and generations.</p></a>
+    <a class="card" href="a04-inside-tensix.html"><span class="n">A04–A09 · The machine</span><h4>Inside the chip</h4><p>The Tensix core and its five RISC-Vs; tiles and number formats; the matrix and vector engines; the NoC; L1, DRAM, interleaving and sharding.</p></a>
+    <a class="card" href="a10-first-program.html"><span class="n">A10–A14 · Programming</span><h4>TT-Metalium from the ground up</h4><p>Your first program; reader/writer kernels and circular buffers; compute kernels; LLK, MOPs and the JIT; one tile's journey end to end.</p></a>
+    <a class="card" href="a15-matmul-one-to-many.html"><span class="n">A15–A17 · Scaling on one chip</span><h4>Matmul, multicast, dispatch</h4><p>Blocked matmul across many cores (this chapter's reuse, made real); multicast and semaphores; how the host dispatches work.</p></a>
+    <a class="card" href="a18-ttnn-user.html"><span class="n">A18–A22 · The full stack</span><h4>TT-NN, performance, many chips, LLMs</h4><p>TT-NN as a user; how ops and compilers are built; thinking in rooflines again; Ethernet meshes; a capstone running an LLM.</p></a>
+    <a class="card" href="../sim-labs/b00-workbench.html"><span class="n">B00–B11 · ttsim Labs</span><h4>Verify it in the simulator</h4><p>Interleaved with Series A: run real kernels on ttsim, trace instructions, NoC transfers, circular buffers and fidelity, bit for bit.</p></a>
+  </div>
+
+  <h2 id="recap">Recap</h2>
+  <ul>
+    <li><b>The work is matmul.</b> In a BERT layer, matmuls are 99.8% of FLOPs (Ivanov et al.). A model with N parameters needs about 2N FLOPs per token for inference and 6N for training (Kaplan et al.).</li>
+    <li><b>Arithmetic intensity</b> = FLOPs ÷ bytes moved. Element-wise ops are stuck near 0.17 FLOP/B in bf16. An N×N matmul can reach about N/3, because each input is reused N times, but only if the chip keeps it on chip between uses.</li>
+    <li><b>Roofline:</b> attainable = min(peak, bandwidth × AI). The ridge point is peak ÷ bandwidth: about 295 FLOP/B for an H100, 257 for a Wormhole n150, and about 1,300 for a Blackhole p150 in BFP8 (all derived from spec sheets). Element-wise ops get under 0.1% of peak on all three.</li>
+    <li><b>Energy:</b> at 45 nm, one 32-bit DRAM read (≈640 pJ) costs about 173 FP32 multiplies (3.7 pJ). An instruction's overhead (≈70 pJ) dwarfs a 32-bit add (0.1 pJ).</li>
+    <li><b>Memory wall:</b> FLOPS grows about 3.0× per 2 years and DRAM bandwidth about 1.6×, so the ridge keeps moving right.</li>
+    <li><b>Dennard scaling ended</b> in the mid-2000s, so chips are power-limited, and performance = power × ops/J. Specialized designs that amortize control and keep data close win by orders of magnitude. Tenstorrent's answer is a grid of cores with large software-managed SRAM, explicit networks, tile-sized operations and compact number formats.</li>
+  </ul>
+
+  <h2 id="quiz">Check yourself</h2>
+  <details class="quiz"><summary>1. A ReLU over a 1 GB bf16 tensor (read it, write the result) runs on a Wormhole n150. Roughly how long should it take, and is the 74 TF peak relevant?</summary>
+    <p>ReLU does about 1 operation per element and moves 2 bytes in plus 2 bytes out, so AI ≈ 0.25 op/B. That is far left of the n150's ridge (≈257), so it is memory-bound. It moves 2 GB at 288 GB/s, which takes about 7 ms. The compute peak barely matters: 0.5 G ops at 74 TF would take 7 µs, about 1000× less. To speed it up, fuse the ReLU into the previous op so the tensor never makes a separate round trip to DRAM.</p></details>
+  <details class="quiz"><summary>2. Why does doubling N double the arithmetic intensity of a square matmul, while doubling the length of a vector add does nothing?</summary>
+    <p>In an N×N matmul each input element takes part in N multiply-adds (a row of A meets every column of B). FLOPs grow as 2N³ and data as 3N², so the ratio grows as N. In a vector add each element is used exactly once, so FLOPs and bytes both grow linearly and their ratio is fixed at 1/6 FLOP/B in bf16. Intensity measures <i>reuse</i>, and only the matmul has any.</p></details>
+  <details class="quiz"><summary>3. The Blackhole p150's ridge point (≈1,300 FLOP/B) is about 4× the H100's (≈295). Is that a strength or a weakness, and what does the chip do about it?</summary>
+    <p>On its own it is a demand: to reach peak, each DRAM byte must feed about 1,300 FLOPs, so many workloads will be memory-bound if data streams from DRAM. Tenstorrent's design answers it with about 1.5 MB of SRAM per core (180 MB total). HC2024 lists about 94 TB/s of local SRAM bandwidth against 512 GB/s of DRAM. Add core-to-core networks with multicast and compact BFP8 data (1.0625 B per element). The real ridge that matters is against the memory your data lives in, and good Tenstorrent programs keep data in SRAM. (Remember also that the 664 TF is a BLOCKFP8 figure and the H100's is BF16.)</p></details>
+  <details class="quiz"><summary>4. Using the 45 nm table: in an FP32 dot product where every operand comes from DRAM, what fraction of the energy goes to arithmetic?</summary>
+    <p>Each multiply-add needs two 32-bit operands (2 × 640 = 1280 pJ) and performs one multiply plus one add (3.7 + 0.9 = 4.6 pJ). Arithmetic is 4.6 / 1284.6 ≈ 0.36% of the energy. If one operand is instead reused from an 8 KB SRAM (5 pJ), the total is 640 + 5 + 4.6 ≈ 650 pJ, which is barely better. Only reusing <i>both</i> operands many times makes arithmetic a significant share. This is the energy version of the roofline.</p></details>
+  <details class="quiz"><summary>5. Under Dennard scaling, why did shrinking transistors not raise power density, and what changed?</summary>
+    <p>Scaling dimensions and voltage by 1/k cuts capacitance by k and V² by k², while frequency rises by k. Power per transistor (CV²f) falls by k², which exactly cancels the k² more transistors per area. Once threshold voltage could not drop further because of leakage, V stopped shrinking. Power per transistor then fell much more slowly than density rose, chips hit about 100 W air-cooling limits, and clocks stalled in the early 2000s. From then on, performance = power × ops/J, and specialization became the way to gain ops/J.</p></details>
+
+  <h2 id="reading">Further reading</h2>
+  <ul class="refs">
+    <li><a href="https://arxiv.org/abs/2007.00072">Ivanov et al., "Data Movement Is All You Need" (MLSys 2021)</a>: the BERT FLOPs-vs-runtime breakdown (Table 1) and how fusing operators reduces data movement.</li>
+    <li><a href="https://arxiv.org/abs/2001.08361">Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a>: §2.1 derives the 2N forward and 6N training FLOPs per token.</li>
+    <li><a href="https://www.osti.gov/biblio/1407078">Williams, Waterman, Patterson, "Roofline" (tech report, free; CACM 2009)</a>: the original roofline model.</li>
+    <li><a href="https://jax-ml.github.io/scaling-book/roofline/">How to Scale Your Model: "All About Rooflines"</a>: a modern, worked treatment of arithmetic intensity for transformers.</li>
+    <li><a href="https://horace.io/brrr_intro.html">Horace He, "Making Deep Learning Go Brrrr From First Principles"</a>: compute vs bandwidth vs overhead, with the factory, warehouse and shipping analogy.</li>
+    <li><a href="https://gwern.net/doc/cs/hardware/2014-horowitz-2.pdf">Horowitz, "Computing's Energy Problem (and what we can do about it)" (ISSCC 2014)</a>: the 45 nm energy table, the 70 pJ instruction, the end of Dennard scaling and the 1000× specialization chart.</li>
+    <li><a href="https://arxiv.org/abs/1506.02626">Han et al., "Learning both Weights and Connections" (2015)</a>: Figure 1 is the source of the widely copied 32-bit 5 pJ SRAM / 640 pJ DRAM rows.</li>
+    <li><a href="http://svmoore.pbworks.com/w/file/fetch/59055930/p162-mckee.pdf">McKee, "Reflections on the Memory Wall" (2004)</a>: the history of Wulf and McKee's 1995 note, by its co-author.</li>
+    <li><a href="https://arxiv.org/abs/2403.14123">Gholami et al., "AI and Memory Wall" (2024)</a>: the 3.0× / 1.6× / 1.4× per two years scaling data.</li>
+    <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md">tt-metal tech report: Matrix Multiply FLOPS</a>: per-core matrix-engine throughput by fidelity, and measured matmul TFLOPS on Wormhole and Blackhole.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole</a> and <a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole</a> spec pages: the official card specs used in the roofline.</li>
+    <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Tenstorrent at Hot Chips 2024 (slides)</a>: Blackhole's architecture, including the SRAM/NoC/DRAM bandwidth table on slide 14.</li>
+  </ul>
+
+  <div class="pager"><a href="../index.html">&larr; Index</a><a class="next" href="a02-gpu-vs-tenstorrent.html">02 Two philosophies: GPU vs Tenstorrent &rarr;</a></div>
+</main>
+</body>
+</html>
