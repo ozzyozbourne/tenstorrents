@@ -52,14 +52,14 @@ void kernel_main() {
         get_absolute_logical_x(),
         get_absolute_logical_y());
 
-    ////////// MULTICAST TILE TO RECEIVERS //////////
+    ////////// MULTICAST 'VALID' STATE TO RECEIVERS //////////
     // A16 BREAK: flag first, data second
     *(receiver_addr_ptr) = VALID;
     uint64_t validity_global_multicast_addr =
             get_noc_multicast_addr(start_x, start_y, end_x, end_y, receiver_addr);
     noc_semaphore_set_multicast(receiver_addr, validity_global_multicast_addr, num_dests);
 
-    ////////// MULTICAST 'VALID' STATE TO RECEIVERS //////////
+    ////////// MULTICAST TILE TO RECEIVERS //////////
     uint64_t identity_tile_global_multicast_addr =
             get_noc_multicast_addr(start_x, start_y, end_x, end_y, tile_l1_addr);
     noc_async_write_multicast(tile_l1_addr, identity_tile_global_multicast_addr, single_tile_size, num_dests);

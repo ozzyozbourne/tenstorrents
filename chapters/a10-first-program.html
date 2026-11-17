@@ -314,7 +314,7 @@ enum NOC : uint8_t {
 distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);</code></pre>
   <p>A <b>MeshWorkload</b> maps programs onto regions of the mesh. <code>device_range</code> covers the whole mesh (<code>MeshCoordinateRange(mesh_device-&gt;shape())</code>), which here is the single chip at (0,0). On a bigger mesh you could put different programs on different chips in one workload. The program is <em>moved</em> in, because the workload now owns it.</p>
   <p><code>EnqueueMeshWorkload</code> is where the orange JIT bar happens. In fast-dispatch mode it compiles the workload, loads the binaries and generates dispatch commands before enqueueing. In slow-dispatch mode the comment says it "normally JIT-compiles inside LaunchProgram":</p>
-  <div class="filename">tt-metal/tt_metal/distributed/distributed.cpp:127-138 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/distributed/distributed.cpp:127-138 @7aad8aac (condensed: the Mock test and its comment are abbreviated)</div>
 <pre><code>if (env.get_rtoptions().get_fast_dispatch() &amp;&amp; !emulated) {
     mesh_workload.impl().compile(mesh_cq.device());
     mesh_workload.impl().load_binaries(mesh_cq);
@@ -364,7 +364,7 @@ FORCE_INLINE T get_arg_val(int arg_idx) {
 }</code></pre>
   <p>It is one load from L1. There is no marshalling and no type information: argument 3 is "the L1 address of src0" only because the host put that word in position 3. Get the order wrong and the kernel happily reads from the wrong place.</p>
   <p><b><code>InterleavedAddrGen&lt;true&gt;</code></b> (<code>true</code> = DRAM) is a tiny struct that turns "page <i>id</i> of this interleaved buffer" into a <b>64-bit NoC address</b>:</p>
-  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:281-304 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:281-305 @7aad8aac (trimmed)</div>
 <pre><code>struct InterleavedAddrGen {
     static constexpr bool is_dram = DRAM;
     uint32_t bank_base_address;  // Base address for the whole tensor.
@@ -569,7 +569,7 @@ noc_async_write_barrier();</code></pre>
   })();
   </script>
   <p>Here is how <code>load_blocking</code> achieves the right-hand ordering:</p>
-  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel.h:155-183 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel.h:155-183 @7aad8aac (trimmed: comment sub-bullets and the 16-bit <code>lhu</code> branch omitted)</div>
 <pre><code>// important note: FENCE on Wormhole is a NOP
 //
 // this code provides a blocking load by doing the following:

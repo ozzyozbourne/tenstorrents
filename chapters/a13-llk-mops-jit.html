@@ -637,7 +637,7 @@ inline void ckernel_template::program()
   <h2 id="sim">Seeing it in ttsim</h2>
   <p>ttsim has no tracing switches (it reads no environment variables), so I made an instrumented copy. These are the steps I ran in this orb, on ttsim b3620244 (Wormhole build) and tt-metal 7aad8aac:</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/a13
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs   # env.sh changes directory, so use absolute paths
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs   # this guide's sim-labs directory (use your checkout's path); env.sh changes directory, so it must be absolute
 source $W/workbench/env.sh wh
 $W/workbench/build_ttsim.sh mop wh     # copy to $LAB_HOME/ttsim-mop, build in ~4 s
 patch -p1 -d $LAB_HOME/ttsim-mop &lt; $W/patches/a13-mop-trace.patch

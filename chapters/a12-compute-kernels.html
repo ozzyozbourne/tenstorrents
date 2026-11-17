@@ -71,7 +71,7 @@
   <h2 id="three">Three copies of one file</h2>
   <p>Before thinking about macros, look at what the JIT compiler actually builds. When the host calls <code>CreateKernel(program, "…/add_2_tiles.cpp", core, ComputeConfig{…})</code>, tt-metal doesn't compile that file directly. It first writes small wrapper files, one per TRISC, into the kernel's directory in the JIT cache:</p>
 
-  <div class="filename">tt-metal/tt_metal/jit_build/genfiles.cpp:814-843 @7aad8aac (trimmed)</div>
+  <div class="filename">tt-metal/tt_metal/jit_build/genfiles.cpp:814-843 @7aad8aac (trimmed; the third argument of <code>build_trisc_prolog</code>, <code>has_blaze_experimental_ct_args</code>, is abbreviated to <code>...</code>)</div>
 <pre><code>    const string unpack_cpp = out_dir + "chlkc_unpack.cpp";
     const string math_cpp = out_dir + "chlkc_math.cpp";
     const string pack_cpp = out_dir + "chlkc_pack.cpp";
@@ -679,7 +679,7 @@ trisc2 (PACK)
   <p>The operands decode cleanly against <code>ckernel_instr_params.h:241-254</code>: STALL_TDMA = 0x1, STALL_SYNC = 0x2, STALL_MATH = 0x40, STALL_SFPU = 0x100, STALL_ON_ZERO = 1 and STALL_ON_MAX = 2. TRISC0's binary contains no MATH_PACK instructions at all. Its only semaphore instructions are two SEMGETs on mask 32 (semaphore 5, <code>UNPACK_SYNC</code>), which the unpacker uses to double-buffer its own configuration (llk_unpack_AB.h:264-280). That machinery belongs to A13.</p>
 
   <h3>How many tiles fit</h3>
-  <p>Dst is 1024 rows of 16 datums (A06), and a 32×32 tile takes 64 rows in 16-bit mode. The LLK computes capacity from exactly two switches, the sync mode and the accumulator width (<code>get_dest_max_tiles</code>, tt-llk ckernel.h:652-658, with <code>DEST_REGISTER_FULL_SIZE = 64 * 16</code> rows in tensix_types.h:192):</p>
+  <p>Dst is 1024 rows of 16 datums (A06), and a 32×32 tile takes 64 rows in 16-bit mode. The LLK computes capacity from exactly two switches, the sync mode and the accumulator width (<code>get_dest_max_tiles</code>, tt-llk ckernel.h:652-658, with <code>DEST_REGISTER_FULL_SIZE = 64 * DEST_FACE_HEIGHT</code> = 64 × 16 rows in wormhole_b0_defines/tensix_types.h:190-192):</p>
   <table>
     <tr><th></th><th>bf16 Dst (<code>fp32_dest_acc_en = false</code>)</th><th>fp32 Dst (<code>fp32_dest_acc_en = true</code>)</th></tr>
     <tr><td>Half sync (default, <code>dst_full_sync_en = false</code>)</td><td><b>8 tiles</b> per acquire</td><td><b>4 tiles</b></td></tr>
@@ -700,7 +700,7 @@ trisc2 (PACK)
 [4531] ERROR: NonContractualBehavior: tensix_semget: sem=0 sem_max=2
 EXIT=1</code></pre>
   <p>ttsim stops the whole process. The first release brought MATH_PACK from 1 to 0. The second one's SEMGET found Value already at 0, and ttsim's Sync-unit model refuses to continue:</p>
-  <div class="filename">ttsim/src/tensix.cpp:5544-5553 @b3620244 (trimmed)</div>
+  <div class="filename">ttsim/src/tensix.cpp:5544-5554 @b3620244 (trimmed)</div>
 <pre><code>TENSIX_EXECUTE_SEMGET() {
     ...
     uint32_t sem_index = __builtin_ctz(sem_sel);

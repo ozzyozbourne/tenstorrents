@@ -278,7 +278,7 @@ noc_async_write_barrier();
 noc_semaphore_inc(sem_addr, 1);
 noc_async_atomic_barrier();
 noc_semaphore_set(sem_ptr, 0);  // Reset semaphore</code></pre>
-  <p>The <code>noc_async_write_barrier()</code> between the data and the increment is the important line. The write and the atomic go out through different command buffers and different VCs. The barrier waits for the write's acknowledgement, which the receiving NIU sends once the data is in L1. So when the increment arrives, the tile is already there. This is the &ldquo;request, wait for the response, then issue the next request&rdquo; approach, which the ISA calls the only way to order requests that travel on different NoCs or VCs (Ordering.md:32). It costs one round trip per handoff. Multicast will let us avoid it.</p>
+  <p>The <code>noc_async_write_barrier()</code> between the data and the increment is the important line. The write and the atomic go out through different command buffers (0 and 3). They share a NoC and, with the default arguments, a VC (<code>NOC_UNICAST_WRITE_VC</code> = 1, <code>dataflow_api.h:880,2398</code>), but a write followed by an atomic is not among the same-VC pairs the ISA orders at the receiving NIU (Ordering.md:20-26), so the example doesn't lean on arrival order. The barrier waits for the write's acknowledgement, which the receiving NIU sends once the data is in L1. So when the increment is issued, the tile is already there. This is the &ldquo;issue a request, wait for the response to arrive, and only then issue the next request&rdquo; approach, which the ISA gives as the fallback whenever software needs stronger ordering than the NoC guarantees, and as the only option across different NoCs (Ordering.md:32). It costs one round trip per handoff. Multicast will let us avoid it.</p>
   <p>Here is the run in ttsim, with the DPRINT lines from both cores (<code>TT_METAL_DPRINT_CORES='(0,0),(0,1)'</code>; the prefix is <code>device:x-y:RISC</code>, and on these cores <code>NC</code> runs the reader and <code>BR</code> the writer):</p>
 <pre><code>$ export TT_METAL_DPRINT_CORES='(0,0),(0,1)'
 $ $EX/metal_example_noc_tile_transfer
@@ -745,7 +745,7 @@ ttsim_printf("      A16 atomic inc at (%u,%u):0x%llx  %u -&gt; %u\n", src_coordi
 <pre><code>export LAB_HOME=$HOME/ttlab/a16
 source sim-labs/workbench/env.sh wh
 sim-labs/workbench/build_ttsim.sh noclog wh               # first run copies ttsim to $LAB_HOME/ttsim-noclog
-(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; ~/workspace/tenstorrent-from-zero/sim-labs/patches/a16-noclog.patch)
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; /path/to/tenstorrent-from-zero/sim-labs/patches/a16-noclog.patch)
 sim-labs/workbench/build_ttsim.sh noclog wh               # rebuild with the A08 + A16 prints (~4 s)
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
   <p>Coordinates in the log are NoC&nbsp;0 positions, with what the kernel wrote in <code>[asked …]</code>. For atomics, ttsim calls the remote end &ldquo;src&rdquo;, so the semaphore being incremented is the &ldquo;src&rdquo; address. The bracketed number is the ttsim clock, which isn't silicon time.</p>

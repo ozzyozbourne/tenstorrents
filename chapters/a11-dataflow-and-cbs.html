@@ -740,7 +740,7 @@ for (uint32_t tile_id = 0; tile_id &lt; num_tiles; tile_id++) {
     <li><b>Waypoints</b>: the last 4-character marker each of the five CPUs passed. By convention a trailing <code>W</code> means "waiting at the top of a loop" and <code>D</code> "done waiting" (lines 94-97).</li>
     <li><b>NoC sanitizing</b>: every transaction is checked for bad coordinates, addresses and alignment before it reaches the hardware.</li>
     <li><b>CB out-of-bounds checks</b> on NoC transactions that touch an active CB.</li>
-    <li><b>Asserts</b> such as the one in <code>cb_push_back</code>, which are compiled out when Watcher is off.</li>
+    <li><b>Asserts</b> such as the one in <code>cb_push_back</code>, which are compiled out when Watcher is off. (There is also a cheaper switch, <code>TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS=1</code>, which enables kernel asserts without the rest of Watcher; see <code>tt_metal/llrt/rtoptions.cpp:1826-1830</code>. I did not run it for this page.)</li>
   </ul>
   <p>The waypoints you will meet most often are already in the code we read:</p>
   <table>

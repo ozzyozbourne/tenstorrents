@@ -42,7 +42,7 @@
   <h2 id="question">The question</h2>
   <p>In <a href="a10-first-program.html">A10</a> one line launched the kernel:</p>
 <pre><code>distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);</code></pre>
-  <p>A few microseconds later on silicon, the BRISC on core (0,0) is running <code>kernel_main</code>. But that BRISC has no idea what a "workload" is. It sits in a loop in its firmware and checks one byte of its own L1 over and over. Somebody has to put a program into its L1, put six argument words next to it, describe the circular buffers, and then flip that byte. Afterwards, somebody has to notice that the kernel has finished.</p>
+  <p>A moment later, the BRISC on core (0,0) is running <code>kernel_main</code>. But that BRISC has no idea what a "workload" is. It sits in a loop in its firmware and checks one byte of its own L1 over and over. Somebody has to put a program into its L1, put six argument words next to it, describe the circular buffers, and then flip that byte. Afterwards, somebody has to notice that the kernel has finished.</p>
   <p><strong>What actually happens between <code>EnqueueMeshWorkload</code> and a kernel starting?</strong> And who is "somebody"?</p>
   <p>There are two answers, and tt-metal implements both. In <em>slow dispatch</em> the host CPU does every step itself, one PCIe transaction at a time. In <em>fast dispatch</em> the host writes a compact list of commands into its own memory, and two Tensix cores on the chip, running firmware called the <em>prefetcher</em> and the <em>dispatcher</em>, fetch those commands and carry them out. This chapter takes both apart. Every count of PCIe transactions below was measured in the simulator with an instrumented copy of ttsim.</p>
 
@@ -74,7 +74,7 @@ struct go_msg_t {
         };
     };
 } __attribute__((packed));</code></pre>
-  <p>When <code>signal</code> becomes <code>RUN_MSG_GO</code> (0x80), the firmware reads the <em>launch message</em> next to it. The launch message is a <code>kernel_config_msg_t</code> (<code>dev_msgs.h:166-196</code>). It says where the kernel-config region is, where each processor's runtime args start (<code>rta_offset</code>), where each binary's text sits (<code>kernel_text_offset</code>), which circular-buffer slots are in use (<code>local_cb_mask</code>), which processors are enabled (<code>enables</code>), and a <code>mode</code> byte that says who launched it: the host or the dispatcher. So a launch has to deliver five things, and then detect a sixth:</p>
+  <p>When <code>signal</code> becomes <code>RUN_MSG_GO</code> (0x80), the firmware reads the <em>launch message</em> next to it. The launch message is a <code>kernel_config_msg_t</code> (<code>dev_msgs.h:166-215</code>). It says where the kernel-config region is, where each processor's runtime args start (<code>rta_offset</code>), where each binary's text sits (<code>kernel_text_offset</code>), which circular-buffer slots are in use (<code>local_cb_mask</code>), which processors are enabled (<code>enables</code>), and a <code>mode</code> byte that says who launched it: the host or the dispatcher. So a launch has to deliver five things, and then detect a sixth:</p>
   <ol>
     <li><b>The binaries</b>, written into the core's L1 kernel-config region.</li>
     <li><b>The runtime args</b> (and common runtime args), at the offsets the launch message names.</li>
@@ -90,7 +90,7 @@ struct go_msg_t {
   <p>But the chip's address space is not flat. Every NoC address is a tile coordinate (x, y) plus a 36-bit address inside that tile (<a href="a08-noc.html">A08</a>). The host's loads and stores, though, carry only a linear offset into BAR0. The bridge between the two is a set of <em>TLB windows</em> in the PCIe tile. Each window is a slice of BAR0 that you point at an aligned region of one tile's address space by writing a 64-bit configuration register. The ISA documentation describes the layout:</p>
   <blockquote>There are 186 configurable TLB windows, which collectively occupy the low 496 MiB of bar 0. The first 156 windows are each 1 MiB in size, the next 10 windows are each 2 MiB in size, and the final 20 windows are each 16 MiB in size. … The final 16 MiB window is reserved for use by the kernel driver. (<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/PCIExpressTile/TLBs.md">WormholeB0/PCIExpressTile/TLBs.md</a>)</blockquote>
   <p>The configuration array starts at BAR0 offset <code>0x1FC0_0000</code>. In each 64-bit entry, the low N bits are <code>local_offset</code>, the high bits of the 36-bit target address (N = 16, 15 or 12 for 1, 2 or 16 MiB windows). The next fields are <code>x_end</code>, <code>y_end</code>, <code>x_start</code> and <code>y_start</code> (6 bits each), then <code>noc_sel</code>, <code>mcast</code> and a 2-bit <code>ordering</code> mode. UMD has the same numbers (<code>wormhole_implementation.hpp:40-51, 196-205</code>), and so does ttsim, which shows the translation as code:</p>
-  <div class="filename">ttsim/src/pcie.cpp:237-264 @b3620244 (Wormhole branch, trimmed)</div>
+  <div class="filename">ttsim/src/pcie.cpp:237-264 @b3620244 (Wormhole branch, trimmed; one trailing comment dropped)</div>
 <pre><code>if (offset &lt; 0x9C00000) {
     tlb_index = offset / 0x100000;
     window_bits = 20; // 1 MiB TLBs (indices 0-155)
@@ -271,7 +271,7 @@ uint32_t coord = remap_virtual_coordinate(&amp;g_p_tile.base, 0, tlb_cfg &amp; 0
 
   <h2 id="slow">Slow dispatch: the host does everything</h2>
   <p>Set <code>TT_METAL_SLOW_DISPATCH_MODE=1</code> and <code>EnqueueMeshWorkload</code> goes to <code>SDMeshCommandQueue</code>, which calls <code>slow_dispatch::LaunchProgramAsync</code>. Its comment states the order, and the five deliverables appear one after another:</p>
-  <div class="filename">tt-metal/tt_metal/impl/program/slow_dispatch.cpp:376-379, 391-395, 414-420 @7aad8aac (trimmed)</div>
+  <div class="filename">tt-metal/tt_metal/impl/program/slow_dispatch.cpp:376-379, 391-395, 413-419 @7aad8aac (trimmed, call re-wrapped)</div>
 <pre><code>// First configure (allocate buffers + write configs/binaries), then write runtime args.
 ConfigureDeviceWithProgram(device, program, force_slow_dispatch);
 WriteRuntimeArgsToDevice(device, program, force_slow_dispatch);

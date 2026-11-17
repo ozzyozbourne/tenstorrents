@@ -58,7 +58,7 @@
   <ul>
     <li>The <b>unpackers</b> move tiles from L1 into SrcA and SrcB (for the FPU) or directly into Dst.</li>
     <li>The <b>FPU</b> reads SrcA and SrcB and writes or accumulates into <b>Dst</b>.</li>
-    <li>The <b>SFPU</b> never sees SrcA, SrcB or L1. It reads Dst into its own registers, the <b>LRegs</b>, computes there, and writes back to Dst. The ISA's register-access table lists exactly two ways to write an LReg from outside: <code>SFPLOAD</code> and <code>SFPLOADMACRO</code>. Only one instruction writes Dst from an LReg: <code>SFPSTORE</code>.</li>
+    <li>The <b>SFPU</b> never sees SrcA, SrcB or L1. It reads Dst into its own registers, the <b>LRegs</b>, computes there, and writes back to Dst. The ISA's register-access table lists exactly two instructions that write an LReg from Dst: <code>SFPLOAD</code> and <code>SFPLOADMACRO</code> (constants can also arrive as immediates, through <code>SFPLOADI</code>). Only one instruction writes Dst from an LReg: <code>SFPSTORE</code>.</li>
     <li>The <b>packers</b> move Dst back to L1.</li>
   </ul>
   <p>This is why every SFPU operation in a compute kernel starts with <code>copy_tile</code>: the tile must first be unpacked into Dst. It is also why SFPU work chains well. Once a tile is in Dst you can apply exp, then a multiply, then a clamp, without touching L1. <a href="a12-compute-kernels.html">A12</a> covers the kernel-side mechanics (<code>tile_regs_acquire</code> and the rest). This chapter stays with the hardware.</p>
@@ -167,13 +167,13 @@ uint10_t Addr = Imm10 + ThreadConfig[CurrentThread].DEST_TARGET_REG_CFG_MATH_Off
   </script>
 
   <p>In SFPI, the C++ dialect for the SFPU, this all hides behind <code>dst_reg[i]</code>. The index is multiplied by a stride of 2 to form the <code>SFPLOAD</code> address, which is why vector <i>i</i> lands on address 2<i>i</i>:</p>
-  <div class="filename">sfpi 7.92.0 (bundled with tt-metal @7aad8aac) runtime/sfpi/include/sfpi_classes.h:398-400, sfpi_constants.h:16</div>
+  <div class="filename">sfpi 7.92.0 (bundled with tt-metal @7aad8aac) runtime/sfpi/include/sfpi_classes.h:397-399, sfpi_constants.h:16</div>
 <pre><code>sfpi_inline constexpr vReg&lt;&gt; operator[] (int ix) const {
   return vReg&lt;&gt; (ix * SFP_DESTREG_STRIDE);
 }
 constexpr unsigned int SFP_DESTREG_STRIDE = 2;</code></pre>
   <p>The low-level kernel library (LLK) wraps a per-face function in a loop over the four faces, moving the Dst base 16 rows forward after each one:</p>
-  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_sfpu_common.h:32-36, 51-58 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_eltwise_sfpu_common.h:32-36, 50-59 @7aad8aac</div>
 <pre><code>inline void _llk_math_eltwise_sfpu_inc_dst_face_addr_()
 {
     math::inc_dst_addr&lt;8&gt;();
@@ -289,8 +289,8 @@ v_endif;</code></pre>
     texts();
     function active(l, k) {
       var neg = xs[l] < 0;
-      if (k <= 1) return k === 0 ? true : true;
-      if (k === 2) return neg;
+      if (k === 0) return true;
+      if (k === 1 || k === 2) return neg;   // state after SFPSETCC: only lanes with x < 0 stay enabled
       if (k === 3) return !neg;
       if (k === 4) return !neg;
       return true;

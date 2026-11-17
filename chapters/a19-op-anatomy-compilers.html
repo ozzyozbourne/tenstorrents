@@ -117,7 +117,7 @@
 
     return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);
 }</code></pre>
-  <p><code>ttnn.add</code> follows the same shape. The Python name is a nanobind binding of the C++ <code>ttnn::add</code>. A macro expands that to <code>invoke_binary_ng(..., BinaryOpType::ADD, ...)</code> (<code>binary.cpp:20-44, 1230</code>). That function fills <code>BinaryNgDeviceOperation::operation_attributes_t</code>, about twenty fields long, and ends with the same one line: <code>return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);</code> (<code>binary_ng_device_operation.cpp:807</code>). Everything interesting happens inside <code>launch</code>.</p>
+  <p><code>ttnn.add</code> follows the same shape. The Python name is a nanobind binding of the C++ <code>ttnn::add</code>. A macro expands that to <code>invoke_binary_ng(..., BinaryOpType::ADD, ...)</code> (<code>binary.cpp:185-211, 1230</code>; the plain variant of the macro at lines 20-44 has the same shape). That function fills <code>BinaryNgDeviceOperation::operation_attributes_t</code>, about twenty fields long, and ends with the same one line: <code>return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);</code> (<code>binary_ng_device_operation.cpp:807</code>). Everything interesting happens inside <code>launch</code>.</p>
 
   <h2 id="lifecycle">The life of one call</h2>
   <p>Here is <code>launch</code>, trimmed to its spine:</p>
@@ -334,7 +334,7 @@ constexpr uint8_t unpack_src_format[32] = { 5,5,5,255,255,...</code></pre>
         cb_post_lhs.pop_front(n);
         cb_post_rhs.pop_front(n);</code></pre>
   <p>This is the acquire/commit/wait/release handshake from A12. <code>BINARY_OP</code> is a macro, so one source file serves add, sub and mul. Activations get fused in through <code>PROCESS_*_ACTIVATIONS</code>, which expand to nothing here. The device operation's real work is choosing these defines.</p>
-  <p>Changing the dtype changes the kernel. A float32 <code>ttnn.add</code> in the same orb built <code>eltwise_binary_sfpu_no_bcast</code> instead. For <code>ADD</code>, <code>is_binary_sfpu_op</code> picks the SFPU when both inputs are FLOAT32 (<code>binary_ng_device_operation.cpp:55-58</code>), and <code>resolve_fast_and_approximate_mode</code> defaults to <code>true</code> so that bf16 add keeps the FPU (<code>binary.cpp:922-925</code>).</p>
+  <p>Changing the dtype changes the kernel. A float32 <code>ttnn.add</code> in the same orb built <code>eltwise_binary_sfpu_no_bcast</code> instead. For <code>ADD</code>, <code>is_binary_sfpu_op</code> picks the SFPU when both inputs have the same dtype and it is FLOAT32 (or INT32, UINT32 or UINT16) (<code>binary_ng_device_operation.cpp:55-58</code>), and <code>resolve_fast_and_approximate_mode</code> defaults to <code>true</code> so that bf16 add keeps the FPU (<code>binary.cpp:922-925</code>).</p>
 
   <div class="callout key">A TT-NN op is mostly a <em>decision procedure</em>: from shapes, dtypes, layouts and memory configs it chooses kernel files, defines, compile-time arguments, circular buffers and a core split. The arithmetic itself lives in a few short kernels that it reuses. To learn what an op really does, list what the JIT built under <code>$TT_METAL_CACHE/.../kernels/</code>.</div>
 
@@ -381,7 +381,7 @@ private:
         ttsl::hash::hash_t to_hash() const;
     };</code></pre>
   <p>"Omits logical shape by design." An interleaved add of 32×32 and an add of 64×128 hit the <em>same</em> cached program. That is safe only because the shape-dependent quantities (tile count, how tiles split across cores, strides) are runtime arguments and not compile-time ones, and because the program's kernels already cover the whole worker grid. binary_ng therefore cannot rely on the framework's automatic address patching. It writes an override that re-runs the same argument builder its <code>create_descriptor</code> used:</p>
-  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:413-422 @7aad8aac</div>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:413-421 @7aad8aac (last line cut mid-sentence)</div>
 <pre><code>// SINGLE SOURCE OF TRUTH for binary_ng per-core runtime args.  Run by BOTH create_descriptor()
 // (cache miss) and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit).
 //
@@ -447,7 +447,7 @@ Tensor generic_op(const std::vector&lt;Tensor&gt;&amp; io_tensors, const tt::tt_
         cb_push_back(16, 1); cb_pop_front(0, 1); cb_pop_front(1, 1);
     }</code></pre>
   <p>And the Python that describes the program, one <code>KernelDescriptor</code> per kernel. This is the same structure binary_ng builds in C++:</p>
-  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (sqdiff, trimmed)</div>
+  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (sqdiff, trimmed; comment added)</div>
 <pre><code>    rd_rt[0][0] = [a.buffer_address(), b.buffer_address(), n_tiles]     # runtime args for core (0,0)
     reader = ttnn.KernelDescriptor(kernel_source=READER, source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
         core_ranges=core,
@@ -461,7 +461,7 @@ Tensor generic_op(const std::vector&lt;Tensor&gt;&amp; io_tensors, const tt::tt_
 call 1: a@0x2d6440 out@0x2d4c40 cache entries=1 max|err|=0.0019 PCC=1.00000
 call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</code></pre>
   <p>Every buffer moved between calls, yet there is one cache entry and every result matches torch. That is because generic_op's hash covers kernel sources, core ranges, compile-time arguments, defines and CB layout, but only the <em>number</em> of runtime arguments, not their values:</p>
-  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/device/generic_op_device_operation.cpp:57-72 @7aad8aac</div>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/device/generic_op_device_operation.cpp:57-73 @7aad8aac (comment lines elided)</div>
 <pre><code>    auto hash_kernel = [&amp;](const KernelDescriptor&amp; kernel) -&gt; size_t {
         return ttsl::hash::hash_objects_with_default_seed(
             kernel.kernel_source,
@@ -493,7 +493,7 @@ call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</cod
   <p>There are two roads through TT-MLIR, and they correspond to the two halves of this chapter:</p>
   <ol>
     <li><b>The TT-NN road.</b> TTIR is lowered to the <code>ttnn</code> dialect, where every op is a TT-NN call with a chosen layout, for example <code>memref&lt;2x4x!ttcore.tile&lt;32x32, bf16&gt;, #dram&gt;, &lt;interleaved&gt;</code>. The optimizer picks layouts and sharding, and the result is serialised to a <code>.ttnn</code> flatbuffer, "a compiled binary file intended to be loaded and executed by the TTNN backend runtime". At run time each op in that file becomes an ordinary TT-NN call, which enters <code>device_operation::launch</code> exactly as in Figure 2. The program cache, factories and kernels are the ones you just read.</li>
-    <li><b>The direct-to-metal (D2M) road.</b> TTIR is lowered to <code>d2m.generic</code> regions and then to <code>ttkernel</code>, so the compiler <em>generates</em> its own reader/compute/writer kernels instead of using TT-NN's hand-written ones. The <code>ttnn.jit</code> docs explain how this meets TT-NN: the D2M pipeline "wraps the generated kernels in <code>ttnn.generic</code> operations that contain the necessary host side program setup. Each <code>ttnn.generic</code> op requires a <code>ProgramDescriptor</code>." In other words, compiler-generated kernels enter tt-metal through the same <code>generic_op</code> door your <code>sqdiff</code> used. Its selling point is fusion: a <code>@ttnn_jit.jit()</code>-decorated chain like <code>exp → neg → exp → add → multiply</code> is compiled "into a single fused kernel" instead of five separate ops, each of which would write its intermediate tensor back to memory.</li>
+    <li><b>The direct-to-metal (D2M) road.</b> TTIR is lowered to <code>d2m.generic</code> regions and then to <code>ttkernel</code>, so the compiler <em>generates</em> its own reader/compute/writer kernels instead of using TT-NN's hand-written ones. The <code>ttnn.jit</code> docs explain how this meets TT-NN: the D2M pipeline "wraps the generated kernels in <code>ttnn.generic</code> operations that contain the necessary host side program setup. Each <code>ttnn.generic</code> op requires a <code>ProgramDescriptor</code> …" In other words, compiler-generated kernels enter tt-metal through the same <code>generic_op</code> door your <code>sqdiff</code> used. Its selling point is fusion: a <code>@ttnn_jit.jit()</code>-decorated chain like <code>exp → neg → exp → add → multiply</code> is compiled "into a single fused kernel" instead of five separate ops, each of which would write its intermediate tensor back to memory.</li>
   </ol>
 
   <div class="viz" id="fig-stack"></div>

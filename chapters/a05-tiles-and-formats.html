@@ -726,7 +726,7 @@ cal_pcc = (cov / denom).item()</code></pre>
 <pre><code>@pytest.mark.parametrize("ttnn_dtype, pcc", [(ttnn.bfloat8_b, 0.999), (ttnn.bfloat4_b, 0.97)])</code></pre>
   <p>The pattern, roughly: BF16 tests expect four nines, BFP8_b three, and BFP4_b somewhere between 0.9 and 0.98, depending on the op. Softmax with BFP8 input relaxes PCC to 0.99 and loosens <code>rtol</code>/<code>atol</code> too (<code>tests/ttnn/unit_tests/operations/fused/test_softmax.py:1178-1180</code>). Even the allclose fallback in <code>comp_pcc</code> scales with the format: for BF16 or FP16 tensors it widens the relative tolerance to 4 units of the format's epsilon, <code>max(rtol, 4 * max(sixteen_bit_eps))</code> (<code>comparison.py:78-83</code>), because "a result one ULP from the golden" would otherwise fail.</p>
   <p>Even a plain BF16 add is not bit-identical to PyTorch. Running the workbench's 32&times;32 <code>ttnn.add</code> script on the simulated Wormhole gave:</p>
-  <div class="filename">refs/sim-runs/ttnn/ttnn_add.py, run on ttsim (wh), output trimmed</div>
+  <div class="filename">ttnn_add.py (the 32&times;32 <code>ttnn.add</code> check described in <a href="../sim-labs/b00-workbench.html">B00</a>; the script is not shipped in this repository), run on ttsim (wh), output trimmed</div>
 <pre><code>max abs diff: 0.0078125
 elements differing from torch bf16 add: 120/1024 (bf16 rounding differences, max 1 ulp expected)
 PCC: 0.999983

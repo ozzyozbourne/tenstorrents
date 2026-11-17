@@ -45,7 +45,7 @@ Pinned sources: tt-metal `7aad8aac`, ttsim `b3620244` (v1.15.0), tt-isa-document
 | 19 | a19-op-anatomy-compilers | How an op is built, and the compiler stack | Device operation structure (ProgramDescriptor, program factory, kernels); program cache; TT-Forge / TT-MLIR / TT-XLA lowering | "What happens between ttnn.add(a,b) and the FPU?" / one call descending the stack, each layer emitting its artifact | B11 |
 | 20 | a20-performance | Thinking like a performance engineer | Which wall: compute (fidelity, format), L1/NoC, DRAM, dispatch/host; the profiler, Tracy, the ops CSV; a checklist | "Which wall is your op hitting?" / multi-roofline with toggles | — |
 | 21 | a21-many-chips | Many chips: Ethernet, meshes and TT-Fabric | Ethernet cores; n300, T3K, Galaxy; MeshDevice; mappers; CCLs (all-gather, reduce-scatter, all-reduce); tensor parallelism; TT-Fabric layers | "How do 32 chips with no shared memory act as one?" / ring all-gather; column→row parallel MLP | B10 |
-| 22 | a22-llm-capstone | Capstone: running an LLM | A transformer primer; prefill vs decode; KV cache; decode is DRAM-bound; sharded and DRAM-sharded matmuls; precision ladder; trace; tt_transformers; a tour of tt-lab | "Why does generating one token take about as long as reading every weight once?" / decode roofline with a batch slider; growing KV cache | — |
+| 22 | a22-llm-capstone | Capstone: running an LLM | A transformer primer; prefill vs decode; KV cache; decode is DRAM-bound; sharded and DRAM-sharded matmuls; precision ladder; trace; tt_transformers; tensor parallelism on two chips; three ttsim runs (a toy Llama layer, the real tt_transformers block, a traced decode MLP) | "Why does generating one token take about as long as reading every weight once?" / decode roofline with a batch slider; growing KV cache | — |
 
 ## Series B: ttsim Labs
 
@@ -64,6 +64,6 @@ Every lab is run in this orb. Its page shows the exact commands, any patches, an
 | B08 | b08-formats-and-sfpu | Data formats and SFPU numerics | BF16/FP32/BFP8 behaviour; Dst encoding; **write a custom SFPI kernel**; WH vs BH numerics | A05, A07 |
 | B09 | b09-breaking-things | Breaking things on purpose | The error taxonomy; trigger UB/NCB/Unsupported; lldb on a debug build; what ttsim cannot see; capstone: drive libttsim directly via dlopen | Simulator contract, A17 |
 | B10 | b10-two-chips | Two chips | `wh_x2` with the N300 cluster descriptor; a 2-device mesh buffer; what multichip support exists and what does not | A21 |
-| B11 | b11-ttnn-on-sim | TT-NN on the simulator | ttnn tensors, layouts, sharding, memory dumps, format-ladder PCC, a small matmul with program configs (if ttnn runs under ttsim) | A09, A18, A19 |
+| B11 | b11-ttnn-on-sim | TT-NN on the simulator | ttnn tensors, layouts, sharding, memory dumps, format-ladder PCC, a small matmul with program configs; which prebuilt examples and ttnn tests run under ttsim | A09, A18, A19 |
 
 Reading order in the index: A01–A03, then B00–B02, A04, B03, A05–A07, B07–B08, A08–A09, B05, A10–A12, B06, A13–A14, B04, then A15–A22 with B09–B11 placed beside them.

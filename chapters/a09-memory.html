@@ -143,8 +143,7 @@ g_dram[i].p_mem = (uint8_t *)mmap(nullptr, DRAM_CHANNEL_SIZE, PROT_READ | PROT_W
   <h3>Interleaving: dealing cards</h3>
   <p>An <b>interleaved</b> buffer deals its pages to the banks like a dealer dealing cards: page 0 to bank 0, page 1 to bank 1, … page 11 to bank 11, page 12 back to bank 0. Every new buffer starts dealing at bank 0 (<code>tensor_layouts.md:97-99</code>). Each bank stores its pages one after another. So page <i>p</i> is the ⌊<i>p</i>/12⌋-th page <i>inside</i> bank <i>p</i> mod 12. Here is that sentence as the device-side code, which runs on a RISC-V core inside a reader kernel:</p>
   <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:226-238 @7aad8aac</div>
-<pre><code>template &lt;bool DRAM&gt;
-uint64_t get_dram_noc_addr(
+<pre><code>uint64_t get_dram_noc_addr(
     const uint32_t id,
     const uint32_t page_size,
     const uint32_t bank_base_address,
@@ -540,7 +539,7 @@ shard spec: ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":3,"y":0}], shape=[
     <tr><td>L1 interleaved</td><td>"Tiles are interleaved across the L1 of all the cores and are read across the NoC."</td></tr>
     <tr><td>L1 sharded</td><td>"particularly fast when the data an OP requires is already placed in L1 of the correct core, avoiding the NOC entirely".</td></tr>
   </table>
-  <p>The report's rule of thumb follows: "Activations are placed in L1 and weights placed in DRAM." Activations are produced and consumed by neighbouring ops, so a sharded layout can flow from one op to the next without ever leaving L1. METALIUM_GUIDE calls this an alternative to aggressive fusion: intermediate data "can persist in SRAM across multiple operations without eviction pressure" (<code>METALIUM_GUIDE.md:210</code>). Weights are too big for 64 × 1.4 MiB, so they stream from DRAM, and the next section is about streaming them as fast as the GDDR6 allows.</p>
+  <p>The report's rule of thumb follows: "Activations are placed in L1 and weights placed in DRAM." Activations are produced and consumed by neighbouring ops, so a sharded layout can flow from one op to the next without ever leaving L1. METALIUM_GUIDE calls this an alternative to aggressive fusion: the architecture "allows intermediate data to persist in SRAM across multiple operations without eviction pressure" (<code>METALIUM_GUIDE.md:210</code>). Weights are too big for 64 × 1.4 MiB, so they stream from DRAM, and the next section is about streaming them as fast as the GDDR6 allows.</p>
 
   <h2 id="bandwidth">The DRAM bandwidth story: 267 of 288 GB/s</h2>
   <p>Start with the ceiling. Each GDDR6 channel moves 16 bits per transfer at 12 GT/s, which is 24 GB/s. Twelve channels give <b>288 GB/s</b>. Self-refresh and similar overheads cost a few percent, so "well-written software can expect to achieve approximately 92% of the theoretical maximum" (<code>WormholeB0/DRAMTile/README.md:66</code>). Note also that one NoC hop sustains 32 GB/s. A single channel (24 GB/s) is therefore slower than a link (same file, line 70). By the same arithmetic, two channels' traffic sharing a link (48 GB/s) would be more than the link can carry.</p>
