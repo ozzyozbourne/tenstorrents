@@ -58,7 +58,7 @@
 
   <h2 id="setup">Setup</h2>
   <p>We use a lab directory of our own, the workbench's <code>mm_fid</code> host program (<a href="b00-workbench.html">B00</a>), and later an editable copy of ttsim:</p>
-<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/b07
 source $W/env.sh wh
 cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/mm_fid.cpp</code></pre>

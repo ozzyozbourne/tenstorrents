@@ -325,7 +325,7 @@ inline std::string get_simulator_soc_descriptor_path(const std::filesystem::path
 
   <h2 id="metal">Step 4: Install dependencies and build tt-metal</h2>
   <p class="provenance">We did not rebuild tt-metal for this lab (it takes about half an hour). The outputs in this section are excerpts of the logs saved when the series' environment was built, in <code>refs/build-logs/</code> on the build machine. That directory is not part of this repository, so the excerpts here and in Steps 1, 2 and 5 are all there is; you cannot open the full logs. The logs record outputs, not the commands typed. The configure command line is printed verbatim by <code>build_metal.sh</code>; the ninja commands are reconstructed from each log's first and last lines.</p>
-  <p>tt-metal's <code>INSTALLING.md</code> lists Ubuntu 22.04 for its supported hardware configurations, and its "From source" path is: clone, <code>./build_metal.sh</code>, <code>./create_venv.sh</code>. Our orb runs Debian 12, which the dependency script recognises (<code>Detected OS: debian 12 (apt)</code>) but which needed three workarounds. On Ubuntu you may need none of them; we did not test Ubuntu or WSL2.</p>
+  <p>tt-metal's <code>INSTALLING.md</code> lists Ubuntu 22.04 for its supported hardware configurations, and its "From source" path is: clone, <code>./build_metal.sh</code>, <code>./create_venv.sh</code>. Our orb runs Debian 12, which the dependency script recognises (<code>Detected OS: debian 12 (apt)</code>) but which needed three workarounds. A later rebuild of the same pins on Ubuntu 24.04 needed none of the three, but ran into three different problems; they are listed under <a href="#trouble-build">Troubleshooting</a>. We did not test WSL2.</p>
 
   <h3>4a. System packages, and the SFPI .deb that fails</h3>
 <pre><code>cd ~/tt-metal
@@ -425,20 +425,24 @@ Installing Python 3.11 via uv...
 Installed Python 3.11.16 in 1.41s
 ...
 Activate with: source python_env/bin/activate</code></pre>
-  <p>To check it, we ran a 32×32 bf16 <code>ttnn.add</code> on the simulated Wormhole with the series' environment (script: <code>refs/sim-runs/ttnn/ttnn_add.py</code> on the build machine, copied to <code>$LAB_HOME/run</code>). That script is not shipped in this repository, so you cannot reproduce the numbers below digit for digit. The closest shipped check is <code>sim-labs/workbench/py/b11_s0_add.py</code> (also a 32×32 bf16 <code>ttnn.add</code>; it prints the grid, the max abs difference from torch, and the wall time), used in <a href="b11-ttnn-on-sim.html">B11</a>. Our run:</p>
-<pre class="out"><code>$ source $TT_METAL_HOME/python_env/bin/activate
+  <p>On Ubuntu 24.04 the trap is the other way round. There <code>create_venv.sh</code> picks 3.12 by itself, so no flag is needed, but <code>build_metal.sh</code> still hands CMake whatever <code>python3</code> is first on your PATH. If that is not a 3.12 (another virtual environment that is active, a pyenv or conda Python), the bindings and the venv disagree. The fix that worked on our Ubuntu machine is in <a href="#trouble-build">Troubleshooting</a>: create the venv first, then configure with <code>Python3_EXECUTABLE</code> pointing at the venv's own interpreter.</p>
+  <p>To check the result, run a small <code>ttnn</code> program on the simulated Wormhole. The workbench ships one, <code>sim-labs/workbench/py/a05_add.py</code>: it adds two seeded 32×32 bf16 tensors with <code>ttnn.add</code> and compares the result with PyTorch's own bf16 add of the same inputs. Source <code>env.sh</code> first (<a href="#workbench">Step 6</a> explains it and the <code>W</code> variable), then activate the venv. This run is from the Ubuntu 24.04 rebuild, with the <code>info</code> and <code>DEBUG</code> log lines removed:</p>
+<pre class="out"><code>$ source $W/env.sh wh
+$ source $TT_METAL_HOME/python_env/bin/activate
 $ python --version
-Python 3.11.16
-$ python ttnn_add.py
-[0] 2.7 seconds (0.0 KHz)
-device result[0,:4]: [0.75, 0.8515625, 0.91796875, 1.25]
-torch  result[0,:4]: [0.75, 0.8515625, 0.91796875, 1.25]
-max abs diff: 0.0078125
-elements differing from torch bf16 add: 120/1024 (bf16 rounding differences, max 1 ulp expected)
-PCC: 0.999983
+Python 3.12.13
+$ python $W/py/a05_add.py
+[0] 1.5 seconds (0.0 KHz)
+device result[0,:4]: [-2.21875, -1.2890625, -0.9296875, -1.75]
+torch  result[0,:4]: [-2.21875, -1.28125, -0.9296875, -1.75]
+max abs diff vs torch bf16 add: 0.03125
+elements differing from torch bf16 add: 108/1024
+max abs diff vs exact fp32 sum: 0.015625
+PCC vs exact fp32 sum: 0.999999
+largest difference in ulps: 1.0
 PASS
-[4881] 3.2 seconds (1.5 KHz)</code></pre>
-  <p>Notice the 120 differing elements. ttsim is bit-exact with <em>the chip</em>, not with PyTorch. The device's bf16 add rounds differently from torch's, and the simulator faithfully reproduces the device. Later chapters on number formats explain where that last bit goes.</p>
+[4881] 1.9 seconds (2.6 KHz)</code></pre>
+  <p>Notice the 108 differing elements, each exactly one bf16 unit in the last place away from PyTorch (the second number in the first row is one of them). ttsim is bit-exact with <em>the chip</em>, not with PyTorch. The device's bf16 add rounds differently from torch's, and the simulator faithfully reproduces the device. <a href="../chapters/a05-tiles-and-formats.html">A05</a> runs the same script and explains where that last bit goes. (An earlier version of this page showed a different script with different random inputs, which gave 120 differing elements at the same <code>[4881]</code> clocks; that script was never shipped, so it has been replaced by this one.)</p>
 
   <h2 id="workbench">Step 6: The workbench scripts</h2>
   <p>Typing a dozen <code>export</code>s before every experiment gets old, and getting one wrong produces errors that look like tt-metal bugs. The series keeps three small scripts in <code>sim-labs/workbench/</code> (with a <a href="workbench/README.md">README</a>):</p>
@@ -449,7 +453,11 @@ PASS
     <tr><td><code>build_ttsim.sh &lt;name&gt; [wh|bh] [release|debug]</code></td><td>makes an editable copy of ttsim, builds it, and packages it with <code>soc_descriptor.yaml</code></td><td>about 3.5 s</td></tr>
   </table>
 
-  <p>Every command in this lab was run with <code>LAB_HOME=$HOME/ttlab/b00</code>. In the transcripts, script paths are shortened to the script name, and long tt-metal log output is trimmed (marked <code>...</code>).</p>
+  <p>Every lab in the series starts the same way: set <code>W</code> to the workbench directory of your copy of this repository, pick a scratch directory, and source <code>env.sh</code>.</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b00
+source $W/env.sh wh</code></pre>
+  <p><code>W</code> is the only path you have to adjust. The scripts are <code>$W/env.sh</code>, <code>$W/build_host.sh</code> and <code>$W/build_ttsim.sh</code>, the example sources are under <code>$W/host</code>, <code>$W/kernels</code> and <code>$W/py</code>, and the patches that later labs apply are in <code>$W/../patches</code>. Every command in this lab was run with <code>LAB_HOME=$HOME/ttlab/b00</code>, on a machine whose home directory is <code>/home/user</code>, which is why that path appears in the outputs. Long tt-metal log output is trimmed (marked <code>...</code>).</p>
 
   <h3>env.sh, line by line</h3>
   <p>Here is every variable, who reads it, and why it has the value it has. Each one marked "override" keeps a value you exported before sourcing.</p>
@@ -626,16 +634,17 @@ Error: Expected result of 21, got 98
 cwd=/home/user/ttlab/b00/looks-like-tt-metal-home   # cwd copy wins (priority 1)
 Success: Result is 21</code></pre>
   <div class="callout key">The overlay gives you an edit-and-rerun loop of under a second with zero rebuilds: copy a kernel into <code>$LAB_HOME/kernels/</code> at the same relative path, edit it, and rerun from <code>$LAB_HOME/run</code>. It only works if your cwd does <em>not</em> contain a <code>tt_metal/</code> tree. That is the whole reason <code>env.sh</code> ends with <code>cd $LAB_HOME/run</code>.</div>
+  <p><b>"The same relative path" means the whole string the host passes.</b> Every stock programming example is compiled with <code>OVERRIDE_KERNEL_PREFIX="tt_metal/programming_examples/"</code>, and so is anything you build with <code>build_host.sh</code>. An overlay for one of their kernels is therefore only picked up under <code>$LAB_HOME/kernels/tt_metal/programming_examples/…</code>, for example <code>$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp</code>. A copy at <code>$LAB_HOME/kernels/add_2_integers_in_riscv/kernels/…</code> is silently ignored: we tried it, and the run printed <code>Success: Result is 21</code> with <code>9/9 hits</code>. The later labs and chapters all rely on this rule. The only exceptions are host programs that name their kernels without the prefix, such as the workbench's own <code>b06_scale_add</code>, which asks for <code>b06/compute.cpp</code> and so finds <code>$LAB_HOME/kernels/b06/compute.cpp</code>.</p>
 
   <h3>build_host.sh: your own host program in 6 seconds</h3>
   <p>Editing kernels covers most labs. When you need a different <em>host</em> program, rebuilding inside tt-metal's CMake tree would be slow and would modify the tree. <code>build_host.sh</code> instead runs <code>clang++-20</code> once with the same flags the in-tree examples use (including <code>-DOVERRIDE_KERNEL_PREFIX="tt_metal/programming_examples/"</code>, so kernel paths resolve as above), then links against the shared libraries in <code>build_Release</code> with an rpath. No install step is needed. Output lands next to the source:</p>
-<pre class="out"><code>$ mkdir -p $LAB_HOME/host &amp;&amp; cp sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/host/
-$ time build_host.sh $LAB_HOME/host/mm_fid.cpp
+<pre class="out"><code>$ mkdir -p $LAB_HOME/host &amp;&amp; cp $W/host/mm_fid.cpp $LAB_HOME/host/
+$ time $W/build_host.sh $LAB_HOME/host/mm_fid.cpp
 compiled /home/user/ttlab/b00/host/mm_fid.o
 
 real	0m5.809s
 
-$ MM_FIDELITY=LoFi MM_SEED=42 $LAB_HOME/host/mm_fid
+$ MM_FIDELITY=0 MM_SEED=42 $LAB_HOME/host/mm_fid       # 0 = LoFi; the value is a number (2, 3, 4 for HiFi2-4), and a name is read as 0
 math_fidelity = 0
 Output vector of size 409600
 Metalium vs Golden -- PCC = 0.9808531
@@ -646,15 +655,15 @@ Test Passed
 
   <h3>build_ttsim.sh: an instrumented simulator in 4 seconds</h3>
   <p>Some labs add a <code>printf</code> inside ttsim itself. You never edit the pinned <code>~/ttsim</code>: the script copies it (minus <code>.git</code> and build outputs) to <code>$LAB_HOME/ttsim-&lt;name&gt;/</code>, builds just the flavour you asked for, packages it with the right descriptor, and prints the line to paste:</p>
-<pre class="out"><code>$ time build_ttsim.sh probe wh
+<pre class="out"><code>$ time $W/build_ttsim.sh probe wh
 copied ttsim source to /home/user/ttlab/b00/ttsim-probe (edit files in /home/user/ttlab/b00/ttsim-probe/src/)
 export TT_METAL_SIMULATOR=/home/user/ttlab/b00/sim-probe-wh-release/libttsim.so
 
 real	0m3.473s
 
-$ ls /home/user/ttlab/b00/sim-probe-wh-release
+$ ls $LAB_HOME/sim-probe-wh-release
 libttsim.so  soc_descriptor.yaml
-$ export TT_METAL_SIMULATOR=/home/user/ttlab/b00/sim-probe-wh-release/libttsim.so
+$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-probe-wh-release/libttsim.so
 $ $EX/metal_example_add_2_integers_in_riscv
 Success: Result is 21
 [4501] 0.2 seconds (26.5 KHz)</code></pre>
@@ -662,8 +671,9 @@ Success: Result is 21
 
   <h2 id="smoke">Step 7: Smoke test</h2>
   <p>With everything in place, the full smoke test is three lines. This is the exact output from this orb (only the date prefix is trimmed from each log line):</p>
-<pre class="out"><code>$ export LAB_HOME=$HOME/ttlab/b00
-$ source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+<pre class="out"><code>$ W=/path/to/tenstorrent-from-zero/sim-labs/workbench
+$ export LAB_HOME=$HOME/ttlab/b00
+$ source $W/env.sh wh
 ttsim lab env: ARCH=wh SIM=/home/user/sim/wh/libttsim_wh.so cwd=/home/user/ttlab/b00/run
 $ $EX/metal_example_add_2_integers_in_riscv
 WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of the Data Movement kernels.
@@ -692,7 +702,7 @@ Success: Result is 21
   <p>Now the same test the way a brand-new reader experiences it, with an empty cache. We pointed <code>TT_METAL_CACHE</code> at a fresh directory and ran twice:</p>
 <pre class="out"><code>$ export TT_METAL_CACHE=$LAB_HOME/cache
 $ for i in 1 2; do /usr/bin/time -f "wall %e s" $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 \
-    | grep -E "Success|got|JIT cache stats|^\[|wall"; done
+    | grep -E "Success|got|JIT cache stats|^\[|wall"; done        # no /usr/bin/time? see the note below
 [0] 0.1 seconds (0.0 KHz)
 Success: Result is 21
 2026-10-30 07:21:39.524 | info     |    BuildKernels | JIT cache stats: 0/9 hits (0.0%) [0 cached, ...]
@@ -703,22 +713,23 @@ Success: Result is 21
 2026-10-30 07:21:39.892 | info     |    BuildKernels | JIT cache stats: 9/9 hits (100.0%) [9 cached, ...]
 [4501] 0.2 seconds (26.2 KHz)
 wall 0.35 s</code></pre>
+  <p><code>/usr/bin/time</code> is GNU time, a separate package that a default Ubuntu 24.04 does not have. bash's built-in <code>time</code> does the same job: <code>TIMEFORMAT='wall %R s'; for i in 1 2; do time $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep -E "Success|got|JIT cache stats|^\["; done</code>. Run that way on the Ubuntu machine, the two runs printed <code>0/9 hits</code> and <code>wall 3.842 s</code>, then <code>9/9 hits</code> and <code>wall 0.326 s</code>, with <code>[4501]</code> both times.</p>
   <p>The first run spends about 3.5 seconds compiling firmware and kernels with SFPI. The second is pure simulation. The clock count is 4501 both times: compiling happens on the host, outside simulated time. Finally, Blackhole, and DPRINT, the debugging tool you'll use most:</p>
-<pre class="out"><code>$ source .../env.sh bh
+<pre class="out"><code>$ source $W/env.sh bh
 ttsim lab env: ARCH=bh SIM=/home/user/sim/bh/libttsim_bh.so cwd=/home/user/ttlab/b00/run
 $ $EX/metal_example_add_2_integers_in_riscv
 ... TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0xb140 (tt_sim_tt_device.cpp:163)
 Success: Result is 21
 [6596] 0.2 seconds (27.2 KHz)
 
-$ source .../env.sh wh                                                        # back on wh
+$ source $W/env.sh wh                                                        # back on wh
 $ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_riscv
 0:0-0:BR: Adding integers: 14 + 7
 Success: Result is 21
 [5070] 0.3 seconds (17.9 KHz)       # varies from run to run with DPRINT on</code></pre>
   <p>Notice how the clock count moves: 4501 on Wormhole and 6596 on Blackhole, run after run. With DPRINT on it is higher, and it is <em>not</em> repeatable: this run printed 5070, and other runs in this orb gave 5056, 5062, 5944 and 6611. DPRINT starts a host thread that polls the device for print data (<code>dprint_server.cpp:998</code>), and every host read advances the simulated clock by one tick (Figure 1, step 6). How many reads that thread gets in before the program finishes depends on host thread scheduling, which is the most likely reason the count wanders. So a DPRINT-on count is not a fingerprint; compare clock counts only with DPRINT off. <a href="b01-meet-ttsim.html">B01</a> takes this apart properly.</p>
   <p>If you want a lower-level check that skips tt-metal entirely, <code>workbench/harness/h.c</code> <code>dlopen</code>s the library and calls three of its entry points directly:</p>
-<pre class="out"><code>$ gcc -O2 -o h sim-labs/workbench/harness/h.c -ldl
+<pre class="out"><code>$ gcc -O2 -o h $W/harness/h.c -ldl
 $ ./h ~/sim/wh/libttsim_wh.so
 cfg[0] = 0x401e1e52 (device&lt;&lt;16 | vendor)
 [1000] 0.0 seconds (174.9 KHz)
@@ -761,13 +772,29 @@ terminate called after throwing an instance of 'std::runtime_error'
   <p>Compiled firmware and kernels go to <code>$HOME/.cache/tt-metal-cache/</code>, or <code>/tmp/tt-metal-cache/</code> if <code>$HOME</code> doesn't exist (<code>build.cpp:191-198</code>). Inside it, each build configuration (architecture, debug features and so on) gets a numeric <em>build key</em> directory with <code>firmware/</code> and <code>kernels/&lt;kernel name&gt;/&lt;hash&gt;/</code> under it (<code>build.cpp:557-558</code>). In this orb it held four build-key directories and 430 MB. You normally never need to clear it. The hash directory is keyed on the kernel's resolved path, its arguments and the build configuration, so the overlay copy got a directory of its own (our <code>8/9 hits</code> above). When we then edited the same overlay file a second time, no new directory appeared: the <code>brisc.elf.dephash</code> and <code>brisck.o.dephash</code> files stored beside the ELF record hashes of the sources, the stale kernel was recompiled in place, and the run again reported <code>8/9 hits</code>. Clear it (<code>rm -rf ~/.cache/tt-metal-cache</code>) only if you suspect corruption or need disk space; the next run just recompiles, as the 3.9 s cold run showed.</p>
   <div class="callout warn">One quirk if you set <code>TT_METAL_CACHE=/some/dir</code>: tt-metal appends <code>tt-metal-cache</code> without a slash (<code>rtoptions.cpp:505</code>), and the build key is then pasted straight on (<code>build.cpp:557-558</code>). The kernels end up in sibling directories such as <code>/some/dir/tt-metal-cache13101861097061555864/</code>, while the precompiled headers go to <code>/some/dir/tt-metal-cache/pch/</code>. We saw exactly that layout in <code>$LAB_HOME/cache</code>. It works; it just looks odd when you go looking.</div>
 
+  <h3 id="trouble-build">Build problems on Ubuntu 24.04</h3>
+  <p>Steps 4 and 5 describe the Debian 12 build. The same two pins were later built on Ubuntu 24.04.5 with Ubuntu's own clang 20.1.2, CMake 4.0.2 and a Python 3.12 virtual environment, and the outputs of labs B00 to B07 were re-checked against that build. Three things went wrong on the way that Step 4 does not cover. The excerpts are from that machine's build logs.</p>
+  <ul>
+    <li><b>An older LLVM's <code>llvm-ar</code> on PATH.</b> Ubuntu 24.04's default LLVM is 18, so the unversioned <code>/usr/bin/llvm-ar</code>, <code>llvm-ranlib</code> and <code>ld.lld</code> belonged to LLVM 18 while the compiler was clang 20. tt-metal's toolchain file names <code>clang-20</code> and <code>clang++-20</code> explicitly (<code>cmake/x86_64-linux-clang-20-libstdcpp-toolchain.cmake:3-5</code>) but leaves the archiver to CMake, which picked the unversioned one. The configure log said <code>Linker not specified. Using LLD linker 18.1.3: /usr/bin/ld.lld</code>, and the build stopped at step 791 of 1547, in the profiler tools:
+<pre class="out"><code>[791/1547] Linking C static library tt_metal/third_party/tracy/csvexport/libTracyGetOpt.a
+FAILED: tt_metal/third_party/tracy/csvexport/libTracyGetOpt.a
+: &amp;&amp; ... "/usr/bin/llvm-ar" qc tt_metal/third_party/tracy/csvexport/libTracyGetOpt.a ... getopt.c.o &amp;&amp; "/usr/bin/llvm-ranlib" ...
+/usr/bin/llvm-ar: error: tt_metal/third_party/tracy/csvexport/libTracyGetOpt.a: 'getopt.c.o': Invalid attribute group entry (Producer: 'LLVM20.1.2' Reader: 'LLVM 18.1.3')</code></pre>
+      Check with <code>llvm-ar --version</code> and <code>ld.lld --version</code>: both must say 20. On that machine the fix was to make the unversioned names point at LLVM 20 (<code>/usr/bin/llvm-ar -&gt; /usr/lib/llvm-20/bin/llvm-ar</code>, and the same for <code>llvm-ranlib</code> and <code>ld.lld</code>) and build again; the second configure reported <code>Linker version: 20.1.2</code> and the build finished. We did not try the alternative of passing <code>-DCMAKE_AR=/usr/bin/llvm-ar-20 -DCMAKE_RANLIB=/usr/bin/llvm-ranlib-20</code> to CMake. <code>build_host.sh</code> links with <code>-fuse-ld=lld</code>, so it wants the same LLD 20.</li>
+    <li><b>CMake picks a different Python from the venv's.</b> <code>build_metal.sh</code> passes <code>-DPython3_EXECUTABLE=$(command -v python3)</code> and the matching include directory and library (<code>build_metal.sh:454-456</code>). On that machine the first <code>python3</code> on PATH was a 3.13 (the logged configure line reads <code>-DPython3_EXECUTABLE=…/cmakeenv/bin/python3 -DPython3_INCLUDE_DIR=/usr/local/include/python3.13 -DPython3_LIBRARY=/usr/local/lib/libpython3.13.so</code>), while <code>create_venv.sh</code> made a 3.12 environment (<code>Python version: 3.12</code>, <code>Installed Python 3.12.13</code>). The C++ examples were fine, but <code>ttnn</code> was not usable until the build directory was configured again with the venv's interpreter, <code>cmake -B build_Release -DPython3_EXECUTABLE=$PWD/python_env/bin/python</code> (the cache shows that value, with <code>Python3_FIND_VIRTUALENV=ONLY</code> and no explicit include or library path), and <code>ninja -C build_Release install</code> was run again. That configure printed
+<pre class="out"><code>-- Found Python3: /home/user/sims/tt-metal/python_env/bin/python (found version "3.12.13") found components: Interpreter Development.Module Development.SABIModule
+-- Python3 include dirs: /root/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/include/python3.12</code></pre>
+      and afterwards <code>python -c "import ttnn"</code> worked inside the venv. The log records the outputs, not the exact command line, so treat the command above as a reconstruction. The simple way to avoid the problem is to run <code>./create_venv.sh</code> first, <code>source python_env/bin/activate</code>, and only then run <code>build_metal.sh</code>, so that <code>command -v python3</code> is already the venv's. Whichever way you do it, look for the <code>Found Python3:</code> line in the configure output and check that it names <code>python_env</code>.</li>
+    <li><b>The system CMake instead of 4.0.2.</b> Ubuntu 24.04's packaged CMake is 3.28.3, and <code>install_dependencies.sh</code> installs 4.0.2 (<code>install_dependencies.sh:301</code>), the version both of our builds used for the main build. The first attempt on the Ubuntu machine was made with 3.28 and failed on missing gtest include paths. That attempt was not logged, so there is no excerpt to show, and we have not isolated the cause: tt-metal declares <code>cmake_minimum_required(VERSION 3.25...4.2)</code>, and the later Python reconfigure above did go through <code>/usr/bin/cmake</code> 3.28.3. If you see gtest include errors, check <code>cmake --version</code> first and put a 4.0.x in front on PATH (<code>pip install cmake==4.0.2</code> into a virtual environment is enough; but then mind the Python item above, because that environment's <code>python3</code> is now first on PATH too).</li>
+  </ul>
+
   <h3>Smaller things</h3>
   <ul>
     <li><b><code>Failed to start Inspector RPC server ... Address already in use; toString() = 127.0.0.1:50051</code></b>: a warning we saw while another tt-metal process was running in the same orb. Each process tries to bind the same port. It is harmless; <code>TT_METAL_INSPECTOR_RPC=0</code> turns the server off (<code>rtoptions.cpp:1663-1668</code>).</li>
     <li><b><code>clang++-20: command not found</code></b> from <code>build_host.sh</code>, or a configure error about the toolchain file: <code>llvm.sh 20</code> didn't run (Step 4a).</li>
     <li><b><code>ld.lld: error: unable to find library -lnsl</code></b> from an older copy of <code>build_host.sh</code>: the link line was copied from the Debian 12 build, where CMake found <code>libnsl.so</code> and added it. On Ubuntu 24.04 that library has no development symlink and tt-metal's own link line omits it. The current script adds <code>-lnsl</code> only when the compiler can find it; with that change <code>mm_fid</code> built on Ubuntu 24.04 and printed the same <code>result_hash = 213e53fed10c0383</code> at <code>[699743]</code>.</li>
-    <li><b><code>/usr/bin/time: No such file or directory</code></b> in the cold-cache loop above: GNU <code>time</code> is a separate package on some systems. Use the shell's <code>time</code> keyword instead; only the wall-time line changes.</li>
-    <li><b><code>ImportError</code> when importing <code>ttnn</code></b>: the venv's Python minor version differs from the one <code>build_metal.sh</code> saw (Step 5).</li>
+    <li><b><code>/usr/bin/time: No such file or directory</code></b> in the cold-cache loop above, or wherever a lab times a command: GNU <code>time</code> is a separate package that Ubuntu 24.04 does not install by default. Use the shell's <code>time</code> keyword instead (the bash line is given under the cold-cache loop in Step 7); only the format of the wall-time line changes.</li>
+    <li><b><code>ImportError</code> when importing <code>ttnn</code></b>: the venv's Python minor version differs from the one <code>build_metal.sh</code> saw (Step 5, and "Build problems on Ubuntu 24.04" above).</li>
     <li><b>An <code>UnsupportedFunctionality</code> error mentioning SFPLOADMACRO</b>: <code>TT_METAL_DISABLE_SFPLOADMACRO</code> is not set; source <code>env.sh</code>.</li>
     <li><b>WSL2</b>: the ttsim README lists Windows via WSL2 as a supported host. We did not test it. Keep the checkouts inside the Linux filesystem (<code>~</code>), not under <code>/mnt/c</code>, or the build will be very slow.</li>
   </ul>
@@ -777,8 +804,8 @@ terminate called after throwing an instance of 'std::runtime_error'
     <li>The simulator is one <code>libttsim.so</code> per chip that tt-metal's user-mode driver <code>dlopen</code>s when <code>TT_METAL_SIMULATOR</code> is set. Everything above UMD is the same binary you would run on silicon.</li>
     <li>Pin <b>tt-metal 7aad8aac</b> and <b>ttsim v1.15.0 (b3620244)</b>. ttsim builds in about 10 s with <code>./make.py :build</code>; the release binaries work too and give identical results.</li>
     <li>Each <code>.so</code> lives in its own directory next to <code>soc_descriptor.yaml</code>, because tt-metal derives that path from the library path and parses it to learn the architecture.</li>
-    <li>On Debian 12: ignore the failed SFPI <code>.deb</code> (CMake fetches a working tarball), run <code>llvm.sh 20</code> yourself, build with <code>--without-distributed</code>, and name the <code>metal_example_*</code> ninja targets explicitly.</li>
-    <li>For ttnn, match the venv's Python to the <code>python3</code> used at configure time (<code>--python-version 3.11</code> here).</li>
+    <li>On Ubuntu 24.04: make sure <code>llvm-ar</code> and <code>ld.lld</code> are LLVM 20 and <code>cmake</code> is 4.0.x. On Debian 12: ignore the failed SFPI <code>.deb</code> (CMake fetches a working tarball), run <code>llvm.sh 20</code> yourself, build with <code>--without-distributed</code>, and name the <code>metal_example_*</code> ninja targets explicitly.</li>
+    <li>For ttnn, match the venv's Python to the <code>python3</code> used at configure time (<code>--python-version 3.11</code> on our Debian machine; on Ubuntu 24.04, a 3.12 venv and <code>Python3_EXECUTABLE</code> pointing at it).</li>
     <li><code>env.sh</code> sets the runtime root, the kernel overlay and the log paths, then <code>cd</code>s to <code>$LAB_HOME/run</code>, because the cwd is searched <em>first</em> for kernels.</li>
     <li>Smoke test: <code>Success: Result is 21</code> at <code>[4501]</code> clocks on Wormhole, every time (with DPRINT off; DPRINT's polling thread makes the count vary). That number is a fingerprint, not a speed.</li>
   </ul>

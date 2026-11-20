@@ -56,8 +56,9 @@
 
   <h2 id="run">1. Run real programs on Wormhole and Blackhole</h2>
   <p>Set up the workbench from <a href="b00-workbench.html">B00</a>. Give each lab its own scratch directory so that labs never share output:</p>
-<pre><code>export LAB_HOME=$HOME/ttlab/b01
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b01
+source $W/env.sh wh
 $EX/metal_example_add_2_integers_in_riscv</code></pre>
   <p><code>env.sh wh</code> points <code>TT_METAL_SIMULATOR</code> at <code>~/sim/wh/libttsim_wh.so</code>, sets slow dispatch, and changes directory into <code>$LAB_HOME/run</code>. That library is byte-identical to the one built from the pinned source: on our build machine its md5sum <code>db0520ab…</code> matched <code>~/ttsim/src/_out/release_wh/libttsim.so</code>. The hash itself depends on your compiler (a build with Ubuntu 24.04's g++ equals the v1.15.0 release binary and gives <code>e9d6a01c…</code>), so compare your two files with <code>cmp</code> and do not expect our digits. Here is the run, with most of the <code>info</code> lines removed:</p>
 <pre><code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of the Data Movement kernels.
@@ -72,7 +73,7 @@ Success: Result is 21
 
 real	0m0.351s</code></pre>
   <p>The host program never knew it wasn't talking to a real card. UMD, the user-mode driver, read PCI config space and got vendor <code>0x1e52</code> (Tenstorrent) and device <code>0x401e</code> (Wormhole). Running <code>env.sh bh</code> gives <code>device_id=0xb140</code> (Blackhole) and firmware bundle 18.5.0. The two lines beginning with a number in brackets come from ttsim itself. Section 2 decodes them.</p>
-  <p>Now run three examples on each chip, twice each. The table summarises the twelve runs. Every cell is a real measurement, and "wall" is <code>/usr/bin/time</code> elapsed time on the warm second run:</p>
+  <p>Now run three examples on each chip, twice each. The table summarises the twelve runs. Every cell is a real measurement, and "wall" is <code>/usr/bin/time</code> elapsed time on the warm second run (GNU <code>time</code> is a separate package and is missing on a default Ubuntu 24.04; the shell's own <code>time $EX/…</code> gives the same <code>real</code> and <code>user</code> figures):</p>
   <table>
     <tr><th>Example</th><th>Result line</th><th class="num">WH clocks (run 1 / run 2)</th><th class="num">BH clocks (run 1 / run 2)</th><th class="num">wall, WH / BH</th></tr>
     <tr><td><code>add_2_integers_in_riscv</code></td><td>Success: Result is 21</td><td class="num">4501 / 4501</td><td class="num">6596 / 6596</td><td class="num">0.35 s / 0.42 s</td></tr>
@@ -134,8 +135,8 @@ wall=8.43 s user=8.72 s</code></pre>
   <p>The UMD side also clocks the simulator synchronously from the calling thread. Its comment explains why: "A background clock thread would race with reads/writes and produce non-reproducible runs" (<code>tt_sim_tt_device.cpp:418-427</code>).</p>
   <p>The stock matmul has a catch. It fills its inputs from <code>std::mt19937 rng(std::random_device{}())</code> (<code>matmul_single_core.cpp:203</code>), so every run multiplies different numbers. You can see it in the two Wormhole runs: PCC was 0.98139745 and then 0.98024255. Yet the clock count was 330591 both times. To compare results bit for bit, use the workbench's <code>mm_fid</code>. It is the same program with a seed (<code>MM_SEED</code>), a selectable fidelity (<code>MM_FIDELITY</code>), and a hash over the output:</p>
 <pre><code>mkdir -p $LAB_HOME/host
-cp /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/host/
-/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/build_host.sh $LAB_HOME/host/mm_fid.cpp
+cp $W/host/mm_fid.cpp $LAB_HOME/host/
+$W/build_host.sh $LAB_HOME/host/mm_fid.cpp
 MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid      # run it twice</code></pre>
 <pre><code>math_fidelity = 4
 Metalium vs Golden -- PCC = 0.9801915
@@ -506,10 +507,9 @@ env -u TT_METAL_SLOW_DISPATCH_MODE $EX/metal_example_add_2_integers_in_riscv</co
   <h3>Proving it with an instrumented simulator</h3>
   <p>Claims about code are cheap, so let's measure. <code>build_ttsim.sh count wh</code> makes an editable copy of ttsim. In it we added seven counters to <code>libttsim.cpp</code>: calls to <code>libttsim_clock</code> (and how many had n = 1), BAR reads and writes, hart-steps, successful Tensix instructions, and extra passes. They are printed at <code>libttsim_exit</code>.</p>
 <p>The exact change is <a href="patches/b01-count.patch"><code>patches/b01-count.patch</code></a>, a <code>diff -u</code> against pristine ttsim <code>b3620244</code>. Make the copy, apply the patch, and rebuild:</p>
-<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs
-$W/workbench/build_ttsim.sh count wh       # first use copies ttsim to $LAB_HOME/ttsim-count
-patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/patches/b01-count.patch
-$W/workbench/build_ttsim.sh count wh       # rebuild with the counters
+<pre><code>$W/build_ttsim.sh count wh       # first use copies ttsim to $LAB_HOME/ttsim-count
+patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/../patches/b01-count.patch
+$W/build_ttsim.sh count wh       # rebuild with the counters
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
 $EX/metal_example_add_2_integers_in_riscv
 …
@@ -535,8 +535,8 @@ Success: Result is 21
   <p style="text-align:center; font-family:var(--mono)">LoFi: 699,743 + 190,276 = 890,019 &nbsp;&nbsp;&nbsp; HiFi4: 330,591 + 559,476 = 890,067</p>
   <p>The two totals agree to within 48. The matmul tile needs about 890,000 passes either way, and these passes are mostly RISC-V instructions: loop counters, CB polling, <code>tti</code> pushes. Every extra MVMUL that succeeds buys one more pass inside the same clock. HiFi4 has more MVMULs, so it gets more free passes and needs fewer real clocks. The simulator's clock is cheaper exactly when the matrix engine is doing more work.</p>
   <p>To confirm it, remove the hack. Make a second copy (<code>ttsim-noloop</code>) and replace the <code>if (!any_tensix) break;</code> with an unconditional <code>break;</code>, so each tile gets exactly one pass per clock. <a href="patches/b01-noloop.patch"><code>patches/b01-noloop.patch</code></a> is the counters plus that one change:</p>
-<pre><code>$W/workbench/build_ttsim.sh noloop wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-noloop &lt; $W/patches/b01-noloop.patch
-$W/workbench/build_ttsim.sh noloop wh
+<pre><code>$W/build_ttsim.sh noloop wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-noloop &lt; $W/../patches/b01-noloop.patch
+$W/build_ttsim.sh noloop wh
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noloop-wh-release/libttsim.so
 MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid</code></pre>
 <pre><code>[889442] COUNT clock_calls=889442 … tensix_insts=265474 …     # LoFi,  hash 213e53fed10c0383, wall 12.45 s
@@ -699,7 +699,7 @@ MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HO
     <tr><td><code>libttsim_tile_rd_bytes</code> / <code>wr_bytes</code></td><td>Transitional; on WH and BH they raise <code>UnsupportedFunctionality</code></td><td><code>:199-208</code></td></tr>
   </table>
   <p>UMD resolves 9 of them by name with <code>dlsym</code> right after the <code>dlopen</code> (<code>tt_sim_communicator.cpp:755-770</code>). The only one it skips there is <code>pci_config_wr32</code>. Because the surface is this small, you can drive the chip with no tt-metal at all. The workbench's 16-line <code>harness/h.c</code> <code>dlopen</code>s the library, calls <code>init</code>, reads config space, clocks 1000 times and exits:</p>
-<pre><code>$ gcc -o h sim-labs/workbench/harness/h.c -ldl &amp;&amp; ./h ~/sim/wh/libttsim_wh.so
+<pre><code>$ gcc -o h $W/harness/h.c -ldl &amp;&amp; ./h ~/sim/wh/libttsim_wh.so
 cfg[0] = 0x401e1e52 (device&lt;&lt;16 | vendor)
 [1000] 0.0 seconds (163.2 KHz)</code></pre>
   <p>Here the clock count is exactly what the caller asked for, because no host poll loop is involved. The rate is far higher because every Tensix core is still held in reset (<code>t_tile_init</code>), so there are no busy Tensix tiles to step. <a href="b09-breaking-things.html">B09</a> builds this into a full bare-metal harness.</p>

@@ -57,14 +57,13 @@
   <h2 id="setup">Set up an instrumented simulator</h2>
   <p>Use the workbench from <a href="b00-workbench.html">B00</a> with a scratch directory of your own. <code>build_ttsim.sh</code> copies ttsim's source to <code>$LAB_HOME/ttsim-boot/</code> on first use and builds it in about 4 seconds:</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/b02
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # env.sh cds away, so use absolute paths
-P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 source $W/env.sh wh
 $W/build_ttsim.sh boot wh                     # first call: copy the source, build the stock simulator
 cd $LAB_HOME/ttsim-boot
-patch -p1 &lt; $P/b02-1-inventory.patch
-patch -p1 &lt; $P/b02-2-noc-map.patch
-patch -p1 &lt; $P/b02-3-soft-reset.patch
+patch -p1 &lt; $W/../patches/b02-1-inventory.patch
+patch -p1 &lt; $W/../patches/b02-2-noc-map.patch
+patch -p1 &lt; $W/../patches/b02-3-soft-reset.patch
 $W/build_ttsim.sh boot wh                     # rebuild with the patches
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-boot-wh-release/libttsim.so
 cd $LAB_HOME/run</code></pre>

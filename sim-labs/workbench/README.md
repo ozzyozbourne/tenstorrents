@@ -17,6 +17,11 @@ Export `TT_METAL_HOME`, `TTSIM_HOME`, `LAB_HOME` or `SIM` before sourcing `env.s
 these. If `~/tt-metal` or `~/ttsim` is missing, `env.sh` falls back to `~/workspace/refs/...` (the
 series' own build machine).
 
+In every example below and on every lab page, `W` is this directory in your checkout. Set it once per shell
+(`W=/path/to/tenstorrent-from-zero/sim-labs/workbench`, adjusted to where you cloned the repository, and absolute,
+because `env.sh` changes directory). Patches are then `$W/../patches/` and kernel overlays `$W/../overlays/`;
+where this file writes `../patches/...` or `../overlays/...`, read `$W/../patches/...` and `$W/../overlays/...`.
+
 ## Scripts
 
 ### `source env.sh [wh|bh]`
@@ -36,7 +41,10 @@ Sets up one lab session, then changes into `$LAB_HOME/run`.
 Use a separate `LAB_HOME` per lab (default `~/ttlab`), for example `export LAB_HOME=~/ttlab/b01`.
 
 **Kernel overlay:** copy a kernel to `$LAB_HOME/kernels/<the relative path the host passes>`, edit
-it, and rerun. No rebuild is needed. Kernels are searched in the cwd first, then
+it, and rerun. No rebuild is needed. For the stock programming examples, and for any host program built with
+`build_host.sh` that uses `OVERRIDE_KERNEL_PREFIX`, that path starts with `tt_metal/programming_examples/`, so an
+overlay is only picked up under `$LAB_HOME/kernels/tt_metal/programming_examples/...`; anywhere else it is silently
+ignored. Kernels are searched in the cwd first, then
 `TT_METAL_KERNEL_PATH`, then `/usr/share/tenstorrent/kernels`, then the runtime root
 (`tt_metal/impl/kernels/kernel.cpp:48-95`). So run from `$LAB_HOME/run`, never from
 `$TT_METAL_HOME`, or the stock kernel silently wins.
@@ -72,6 +80,8 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 
 - `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=0|2|3|4` (numeric: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; names silently mean LoFi) and `MM_SEED`;
   prints `mean_abs_err` and `result_hash`.
+- `host/mm_fid32.cpp` (chapter A06): `mm_fid.cpp` with one change, `.fp32_dest_acc_en = true` in the `ComputeConfig` at line 167,
+  so Dst accumulates in FP32. Same knobs; `MM_FIDELITY=0 MM_SEED=42` prints `result_hash = 6d9ab28ca8ce0383` at `[699743]`.
 - `host/gridinfo.cpp` (chapter A03): opens one device and prints `grid_size`, `logical_grid_size`, the compute grid,
   `dram_grid_size` and `worker_core_from_logical_core()` for four logical cores. On `wh` the first line is
   `grid_size            = 10x12` and logical (0,0) maps to (18,18); on `bh` it is `17x12` and (1,2).
@@ -80,7 +90,10 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `host/b06_scale_add.cpp` + `kernels/b06/{reader,compute,writer}.cpp` (lab B06): out = relu(a + b) over N bf16 tiles
   with your own three kernels; `b06_scale_add [n_tiles=8] [cb_pages=2]` prints `exact=`, `off_by_more_than_1ulp=` and
   PASS/FAIL. The host finds the kernels as `b06/*.cpp`, so run it with `TT_METAL_KERNEL_PATH=$W/kernels`, or copy
-  `kernels/b06` into `$LAB_HOME/kernels/` to edit them.
+  `kernels/b06` into `$LAB_HOME/kernels/` to edit them. `kernels/b06/compute_pair.cpp` is the two-tiles-per-iteration
+  compute kernel of the lab's breaks B and C2; the host never loads it by that name, so copy it over
+  `$LAB_HOME/kernels/b06/compute.cpp`. As shipped (`WAIT2 = 2`) `b06_scale_add 8 2` prints `exact=7704 ... PASS` at `[4865]`;
+  with `WAIT2 = 1` it prints `exact=6174 off_by_more_than_1ulp=1681 ... FAIL`.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `host/b10_inventory.cpp`, `host/b10_workload.cpp`, `host/b10_fabric.cpp`, `host/b10_fabric_send.cpp` (lab B10): on `wh_x2` with
   `wormhole_N300.yaml`, list each chip's Ethernet cores and peers; run one program per chip in a `MeshWorkload` (prints
@@ -93,10 +106,10 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
   is the stock `distributed_eltwise_add` with `MeshShape(2, 1)`; build it with `build_host.sh`. The Ethernet log comes from
   `../patches/b10-ethlog.patch` (`B10_ETHLOG=1`).
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
-  `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
+  `gcc -O2 -o h $W/harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
 - `harness/b09_step.c` (lab B09): drives `libttsim.so` like a host driver, with no tt-metal. It finds BAR0, programs two
   1 MiB TLBs onto one core, writes an 8-instruction RISC-V program to L1, releases BRISC from soft reset and steps the
-  clock one cycle at a time. `gcc -O2 -o b09_step harness/b09_step.c -ldl && ./b09_step ~/sim/wh/libttsim_wh.so [x y] [clocks]`
+  clock one cycle at a time. `gcc -O2 -o b09_step $W/harness/b09_step.c -ldl && ./b09_step ~/sim/wh/libttsim_wh.so [x y] [clocks]`
   (defaults 18 18 30) prints the running sum `5, 9, 12, 14, 15` after clocks 5-21. Wormhole only.
 - `py/b09_cbpeek.py` (lab B09): attaches tt-exalens to a hung run started with `TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1`
   and prints `tiles_received`/`tiles_acked` for some CBs of one core:
@@ -120,7 +133,7 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
   and on the device. `B08_SRC=bf16` starts from a BF16 tile (needed on Wormhole, where FP32 typecast hits ttsim UB).
 - `host/b08_sfpu.cpp` (lab B08): one SFPU function over evenly spaced inputs vs a double reference, chosen with
   `B08_FN=copy|map|piecewise|sin|exp|recip` and `B08_FMT`, `B08_DST32`, `B08_U2D`, `B08_APPROX`, `B08_EXPT`, `B08_FOLD`.
-  Needs the overlay: `cp -r ../overlays/b08/. $LAB_HOME/kernels/`.
+  Needs the overlay: `cp -r $W/../overlays/b08/. $LAB_HOME/kernels/`.
 - `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
   built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
 - `py/b07_mvmul.py` (lab B07): reproduces every Dst element of an MVMUL dump bit for bit (independent and chained
@@ -149,6 +162,10 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 
 - `YAML::BadFile ... soc_descriptor.yaml`: there is no descriptor next to the `.so`.
 - `TT_FATAL: Root Directory is not set.`: `TT_METAL_RUNTIME_ROOT` is unset (source `env.sh`).
-- An edit has no effect: the cwd contains a `tt_metal/` tree; `cd $LAB_HOME/run`.
+- An edit has no effect: the cwd contains a `tt_metal/` tree (`cd $LAB_HOME/run`), or the overlay is not under
+  `$LAB_HOME/kernels/tt_metal/programming_examples/...`.
+- `/usr/bin/time: No such file or directory` (Ubuntu 24.04 has no GNU time by default): use the shell's `time`.
+- `llvm-ar: error: ... Invalid attribute group entry (Producer: 'LLVM20...' Reader: 'LLVM 18...')` while building
+  tt-metal, or a `ttnn` that does not import: see "Build problems on Ubuntu 24.04" in lab B00.
 - The JIT cache is `~/.cache/tt-metal-cache/`. Kernel hash directories are keyed on the kernel path, args and config
   (not file contents); edits are detected through `.dephash` sidecar files, so it rarely needs clearing.

@@ -58,12 +58,11 @@
   <p>Every command below was run in this orb against tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code>. Every output block is pasted from those runs and trimmed with <code>…</code>.</p>
 
   <h2 id="setup">0. Setup</h2>
-<pre><code>export LAB_HOME=$HOME/ttlab/b06
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
-P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b06
 source $W/env.sh wh                       # stock Wormhole ttsim; cds into $LAB_HOME/run
 $EX/metal_example_eltwise_binary          # Test Passed   [7959]</code></pre>
-  <p><code>env.sh</code> sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code>, so a kernel copied there under the path the host asks for replaces the stock one (<a href="b00-workbench.html">B00</a>). The patches for this lab are <code>sim-labs/patches/b06-*.patch</code>: three kernel overlays for <code>eltwise_binary</code> and one for ttsim. The program you write in step 3 lives in <code>sim-labs/workbench/host/b06_scale_add.cpp</code> and <code>sim-labs/workbench/kernels/b06/</code>.</p>
+  <p><code>env.sh</code> sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code>, so a kernel copied there under the path the host asks for replaces the stock one (<a href="b00-workbench.html">B00</a>). The patches for this lab are <code>sim-labs/patches/b06-*.patch</code>: three kernel overlays for <code>eltwise_binary</code> and one for ttsim. The program you write in step 3 lives in <code>sim-labs/workbench/host/b06_scale_add.cpp</code> and <code>sim-labs/workbench/kernels/b06/</code>. Mind the two overlay layouts in this lab: the stock <code>eltwise_binary</code> asks for its kernels with the <code>tt_metal/programming_examples/</code> prefix, so its overlays go under <code>$LAB_HOME/kernels/tt_metal/programming_examples/eltwise_binary/kernels/</code> (the <code>R</code> variable below), while <code>b06_scale_add</code> asks for plain <code>b06/*.cpp</code> and finds them in <code>$LAB_HOME/kernels/b06/</code>.</p>
 
   <h2 id="pointers">1. Watch the CB pointers move</h2>
   <h3>1a. Four views of two CBs</h3>
@@ -81,7 +80,7 @@ $EX/metal_example_eltwise_binary          # Test Passed   [7959]</code></pre>
   <p>Two details in it are already lessons. The <code>&lt;&lt; 4</code> is there because on a TRISC the CB pointers are not byte addresses: <code>setup_local_cb_read_write_interfaces</code> shifts them right by <code>cb_addr_shift</code>, which is <code>CIRCULAR_BUFFER_COMPUTE_ADDR_SHIFT = 4</code> on TRISCs and 0 on BRISC/NCRISC (<code>circular_buffer_interface.h:138-142</code>, <code>circular_buffer_constants.h:31</code>). The unpacker and packer address L1 in 16-byte words, so the firmware stores pointers in their unit. And we print both a <em>local</em> counter (a field of the TRISC's own <code>LocalCBInterface</code>) and the <em>register</em> (the shared stream register), because on the compute side they are different things. Apply and run:</p>
 <pre><code>R=tt_metal/programming_examples/eltwise_binary/kernels
 mkdir -p $LAB_HOME/kernels/$R && cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-cb-dprint.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b06-cb-dprint.patch)
 TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_eltwise_binary</code></pre>
   <div class="filename">output (Wormhole ttsim, this orb; first two iterations)</div>
 <pre><code>0:0-0:TR0: U view: c0 base=0x19e60 limit=0x1ae60 pages=0 | c16 wr=0x0
@@ -142,7 +141,7 @@ constexpr uint32_t NREC = 8;
         PACK(if (i &lt; NREC) pp[i] = Ev{CLK(), (uint16_t)get_local_cb_interface(cb_out0).fifo_wr_ptr,
             (uint16_t)*get_cb_tiles_received_ptr(cb_out0), (uint16_t)*get_cb_tiles_acked_ptr(cb_out0), 0};)</code></pre>
 <pre><code>rm -rf $LAB_HOME/kernels/tt_metal; mkdir -p $LAB_HOME/kernels/$R &amp;&amp; cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-cb-recorder.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b06-cb-recorder.patch)
 TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_eltwise_binary | grep -o "EV.*" | sort -n -k2</code></pre>
   <div class="filename">output (Wormhole ttsim; the first 22 of 64 events, sorted by clock; the absolute clocks, and the order of events that share a clock, differ from run to run)</div>
 <pre><code>EV 6952 R reserved c0 i=0 ptr=0x19e60 recv=0 ack=0
@@ -326,7 +325,7 @@ EV 7602 W popped   c16 i=7 ptr=0x1be60 recv=8 ack=8</code></pre>
 +            return false;
 +        }</code></pre>
 <pre><code>$W/build_ttsim.sh semtrace wh                 # first run copies ttsim to $LAB_HOME/ttsim-semtrace
-(cd $LAB_HOME/ttsim-semtrace &amp;&amp; patch -p1 &lt; $P/b06-sem-trace.patch)
+(cd $LAB_HOME/ttsim-semtrace &amp;&amp; patch -p1 &lt; $W/../patches/b06-sem-trace.patch)
 $W/build_ttsim.sh semtrace wh                 # rebuild with the patch
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-semtrace-wh-release/libttsim.so
 rm -rf $LAB_HOME/kernels/tt_metal             # stock kernels
@@ -365,7 +364,7 @@ grep sem1 $LAB_HOME/sem.log | head -20</code></pre>
   <p>The second surprise is the per-tile pattern. Look at clock 4523. MATH posts (value 1), the packer's wait passes, and <em>before</em> the packer's <code>SEMGET</code>, MATH's next acquire passes with value 1. For a moment MATH owns one half of Dst and PACK owns the other. That is half-sync double buffering, caught in the act. Many events share one clock because ttsim keeps stepping a tile within a clock as long as its Tensix threads make progress (<code>libttsim.cpp:252</code>), so read the order of lines, not the gaps between clocks.</p>
   <p>In this run the value never reaches 2. The packer always caught up before MATH finished the next tile: <code>waited=17</code>, <code>40</code>, <code>52</code> are the clocks the <em>packer</em> spent waiting for MATH. To see MATH wait, slow down the end of the pipeline. <code>b06-slow-writer.patch</code> makes the writer spin 300 ttsim clocks before each tile:</p>
 <pre><code>mkdir -p $LAB_HOME/kernels/$R &amp;&amp; cp -r $TT_METAL_HOME/$R/* $LAB_HOME/kernels/$R/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b06-slow-writer.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b06-slow-writer.patch)
 B06_SEM_OUT=$LAB_HOME/sem-slow.log $EX/metal_example_eltwise_binary     # Test Passed [27702]</code></pre>
   <div class="filename">output: $LAB_HOME/sem-slow.log, sem1, from the third tile on</div>
 <pre><code>4626 T1 SEMPOST sem1 0-&gt;1 max=2
@@ -699,7 +698,11 @@ tile 7: matches relu(A[t]+B[t]) 355  matches relu(A[t-1]+B[t]) 1024</code></pre>
   <p>Output tile <i>t</i> ≥ 3 is <code>relu(A[t−1] + B[t])</code> in every element (to the same 1-ulp tolerance): the unpacker paired each B with the <em>previous</em> A. (The ~300-350 chance matches are elements where both sums are negative and relu makes both 0.) Blackhole gave identical numbers. Watcher said nothing: every NoC transaction was in bounds and every push and pop advanced by one page, so no check had anything to catch. The leftover count does not leak into the next program either: TRISC0 zeroes all <code>received</code>/<code>acked</code> registers at each launch (<code>init_sync_registers</code>, <code>trisc.cc:97-106, 138</code>), unlike the leaked semaphore count in A12's double-commit experiment.</p>
 
   <h3>Break B: wait for cumulative counts wrongly</h3>
-  <p>The CB doc comment says repeated waits are cumulative: "4 calls of cb_wait_front(8) followed by a cb_pop_front(32) would produce incorrect behavior. Instead 4 calls of cb_wait_front() waiting on 8, 16, 24, 32 tiles should be issued" (<code>cb_api.h:25-27</code>, the same text as <code>dataflow_api.h:459-461</code>). To make that mistake possible, change compute to handle tiles in pairs: wait for the first, add it into Dst[0], wait for the second, add it into Dst[1], then pop 2, pack 2, push 2. The second wait must ask for <b>2</b>.</p>
+  <p>The CB doc comment says repeated waits are cumulative: "4 calls of cb_wait_front(8) followed by a cb_pop_front(32) would produce incorrect behavior. Instead 4 calls of cb_wait_front() waiting on 8, 16, 24, 32 tiles should be issued" (<code>cb_api.h:25-27</code>, the same text as <code>dataflow_api.h:459-461</code>). To make that mistake possible, change compute to handle tiles in pairs: wait for the first, add it into Dst[0], wait for the second, add it into Dst[1], then pop 2, pack 2, push 2. The second wait must ask for <b>2</b>. The whole kernel is in the workbench as <code>kernels/b06/compute_pair.cpp</code>, with <code>WAIT2 = 2</code>. The host always asks for <code>b06/compute.cpp</code>, so copy the pair kernel over your overlay's copy and edit the constant there:</p>
+<pre><code>cp $W/kernels/b06/compute_pair.cpp $LAB_HOME/kernels/b06/compute.cpp
+sed -i 's/^constexpr uint32_t WAIT2 = 2;/constexpr uint32_t WAIT2 = 1;/' $LAB_HOME/kernels/b06/compute.cpp   # BREAK B1
+$LAB_HOME/b06_scale_add 8</code></pre>
+  <p>The part that differs from <code>compute.cpp</code>:</p>
 <pre><code>constexpr uint32_t WAIT2 = 1;   // correct: 2 (cumulative).  BREAK B1: 1
 ...
     for (uint32_t i = 0; i &lt; n_tiles; i += 2) {
@@ -812,7 +815,8 @@ PASS
 TT_METAL_WATCHER=1 $LAB_HOME/b06_scale_add 8 1                 # also PASS, nothing in watcher.log</code></pre>
   <p>Nothing breaks. With chunks of one page, every rule still holds: pushes per lap sum to the CB size (1), and no wait asks for more than 1. What you lose is overlap. With one page, BRISC cannot reserve tile <i>i</i>+1 until TRISC0 has popped tile <i>i</i>, so reading and unpacking strictly take turns, as in A11's ring figure. On silicon that roughly doubles the time per tile when the two stages are similar. ttsim has no timing model, so it cannot show you the cost; the protocol is correct and that is all it checks.</p>
   <p>The 1-page CB turns into a real failure when a kernel moves more than one page at a time. Run the <em>correct</em> pair kernel from break B (<code>WAIT2 = 2</code>) on 1-page CBs:</p>
-<pre><code>$LAB_HOME/b06_scale_add 8 2       # pair kernel, 2-page CBs: PASS
+<pre><code>cp $W/kernels/b06/compute_pair.cpp $LAB_HOME/kernels/b06/compute.cpp     # the pair kernel as shipped, WAIT2 = 2
+$LAB_HOME/b06_scale_add 8 2       # pair kernel, 2-page CBs: PASS
 timeout 20 $LAB_HOME/b06_scale_add 8 1; echo EXIT=$?          # EXIT=124
 TT_METAL_WATCHER=1 timeout 75 $LAB_HOME/b06_scale_add 8 1      # dump count varies by run (65, 66)
      65 Device 0 worker core(x= 0,y= 0) virtual(x=18,y=18): CRBW,CWFW,UABD,MWDD,   K  rmsg:H0G|BNT h_id:  0 smsg:GGGG</code></pre>

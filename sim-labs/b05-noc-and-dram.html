@@ -58,10 +58,9 @@
   <p>A08 already showed a NoC log from an instrumented ttsim. This lab builds a slightly different logger: the format is easier to parse, multicast receivers get their own lines, and it then puts the log to work. All commands below were run in this orb on the Wormhole model, and every output shown is real, trimmed only where marked.</p>
 
   <h2 id="setup">0. Setup</h2>
-<pre><code>export LAB_HOME=$HOME/ttlab/b05                 # the three paths below: adjust to your checkout
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
-P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches</code></pre>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b05
+source $W/env.sh wh</code></pre>
   <p><code>env.sh</code> points tt-metal at the stock Wormhole simulator, turns on slow dispatch, sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code> for kernel overlays, and changes into <code>$LAB_HOME/run</code>. <a href="b00-workbench.html">B00</a> explains each variable. Patches for this lab live in <code>sim-labs/patches/b05-*.patch</code>: two for ttsim and three for kernels.</p>
 
   <h2 id="log">1. Build a NoC-logging simulator</h2>
@@ -74,7 +73,7 @@ P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches</code></pre>
   </ul>
   <p>Make an editable copy of ttsim and apply the patch:</p>
 <pre><code>$W/build_ttsim.sh noclog wh                 # first run copies ttsim to $LAB_HOME/ttsim-noclog
-(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch)
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $W/../patches/b05-noclog.patch)
 $W/build_ttsim.sh noclog wh                 # rebuild: about 1.5 s
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
   <div class="filename">sim-labs/patches/b05-noclog.patch (against ttsim/src/tile.cpp @b3620244, inserted after line 1466)</div>
@@ -393,7 +392,7 @@ grep NOCLOG $LAB_HOME/mcast.log</code></pre>
 <pre><code>K=$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels
 mkdir -p $K
 cp $TT_METAL_HOME/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp $K/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-misalign-kernel.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b05-misalign-kernel.patch)
 $EX/metal_example_add_2_integers_in_riscv          # stock ttsim, Watcher off</code></pre>
 <pre><code>[0] 0.0 seconds (0.0 KHz)
 [4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match
@@ -545,7 +544,7 @@ real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
 <pre><code>rm $LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
 K=$LAB_HOME/kernels/tt_metal/programming_examples/loopback/kernels; mkdir -p $K
 cp $TT_METAL_HOME/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp $K/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-no-read-barrier.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b05-no-read-barrier.patch)
 export TT_METAL_SIMULATOR=$HOME/sim/wh/libttsim_wh.so      # stock ttsim
 $EX/metal_example_loopback</code></pre>
 <pre><code>Test Passed
@@ -580,7 +579,7 @@ inline __attribute__((always_inline)) bool ncrisc_noc_reads_flushed(uint32_t noc
   <h3>Make ttsim honest about one delay</h3>
   <p>The fix to the model is small: do not finish a Tensix read when it is issued. Queue it, and complete it on a later clock, doing the copy and the counter increment together, as the hardware's response would. Until then the read also counts as outstanding for its transaction ID, the counter that <code>noc_async_read_barrier_with_trid</code> polls (<code>noc_nonblocking_api.h:465-467</code>), so trid barriers wait for it too. That is <code>b05-delay-reads.patch</code>, applied on top of the logging patch:</p>
 <pre><code>$W/build_ttsim.sh lazy wh                     # copy
-(cd $LAB_HOME/ttsim-lazy &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch &amp;&amp; patch -p1 &lt; $P/b05-delay-reads.patch)
+(cd $LAB_HOME/ttsim-lazy &amp;&amp; patch -p1 &lt; $W/../patches/b05-noclog.patch &amp;&amp; patch -p1 &lt; $W/../patches/b05-delay-reads.patch)
 $W/build_ttsim.sh lazy wh                     # rebuild
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-lazy-wh-release/libttsim.so</code></pre>
   <div class="filename">sim-labs/patches/b05-delay-reads.patch (ttsim/src/tile.cpp and src/libttsim.cpp @b3620244, core of the change)</div>

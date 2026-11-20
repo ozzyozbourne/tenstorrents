@@ -55,7 +55,7 @@
 
   <h2 id="setup">Setup</h2>
   <p>We use a lab directory of our own and an editable copy of ttsim (<a href="b00-workbench.html">B00</a> explains the scripts):</p>
-<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/b04
 source $W/env.sh wh
 $W/build_ttsim.sh trace wh</code></pre>
