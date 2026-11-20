@@ -693,8 +693,9 @@ sfpi_inline sfpi::vFloat sfpu_reciprocal_iter(const sfpi::vFloat x) {
 
   <h2 id="sim">Running it in ttsim</h2>
   <p>All runs below were made in this orb with the workbench (<a href="../sim-labs/b00-workbench.html">B00</a>), on both architectures. As always: <b>ttsim is a functional, bit-exact model, not a timing model.</b> The bracketed number is a simulated clock driven by host polling, not a performance figure. Do not compare it across examples or architectures.</p>
-<pre><code>$ export LAB_HOME=$HOME/ttlab/a07
-$ source tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+<pre><code>$ W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout
+$ export LAB_HOME=$HOME/ttlab/a07
+$ source $W/env.sh wh
 $ $EX/metal_example_eltwise_sfpu          # exp() of 64 bf16 tiles, checked against std::exp
 UMD | Creating TopologyDiscovery for architecture: wormhole_b0
 EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0x401e
@@ -706,7 +707,7 @@ UMD | Creating TopologyDiscovery for architecture: wormhole_b0
 Test Passed
 [4797] 0.2 seconds (22.8 KHz)
 
-$ source tenstorrent-from-zero/sim-labs/workbench/env.sh bh
+$ source $W/env.sh bh
 $ $EX/metal_example_eltwise_sfpu
 UMD | Creating TopologyDiscovery for architecture: blackhole
 EmulationDriver | TTSimTTDevice chip_id=0 PCI vendor_id=0x1e52 device_id=0xb140
@@ -724,7 +725,7 @@ Test Passed
 $ $EX/metal_example_custom_sfpi_add       # BH, same overlay
 Test Passed
 [6848] 0.3 seconds (22.4 KHz)</code></pre>
-  <p>The host check (|expected − actual| ≤ 0.01 for every element, with <code>a</code> uniform in [0, 1) and <code>b</code> = −1) passed on both. That means about half the lanes in each vector took each branch and the masks combined correctly. The disassembly earlier in the chapter comes from these runs' JIT build directories under <code>~/.cache/tt-metal-cache/</code>.</p>
+  <p>The host check (|expected − actual| ≤ 0.01 for every element, with <code>a</code> uniform in [0, 1) and <code>b</code> = −1) passed on both. That means about half the lanes in each vector took each branch and the masks combined correctly. The disassembly earlier in the chapter comes from these runs' JIT build directories. They live under <code>~/.cache/tt-metal-cache/</code> (or <code>$TT_METAL_CACHE</code> if you set it), at <code>tt-metal-cache&lt;hash&gt;/kernels/&lt;kernel name&gt;/&lt;hash&gt;/trisc1/trisc1.elf</code>, with one top-level directory per architecture build. Disassemble one with <code>$TT_METAL_HOME/runtime/sfpi/compiler/bin/riscv-tt-elf-objdump -d</code>. After these runs <code>kernels/tiles_add/</code> holds two hash directories, one for the stock kernel and one for the overlay. The directory name is keyed on the kernel's resolved file path (and its build settings), not on its contents, so the overlay copy at a new path gets its own directory. If you then edit the overlay file in place, the directory stays the same: tt-metal notices the change through the <code>.dephash</code> files stored next to each object and rebuilds there. <a href="a13-llk-mops-jit.html#cache">A13</a> covers the cache.</p>
   <div class="callout sim">Do it yourself in <a href="../sim-labs/b08-formats-and-sfpu.html">B08</a>. You will write a custom SFPI kernel, look at its <code>trisc1.elf</code> disassembly to count the instructions behind each line, and check the WH vs BH numerics differences from this chapter bit by bit.</div>
 
   <h2 id="recap">Recap</h2>

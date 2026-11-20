@@ -19,7 +19,7 @@ Sources: [TM] = tt-metal 7aad8aac, [SIM] = ttsim b3620244, [ISA] = tt-isa-docume
 - BH worker columns: x=1-7 and 10-16; rows y=2-11. DRAM at x=0,9; Ethernet at y=1; PCIe (2,0), (11,0); ARC (8,0) ([TM] blackhole_140_arch.yaml).
 - RISC-V counts *(derived)*:
   - WH: 400 + 16 = 416 RV32 cores.
-  - BH: 700 + 28 (Ethernet, 2 each) + 24 (DRAM tiles) + 16 x280 = 768.
+  - BH: 700 + 28 (Ethernet, 2 each) + 24 (DRAM tiles, 1 each: [TM] tt_metal/hw/inc/internal/tt-1xx/blackhole/core_config.h:22) = 752 baby cores, matching the 752 on the Hot Chips 2024 slides; + 16 x280 = 768.
 - Quasar worker node: 8 DM cores plus 4 Tensix engines with 4 TRISCs each; MX formats ([TM] tt_metal/hw/inc/internal/tt-2xx/quasar/core_config.h).
 
 ## Tensix tile ([ISA] WormholeB0/TensixTile/README.md)
@@ -106,7 +106,7 @@ Sources: [TM] = tt-metal 7aad8aac, [SIM] = ttsim b3620244, [ISA] = tt-isa-docume
 - Transactions: read, write (posted or inline), atomics, rectangle multicast to Tensix tiles. BH adds strided and L-shaped multicast.
 - Deadlock avoidance: virtual channels plus a dateline. Ordering is weak, with completion counters.
 - Coordinates: raw per NoC, plus a translated scheme (WH Tensix at x 18-25, y 18-27) that moves harvested rows to the end. Metalium works in logical coordinates.
-- Compute grid: 8×8 on n150, 13×10 on p150 (the remaining rows/columns presumably go to dispatch, inferred).
+- Compute grid: 8×8 on n150; 13×10 on an unharvested 140-core Blackhole ([TM] tt_metal/core_descriptors/blackhole_140_arch.yaml, `unharvested`, end [12, 9]); 11×10 on the 120-core p150 that ttsim models (`2xharvested`, end [10, 9]; confirmed by running sim-labs/workbench/host/gridinfo.cpp: logical grid 12×10, compute grid 11×10). The remaining row (WH) or column (BH) holds the dispatch cores.
 - Harvesting: the n150 disables 1 row and the n300 2 rows per chip; which rows varies by chip.
 
 ## Memory

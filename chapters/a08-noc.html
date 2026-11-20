@@ -767,9 +767,13 @@
             src_tile_type, src_coordinate &amp; 63, src_coordinate &gt;&gt; 6, raw_src &amp; 63, raw_src &gt;&gt; 6, (unsigned long long)src_addr,
             dst_tile_type, dst_coordinate &amp; 63, dst_coordinate &gt;&gt; 6, raw_dst &amp; 63, raw_dst &gt;&gt; 6, (unsigned long long)dst_addr, noc_at_len_be);
     }</code></pre>
-<pre><code>export LAB_HOME=$HOME/ttlab/a08
-source sim-labs/workbench/env.sh wh
-sim-labs/workbench/build_ttsim.sh noclog wh      # copy, edit src/tile.cpp, rebuild (~4 s)
+<p>You don't have to type the edit in. The series ships it as <a href="../sim-labs/patches/a16-noclog.patch"><code>sim-labs/patches/a16-noclog.patch</code></a>, which is this logging plus a few extra fields that <a href="a16-multicast-sync.html">A16</a> uses (so its multicast-rectangle and atomic lines are a little longer than the ones shown below). With the workbench from lab <a href="../sim-labs/b00-workbench.html">B00</a>:</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; env.sh changes directory, so keep it absolute
+export LAB_HOME=$HOME/ttlab/a08
+source $W/env.sh wh
+$W/build_ttsim.sh noclog wh      # first run: copies ttsim to $LAB_HOME/ttsim-noclog and builds it
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $W/../patches/a16-noclog.patch)   # or edit src/tile.cpp by hand
+$W/build_ttsim.sh noclog wh      # rebuild (~4 s)
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so
 $EX/metal_example_loopback</code></pre>
   <p>The loopback example's single kernel reads each 2 KiB tile from a DRAM buffer into L1 and writes it back to another DRAM buffer, with a barrier after each (<code>programming_examples/loopback/kernels/loopback_dram_copy.cpp</code>). The run printed 100 NoC commands, 50 reads and 50 writes, then <code>Test Passed</code>. Here are the first eight, trimmed:</p>

@@ -94,8 +94,9 @@
   <p>You don't have to take the code's word for it. I ran the stock example in ttsim in this orb, with the JIT cache pointed at a private directory, and then listed the kernel's cache directory:</p>
 
   <div class="filename">output: Wormhole ttsim run in this orb, $LAB_HOME = ~/ttlab/a12</div>
-<pre><code>$ export LAB_HOME=$HOME/ttlab/a12
-$ source sim-labs/workbench/env.sh wh
+<pre><code>$ W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+$ export LAB_HOME=$HOME/ttlab/a12
+$ source $W/env.sh wh
 $ export TT_METAL_CACHE=$LAB_HOME/cache
 $ $EX/metal_example_add_2_integers_in_compute
 Success: Result matches expected value!
@@ -122,6 +123,7 @@ void kernel_main();
 #include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/add_2_integers_in_compute/kernels/compute/add_2_tiles.cpp"</code></pre>
 
   <p>That's the whole trick: three four-line files that differ in their first line, each including the same source. Each one is compiled into its own ELF, in <code>trisc0/</code>, <code>trisc1/</code> and <code>trisc2/</code>. (A small quirk: when <code>TT_METAL_CACHE</code> is set, the build key is glued onto the <code>tt-metal-cache</code> directory name without a slash. The default is <code>~/.cache/tt-metal-cache/&lt;key&gt;/</code>.)</p>
+  <p>Two things in that listing will differ on your machine. The <code>#include</code> line is the absolute path of your own tt-metal checkout (this orb keeps it under <code>/home/user/workspace/refs/</code>). And the last directory name, <code>15221009478522750518</code>, is a hash that covers that resolved path together with the kernel's config, so a checkout at another path gets another number: a re-run with tt-metal at <code>/root/tt-metal</code> produced the same nine entries under <code>add_2_tiles/3189993212117353383/</code>. Use <code>cd $LAB_HOME/cache/tt-metal-cache*/kernels/add_2_tiles/*/</code> rather than typing the numbers. The hash does not cover the file's contents. If you edit a kernel in place, the same directory is reused and rebuilt, because a <code>.dephash</code> file next to each object records a hash of the source and every header it included (A10 shows the experiment; A13 the mechanism).</p>
   <p>How does each ELF pick up its own <code>chlkc_*.cpp</code>? The compile command for processor <i>i</i> of the compute class gets a different <code>-D</code> flag:</p>
 
   <div class="filename">tt-metal/tt_metal/llrt/hal/tt-1xx/hal_1xx_common.cpp:42-50 @7aad8aac</div>
@@ -410,6 +412,7 @@ ALWI void add_tiles(
 0:0-0:TR2: PACK: pushed PACR and release; MATH_PACK reads 0
 Success: Result matches expected value!
 [7734] 0.6 seconds (12.3 KHz)</code></pre>
+  <p>(With DPRINT on, neither the clock count nor the interleaving of the lines is repeatable. Three more runs of the same overlay ended at <code>[12762]</code>, <code>[5430]</code> and <code>[5417]</code>, and the TR0 and TR2 lines did not always arrive in the same order. Without DPRINT the stock kernel takes <code>[4682]</code> every time.)</p>
 
   <p>The plain <code>DPRINT</code> appears three times, tagged TR0, TR1 and TR2. Each targeted print appears once, on its own core. Two cautions about reading this log:</p>
   <ul>
@@ -733,7 +736,8 @@ run 1 finished
 run 2 finished
 Error: Result does not match expected value!
 [7765] 0.5 seconds (16.1 KHz)</code></pre>
-  <p>Without the DPRINT the failure looks like this (first and last lines of 1022 mismatches):</p>
+  <p>(The semaphore values and the final error repeat on every run. The clock count does not, because DPRINT is on: two re-runs ended at <code>[7797]</code> and <code>[6040]</code>.)</p>
+  <p>Without the DPRINT the failure looks like this (first and last lines of 1022 mismatches; the inputs are random, so the expected values differ on every run, and a re-run listed all 1024 indices):</p>
   <div class="filename">output: $LAB_HOME/host/run_twice (double-commit overlay, Wormhole ttsim; trimmed)</div>
 <pre><code>Mismatch at index 0: expected 9.0625, got 0
 Mismatch at index 1: expected 17.53125, got 0
@@ -742,7 +746,7 @@ Mismatch at index 1023: expected 18.78125, got 0
 run 1 finished
 run 2 finished
 Error: Result does not match expected value!</code></pre>
-  <p>Every element of the second run's output is 0. The two elements not listed had expected sums within the example's 0.3 tolerance of 0. A control run of the same host program with the stock kernel printed "run 1 finished", "run 2 finished" and "Success". Here is what the leaked count did. The second program started with Value = 1. Its PACK thread's <code>tile_regs_wait</code> saw 1 ≠ 0 and went straight through, so the packer copied Dst, which was all zeros from <code>run_kernel</code>'s <code>zeroacc()</code>, before MATH had done anything. Its release took Value back to 0. That freed MATH's startup spin loop, and MATH then did the add into a Dst that nobody would ever pack again. The program "finished" normally. The bug from program 1 corrupted program 2.</p>
+  <p>Every element of the second run's output is 0. The two elements not listed in that run had expected sums within the example's 0.3 tolerance of 0. A control run of the same host program with the stock kernel printed "run 1 finished", "run 2 finished" and "Success". Here is what the leaked count did. The second program started with Value = 1. Its PACK thread's <code>tile_regs_wait</code> saw 1 ≠ 0 and went straight through, so the packer copied Dst, which was all zeros from <code>run_kernel</code>'s <code>zeroacc()</code>, before MATH had done anything. Its release took Value back to 0. That freed MATH's startup spin loop, and MATH then did the add into a Dst that nobody would ever pack again. The program "finished" normally. The bug from program 1 corrupted program 2.</p>
   <div class="callout warn"><b>Unbalanced handshakes are time bombs.</b> ttsim catches a SEMGET at zero and a SEMPOST at or above Max (tensix.cpp:5538-5539), because the ISA calls those NonContractualBehavior. An extra commit that stays within Max is legal hardware behaviour. No simulator check can flag it, and it surfaces as wrong data in a <i>different</i> kernel. The rule is mechanical: per loop iteration, MATH does exactly one acquire and one commit, and PACK exactly one wait and one release. The docs add that you must commit and release even if you pack nothing (compute_engines_and_dataflow_within_tensix.rst:118-120).</div>
 
   <div class="callout sim">Trace the SEMINIT/SEMWAIT/SEMPOST/SEMGET stream instruction by instruction, and write your own reader/compute/writer kernel, in <a href="../sim-labs/b06-cbs-and-semaphores.html">B06</a>. To follow the MOPs above as they expand into ELWADDs and PACRs per pipe, see <a href="../sim-labs/b04-tensix-instructions.html">B04 · Following Tensix instructions</a>.</div>
@@ -1009,7 +1013,7 @@ inline void my_add_tile(uint32_t idx_dst0, uint32_t idx_dst1, uint32_t idx_out0)
 <pre><code>[0] 0.1 seconds (0.0 KHz)
 Test Passed
 [4797] 0.2 seconds (20.3 KHz)</code></pre>
-  <p>To make it yours, copy <code>tiles_add.cpp</code> into the overlay directory and change <code>a + b</code> to something else. That's the A07 exercise with <code>v_if</code>. The overlay rebuilds without touching tt-metal. Change both the kernel and the host check if you change the maths, because the example's host side checks for a sum.</p>
+  <p>To make it yours, copy <code>tiles_add.cpp</code> to <code>$LAB_HOME/kernels/tt_metal/programming_examples/custom_sfpi_add/kernels/compute/tiles_add.cpp</code> (the overlay is only found under that full path, <code>tt_metal/programming_examples/</code> prefix included) and change <code>a + b</code> to something else. That's the A07 exercise with <code>v_if</code>. The overlay rebuilds without touching tt-metal. Change both the kernel and the host check if you change the maths, because the example's host side checks for a sum.</p>
   <div class="callout warn">The "init" lesson applies here too, quietly. This example has no SFPU init beyond <code>copy_init</code>, and it passes in ttsim. Its face function uses only loads, an add and stores, so it doesn't depend on the programmable constants or macros that library inits set up. As soon as your SFPI function uses <code>vConstFloatPrgm0</code> or similar, it needs an init that programs them, and any other SFPU op in the same kernel may have overwritten them.</div>
 
   <h2 id="recap">Recap</h2>

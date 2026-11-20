@@ -583,10 +583,11 @@ tt::tt_metal::MathFidelity math_fidelity =
     fid_env ? static_cast&lt;tt::tt_metal::MathFidelity&gt;(std::atoi(fid_env)) : tt::tt_metal::MathFidelity::HiFi4;</code></pre>
   <div class="callout warn"><code>MM_FIDELITY</code> is parsed with <code>atoi</code>, so pass the enum <i>number</i>: 0, 2, 3 or 4. Passing <code>MM_FIDELITY=HiFi2</code> parses as 0, and you would silently get LoFi.</div>
   <p>Here is what I ran in this orb (Wormhole build of ttsim, slow dispatch):</p>
-<pre><code>export LAB_HOME=$HOME/ttlab/a06
-source sim-labs/workbench/env.sh wh
-mkdir -p $LAB_HOME/src &amp;&amp; cp sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/src/
-sim-labs/workbench/build_host.sh $LAB_HOME/src/mm_fid.cpp      # ~6 s
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; env.sh changes directory, so keep it absolute
+export LAB_HOME=$HOME/ttlab/a06
+source $W/env.sh wh
+mkdir -p $LAB_HOME/src &amp;&amp; cp $W/host/mm_fid.cpp $LAB_HOME/src/
+$W/build_host.sh $LAB_HOME/src/mm_fid.cpp      # ~6 s
 for f in 0 2 3 4; do MM_SEED=42 MM_FIDELITY=$f $LAB_HOME/src/mm_fid; done</code></pre>
   <p>Trimmed output for LoFi and HiFi4:</p>
 <pre><code>math_fidelity = 0
@@ -753,7 +754,7 @@ Test Passed
     <li><a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole card specifications</a>: n150/n300 cores, clock and the published FP8 / BLOCKFP8 / FP16 TFLOPS.</li>
     <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole card specifications</a>: p100a/p150a/p150b cores, clock and BLOCKFP8 TFLOPS.</li>
     <li><a href="https://hc2024.hotchips.org/assets/program/conference/day1/88_HC2024.Tenstorrent.Jasmina.Davor.v7.pdf">Hot Chips 2024: "Blackhole &amp; TT-Metalium" (Tenstorrent)</a>: the per-format TFLOPS table for the 140-core Blackhole die, plus the Wormhole and Blackhole roadmap figures.</li>
-    <li><a href="https://tenstorrent.com/hardware/galaxy">Tenstorrent Galaxy (Wormhole)</a>: 80 cores at 1 GHz and 292 FP8 TFLOPS per module.</li>
+    <li><a href="https://tenstorrent.com/hardware/galaxy">Tenstorrent Galaxy</a>: when this chapter was written the page described the Wormhole Galaxy (80 cores at 1 GHz and 292 FP8 TFLOPS per module). It now describes the Blackhole Galaxy and no longer lists those figures.</li>
     <li><a href="https://github.com/tenstorrent/ttsim">ttsim</a>: the bit-exact simulator; <code>src/tensix.cpp</code> holds the <code>mvmul</code> code this chapter's calculator ports.</li>
     <li><a href="https://arxiv.org/abs/2203.03341">Ootomo &amp; Yokota, "Recovering single precision accuracy from Tensor Cores while surpassing the FP32 theoretical peak performance"</a>: the split-precision idea behind fidelity phases, applied on GPUs.</li>
     <li><a href="https://arxiv.org/abs/1905.12322">Kalamkar et al., "A Study of BFLOAT16 for Deep Learning Training"</a>: why 8 bits of significand are enough for training, and what is lost.</li>

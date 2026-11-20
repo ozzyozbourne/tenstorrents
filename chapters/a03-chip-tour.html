@@ -170,9 +170,15 @@ functional_workers:
 
   <h3>3. Logical coordinates</h3>
   <p>TT-Metalium goes one step further. A <b>logical</b> worker coordinate counts only the usable Tensix tiles, starting at <code>(0,0)</code>. On an n150 it runs from <code>(0,0)</code> to <code>(7,8)</code>, with no holes and no knowledge of which physical row was lost. Host code uses logical coordinates to place kernels, and the runtime converts them to translated coordinates for the device. The core descriptor YAMLs say so in their first line: "Anything using [[#, #]] is logical coordinates" (<code>tt_metal/core_descriptors/wormhole_b0_80_arch.yaml:1</code>).</p>
-  <p>To check this on the simulator, I wrote a short host program (about 20 lines), <code>gridinfo.cpp</code>, that opens one device and prints the grid sizes and <code>worker_core_from_logical_core()</code> for a few cores. Here is the real output from this orb, with UMD log lines trimmed:</p>
+  <p>To check this on the simulator, I wrote a short host program (under 30 lines), <code>gridinfo.cpp</code>, that opens one device and prints the grid sizes and <code>worker_core_from_logical_core()</code> for a few cores. It ships with the series as <code>sim-labs/workbench/host/gridinfo.cpp</code>. Lab <a href="../sim-labs/b00-workbench.html">B00</a> sets up the workbench; with it in place, build and run the program like this (set <code>W</code> to your own checkout):</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout
+export LAB_HOME=~/ttlab/a03
+source $W/env.sh wh                                   # or: bh
+cp $W/host/gridinfo.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/gridinfo.cpp
+$LAB_HOME/gridinfo</code></pre>
+  <p>Here is the real output, with tt-metal and UMD log lines trimmed:</p>
 
-  <div class="filename">$ source sim-labs/workbench/env.sh wh; ./gridinfo   (ttsim WH)</div>
+  <div class="filename">$ source $W/env.sh wh; $LAB_HOME/gridinfo   (ttsim WH)</div>
 <pre><code>grid_size            = 10x12
 logical_grid_size    = 8x9
 compute grid         = 8x8
@@ -231,7 +237,7 @@ logical (7,8) -&gt; virtual/translated (25,26)</code></pre>
   </table>
   <p>Running the same <code>gridinfo</code> program against ttsim's Blackhole model:</p>
 
-  <div class="filename">$ source sim-labs/workbench/env.sh bh; ./gridinfo   (ttsim BH)</div>
+  <div class="filename">$ source $W/env.sh bh; $LAB_HOME/gridinfo   (ttsim BH)</div>
 <pre><code>grid_size            = 17x12
 logical_grid_size    = 12x10
 compute grid         = 11x10
@@ -255,7 +261,7 @@ logical (11,9) -&gt; virtual/translated (14,11)</code></pre>
     <tr><td><b>Total</b></td><td><b>416</b></td><td><b>768</b> (752 baby + 16 big)</td></tr>
   </table>
   <p>Sources: 5 baby cores per Tensix tile and 1 or 2 per Ethernet tile come from the ISA's <code>TensixTile/README.md</code> and <code>EthernetTile/README.md</code> for each chip, mirrored in ttsim's <code>RV32_CORES_PER_T_TILE 5</code> and <code>RV32_CORES_PER_E_TILE 1</code> or <code>2</code> (<code>src/config.h</code>). The 16 x280s are in <code>BlackholeA0/README.md</code>. ARC's four cores are not RISC-V and are not counted.</p>
-  <p>Blackhole's DRAM tiles also contain small RISC-V cores. tt-metal has a memory map for them ("DRISC has 128KB L1", <code>tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h:323-327</code>) and an optional "DRAM programmable cores" mode (<code>tt_metal/impl/context/metal_env.cpp:111-120</code>). The ISA docs have no Blackhole DRAM-tile page, so the count comes from two other places. tt-metal's HAL defines exactly one programmable core per DRAM tile (<code>enum class DramProcessorTypes { DM0 = 0, COUNT = 1 }</code> in <code>tt_metal/hw/inc/internal/tt-1xx/blackhole/core_config.h:22</code>). And Tenstorrent's Hot Chips 2024 slides (slides 5, 6 and 20) list <b>752</b> baby RISC-Vs for the 140-core Blackhole and draw one RISC-V in each DRAM core. 752 is exactly 700 + 28 + 24 <i>(derived)</i>. With the 16 x280s that makes <b>768</b> RISC-V cores on the full die. On products the counts drop with harvesting: a 72-core n150 has 72 × 5 + 16 = 376 RISC-V cores enabled.</p>
+  <p>Blackhole's DRAM tiles also contain small RISC-V cores. tt-metal has a memory map for them ("DRISC has 128KB L1", <code>tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h:323-327</code>) and an optional "DRAM programmable cores" mode (<code>tt_metal/impl/context/metal_env.cpp:111-120</code>). The ISA docs have no Blackhole DRAM-tile page, so the count comes from two other places. tt-metal's HAL defines exactly one programmable core per DRAM tile (<code>enum class DramProcessorTypes { DM0 = 0, COUNT = 1 }</code> in <code>tt_metal/hw/inc/internal/tt-1xx/blackhole/core_config.h:22</code>). And Tenstorrent's Hot Chips 2024 slides (slides 5, 6 and 20) list <b>752</b> baby RISC-Vs for the 140-core Blackhole and draw one RISC-V in each DRAM core. 752 is exactly 700 + 28 + 24 <i>(derived)</i>. With the 16 x280s that makes <b>768</b> RISC-V cores on the full die. On products the counts drop with harvesting. For example, a Wormhole n150 with 72 Tensix tiles enabled has 72 × 5 = 360 baby cores in Tensix tiles, plus the 16 in its Ethernet tiles: 376 <i>(derived)</i>.</p>
 
   <div class="callout gpu">Counting "cores" across architectures is close to meaningless. An NVIDIA "CUDA core" is one FP32 lane. A baby RISC-V is a whole tiny in-order CPU that doesn't do the tensor math at all, and the matrix engine next to it does far more work per cycle than the RISC-V. Compare chips on FLOP/s, bytes per second and bytes of SRAM, not on core counts.</div>
 
@@ -280,8 +286,8 @@ logical (11,9) -&gt; virtual/translated (14,11)</code></pre>
   <h3>The conflicts, spelled out</h3>
   <ul>
     <li><b>p150 core count.</b> The ISA README's product table gives p150 140 Tensix tiles and p100 120. docs.tenstorrent.com gives 120 for p100a, p150a and p150b alike. Two pieces of evidence lean towards 120 for current p150 cards. First, the docs' 664 TFLOPS (BLOCKFP8) matches 120 × 4096 × 1.35 GHz = 663.6, using the 4096 FLOP/cycle per core that <a href="a06-matrix-engine.html">A06</a> derives, while 140 cores would give 774. Second, ttsim's p150 model harvests two columns (mask <code>0xC0</code>). The ISA table may describe the design intent or a different SKU. We can't settle this from public sources.</li>
-    <li><b>Wormhole FP8 peak.</b> The n150's quoted FP8 figure is 262 TFLOPS, but 72 × 4096 × 1 GHz = 295. The BLOCKFP8 (148) and FP16 (74) figures do fit 295 ÷ 2 and ÷ 4. We have no source for the 0.89 factor. The Galaxy page's 9.3 PFLOPS for 32 chips (about 291 per chip) shows the same ratio against 80 × 4096 = 328, though the current page labels that figure Block FP8 rather than FP8.</li>
-    <li><b>Galaxy per-chip numbers.</b> Earlier versions of the Galaxy page listed 14 GT/s memory and 16 × 200 Gbps Ethernet per chip. The current page (checked 2026-10-30) lists 384 GB at 9.2 TB/s, about 288 GB/s per chip, which fits 12 GT/s, and "up to 16× 100 GbE links per ASIC", which matches the ISA. Treat older per-chip figures you find quoted elsewhere with care.</li>
+    <li><b>Wormhole FP8 peak.</b> The n150's quoted FP8 figure is 262 TFLOPS, but 72 × 4096 × 1 GHz = 295. The BLOCKFP8 (148) and FP16 (74) figures do fit 295 ÷ 2 and ÷ 4. We have no source for the 0.89 factor. The Galaxy page's 9.3 PFLOPS for 32 chips (about 291 per chip; <a href="a06-matrix-engine.html#tflops">A06</a> uses the page's per-module figure, 292) shows the same ratio against 80 × 4096 = 328, though the current page labels that figure Block FP8 rather than FP8.</li>
+    <li><b>Galaxy per-chip numbers.</b> Earlier versions of the Galaxy page listed 14 GT/s memory and 16 × 200 Gbps Ethernet per chip. The current page (checked 2026-10-30) lists 384 GB at 9.2 TB/s, about 288 GB/s per chip, which fits 12 GT/s, and "up to 16× 100 GbE links per ASIC", which matches the ISA. Treat older per-chip figures you find quoted elsewhere with care. The page keeps changing: when re-checked on 2026-11-20 it described the Blackhole Galaxy (32 Blackhole ASICs) and no longer listed any Wormhole Galaxy specifications, so the Wormhole Galaxy numbers in this chapter can no longer be confirmed there.</li>
     <li><b>Blackhole Ethernet.</b> The die has 14 tiles, and the descriptor lists all 14. The ISA says 12 are usable, 8 are wired to the p150's four QSFP-DD ports, and each port is a pair of tiles running at 800G. ttsim marks E12 and E13 as harvested (<code>ETH_LIVE_STATUS_MASK 0x0FFF</code>).</li>
   </ul>
 
@@ -294,7 +300,7 @@ logical (11,9) -&gt; virtual/translated (14,11)</code></pre>
     <tr><td><b>p150a / p150b</b></td><td>1 Blackhole</td><td class="warn">120 (docs) or 140 (ISA) ⚠</td><td>32 GB, 512 GB/s</td><td>300 W; 4× QSFP-DD 800G. "a" is actively cooled, "b" is passive for racks.</td></tr>
     <tr><td><b>Galaxy</b> (Wormhole server)</td><td>32 Wormhole</td><td>2,560 (80 per chip, none harvested)</td><td>384 GB</td><td>An Ethernet mesh of 32 chips. tt-metal layout "galaxy" (0 harvested rows), and ttsim's 32-chip mask is 0.</td></tr>
   </table>
-  <p>Product numbers come from the docs.tenstorrent.com spec pages and tenstorrent.com/hardware/galaxy, checked on 2026-10-30.</p>
+  <p>Product numbers come from the docs.tenstorrent.com spec pages and tenstorrent.com/hardware/galaxy, checked on 2026-10-30 (the Galaxy page has since changed; see the conflicts above).</p>
 
   <h2 id="ttsim">What ttsim builds</h2>
   <p>The simulator hard-codes the same geometry. If you read <code>ttsim/src</code>, these are the constants that set up the map you just explored:</p>

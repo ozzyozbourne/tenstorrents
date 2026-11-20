@@ -163,7 +163,7 @@
   <!-- ============================================================ -->
   <h2 id="systolic">A second lineage: systolic arrays and the TPU</h2>
 
-  <p>In 1982, H. T. Kung asked how a special-purpose chip could compute faster than its memory could feed it. His answer was the <b>systolic array</b>: a grid of simple cells through which data "pulses" rhythmically, "much as blood circulates to and from the heart". The point is reuse: "once a data item is brought out from the memory it can be used effectively at each cell it passes while being 'pumped' from cell to cell" (Kung, <i>Why Systolic Architectures?</i>, IEEE Computer 1982). Kung's paper even names matrix multiplication as the archetypal compute-bound problem, since "every entry in a matrix is multiplied by all entries in some row or column".</p>
+  <p>In 1982, H. T. Kung asked how a special-purpose chip could compute faster than its memory could feed it. His answer was the <b>systolic array</b>: a grid of simple cells through which data "pulses" rhythmically, "much as blood circulates to and from the heart". The point is reuse: "once a data item is brought out from the memory it can be used effectively at each cell it passes while being 'pumped' from cell to cell" (Kung, <i>Why Systolic Architectures?</i>, IEEE Computer 1982). Kung's paper even gives matrix multiplication as its example of a compute-bound problem, since "every entry in a matrix is multiplied by all entries in some row or column".</p>
   <p>Think of a bucket brigade instead of a crowd running back and forth to the well. Each bucket is fetched once and then passed hand to hand, and every hand uses it.</p>
   <p>Google's first <b>TPU</b> (Jouppi et al., ISCA 2017) put that idea into a datacenter chip:</p>
   <ul>
