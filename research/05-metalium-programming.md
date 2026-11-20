@@ -28,7 +28,7 @@
   - `ComputeConfig{.math_fidelity=HiFi4 default, .fp32_dest_acc_en, .dst_full_sync_en, .math_approx_mode, .compile_args, .defines}` (kernel_types.hpp:106-134)
 - **Circular buffers.**
   - `CreateCircularBuffer(program, core, CircularBufferConfig(n*tile_bytes, {{cb_idx, tt::DataFormat::Float16_b}}).set_page_size(cb_idx, tile_bytes))`
-  - Up to 32 CBs. Two tiles per CB gives double buffering.
+  - Up to 32 CBs on Wormhole, 64 on Blackhole (hw/inc/api/circular_buffer_constants.h:14-27). Two tiles per CB gives double buffering.
   - `.set_globally_allocated_address(*l1_buf)` makes a sharded buffer act as a CB without copying.
 - **Args.**
   - Runtime args: `SetRuntimeArgs` on the host, `get_arg_val<uint32_t>(i)` on the device.
@@ -88,7 +88,7 @@
   }
   ```
   (hw/inc/api/compute/eltwise_binary.h:266-275)
-- **Dst handshake.** `tile_regs_acquire` (MATH waits) → `commit` (MATH posts semaphore MATH_PACK) → `wait` (PACK SEMWAITs) → `release` (PACK frees; ZEROACC in full-sync mode). Dst capacity:
+- **Dst handshake.** `tile_regs_acquire` (MATH waits) → `commit` (MATH posts semaphore MATH_PACK) → `wait` (PACK SEMWAITs) → `release` (PACK does STALLWAIT, a ZEROACC of the section it just packed in both sync modes (CLR_ALL in full sync, CLR_HALF in half sync; llk_pack_common.h:58-83), then SEMGET). Dst capacity:
 
   | | 16-bit | 32-bit |
   |---|---|---|
@@ -153,7 +153,11 @@
 
 ## JIT build
 - Kernels are compiled at runtime with SFPI `riscv-tt-elf-g++`. CPU flags: `-mcpu=tt-wh-tensix` for compute, `tt-wh` for data movement.
-- Cache: `~/.cache/tt-metal-cache/<build_key>/kernels/<hash>`. Override with `TT_METAL_CACHE`; force recompilation with `TT_METAL_FORCE_JIT_COMPILE`.
+- Cache: `~/.cache/tt-metal-cache/<build_key>/kernels/<kernel name>/<hash>/` (firmware in `<build_key>/firmware/`, precompiled headers in a sibling `pch/`). Override the root with `TT_METAL_CACHE` (the tree is then `$TT_METAL_CACHE/tt-metal-cache<build_key>/...`, with no slash before the key); force recompilation with `TT_METAL_FORCE_JIT_COMPILE`.
+  - `<build_key>` covers arch, compiler flags, defines and compiler version (jit_build/build.cpp:539-558), so turning DPRINT or Watcher on or off selects a different tree and rebuilds the firmware once.
+  - `<hash>` is `KernelCompileHash` (impl/program/kernel_compile_utils.cpp:23-32): build key, CB descriptors and `Kernel::compute_hash`, which hashes the **resolved source path** (impl/kernels/kernel.cpp:832), compile-time args, defines and config. It does not hash the file's contents.
+  - Content edits are caught separately by `.dephash` files beside each object and ELF: a list of every source and header with a content hash, checked on each run (jit_build/depend.cpp). An edited file is rebuilt in place in the same `<hash>` directory.
+  - Verified on ttsim (round 2): overlay copy of `reader_writer_add_in_riscv.cpp` → second `<hash>` directory, 8/9 hits; editing that copy in place → no new directory, 8/9 hits again; rerun → 9/9; `TT_METAL_DPRINT_CORES=0,0` → new `<build_key>` tree, 0/9 once.
 - Compile-time args are passed as `-DKERNEL_COMPILE_TIME_ARGS`.
 
 ## Links

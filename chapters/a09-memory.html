@@ -122,7 +122,7 @@ dram_view_size:
     <tr><td>NoC tile (x-y)</td><td>0-11</td><td>0-1</td><td>0-5</td><td>0-7</td><td>5-1</td><td>5-11</td><td>5-2</td><td>5-9</td><td>5-8</td><td>5-3</td><td>5-5</td><td>5-7</td></tr>
     <tr><td>Offset</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td><td>0</td><td>1 GiB</td></tr>
   </table>
-  <p>Blackhole is simpler. It has 8 controllers and 8 banks of 4080 MiB each (<code>dram_bank_size: 4278190080</code> in <code>blackhole_140_arch.yaml</code>), with no split into two views. The p150 has 32 GB of GDDR6 on a 256-bit bus at 16 GT/s, for 512 GB/s according to the <a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole spec page</a>.</p>
+  <p>Blackhole is simpler. It has 8 controllers and 8 banks of 4080 MiB each (<code>dram_bank_size: 4278190080</code> in <code>blackhole_140_arch.yaml</code>), with no split into two views. The <a href="https://docs.tenstorrent.com/aibs/blackhole/index.html#specifications">Blackhole spec table</a> lists the p150a and p150b with "32 GB GDDR6", "16 GT/sec" and "512 GB/sec" (the p100a has 28 GB and 448 GB/sec). The table gives no bus width. 512 GB/s at 16 GT/s works out to 32 bytes per transfer, so 256 data bits, which would be sixteen 16-bit channels, two per controller as on Wormhole; that last step is my arithmetic, not a vendor statement.</p>
   <div class="callout warn"><b>Sources disagree on "how many DRAM banks does Wormhole interleave over?"</b> The kernel-developer guide's figure says a 64-tile buffer "round-robins across the 6 DRAM controllers" (<code>memory_for_kernel_developers.rst:216</code>). The allocator report says "on Wormhole there are 12 ~1GB DRAM banks" (<code>tech_reports/memory/allocator.md:21</code>). The code follows the allocator: <code>num_dram_channels = soc_desc.get_num_dram_views()</code> (<code>l1_banking_allocator.cpp:236</code>), and the simulator run below printed <code>DRAM banks=12</code>. Consecutive pages therefore alternate between the two GDDR6 channels of one controller before moving to the next controller. So both statements are true in a sense: pages 0 and 1 hit controller 0, and pages 0–11 together touch all 6 controllers.</div>
   <p>And ttsim? It models the memory per <i>controller</i>, not per bank. Each simulated chip gets one anonymous <code>mmap</code> per controller, and a comment admits the shortcut:</p>
   <div class="filename">ttsim/src/config.h:14,35 and src/sim.cpp:37 @b3620244</div>
@@ -293,6 +293,7 @@ distributed::DeviceLocalBufferConfig input_dram_config{
 0:0-1:BR: Core (0,1): 10 12 14 16 
 Program finished successfully.
 [8280] 0.5 seconds (16.7 KHz)</code></pre>
+  <p>(The values repeat on every run. The order of the four <code>BR:</code> lines and the clock count do not, because DPRINT is on: three re-runs printed the cores in three different orders and ended at <code>[12987]</code>, <code>[5735]</code> and <code>[5691]</code>. Without <code>TT_METAL_DPRINT_CORES</code> the example prints no core lines and ends at <code>[4619]</code>.)</p>
   <p>Core (0,1) asked for sticks 2 and 3, which means banks 2 and 3: two reads to two different DRAM tiles for 8 bytes of data. That is the price of interleaving with tiny pages. The prints arrive out of order because the four cores run concurrently, and nothing orders their DPRINT output.</p>
 
   <h2 id="sharding">Sharding: putting data where the work is</h2>
@@ -528,6 +529,7 @@ L1 height-sharded  addr=0x16c000 layout=TensorMemoryLayout.HEIGHT_SHARDED match=
 L1 width-sharded   addr=0x16a000 layout=TensorMemoryLayout.WIDTH_SHARDED match=True
 shard spec: ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":3,"y":0}], shape=[32, 128], orientation=ShardOrientation::ROW_MAJOR}
 [5429] 3.3 seconds (1.7 KHz)</code></pre>
+  <p>(This script is not in the workbench. To run it yourself, put the excerpt between <code>device = ttnn.open_device(device_id=0)</code> and <code>ttnn.close_device(device)</code>, keep the three tensors alive in a list, and run it with <code>python</code> from tt-metal's <code>python_env</code> after sourcing <code>env.sh</code>. The workbench's <code>py/a18_shard.py</code>, used in A18, is a fuller shipped script on the same theme. This output is from the original run; it has not been repeated since.)</p>
   <p>The addresses tell the allocator's story, which the sidebar explains. The DRAM tensor sits at the very bottom of free DRAM, at the same 0x2d4c40 as d0 in the C++ probe. The height-sharded tensor sits 8 KiB below the top of L1 (0x16E000 − 0x2000): one 4-tile shard per core. The width-sharded tensor is allocated while the height-sharded one is still alive, so it lands another 8 KiB lower.</p>
 
   <h3>Why it matters: the numbers</h3>
@@ -700,7 +702,14 @@ uint64_t allocatable_l1_size =
   <p>On one chip there is at least a common <i>naming</i> scheme, (x, y, address), and any core can reach any tile through the NoC. Between chips even that is gone. "In a multichip system, there is no concept of shared memory or global addressability across chips for Wormhole or Blackhole" (<code>tech_reports/EthernetMultichip/BasicEthernetGuide.md:188</code>). Only Ethernet cores can send across a link, and only into the L1 of the Ethernet core at the other end. Longer routes are relayed hop by hop. So a tensor "on" a two-chip n300 is really two tensors, one per chip, each allocated by its own allocator with its own lockstep addresses. Keeping them consistent is the job of collective operations that software issues explicitly. ttsim mirrors this: each simulated chip has its own <code>ChipState</code> with its own <code>dram[]</code> mmaps (<code>src/sim.h:572-582</code>), and nothing is shared. <a href="a21-many-chips.html">A21</a> builds meshes and collectives on top of this.</p>
 
   <h2 id="sim">In the simulator</h2>
-  <p>Every address on this page came from runs in this orb, against ttsim's Wormhole model. Besides the two stock examples, I wrote a small probe host program (<code>sim-labs/workbench/host/a09_memmap.cpp</code>, built with <code>build_host.sh</code> in about 6 s). It opens the device, prints the allocator's view of the banks, allocates a few buffers and dumps the sharded page mappings. Its first lines:</p>
+  <p>Every address on this page came from runs in this orb, against ttsim's Wormhole model. Besides the two stock examples, I wrote a small probe host program (<code>sim-labs/workbench/host/a09_memmap.cpp</code>, built with <code>build_host.sh</code> in about 6 to 11 s). It opens the device, prints the allocator's view of the banks, allocates a few buffers and dumps the sharded page mappings. To build and run it (workbench setup is in <a href="../sim-labs/b00-workbench.html">B00</a>):</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/a09
+source $W/env.sh wh                                   # or bh; cds into $LAB_HOME/run
+mkdir -p $LAB_HOME/host &amp;&amp; cp $W/host/a09_memmap.cpp $LAB_HOME/host/
+$W/build_host.sh $LAB_HOME/host/a09_memmap.cpp        # once; the same binary serves wh and bh
+$LAB_HOME/host/a09_memmap</code></pre>
+  <p>Its first lines:</p>
   <div class="filename">$ $LAB_HOME/host/a09_memmap   # ttsim, Wormhole (trimmed)</div>
 <pre><code>DRAM banks=12 bank_size=1021 MiB alignment=32 B
 L1 banks=64 bank_size=1393056 B (1360 KiB) of worker_l1_size=1499136 B, alignment=16 B
@@ -717,7 +726,7 @@ worker logical (0,0) (3,0) (0,3) (7,7) -&gt; virtual 18-18 21-18 18-21 25-25
 DRAM interleaved: d0 (1 page) @0x2d4c40, d1 (14 pages) @0x2d5440, d2 (1 page) @0x2d6440
 L1 interleaved:   l0 (1 page) @0x16d800, l1 (100 pages) @0x16c800, l2 (1 page) @0x16c000
 [4179] 0.1 seconds (29.8 KHz)</code></pre>
-  <p>Notes on reading this. The 1021 MiB per DRAM bank is 1 GiB minus the reserved 0x2d4c40 at the bottom. Wormhole's DRAM tiles have identical virtual and NoC 0 coordinates, but its Tensix cores use the translated range 18–25 (A08), so the probe cannot show their physical tiles directly. ttsim's Wormhole <code>soc_descriptor.yaml</code> lists no harvested workers (<code>harvested_workers: []</code>), so the hop figures above use the unharvested physical layout, with logical (0,0) at NoC tile (1,1). On a harvested n150 or n300 the rows shift, and so do the hop counts. On Blackhole (<code>env.sh bh</code>) the same probe prints <code>DRAM banks=8 bank_size=4074 MiB alignment=64 B</code> and <code>L1 banks=110</code>, and every bank's offset is 0 because there is no two-view split.</p>
+  <p>Notes on reading this. The 1021 MiB per DRAM bank is 1 GiB minus the reserved 0x2d4c40 at the bottom. Wormhole's DRAM tiles have identical virtual and NoC 0 coordinates, but its Tensix cores use the translated range 18–25 (A08), so the probe cannot show their physical tiles directly. ttsim's Wormhole <code>soc_descriptor.yaml</code> lists no harvested workers (<code>harvested_workers: []</code>), so the hop figures above use the unharvested physical layout, with logical (0,0) at NoC tile (1,1). On a harvested n150 or n300 the rows shift, and so do the hop counts. On Blackhole (<code>env.sh bh</code>) the same probe prints <code>DRAM banks=8 bank_size=4074 MiB alignment=64 B</code> and <code>L1 banks=110 bank_size=1460864 B (1426 KiB) of worker_l1_size=1572864 B</code> on an 11×10 compute grid, and every bank's offset is 0 because there is no two-view split. The buffer addresses move too (<code>d0</code> at <code>0x593e80</code>, the sharded buffers at <code>0x17c800</code>), but the page-to-core lists of all four sharding modes are identical to Wormhole's.</p>
   <div class="callout sim">To reproduce and break these mechanisms yourself: <a href="../sim-labs/b05-noc-and-dram.html">B05, NoC transactions, DRAM and the alignment trap</a> logs every NoC transfer of a DRAM loopback (watch the page-to-bank arithmetic happen) and misaligns a read so that both ttsim and Watcher catch it. <a href="../sim-labs/b11-ttnn-on-sim.html">B11, TT-NN on the simulator</a> goes further with ttnn memory configs, sharding and <code>dump_device_memory_state</code>.</div>
   <div class="callout warn">ttsim is functional, not a timing model. It gets every byte to the right address, and it will flag undefined behaviour such as misaligned NoC transfers. It cannot show you the 190 versus 240 GB/s difference, NoC congestion, or bank conflicts inside L1. Use it to check <i>where</i> data goes, not how fast it gets there.</div>
 
@@ -754,7 +763,7 @@ L1 interleaved:   l0 (1 page) @0x16d800, l1 (100 pages) @0x16c800, l2 (1 page) @
     <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md">METALIUM_GUIDE.md</a>: the "Where is the cache hierarchy" section on why there is none.</li>
     <li><a href="https://supermina999.github.io/sharding-visual/">Sharding visualiser</a>: an interactive tool for trying shard shapes and grids.</li>
     <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/EthernetMultichip/BasicEthernetGuide.md">Basic Ethernet multichip guide</a>: no shared memory across chips, and how ERISC cores move data.</li>
-    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole card specifications</a>: GDDR6 capacity, speed and bandwidth per card.</li>
+    <li><a href="https://docs.tenstorrent.com/aibs/blackhole/index.html#specifications">Blackhole card specifications</a>: GDDR6 capacity, speed and bandwidth per card.</li>
   </ul>
 
   <div class="pager"><a href="a08-noc.html">&larr; 08 The Network-on-Chip</a><a class="next" href="a10-first-program.html">10 Your first TT-Metalium program &rarr;</a></div>

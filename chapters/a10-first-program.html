@@ -719,7 +719,7 @@ Success: Result is 21</code></pre>
   <h3>The hello-world kernels</h3>
 <pre><code>TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_datamovement_kernel
 TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_compute_kernel</code></pre>
-  <p>The outputs are shown in the DPRINT section above. Without <code>TT_METAL_DPRINT_CORES</code>, the compute example prints its <code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES…</code> lines, no TR lines at all, and finishes at <code>[4385]</code> clocks instead of roughly 5100–6600 (<code>[6520]</code> on one run; with DPRINT on the count varies with host polling). With DPRINT on and a warm cache (10/10 and 11/11 hits), each took about 1.0–1.1 s of wall time. I did not break down why that is longer than the add example's 0.36 s.</p>
+  <p>The outputs are shown in the DPRINT section above. Without <code>TT_METAL_DPRINT_CORES</code>, the compute example prints its <code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES…</code> lines, no TR lines at all, and finishes at <code>[4385]</code> clocks instead of anything from about 5000 to 9200 (<code>[6520]</code> on one run, and 9156, 5038 and 5140 on three re-runs; with DPRINT on the count varies with host polling and is highest on the run that also compiles). With DPRINT on and a warm cache (10/10 and 11/11 hits), each took about 1.0–1.1 s of wall time. I did not break down why that is longer than the add example's 0.36 s.</p>
 
   <h2 id="recap">Recap</h2>
   <ul>
