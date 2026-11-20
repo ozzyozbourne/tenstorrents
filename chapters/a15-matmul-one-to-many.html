@@ -612,7 +612,7 @@ CircularBufferConfig cb_output_config = CircularBufferConfig(out_CB_size, output
 
   <h2 id="sim">In the simulator: counting every DRAM byte</h2>
   <p>All three examples run unchanged on ttsim (Wormhole build, slow dispatch). I ran each from <code>$LAB_HOME/run</code>:</p>
-  <div class="filename">$ export LAB_HOME=$HOME/ttlab/a15; source sim-labs/workbench/env.sh wh; $EX/metal_example_matmul_single_core   # then _multi_core, _multicore_reuse (info lines trimmed)</div>
+  <div class="filename">$ W=/path/to/tenstorrent-from-zero/sim-labs/workbench; export LAB_HOME=$HOME/ttlab/a15; source $W/env.sh wh; $EX/metal_example_matmul_single_core   # then _multi_core, _multicore_reuse (info lines trimmed)</div>
 <pre><code>== matmul_single_core
 Output vector of size 409600
 Metalium vs Golden -- PCC = 0.98065174
@@ -634,7 +634,7 @@ Test Passed
 [17560] 5.5 seconds (3.3 KHz)</code></pre>
   <p>Do not compare the PCCs across examples. The inputs differ: single_core draws from [0, 1), multi_core from [−0.5, 0.5), and reuse uses fixed-seed vectors. The first two are reseeded on every run, so their PCC changes slightly between runs (0.98117, 0.98065 and 0.98099 for single_core in three of my runs). All-positive inputs with a bf16 Dst accumulate rounding error in one direction, which is why single_core has the lowest PCC (<a href="a06-matrix-engine.html">A06</a> measured this in detail). The pass thresholds are 0.97 for the first two and 0.99 for reuse.</p>
   <h3>Instrumenting ttsim to count DRAM reads</h3>
-  <p>The read counts in this chapter came from reading loops. To check them independently, I patched a copy of ttsim (made with <code>build_ttsim.sh dramcount wh</code>). Every NoC read command whose source is a DRAM tile adds its length to a per-core counter, and the totals print when the simulator exits. The patch is one line in the read path of <code>noc_cmd_ctrl</code> plus a dump function called from <code>ttsim_exit</code>. It is saved as <a href="../sim-labs/patches/a15-dram-read-count.patch"><code>sim-labs/patches/a15-dram-read-count.patch</code></a>:</p>
+  <p>The read counts in this chapter came from reading loops. To check them independently, I patched a copy of ttsim (<code>$W/build_ttsim.sh dramcount wh</code>, then <code>patch -p1 -d $LAB_HOME/ttsim-dramcount &lt; $W/../patches/a15-dram-read-count.patch</code>, then <code>build_ttsim.sh</code> again; <code>W</code> is your checkout's <code>sim-labs/workbench</code> as an absolute path). Every NoC read command whose source is a DRAM tile adds its length to a per-core counter, and the totals print when the simulator exits. The patch is one line in the read path of <code>noc_cmd_ctrl</code> plus a dump function called from <code>ttsim_exit</code>. It is saved as <a href="../sim-labs/patches/a15-dram-read-count.patch"><code>sim-labs/patches/a15-dram-read-count.patch</code></a>:</p>
   <div class="filename">ttsim/src/tile.cpp, inside noc_cmd_ctrl's read branch @b3620244 (patched copy)</div>
 <pre><code>if (src_tile_type == 'D') { // DRAM -&gt; L1
     if (tile_type == 'T') { a15_dram_rd_bytes[tile_id] += noc_at_len_be; a15_dram_rd_cmds[tile_id]++; }</code></pre>
