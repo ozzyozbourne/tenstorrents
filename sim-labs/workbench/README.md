@@ -53,7 +53,8 @@ $EX/metal_example_add_2_integers_in_riscv     # Success: Result is 21, [4501] cl
 Compiles and links one host program out of tree against `$TT_METAL_HOME/build_Release`, using the
 in-tree examples' flags (about 6 s). The object and binary are written next to `file.cpp`. The flags
 contain pinned `.cpmcache/` hashes and library versions, so regenerate them from
-`build_Release/build.ninja` if you move the tt-metal pin. Needs `clang++-20`.
+`build_Release/build.ninja` if you move the tt-metal pin. Needs `clang++-20`. `-lnsl` is passed only when
+the compiler can find `libnsl.so` (Debian 12 has it, Ubuntu 24.04 does not), which is what tt-metal's own link line does.
 
 ```bash
 cp $W/host/mm_fid.cpp $LAB_HOME/ && $W/build_host.sh $LAB_HOME/mm_fid.cpp
@@ -71,6 +72,9 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 
 - `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=0|2|3|4` (numeric: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; names silently mean LoFi) and `MM_SEED`;
   prints `mean_abs_err` and `result_hash`.
+- `host/gridinfo.cpp` (chapter A03): opens one device and prints `grid_size`, `logical_grid_size`, the compute grid,
+  `dram_grid_size` and `worker_core_from_logical_core()` for four logical cores. On `wh` the first line is
+  `grid_size            = 10x12` and logical (0,0) maps to (18,18); on `bh` it is `17x12` and (1,2).
 - `host/run_twice.cpp` (chapter A12): the stock `add_2_integers_in_compute` host program with the enqueue run twice on the same core;
   prints `run 1 finished`, `run 2 finished`, then the usual result check. Pair it with a kernel overlay.
 - `host/b06_scale_add.cpp` + `kernels/b06/{reader,compute,writer}.cpp` (lab B06): out = relu(a + b) over N bf16 tiles

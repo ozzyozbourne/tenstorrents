@@ -62,7 +62,7 @@ $W/build_ttsim.sh trace wh</code></pre>
 <pre class="out"><code>ttsim lab env: ARCH=wh SIM=/home/user/sim/wh/libttsim_wh.so cwd=/home/user/ttlab/b04/run
 copied ttsim source to /home/user/ttlab/b04/ttsim-trace (edit files in /home/user/ttlab/b04/ttsim-trace/src/)
 export TT_METAL_SIMULATOR=/home/user/ttlab/b04/sim-trace-wh-release/libttsim.so</code></pre>
-  <p>The edits go in <code>$LAB_HOME/ttsim-trace/src/</code>. Three patches are saved next to this page: <a href="patches/b04-trace.patch"><code>patches/b04-trace.patch</code></a> (step 1), <a href="patches/b04-mop.patch"><code>patches/b04-mop.patch</code></a> (step 3, applied on top of the first) and <a href="patches/b04-mm-small.patch"><code>patches/b04-mm-small.patch</code></a> (step 4, a smaller matmul host program). Apply them with <code>patch -p1</code> from the root of the ttsim copy (from <code>$LAB_HOME</code> for the third). We checked that applying the first two to pristine <code>b3620244</code> sources gives exactly the files we built.</p>
+  <p>The edits go in <code>$LAB_HOME/ttsim-trace/src/</code>. Three patches are saved next to this page: <a href="patches/b04-trace.patch"><code>patches/b04-trace.patch</code></a> (step 1), <a href="patches/b04-mop.patch"><code>patches/b04-mop.patch</code></a> (step 3, applied on top of the first) and <a href="patches/b04-mm-small.patch"><code>patches/b04-mm-small.patch</code></a> (step 3, a smaller matmul host program). Apply them with <code>patch -p1</code> from the root of the ttsim copy (from <code>$LAB_HOME</code> for the third). We checked that applying the first two to pristine <code>b3620244</code> sources gives exactly the files we built.</p>
 
   <h2 id="trace">Step 1: An opcode trace for one tile</h2>
   <h3>Where does an instruction "execute"?</h3>
@@ -170,7 +170,8 @@ export TT_METAL_SIMULATOR=/home/user/ttlab/b04/sim-trace-wh-release/libttsim.so<
   <div class="callout gpu">This is the moral equivalent of running a GPU kernel under an instruction-level tracer (think SASS-level tracing in a simulator such as GPGPU-Sim, or binary instrumentation with NVBit) and post-processing with the ISA tables. The difference is how small it is. The whole Tensix frontend and backend of ttsim fit in one 6000-line file, and our hook is one function.</div>
 
   <h2 id="stream">Step 2: One tile, three instruction streams</h2>
-<pre><code>$W/build_ttsim.sh trace wh
+<pre><code>(cd $LAB_HOME/ttsim-trace &amp;&amp; patch -p1 &lt; $W/../patches/b04-trace.patch)    # the step 1 patch
+$W/build_ttsim.sh trace wh
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-trace-wh-release/libttsim.so
 export TTSIM_HOME=~/ttsim            # where b04_trace.py finds data/wh/tensix_isa.json
 B04_OUT=$LAB_HOME/add.trace $EX/metal_example_add_2_integers_in_compute
@@ -396,7 +397,7 @@ X     4531   4409 T2 a5000008 SEMGET     MATH_PACK
 +            b04_ev('Y', p_tensix, pipe, p_tensix-&gt;replay_buf[pipe][p_tensix-&gt;replay_play_index[pipe]]);
  ...                                                     (in tensix_push_inst)
 +    b04_ev('P', p_tensix, pipe, inst, bypass_mop_expander ? " 1" : " 0");</code></pre>
-  <p>Rebuild, rerun (the result and the 4682 clocks are unchanged), and ask for the MOPs:</p>
+  <p>Apply it on top of the first (<code>(cd $LAB_HOME/ttsim-trace &amp;&amp; patch -p1 &lt; $W/../patches/b04-mop.patch)</code>), rebuild with <code>$W/build_ttsim.sh trace wh</code>, rerun the same <code>B04_OUT=... $EX/metal_example_add_2_integers_in_compute</code> line (the result and the 4682 clocks are unchanged; the trace now has 314 lines, 151 of them <code>X</code>), and ask for the MOPs:</p>
 <pre class="out"><code>$ python3 $W/py/b04_trace.py mops $LAB_HOME/add.trace
 T1 clock 4325 round 4116: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=4 inner=2
       start=NOP end0=SETRWC end1=NOP loop=ELWADD loop1=NOP last0=ELWADD last1=ELWADD
@@ -552,7 +553,7 @@ T0 clock 4531 round 4384: MOP 01800000  type=1 loop_count=0 zmask_lo=0x0  outer=
 +        constexpr uint32_t M = 64;  // B04: 2x2 tiles, so the trace stays small
 +        constexpr uint32_t N = 64;  // B04: 2x2 tiles, so the trace stays small
 +        constexpr uint32_t K = 64;  // B04: 2x2 tiles, so the trace stays small</code></pre>
-<pre><code>cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; (cd $LAB_HOME &amp;&amp; patch -p1 -o mm_small.cpp mm_fid.cpp &lt; .../patches/b04-mm-small.patch)
+<pre><code>cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; (cd $LAB_HOME &amp;&amp; patch -p1 -o mm_small.cpp mm_fid.cpp &lt; $W/../patches/b04-mm-small.patch)
 $W/build_host.sh $LAB_HOME/mm_small.cpp
 MM_FIDELITY=4 MM_SEED=42 B04_OUT=$LAB_HOME/mm4.trace $LAB_HOME/mm_small
 MM_FIDELITY=0 MM_SEED=42 B04_OUT=$LAB_HOME/mm0.trace $LAB_HOME/mm_small</code></pre>

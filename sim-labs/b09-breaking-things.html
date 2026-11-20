@@ -509,7 +509,7 @@ core(x= 0,y= 1) virtual(x=18,y=19): CWFW, NSW,   W,   W,   W  rmsg:H1G|BNt h_id:
   <p>Core (0,0)'s BRISC (writer0) is in <code>noc_semaphore_wait</code> (<code>NSW</code>, <code>dataflow_api.h:2115</code>) for the "ready" that was deleted. Core (0,1)'s NCRISC (reader1) is in its own <code>NSW</code>, waiting for "data sent", which writer0 will never send. Its BRISC (writer1) waits on the CB that reader1 would have filled (<code>CWFW</code>). The <code>k_ids</code> lines map each column to a kernel file (<code>2|1</code> and <code>4|3</code>; file names at the end of each dump). It is a circular wait across two cores, and the waypoints show it directly.</p>
 
   <h2 id="lldb">6. Debugging the simulator itself with lldb</h2>
-  <p>The UB in section 3.4 printed "access past end of tensix_sram", with no address and no core. When a message is not enough, debug the simulator. Its source is in the workbench, and lldb-20 is installed (gdb is not). Build a debug copy:</p>
+  <p>The UB in section 3.4 printed "access past end of tensix_sram", with no address and no core. When a message is not enough, debug the simulator. Its source is in the workbench, and lldb-20 is installed (gdb is not) on the machine these sessions were recorded on. Any recent lldb will do: a re-run with lldb 18 (plain <code>lldb</code> in place of <code>lldb-20</code>) printed the same frames and values, apart from code addresses inside <code>libttsim.so</code>. Build a debug copy:</p>
   <div class="filename">ttsim/src/rules.py:33-36 @b3620244</div>
 <pre><code>    config_compile_opts = {
         'debug': ['-g', '-Og', '-DDEBUG'],
