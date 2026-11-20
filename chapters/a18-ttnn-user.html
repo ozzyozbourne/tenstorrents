@@ -539,7 +539,7 @@ matmul  64x128@128x96 PCC 0.999984  mean|err| 0.0472  shape Shape([64, 96])
 softmax 32x64     PCC 0.999722  row sums [0.9995536804199219, 1.000579833984375, 0.9993896484375]</code></pre>
   <p>The same script on the Blackhole build of ttsim prints identical numbers. How should you read them? <a href="a05-tiles-and-formats.html#pcc">A05</a> defined PCC, the Pearson correlation between the device result and a torch reference; it checks the <em>shape</em> of the answer but not its scale, so pair it with an absolute error. The LLM tech report asks for a PCC of about 0.999 for small submodules such as an MLP, about 0.998 for a decoder layer and about 0.99 for the full model (<code>tech_reports/LLMs/llms.md:1665-1666</code>).</p>
   <ul>
-    <li>The <b>add</b> is not bit-identical to torch's bfloat16 add. The largest error, 0.0312, is one bfloat16 step for values between 4 and 8. Both sides round to bfloat16, and the research notes for this series found about 12% of elements one ulp apart on a 32×32 add, so expect PCC near, but not at, 1.</li>
+    <li>The <b>add</b> is not bit-identical to torch's bfloat16 add. The largest error, 0.0312, is one bfloat16 step for values between 4 and 8. Both sides round to bfloat16, and <a href="a05-tiles-and-formats.html#pcc">A05</a>'s 32×32 add found 108 of 1,024 elements (about 11%) one ulp apart, so expect PCC near, but not at, 1.</li>
     <li>The <b>matmul</b> accumulates 128 products per output. Its error depends on the fidelity and on how the accumulator is rounded, the subject of the next section.</li>
     <li><b>softmax</b> uses the SFPU's exponential (A07) in an approximate mode by default for bfloat16 inputs, and the rows sum to 1 only within about 0.1%.</li>
   </ul>
@@ -617,15 +617,16 @@ fp32_dest_acc_en=False MathFidelity.HiFi4   mean|err| 0.10931  max|err| 0.9344
 
   <h2 id="path">From ttnn.add down to the kernels</h2>
   <p>What actually runs when you call <code>ttnn.add(ta, tb)</code>? To find out without reading every layer, give the run its own kernel cache directory (<code>TT_METAL_CACHE</code>) so it starts empty, call add three times, and list what got compiled (<code>a18_addpath.py</code>):</p>
-<pre><code>ttnn.add call 1: 1.13 s wall   program cache entries: 1
+<pre><code>ttnn.add call 1: 1.85 s wall   program cache entries: 1
 ttnn.add call 2: 0.01 s wall   program cache entries: 1
 ttnn.add call 3: 0.01 s wall   program cache entries: 1
-eltwise_binary_no_bcast/10083976056017848008/trisc0
-eltwise_binary_no_bcast/10083976056017848008/trisc1
-eltwise_binary_no_bcast/10083976056017848008/trisc2
-reader_interleaved_no_bcast/10456270060302663221/ncrisc
-writer_interleaved_no_bcast/2689147808996234265/brisc</code></pre>
-  <p>Three kernels, five binaries: a reader on NCRISC, a compute kernel compiled three times for TRISC0/1/2, a writer on BRISC. That is exactly the shape of the program you wrote by hand in <a href="a11-dataflow-and-cbs.html">A11</a>–<a href="a12-compute-kernels.html">A12</a>. The first call paid for compilation. When the device closes, tt-metal's log reports <code>JIT cache stats: 0/13 hits (0.0%)</code>: besides these five binaries, the cold cache also had to build the firmware (seven images, one per RISC-V type, in <code>$TT_METAL_CACHE/*/firmware/</code>). Five plus seven is twelve, not thirteen: the statistic counts compiled source files, not images (<code>tt_metal/jit_build/build.cpp:925</code> records <code>srcs_.size()</code>), and by my reading of the source the Wormhole active-Ethernet firmware is built from two of them, <code>erisc.cc</code> and <code>erisc-crt0.cc</code> (<code>wh_hal.cpp:176-177</code>). The firmware is built when the device opens and the five kernel binaries on the first call; the next two calls found the program in the program cache and only had to run it. The animation follows the call down the stack. <a href="a19-op-anatomy-compilers.html">A19</a> opens each box.</p>
+eltwise_binary_no_bcast/755991111188418639/trisc0
+eltwise_binary_no_bcast/755991111188418639/trisc1
+eltwise_binary_no_bcast/755991111188418639/trisc2
+reader_interleaved_no_bcast/2340265801235945965/ncrisc
+writer_interleaved_no_bcast/8401048097862775217/brisc</code></pre>
+  <p>The wall times change from run to run and with the machine's load (1.1 s to 1.9 s for the first call here). The long numbers are the hashes tt-metal computes for each kernel build; they stay the same from run to run on one installation but differ between installations and between Wormhole and Blackhole, so expect other digits.</p>
+  <p>Three kernels, five binaries: a reader on NCRISC, a compute kernel compiled three times for TRISC0/1/2, a writer on BRISC. That is exactly the shape of the program you wrote by hand in <a href="a11-dataflow-and-cbs.html">A11</a>–<a href="a12-compute-kernels.html">A12</a>. The first call paid for compilation. When the device closes, tt-metal's log reports <code>JIT cache stats: 0/13 hits (0.0%)</code>: besides these five binaries, the cold cache also had to build the firmware (seven images, one per RISC-V type, in <code>$TT_METAL_CACHE/*/firmware/</code>). Five plus seven is twelve, not thirteen: the statistic counts compiled source files, not images (<code>tt_metal/jit_build/build.cpp:925</code> records <code>srcs_.size()</code>), and the Wormhole active-Ethernet firmware is built from two of them, <code>erisc.cc</code> and <code>erisc-crt0.cc</code> (<code>wh_hal.cpp:176-177</code>); after the run, <code>firmware/erisc/</code> is the only firmware directory with two object files, <code>erisc.o</code> and <code>erisc-crt0.o</code>. So the count is five kernel sources plus eight firmware sources. A second run on the now-warm cache logs <code>13/13 hits (100.0%)</code>. Blackhole also reports 0/13 on an empty cache, by a different sum: eight firmware images of one source each (it adds <code>active_erisc</code> and <code>subordinate_idle_erisc</code> and has no <code>erisc</code>). The firmware is built when the device opens and the five kernel binaries on the first call; the next two calls found the program in the program cache and only had to run it. The animation follows the call down the stack. <a href="a19-op-anatomy-compilers.html">A19</a> opens each box.</p>
 
   <div class="viz" id="figPath"></div>
   <script>
@@ -742,15 +743,15 @@ out = ttnn.linear(h, W2, bias=b2)</code></pre>
   <h2 id="sim">Running it in the simulator</h2>
   <div class="callout warn">ttsim is a functional, bit-exact model, not a timing model. The bracketed clock counts in its log are not silicon performance, and the wall-clock times on this page measure the simulator on this orb's CPU.</div>
   <p>Every script on this page is in the workbench's <code>py/</code> directory as <code>a18_*.py</code> and runs with the workbench from <a href="../sim-labs/b00-workbench.html">B00</a> and the Python environment of the tt-metal build:</p>
-<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # env.sh cds away, so use absolute paths
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/a18
 source $W/env.sh wh                  # or bh
 source $TT_METAL_HOME/python_env/bin/activate
-export TT_METAL_INSPECTOR=0          # avoid a port clash when several runs share the orb
+export TT_METAL_INSPECTOR=0          # avoid a port clash when several runs share one machine
 python $W/py/a18_ops.py              # also a18_pad, a18_ladder, a18_shard, a18_progcfg, a18_fid, a18_devtilize, a18_shard_edge
 export TT_METAL_CACHE=$LAB_HOME/jit &amp;&amp; rm -rf $TT_METAL_CACHE   # a18_addpath wants an empty kernel cache
 python $W/py/a18_addpath.py</code></pre>
-  <p>Every script whose output depends on random inputs seeds torch's generator, so they print the numbers on this page; only the wall times in <code>a18_addpath.py</code> change from run to run. The opening script is short enough to reproduce whole:</p>
+  <p>Every script whose output depends on random inputs seeds torch's generator, so they print the numbers on this page, PCCs included; only the wall times and the kernel hashes in <code>a18_addpath.py</code> differ (see <a href="#path">above</a>). <code>a18_fid.py</code> ends with the simulator's <code>UnsupportedFunctionality</code> error and a non-zero exit status; that is the expected result. The opening script is short enough to reproduce whole:</p>
   <div class="filename">sim-labs/workbench/py/a18_pad.py (docstring trimmed)</div>
 <pre><code>import torch, ttnn
 device = ttnn.open_device(device_id=0)

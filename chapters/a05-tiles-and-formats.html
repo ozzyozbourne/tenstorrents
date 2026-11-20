@@ -678,7 +678,7 @@ dev_q = ttnn.to_torch(ttnn.typecast(t, ttnn.bfloat8_b))</code></pre>
           -1.5         -1.5           -1.5
    0.200195312     0.203125       0.203125
 0.000999450684            0              0
-[4583] 3.3 seconds (1.4 KHz)</code></pre>
+[4583] 2.3 seconds (2.0 KHz)</code></pre>
   <p>Every difference is an exact tie. 1.0078125 has <code>Man = 129</code> at <code>Shift = 0</code>: the exact magnitude is 64.5, and ties-to-even picks 64 (1.0) while ties-away picks 65 (1.015625). 0.0078125 = 2<sup>&minus;7</sup> sits exactly 7 binades below the max: the exact magnitude is 0.5, so the host gives 0 and the device gives 1 &times; 2<sup>&minus;6</sup>, doubling the value. 1.9921875 saturates to 1.984375 on both. The figure's quantizer reproduces all 16 values in both modes.</p>
   <h3>The double rounding you get by default</h3>
   <p>There is a second packer configuration, and it is the default. Kernels have a <code>bfp8_pack_precise</code> flag that is <code>false</code> unless an op sets it (<code>tt_metal/api/tt-metalium/kernel_types.hpp:111</code>). When it is false, the JIT build picks <code>Bfp8_b</code> as the packer's intermediate format (<code>tt_metal/jit_build/data_format.cpp:329-334</code>), which the ISA describes as an early rounding "To E8M6" (BF16 with 6 mantissa bits) before the BFP conversion (<code>Packers/FormatConversion.md:14,188</code>). <code>typecast</code> to BFP8_b sets the flag to <code>true</code> (<code>ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp:42</code>; only for BFP8_b, not BFP4_b); ordinary ops such as <code>ttnn.add</code> do not. I ran a second probe, <code>sim-labs/workbench/py/bfp8_double.py</code>, that sends the same values through both (output rearranged into columns; identical on <code>wh</code> and <code>bh</code>):</p>
@@ -691,7 +691,7 @@ dev_q = ttnn.to_torch(ttnn.typecast(t, ttnn.bfloat8_b))</code></pre>
   0.2001953125  0.203125            0.1875
          -0.75  -0.75               -0.75
      0.0078125  0.015625            0
-[5325] 3.2 seconds (1.7 KHz)</code></pre>
+[5325] 2.2 seconds (2.5 KHz)</code></pre>
   <p>The interesting line is 1.9921875. In E8M6 it rounds up to 2.0, which raises the block's shared exponent by one. Every other value in the block then loses a bit, which is why 0.30078125 and 0.2001953125 move further from their true values. Pick "device packer, default" in the figure to reproduce this column. For BFP4_b and BFP2_b the device always rounds to BFP8 first and then truncates (<code>Packers/FormatConversion.md:71</code>). The host instead rounds straight to 3 or 1 bits, so host and device differ much more often for those formats. The figure's self-check includes a BFP4_b run (<code>sim-labs/workbench/py/bfp4_probe.py</code>).</p>
   <div class="callout sim">Reproduce these runs and go further, with Dst dumps, BF16 and FP32 behaviour, and a custom SFPI kernel, in <a href="../sim-labs/b08-formats-and-sfpu.html">B08: Data formats and SFPU numerics</a>. ttsim is bit-exact for these conversions, so a mismatch between your model and ttsim is a real finding. One limit: ttsim rejects stochastic rounding as out of scope (<code>src/tensix.cpp:598-603</code>), so you cannot simulate that mode.</div>
 
@@ -725,12 +725,18 @@ cal_pcc = (cov / denom).item()</code></pre>
   <div class="filename">tt-metal/tests/ttnn/unit_tests/operations/eltwise/test_binary_fp32.py:833 @7aad8aac</div>
 <pre><code>@pytest.mark.parametrize("ttnn_dtype, pcc", [(ttnn.bfloat8_b, 0.999), (ttnn.bfloat4_b, 0.97)])</code></pre>
   <p>The pattern, roughly: BF16 tests expect four nines, BFP8_b three, and BFP4_b somewhere between 0.9 and 0.98, depending on the op. Softmax with BFP8 input relaxes PCC to 0.99 and loosens <code>rtol</code>/<code>atol</code> too (<code>tests/ttnn/unit_tests/operations/fused/test_softmax.py:1178-1180</code>). Even the allclose fallback in <code>comp_pcc</code> scales with the format: for BF16 or FP16 tensors it widens the relative tolerance to 4 units of the format's epsilon, <code>max(rtol, 4 * max(sixteen_bit_eps))</code> (<code>comparison.py:78-83</code>), because "a result one ULP from the golden" would otherwise fail.</p>
-  <p>Even a plain BF16 add is not bit-identical to PyTorch. Running the workbench's 32&times;32 <code>ttnn.add</code> script on the simulated Wormhole gave:</p>
-  <div class="filename">ttnn_add.py (the 32&times;32 <code>ttnn.add</code> check described in <a href="../sim-labs/b00-workbench.html">B00</a>; the script is not shipped in this repository), run on ttsim (wh), output trimmed</div>
-<pre><code>max abs diff: 0.0078125
-elements differing from torch bf16 add: 120/1024 (bf16 rounding differences, max 1 ulp expected)
-PCC: 0.999983
-PASS</code></pre>
+  <p>Even a plain BF16 add is not bit-identical to PyTorch. The workbench script <code>a05_add.py</code> adds two 32&times;32 BF16 tensors (seeded, so the numbers repeat) with <code>ttnn.add</code> on the simulated Wormhole and compares the result with PyTorch's own BF16 add of the same inputs, and with the exact FP32 sum:</p>
+  <div class="filename">sim-labs/workbench/py/a05_add.py, run on ttsim (<code>env.sh wh</code>; the same numbers on <code>env.sh bh</code>, where the last line is <code>[6803]</code>), log lines trimmed</div>
+<pre><code>device result[0,:4]: [-2.21875, -1.2890625, -0.9296875, -1.75]
+torch  result[0,:4]: [-2.21875, -1.28125, -0.9296875, -1.75]
+max abs diff vs torch bf16 add: 0.03125
+elements differing from torch bf16 add: 108/1024
+max abs diff vs exact fp32 sum: 0.015625
+PCC vs exact fp32 sum: 0.999999
+largest difference in ulps: 1.0
+PASS
+[4881] 2.2 seconds (2.2 KHz)</code></pre>
+  <p>About one element in ten differs from PyTorch, each by exactly one unit in the last place of BF16 (the second element of the first row is one of them). The largest absolute difference, 0.03125, is one such unit for a result between 4 and 8. The PCC still rounds to 1 at six decimals, so a PCC threshold of 0.9999 passes while a bit-exact comparison fails. The seconds on the last line are wall time and change from run to run; the simulated clock count in brackets does not.</p>
   <div class="callout warn"><b>PCC is blind to some bugs.</b> It is invariant to scale and offset: a result that is exactly 2&times; the golden, or golden + 5, has PCC 1.0. And as the BFP figure showed, one large value can hold PCC above 0.9999 while fifteen others are zero. Pair PCC with a check that does see magnitude (max absolute error, <code>allclose</code>, or a comparison of norms), and look at regions as well as the whole tensor. A slice of all-zero rows hidden in a large tensor barely moves the global PCC.</div>
   <p>How do you pick a format, then? A reasonable default: keep activations in BF16, try weights in BFP8_b (half the DRAM traffic, and weights tend to have well-behaved magnitudes within a face row), and measure the model-level metric, not only per-op PCC. BFP4_b is for weights that tolerate it, usually after checking accuracy end to end. <a href="a06-matrix-engine.html">A06</a> adds the other dial, math fidelity: BFP8 operands need only 2 multiplier phases for full precision where BF16 needs 4 (<code>SrcASrcB.md:110-115</code>), so the narrower format is cheaper to compute as well as to move.</p>
 

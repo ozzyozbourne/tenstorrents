@@ -509,7 +509,7 @@ All results match expected values within tolerance.
 
   <h3>From Python</h3>
   <p>TT-NN wraps the same machinery in <code>MemoryConfig</code> and <code>ShardSpec</code>. A18 covers it properly. Here is a minimal check that runs under ttsim, putting the same 128 × 128 tensor in DRAM, then height- and width-sharded over cores (0,0)–(3,0), with a ReLU on each:</p>
-  <div class="filename">$LAB_HOME/py/shard.py (written for this chapter; excerpt: seeding, open/close_device and the final shard-spec print are omitted; run with the workbench env and python_env active)</div>
+  <div class="filename">sim-labs/workbench/py/a09_shard.py (excerpt: seeding, open/close_device, the list that keeps the tensors alive and the final shard-spec print are omitted; run with the workbench env and python_env active)</div>
 <pre><code>x = torch.randn((128, 128), dtype=torch.bfloat16)          # 4x4 tiles
 grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
 cfgs = {
@@ -528,8 +528,8 @@ for name, mc in cfgs.items():
 L1 height-sharded  addr=0x16c000 layout=TensorMemoryLayout.HEIGHT_SHARDED match=True
 L1 width-sharded   addr=0x16a000 layout=TensorMemoryLayout.WIDTH_SHARDED match=True
 shard spec: ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":3,"y":0}], shape=[32, 128], orientation=ShardOrientation::ROW_MAJOR}
-[5429] 3.3 seconds (1.7 KHz)</code></pre>
-  <p>(This script is not in the workbench. To run it yourself, put the excerpt between <code>device = ttnn.open_device(device_id=0)</code> and <code>ttnn.close_device(device)</code>, keep the three tensors alive in a list, and run it with <code>python</code> from tt-metal's <code>python_env</code> after sourcing <code>env.sh</code>. The workbench's <code>py/a18_shard.py</code>, used in A18, is a fuller shipped script on the same theme. This output is from the original run; it has not been repeated since.)</p>
+[5429] 2.0 seconds (2.7 KHz)</code></pre>
+  <p>To run it yourself, activate tt-metal's <code>python_env</code>, source <code>env.sh wh</code>, and run <code>python $W/py/a09_shard.py</code> with <code>W</code> set to the absolute path of your <code>sim-labs/workbench</code> (<code>env.sh</code> changes directory). The addresses and the final clock count <code>[5429]</code> repeat exactly; the seconds on the last line are wall time and vary. <code>py/a18_shard.py</code>, used in <a href="a18-ttnn-user.html">A18</a>, is a fuller script on the same theme.</p>
   <p>The addresses tell the allocator's story, which the sidebar explains. The DRAM tensor sits at the very bottom of free DRAM, at the same 0x2d4c40 as d0 in the C++ probe. The height-sharded tensor sits 8 KiB below the top of L1 (0x16E000 − 0x2000): one 4-tile shard per core. The width-sharded tensor is allocated while the height-sharded one is still alive, so it lands another 8 KiB lower.</p>
 
   <h3>Why it matters: the numbers</h3>
