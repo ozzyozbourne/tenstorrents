@@ -57,7 +57,7 @@
   <h2 id="setup">0. Setup</h2>
   <p>Only one multichip configuration works in this orb: ttsim's <code>wh_x2</code> build, an n300 (two Wormholes, one with PCIe), with a 2×1 mesh. tt-metal does not probe ttsim for its topology. You hand it a cluster descriptor through <code>TT_METAL_MOCK_CLUSTER_DESC_PATH</code>, as ttsim's README instructs (<code>ttsim/README.md:243-252</code>).</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/b10
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # your checkout, as an absolute path
 SIM=$HOME/sim/wh_x2/libttsim_wh_x2.so source $W/env.sh wh
 export TT_METAL_MOCK_CLUSTER_DESC_PATH=$TT_METAL_HOME/tt_metal/third_party/umd/tests/cluster_descriptor_examples/wormhole_N300.yaml
 mkdir -p $LAB_HOME/kernels/b10
@@ -204,7 +204,7 @@ time $LAB_HOME/dbrw 2&gt;&amp;1 | grep -v "| info"</code></pre>
 real    0m7.705s</code></pre>
   <p><code>bytes=33554432</code> is <code>64 * 128 * tile_size(UInt32)</code> = 8192 × 4096 bytes = 32 MiB, the <code>global_size</code> in <code>dbrw.cpp</code>. The global shape is 64×32 "datums" split into two 32×32 shards, so each chip holds 16 MiB. Chip 0's half goes straight over PCIe. Chip 1's half has to go through chip 0.</p>
   <p>To see it go, build a ttsim that logs every Ethernet transfer. The patch adds one logging function, called from the two places where ttsim moves bytes between chips: the data send (<code>ETH_TXQ_CMD</code> = 2, an L1-to-L1 copy) and the remote register write (<code>ETH_TXQ_CMD</code> = 4). It also prints each link at init.</p>
-<pre><code>P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+<pre><code>P=$W/../patches
 $W/build_ttsim.sh ethlog wh_x2           # first run copies ttsim to $LAB_HOME/ttsim-ethlog
 (cd $LAB_HOME/ttsim-ethlog &amp;&amp; patch -p1 &lt; $P/b10-ethlog.patch)
 $W/build_ttsim.sh ethlog wh_x2           # prints: export TT_METAL_SIMULATOR=$LAB_HOME/sim-ethlog-wh_x2-release/libttsim.so
@@ -276,6 +276,7 @@ chip row 1: x*3+7  in[0..2]=1024 1025 1026  out[0..2]=3079 3082 3085  out[1023]=
 mismatches: 0 of 2048
 [41622] 0.8 seconds (55.3 KHz)</code></pre>
   <p>Check one value by hand: chip 1's first input is 1024, and 1024 × 3 + 7 = 3079. Run it again on the logging ttsim (<code>B10_ETHLOG=1</code>) and the launch on chip 1 shows up as messages. The one on chip 0 does not, because chip 0 is reached directly over PCIe. The next figure replays that log.</p>
+  <div class="callout sim"><b>Two outcomes, both correct.</b> Repeating this run does not always give the same clock count. In a re-check of eight consecutive runs (stock and logging simulator alike), the exit clock alternated between <code>[41622]</code> and <code>[41654]</code>. The Ethernet log shows the difference: in the 41,622 runs the host polls chip 1's go word 229 times (228 replies of "still running", then "done"), and in the 41,654 runs it polls chip 1 only once, at <code>[37930]</code>, and gets "done" at <code>[37941]</code> straight away, with the read-back at <code>[37964]</code>. Which chip the host waits on first differs between runs; the launch sequence up to the go word at <code>[31434]</code> and the results are identical. I did not trace why the order changes. The figure replays a 41,622-clock run.</div>
 
   <div class="viz" id="figFan"></div>
   <script>
@@ -367,7 +368,7 @@ closed
 ... warning | Metal | Skipping ethernet routing reset during teardown: Timeout waiting for Ethernet core service remote IO request flush.
 [1380624] 17.8 seconds (77.5 KHz)
 real    0m19.742s</code></pre>
-  <p>The fabric initializes on both chips, and one routing plane is free for user traffic. Every host access to chip 1 after that times out, and each timeout costs 5 s (<code>NON_MMIO_RW_TIMEOUT = 5'000</code> ms, <code>tt-umd/api/tt-umd/utils/timeouts.hpp:10</code>). A program that writes a buffer to chip 1 after enabling the fabric dies on that write:</p>
+  <p>The fabric initializes on both chips, and one routing plane is free for user traffic. Every host access to chip 1 after that times out, and each timeout costs 5 s (<code>NON_MMIO_RW_TIMEOUT = 5'000</code> ms, <code>tt-umd/api/tt-umd/utils/timeouts.hpp:10</code>). Because those timeouts are measured in wall-clock time while the simulator keeps stepping, the final clock count of this run is not reproducible: re-runs ended at <code>[1762055]</code> and <code>[1442495]</code> with the same messages. A program that writes a buffer to chip 1 after enabling the fabric dies on that write:</p>
 <pre><code>$LAB_HOME/b10_fabric_send       # (section 4b) with the stock fabric router
 terminate called after throwing an instance of 'tt::umd::error::UmdException&lt;tt::umd::error::RuntimeError&gt;'
   what():  Timeout waiting for Ethernet core service remote IO request flush.

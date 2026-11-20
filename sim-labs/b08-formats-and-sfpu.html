@@ -67,7 +67,7 @@ ulp vs correctly rounded: exact=3088 1ulp=1008 >1ulp=0 max=1</code></pre>
     <tr><td><code>sim-labs/workbench/host/b08_sfpu.cpp</code></td><td>A one-core reader/compute/writer program. It fills 4 tiles with evenly spaced inputs, runs one SFPU function chosen by <code>B08_FN</code>, and compares every output with a double-precision reference on the host.</td></tr>
     <tr><td><code>sim-labs/overlays/b08/b08/sfpu_lab.cpp</code></td><td>The compute kernel, with our SFPI face functions. The host asks for it as <code>"b08/sfpu_lab.cpp"</code>; the reader and writer are the stock <code>custom_sfpi_smoothstep</code> dataflow kernels.</td></tr>
   </table>
-<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # absolute: env.sh changes directory
+<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/b08
 source $W/env.sh wh                                   # or bh
 cp -r $W/../overlays/b08/. $LAB_HOME/kernels/          # gives $LAB_HOME/kernels/b08/sfpu_lab.cpp

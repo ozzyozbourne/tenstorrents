@@ -63,9 +63,9 @@
 
   <h2 id="setup">0. Setup</h2>
 <pre><code>export LAB_HOME=$HOME/ttlab/b09
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
-OV=/home/user/workspace/tenstorrent-from-zero/sim-labs/overlays/b09
+W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # your checkout, as an absolute path
+source $W/env.sh wh
+OV=$W/../overlays/b09
 use() { rm -rf $LAB_HOME/kernels/tt_metal; cp -r $OV/$1/. $LAB_HOME/kernels/; }   # switch overlay
 export TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS=localhost:50909   # see the warning in section 5</code></pre>
   <p>Each bug is a <em>kernel overlay</em> (<a href="b00-workbench.html">B00</a>): a modified copy of a stock kernel under <code>sim-labs/overlays/b09/&lt;case&gt;/</code>, at the same relative path the example's host code passes to <code>CreateKernel</code>. The function <code>use</code> swaps one in, and nothing has to be rebuilt. The cases are:</p>

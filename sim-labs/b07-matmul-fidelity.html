@@ -519,6 +519,7 @@ exact (all bits) dot product of this slab: 3.48496389</code></pre>
 
   <h2 id="tile">Step 5: One tile, element by element</h2>
   <p>With <code>--json</code> the script rebuilds the 32×32 operand tiles of the first tile product from the phase-0 MVMULs (SrcB rows → in0, SrcA rows → in1), plus the Dst tile after that tile product and after all 20. It also computes the exact reference: the same BF16 operands, multiplied and summed in double precision, which is exact for these values.</p>
+<pre><code>cd $LAB_HOME/dumps; for f in 0 2 3 4; do python3 -I $W/py/b07_mvmul.py fid$f.txt --json fid$f.json | tail -n 1; done</code></pre>
 <pre class="out"><code>tile (0,0): after 1 tile product mean |Dst - exact| = 0.159058; after 20 = 2.203112; wrote fid0.json
 tile (0,0): after 1 tile product mean |Dst - exact| = 0.023189; after 20 = 1.529170; wrote fid2.json
 tile (0,0): after 1 tile product mean |Dst - exact| = 0.022671; after 20 = 1.523120; wrote fid3.json
