@@ -152,12 +152,13 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
   program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
   Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.
-- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py`, `py/b11_s0_add.py`, `py/b11_s1_probe.py`, `py/b11_s3_hifi.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
+- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py`, `py/b11_s0_add.py`, `py/b11_s1_probe.py`, `py/b11_s3_hifi.py`, `py/b11_s3_compare.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
   under ttsim, restarting pytest after each simulator abort and reporting pass/fail/skip/abort counts; sweep one op over
   shapes, dtypes, layouts and memory configs with PCC and the JIT-compiled kernel list per case (private
   `TT_METAL_CACHE` per case); and run one matmul per memory config for NoC counting under `../patches/a20-counters.patch`.
   `b11_s0_add.py` is the 32×32 smoke test, `b11_s1_probe.py <add_fp32|sum_fp32|mm_fp32acc|trace>` runs one setup probe
-  per process, and `b11_s3_hifi.py` compares HiFi2/3/4 with FP32 accumulation (`B11_SAVE=<file>.pt` saves the outputs).
+  per process, and `b11_s3_hifi.py` compares HiFi2/3/4 with FP32 accumulation (`B11_SAVE=<file>.pt` saves the outputs;
+  `b11_s3_compare.py <wh.pt> <bh.pt>` compares two saved runs bit for bit).
   `../patches/b11-ten3868.patch` makes ttsim skip the dummy unpack Wormhole's LLK issues after unpack-to-Dst, which
   otherwise aborts many Wormhole ops on FP32 tensors or with `fp32_dest_acc_en`. It is a modelling workaround, not a ttsim
   bug fix: ttsim's check follows the ISA. `../patches/b11-api-count.patch` counts the host's PCIe reads, writes and clock calls.

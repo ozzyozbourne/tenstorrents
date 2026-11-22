@@ -66,12 +66,12 @@ case EnvVarID::TT_METAL_SIMULATOR:
     this-&gt;runtime_target_device_ = tt::TargetDevice::Simulator;
     break;</code></pre>
   <p>So the setup is the workbench from <a href="b00-workbench.html">B00</a> plus tt-metal's Python environment:</p>
-<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 P=$W/../patches                                      # the series' ttsim patches
 export LAB_HOME=$HOME/ttlab/b11
 source $W/env.sh wh                                  # or bh
-source $TT_METAL_HOME/python_env/bin/activate        # tt-metal's Python (3.11 here), ttnn, torch, pytest
-export TT_METAL_INSPECTOR=0                          # several runs share the orb: avoid the inspector's port clash
+source $TT_METAL_HOME/python_env/bin/activate        # tt-metal's own venv: Python (3.11 on the build machine), ttnn, torch, pytest
+export TT_METAL_INSPECTOR=0                          # if several tt-metal processes share the machine: avoid the inspector's port clash
 export TT_METAL_CACHE=$LAB_HOME/jit                  # a private JIT cache you can list (section 3)</code></pre>
   <table>
     <tr><th>Variable</th><th>Why it is needed for TT-NN</th></tr>
@@ -87,12 +87,14 @@ export TT_METAL_CACHE=$LAB_HOME/jit                  # a private JIT cache you c
 max abs diff vs torch: 0.015625
 ... BuildKernels | JIT cache stats: 13/13 hits (100.0%) ...
 [4881] 3.1 seconds (1.6 KHz)</code></pre>
-  <p>Two details are worth noticing. The worker grid is 8×8 = 64 cores, the compute grid tt-metal's core descriptor gives this simulated chip (A18 used the same grid). And the run ends at clock 4,881 every time. The whole run took 2.5 s of wall time with a warm cache and 7.2 s with an empty private cache.</p>
+  <p>Two details are worth noticing. The worker grid is 8×8 = 64 cores, the compute grid tt-metal's core descriptor gives this simulated chip (A18 used the same grid). And the run ends at clock 4,881 every time. The whole process took 2.5 s of wall time with a warm cache and 7.2 s with an empty private cache (measured from outside, for example with bash's <code>time python $W/py/b11_s0_add.py</code>; a default Ubuntu 24.04 has no <code>/usr/bin/time</code>, and the shell keyword does the job).</p>
+  <p>The script also prints a line of its own, <code>wall …s</code>, which the output above leaves out. Do not compare it with the figures in the previous paragraph: its timer starts after <code>import ttnn</code>, so it covers only <code>open_device</code> to <code>close_device</code>. On a second machine the script printed <code>wall 2.8s</code> with an empty cache and <code>wall 0.1s</code> with a warm one, while the whole process took 4.9 s and 2.1 s; the difference is the import, which alone took 2.0 s there (<code>time python -c "import ttnn"</code>). The seconds in ttsim's <code>[4881] … seconds</code> line are a third figure again, and all of them describe the host, not the chip.</p>
 
   <h3>What happens under <code>ttnn.add</code></h3>
   <p>To see what "the simulator runs TT-NN" means, I added call counters to ttsim's exported API (<code>patches/b11-api-count.patch</code>, 11 added lines in <code>src/libttsim.cpp</code>) and ran the same script. Its first line is an all-zero <code>B11API</code> line at clock 0, from a short-lived simulator instance that tt-metal opens and closes during start-up; I omit it:</p>
 <pre class="out"><code>B11API pci_mem_rd calls=4919 bytes=21824  pci_mem_wr calls=23551 bytes=722884  clock calls=4881 clocks=4881
 [4881] 3.4 seconds (1.4 KHz)</code></pre>
+  <p>To repeat it: <code>$W/build_ttsim.sh api wh &amp;&amp; (cd $LAB_HOME/ttsim-api &amp;&amp; patch -p1 &lt; $P/b11-api-count.patch) &amp;&amp; $W/build_ttsim.sh api wh</code>, then run the script with <code>TT_METAL_SIMULATOR=$LAB_HOME/sim-api-wh-release/libttsim.so</code> set for that one command.</p>
   <p>The run is identical on a second run. Every byte of tensor data, kernel binary and runtime argument reached the chip as one of 23,551 PCIe writes into the simulated BAR windows. And the simulated chip advanced exactly 4,881 clocks, one per call. Those clocks come from the host, not from a clock of ttsim's own. UMD's simulator device ticks the chip after every read:</p>
   <div class="filename">tt-metal/tt_metal/third_party/umd/tt-umd/src/tt_device/tt_sim_tt_device.cpp:334-338 @7aad8aac</div>
 <pre><code>void TTSimTTDevice::after_read() {
@@ -248,6 +250,7 @@ counts: PASSED=21 SKIPPED=2 ABORTED=16
     <tr><td><code>reduce/test_sum.py -k test_sum_global</code></td><td class="num">96</td><td>34 pass, <b>62 abort</b>; 63 runs, 5 min 8 s</td><td>96 pass; 1 run, 35 s</td></tr>
     <tr><td>same, Blackhole build, stock</td><td class="num">96</td><td colspan="2">96 pass; 1 run, 1 min 38 s</td></tr>
   </table>
+  <p>The wall times in the table are from the build machine. On a second, faster machine the same slice gave the same counts in every cell (including the 12 + 8 split of the matmul aborts and the 2 xfails) in 68 s, 2 min 49 s and 3 min 22 s for the three stock rows with aborts, 65 s and 21 s for the patched matmul and sum rows, and 66 s for Blackhole. Expect the counts to match and the times not to.</p>
   <p>Zero ordinary failures. Every non-pass on stock ttsim was a simulator abort, and each abort message was one of two strings. The skip reasons were the slow-dispatch one, <code>alpha=0 is not supported</code> (a test-level skip), and, for 16 matmul tiny-tile cases, <code>transpose tile does not support tile height less than 16</code> (<code>test_matmul.py:120</code>). The aborted tests were not random. In <code>test_activation.py</code> all 16 were the <code>float32</code> parametrizations. In <code>test_sum_global</code> the 62 were all 32 FLOAT32 cases plus 30 of the 32 BFLOAT16 cases; only the single-tile bf16 cases (h = 32, w = 32 or 31, batch 1) and all 32 BFLOAT8_B cases passed. In the matmul slice they were <code>test_matmul_padding</code> and <code>test_matmul_fp32_crossblock_reload_*</code>. Blackhole passed everything. The pattern points at FP32 data on Wormhole, so that is where we dig.</p>
   <div class="callout key">On a simulator, a red test can mean three different things: your op is wrong (a FAILED with a PCC message), the test does not apply here (a SKIP), or the simulator refused an instruction (an abort with a ttsim category). Only the first is about your code. Always read the category before you read the test.</div>
 
@@ -313,6 +316,7 @@ for c in add_fp32 sum_fp32 mm_fp32acc; do python $W/py/b11_s1_probe.py $c; done<
 <pre class="out"><code>add_fp32 max|err| 0.0 bit-identical True
 sum 32.93839645385742 torch 32.93839645385742
 PCC 0.9999958038338154</code></pre>
+  <p><code>TT_METAL_SIMULATOR</code> now points at the patched build for everything you run in this shell. The right-hand column of the table in section 1 and the "patched" view of the explorer in section 3 were made this way. To go back to the stock simulator, <code>source $W/env.sh wh</code> again: it resets <code>TT_METAL_SIMULATOR</code> and leaves the Python environment and <code>TT_METAL_CACHE</code> alone.</p>
   <p>The table in section 1 has the effect: every one of the 98 aborts in the slice became a pass (or, for two matmul cases, an expected failure the test itself marks <code>xfail</code>). Two controls show the patch changed nothing else. <code>test_add.py</code> gave the same 86/16, and in the 54-case explorer of the next section, all 46 cases that did not abort had the same status, PCC and max error, to the last digit, with and without the patch.</p>
   <div class="callout warn">This patch is a modelling decision, not a fix you can upstream as-is. It assumes the dummy unpack's side effects are invisible. That is what the LLK comment implies, but nothing here verifies it. A ttsim that executed the instruction exactly would need the TEN-3868 hardware behaviour itself, which is not public. Use the patched simulator to test your FP32 op's <em>values</em>. Do not use it to argue about the unpacker.</div>
 
@@ -321,7 +325,7 @@ PCC 0.9999958038338154</code></pre>
 <pre class="out"><code>$LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/eltwise_binary_no_bcast/10083976056017848008/trisc0
 $LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/reader_interleaved_no_bcast/10456270060302663221/ncrisc
 $LAB_HOME/jit0/tt-metal-cache3486047672140553623/kernels/writer_interleaved_no_bcast/2689147808996234265/brisc</code></pre>
-  <p>This listing is from the 32×32 smoke test. The reader runs on NCRISC, the writer on BRISC, and the compute kernel on the three TRISCs. The cache was 93 MB, 92 MB of it precompiled headers, which is why the explorer links them instead of rebuilding.</p>
+  <p>This listing is from the 32×32 smoke test, run once more with <code>TT_METAL_CACHE=$LAB_HOME/jit0</code>; with the setup above yours is under <code>$LAB_HOME/jit</code> (<code>find $LAB_HOME/jit -mindepth 5 -maxdepth 5</code>). The long numbers in your listing will not all match these. The kernel hash directories depend on where your tt-metal checkout lives: the same build, reached once as <code>/root/tt-metal</code> and once through the directory that symlink points to, gave <code>16934910421917161799</code> and <code>18225071932974507683</code> for <code>eltwise_binary_no_bcast</code>, and neither is the <code>10083976056017848008</code> shown here. Changing <code>LAB_HOME</code> or the cache location did not change them, and the <code>tt-metal-cache3486047672140553623</code> directory name was the same on both machines. So match kernels by name, never by hash. The reader runs on NCRISC, the writer on BRISC, and the compute kernel on the three TRISCs. The cache was 93 MB, 92 MB of it precompiled headers, which is why the explorer links them instead of rebuilding.</p>
   <div class="filename">sim-labs/workbench/py/b11_explore.py (the core of one case)</div>
 <pre><code>tx = ttnn.from_torch(x, dtype=dt, layout=lay, device=dev, memory_config=mc)
 if case["op"] == "add":
@@ -553,7 +557,13 @@ B11TRAFFIC mem=block out=TensorMemoryLayout.BLOCK_SHARDED PCC=0.999977
   <h3>2. Wormhole HiFi4 + FP32 accumulation</h3>
   <p>TT-NN prints a warning when you combine them on Wormhole:</p>
 <pre class="out"><code>warning | Op | On Wormhole with fp32 accumulation, output accuracy can be worse with HiFi4 than HiFi3 due to a hardware bug. Prefer using HiFi3 with fp32 accumulation on Wormhole. (compute_kernel_config.cpp:66)</code></pre>
-  <p>The source comment (<code>compute_kernel_config.cpp:44</code>) points to <a href="https://github.com/tenstorrent/tt-metal/issues/38306">issue #38306</a>. That issue reports, so far seen only on Wormhole, a few deterministic outputs off by roughly a power of two (1 bad point in a 4096³ matmul). It also says "Blackhole numerics look different from Wormhole". I ran a 128×1024 @ 1024×128 bf16 matmul with FP32 accumulation at HiFi2/3/4 on patched Wormhole ttsim and stock Blackhole ttsim (<code>workbench/py/b11_s3_hifi.py</code>; the last three lines compare the two runs' tensors, saved with <code>B11_SAVE=&lt;file&gt;.pt</code>, using <code>torch.equal</code>):</p>
+  <p>The source comment (<code>compute_kernel_config.cpp:44</code>) points to <a href="https://github.com/tenstorrent/tt-metal/issues/38306">issue #38306</a>. That issue reports, so far seen only on Wormhole, a few deterministic outputs off by roughly a power of two (1 bad point in a 4096³ matmul). It also says "Blackhole numerics look different from Wormhole". I ran a 128×1024 @ 1024×128 bf16 matmul with FP32 accumulation at HiFi2/3/4 on patched Wormhole ttsim and stock Blackhole ttsim (<code>workbench/py/b11_s3_hifi.py</code>). Each run saves its three output tensors with <code>B11_SAVE=&lt;file&gt;.pt</code>, and <code>workbench/py/b11_s3_compare.py</code> compares the two files with <code>torch.equal</code>; it prints the last three lines below:</p>
+<pre><code>export TT_METAL_SIMULATOR=$LAB_HOME/sim-ten3868-wh-release/libttsim.so     # the patched Wormhole build of section 2
+B11_SAVE=$LAB_HOME/hifi_wh.pt python $W/py/b11_s3_hifi.py
+source $W/env.sh bh                                                        # stock Blackhole; this resets TT_METAL_SIMULATOR
+B11_SAVE=$LAB_HOME/hifi_bh.pt python $W/py/b11_s3_hifi.py
+python $W/py/b11_s3_compare.py $LAB_HOME/hifi_wh.pt $LAB_HOME/hifi_bh.pt
+source $W/env.sh wh                                                        # back to stock Wormhole</code></pre>
 <pre class="out"><code>HiFi2: mean|err| 1.041e-01  max|err| 5.717e-01
 HiFi3: mean|err| 8.225e-03  max|err| 4.194e-02
 HiFi4: mean|err| 8.052e-03  max|err| 3.961e-02

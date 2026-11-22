@@ -29,8 +29,8 @@ commits: tt-metal `7aad8aac` built from source (C++ examples and Python `ttnn`),
   re-run and the deterministic output matched the pages, or the page was corrected. For A20-A22 this covers every counter
   table in A20 (19 `a20_count.py` cases plus the three matmul examples), the profiler transcript, all seven two-chip
   attempts in A21, and the three A22 scripts with their variants. The Python `ttnn` output of A05, A09, A18 and A19 was
-  re-run in the same round. Labs B08-B11 were still being re-run when this paragraph was written; each lab page states
-  its own provenance.
+  re-run in the same round. Labs B00-B11 were re-run in both rounds; each lab page states
+  its own provenance and what was not re-run.
 - **Not re-run:** the tt-metal build transcripts and timings in B00 (they are excerpts of the build machine's logs),
   anything described as measured on silicon (those numbers are quoted from Tenstorrent's reports), and vendor product
   pages that have changed since October 2026 (flagged on the page where that happened).
