@@ -278,7 +278,7 @@ noc_async_write_barrier();
 noc_semaphore_inc(sem_addr, 1);
 noc_async_atomic_barrier();
 noc_semaphore_set(sem_ptr, 0);  // Reset semaphore</code></pre>
-  <p>The <code>noc_async_write_barrier()</code> between the data and the increment is the important line. The write and the atomic go out through different command buffers and different VCs. The barrier waits for the write's acknowledgement, which the receiving NIU sends once the data is in L1. So when the increment arrives, the tile is already there. This is the &ldquo;request, wait for the response, then issue the next request&rdquo; approach, which the ISA calls the only way to order requests that travel on different NoCs or VCs (Ordering.md:32). It costs one round trip per handoff. Multicast will let us avoid it.</p>
+  <p>The <code>noc_async_write_barrier()</code> between the data and the increment is the important line. The write and the atomic go out through different command buffers (0 and 3). They share a NoC and, with the default arguments, a VC (<code>NOC_UNICAST_WRITE_VC</code> = 1, <code>dataflow_api.h:880,2398</code>), but a write followed by an atomic is not among the same-VC pairs the ISA orders at the receiving NIU (Ordering.md:20-26), so the example doesn't lean on arrival order. The barrier waits for the write's acknowledgement, which the receiving NIU sends once the data is in L1. So when the increment is issued, the tile is already there. This is the &ldquo;issue a request, wait for the response to arrive, and only then issue the next request&rdquo; approach, which the ISA gives as the fallback whenever software needs stronger ordering than the NoC guarantees, and as the only option across different NoCs (Ordering.md:32). It costs one round trip per handoff. Multicast will let us avoid it.</p>
   <p>Here is the run in ttsim, with the DPRINT lines from both cores (<code>TT_METAL_DPRINT_CORES='(0,0),(0,1)'</code>; the prefix is <code>device:x-y:RISC</code>, and on these cores <code>NC</code> runs the reader and <code>BR</code> the writer):</p>
 <pre><code>$ export TT_METAL_DPRINT_CORES='(0,0),(0,1)'
 $ $EX/metal_example_noc_tile_transfer
@@ -296,7 +296,7 @@ $ $EX/metal_example_noc_tile_transfer
 0:0-1:BR: 8. WRITER 1: Data saved
 Result = 14 : Expected = 14
 [7424] 0.4 seconds (17.0 KHz)</code></pre>
-  <p>The step numbers are the order the author intended. The printed order shows the cores interleaving: core&nbsp;1 prints step 5 before core&nbsp;0 has printed step 2, because core&nbsp;1 can reserve space and announce itself while core&nbsp;0 is still reading DRAM. Step 6 cannot come before step 3, because core&nbsp;0's increment is what releases core&nbsp;1. The <a href="#sim">ttsim section</a> shows the same run at the level of NoC commands.</p>
+  <p>The step numbers are the order the author intended. (The final clock count is not a fixed number under DPRINT: the print server polls the device on wall-clock time. A re-run on another machine printed the same ten lines in the same order and ended at <code>[8829]</code>.) The printed order shows the cores interleaving: core&nbsp;1 prints step 5 before core&nbsp;0 has printed step 2, because core&nbsp;1 can reserve space and announce itself while core&nbsp;0 is still reading DRAM. Step 6 cannot come before step 3, because core&nbsp;0's increment is what releases core&nbsp;1. The <a href="#sim">ttsim section</a> shows the same run at the level of NoC commands.</p>
 
   <!-- ===================================================================== -->
   <h2 id="coords">Logical cores on the host, NoC coordinates in the kernel</h2>
@@ -526,6 +526,7 @@ Thank you, Core (0, 0) on Device 0, for the multicast.
 [✅ PASS] Receiver tile 3 matches the golden tile.
 [✅ PASS] All 3 receiver tiles match the golden tile.
 [16338] 0.8 seconds (20.8 KHz)</code></pre>
+  <p>As with every DPRINT run, the last line varies: a re-run on another machine printed the same messages, with the receivers acknowledging in the same order (3,0), (1,0), (2,0), and ended at <code>[19388]</code>. Without DPRINT the example ends at <code>[7374]</code> every time.</p>
   <div class="callout warn">The tech report for this example says VALID and INVALID are &ldquo;0xFFFFFFFF&rdquo; and &ldquo;0x0&rdquo; (<code>tech_reports/prog_examples/multicast/multicast.md:108</code>). The code at 7aad8aac defines <code>INVALID = 0</code> and <code>VALID = 1</code> (<code>tt_metal/hostdevcommon/api/hostdevcommon/common_values.hpp:13-14</code>), and ttsim's log below shows the flag multicast carrying the value 1. Trust the header.</div>
 
   <!-- ===================================================================== -->
@@ -743,14 +744,15 @@ else ttsim_printf("      A16 mcast data delivered to %u tiles\n", a16_delivered)
 ttsim_printf("      A16 atomic inc at (%u,%u):0x%llx  %u -&gt; %u\n", src_coordinate &amp; 63, src_coordinate &gt;&gt; 6,
              (unsigned long long)src_addr, old_data, data);</code></pre>
 <pre><code>export LAB_HOME=$HOME/ttlab/a16
-source sim-labs/workbench/env.sh wh
-sim-labs/workbench/build_ttsim.sh noclog wh               # first run copies ttsim to $LAB_HOME/ttsim-noclog
-(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; ~/workspace/tenstorrent-from-zero/sim-labs/patches/a16-noclog.patch)
-sim-labs/workbench/build_ttsim.sh noclog wh               # rebuild with the A08 + A16 prints (~4 s)
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+source $W/env.sh wh
+$W/build_ttsim.sh noclog wh               # first run copies ttsim to $LAB_HOME/ttsim-noclog
+patch -p1 -d $LAB_HOME/ttsim-noclog &lt; $W/../patches/a16-noclog.patch
+$W/build_ttsim.sh noclog wh               # rebuild with the A08 + A16 prints (~4 s)
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
   <p>Coordinates in the log are NoC&nbsp;0 positions, with what the kernel wrote in <code>[asked …]</code>. For atomics, ttsim calls the remote end &ldquo;src&rdquo;, so the semaphore being incremented is the &ldquo;src&rdquo; address. The bracketed number is the ttsim clock, which isn't silicon time.</p>
   <h3>NoC_tile_transfer: seven commands</h3>
-  <p>(This log was taken with the DPRINT setting from above still exported. Without DPRINT the same seven commands appear about 500 clocks earlier, starting at <code>[4421]</code>.)</p>
+  <p>(This log was taken with the DPRINT setting from above still exported. Without DPRINT the same seven commands appear about 500 clocks earlier, at <code>[4421]</code>, <code>[4458]</code>, <code>[4485]</code>, <code>[4508]</code> and <code>[4552]</code>, and those clocks repeat exactly. The DPRINT clocks below do not: a second DPRINT run on another machine showed the same seven lines at <code>[4974]</code> to <code>[5662]</code>.)</p>
 <pre><code>[4952] NOC0 T0 buf1 READ      ack   src D(0,11)[asked 0,11]:0x2d4c40 -&gt; dst T(1,1)[asked 1,1]:0x19e60 len=2048
 [4992] NOC0 T8 buf3 ATOMIC    ack   src T(1,1)[asked 18,18]:0x8a70 -&gt; dst T(1,2)[asked 1,2]:0x4 len=4220
 [4992]       A16 atomic inc at (1,1):0x8a70  0 -&gt; 1
@@ -832,7 +834,7 @@ mcast data delivered to 7 tiles: 256 lines;  mcast data delivered to 1 tiles: 12
     <li><a href="../sim-labs/overlays/a16/flag-first/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp"><code>flag-first/</code></a>: the coordinator multicasts VALID before the tile</li>
     <li><a href="../sim-labs/overlays/a16/num-dests-plus-1/tt_metal/programming_examples/contributed/multicast/kernels/dataflow/coordinator_kernel.cpp"><code>num-dests-plus-1/</code></a>: the data multicast passes <code>num_dests + 1</code></li>
   </ul>
-<pre><code>OV=/path/to/tenstorrent-from-zero/sim-labs/overlays/a16
+<pre><code>OV=$W/../overlays/a16
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so   # the logging build from above
 rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/skip-invalid/. $LAB_HOME/kernels/   # or any directory above
 timeout 300 stdbuf -oL $EX/metal_example_matmul_multicore_reuse_mcast &gt; mm.log 2&gt;&amp;1; echo exit $?
@@ -841,7 +843,7 @@ grep 'atomic inc at (1,2):0x8b30' mm.log | tail          # the row-2 in0 sender'
 rm -rf $LAB_HOME/kernels/tt_metal &amp;&amp; cp -r $OV/sender-n-minus-1/. $LAB_HOME/kernels/   # or flag-first/, num-dests-plus-1/
 timeout 90 stdbuf -oL $EX/contributed/multicast &gt; mc.log 2&gt;&amp;1; echo exit $?   # exit 124 = hang
 grep -E 'A16|MCAST_WR|PASS' mc.log</code></pre>
-  <p>Delete the overlay directory afterwards (<code>rm -rf $LAB_HOME/kernels/tt_metal</code>), or every later run will pick it up. Each run uses <code>timeout</code>, because a broken handshake usually means the host's <code>Finish</code> waits forever, and <code>stdbuf -oL</code>, so the log is not lost in a buffer when <code>timeout</code> kills the process. Here is what actually happened. Some of it is not what you would guess. ttsim is deterministic for a given binary and settings, so each outcome below came out the same when rerun in this orb. But every one of them depends on timing, so treat it as what one interleaving did, not as a property of the bug.</p>
+  <p>Delete the overlay directory afterwards (<code>rm -rf $LAB_HOME/kernels/tt_metal</code>), or every later run will pick it up. Each run uses <code>timeout</code>, because a broken handshake usually means the host's <code>Finish</code> waits forever, and <code>stdbuf -oL</code>, so the log is not lost in a buffer when <code>timeout</code> kills the process. Here is what actually happened. Some of it is not what you would guess. Without DPRINT or Watcher, ttsim is deterministic for a given binary and settings, so those logs came out the same, clock for clock, when rerun in this orb and again on a second machine. The DPRINT and Watcher runs in experiment 2 are different: their host-side polling runs on wall-clock time, so their clocks change from run to run, and the outcome in the table is what every one of my reruns did, not something the simulator guarantees. But every one of them depends on timing, so treat it as what one interleaving did, not as a property of the bug.</p>
   <h3>1. The receiver skips setting INVALID</h3>
   <p>Comment out <code>noc_semaphore_set(in0_mcast_receiver_semaphore_addr_ptr, INVALID)</code> in the interior receiver (<code>in0_receiver_in1_receiver.cpp:79</code>) and run the matmul:</p>
 <pre><code>Metalium vs Golden -- PCC = 0.99988306
@@ -870,7 +872,7 @@ Test Passed
     <tr><th>Run</th><th>What the log shows</th><th>Result</th></tr>
     <tr><td>DPRINT on (<code>TT_METAL_DPRINT_CORES='(0,0)-(3,0)'</code>)</td><td>counter 0&rarr;1&rarr;2&rarr;3 before the coordinator's first poll (it was busy printing the tile slice). No multicast is ever issued.</td><td><b>hang</b> (timeout): the counter passed 2</td></tr>
     <tr><td>no DPRINT</td><td>0&rarr;1&rarr;2, then <code>0 -&gt; 1</code>: the coordinator saw 2 and reset to 0 before the third increment arrived. That receiver had already set INVALID, so it still got the data.</td><td><b>passes</b>, leaving a stale count of 1</td></tr>
-    <tr><td>Watcher on (<code>TT_METAL_WATCHER=1</code>)</td><td>0&rarr;1&rarr;2&rarr;3, with the coordinator's poll landing between the 2nd and 3rd</td><td><b>passes</b> (17 s instead of 3 s)</td></tr>
+    <tr><td>Watcher on (<code>TT_METAL_WATCHER=1</code>)</td><td>0&rarr;1&rarr;2&rarr;3, with the coordinator's poll landing between the 2nd and 3rd</td><td><b>passes</b> (about 17 s of wall time instead of 3 s)</td></tr>
   </table>
   <p>The same bug in the matmul (both in0 sender kernels waiting for 6 instead of 7) <b>hung</b> every time. Both in0 senders' counters reached 7 within about 30 clocks (row 2 from 4562 to 4594, row 1 from 4633 to 4649), long before the senders finished their 64-tile DRAM reads, so a wait for exactly 6 could never succeed. Zero multicasts were issued.</p>
   <h3>3. The flag sent before the data</h3>

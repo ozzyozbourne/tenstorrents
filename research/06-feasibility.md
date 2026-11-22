@@ -1,5 +1,16 @@
 # Feasibility findings: experiments actually run in the orb on 2026-10-30
 
+> **Status of these notes (updated 2026-11-22).** This file is the original record from the build machine ("the orb"),
+> written on 2026-10-30. Two later verification rounds (November 2026) re-ran the experiments on a second machine
+> (Ubuntu 24.04, tt-metal `7aad8aac`, ttsim `b3620244`). What was re-run there and matched: `add_2_integers_in_riscv`
+> (`[4501]`, `[4892]` with the device profiler and a header-only CSV), the matmul examples (`[330591]`, `[10860]`,
+> `[17560]`), `profiler/test_full_buffer` (stops in slow dispatch, `Test Passed` in fast dispatch), the multichip
+> results below (`dbrw` on `wh_x2`: `[372773]`; the 8-device `TT_FATAL`; the `wh_x8` Ethernet firmware error), and
+> Python `ttnn` on the simulator. Not re-run in those rounds: the gdb/lldb item, the Tracy item and the
+> cold/warm wall-time table. Wall times, DPRINT and Watcher clock counts differ between runs and machines; the
+> clock counts of plain runs repeat exactly. Paths starting with `refs/` (`refs/sim-runs/...`, `refs/build-logs/...`)
+> are logs and scripts on the build machine and are **not shipped** in this repository.
+
 ## Workbench
 `sim-labs/workbench/` has been verified end to end.
 
@@ -37,15 +48,15 @@ Unseeded errors by fidelity: HiFi2 1.511, HiFi3 1.505, HiFi4 1.505 (mean_abs_err
   - The stock distributed examples (2x4 mesh) FAIL.
   - `wh_x8` fails with "UndefinedBehavior: eth base fw reported error code 1".
   - `wh_x2` with `MeshShape(2,1)` and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml` works: `host/dbrw.cpp` printed "devices=2 match=true" in 7.6 s.
-  - CCLs and fabric are untested.
+  - CCLs and fabric were untested when this note was written. Later (A21, B10): `ttnn.all_gather` without a fabric fails by design; with `FABRIC_1D` the fabric initializes but host writes to chip 1 time out on stock tt-metal; B10's yield-interval kernel overlay gets a two-chip all-gather through. Fast dispatch fails while opening the mesh.
 - **SFPU examples** (eltwise_sfpu, custom_sfpi_add, sfpu_eltwise_chain, hello_world_datatypes) pass on both WH and BH.
 - **Trace** needs fast dispatch; capture + replay works under ttsim in fast dispatch (A17, wh and bh). Tracy is untested.
 
 ## Build agent's final report: ttnn and the toolchain
 - Toolchain: clang 20.1.8, cmake 4.0.2, SFPI 7.92.0 (riscv-tt-elf-g++ 15.1.0). On Debian 12 the SFPI .deb fails; the SFPI tarball that CMake downloads works.
-- **Python ttnn works on the simulator.** Activate it with `source $TT_METAL_HOME/python_env/bin/activate` (Python 3.11); the example script is `refs/sim-runs/ttnn/ttnn_add.py`.
+- **Python ttnn works on the simulator.** Activate it with `source $TT_METAL_HOME/python_env/bin/activate` (Python 3.11); the original example script was `refs/sim-runs/ttnn/ttnn_add.py` on the build machine, which is not shipped. The shipped equivalent is `sim-labs/workbench/py/a05_add.py` (also `py/b11_s0_add.py`).
   - A 32x32 bf16 `ttnn.add` passes on both WH (2.7 s) and BH (3.5 s).
-  - Accuracy: PCC 0.99998, and 120 of 1024 elements are 1 bf16 ulp away from torch. So the result is NOT bit-identical to torch, and the page should not claim it is.
+  - Accuracy: PCC 0.99998, and 120 of 1024 elements are 1 bf16 ulp away from torch. So the result is NOT bit-identical to torch, and the page should not claim it is. (Those figures are from the unshipped script's random inputs. The shipped `a05_add.py`, seeded, gives 108 of 1,024 elements differing, PCC 0.999999 against the exact fp32 sum, and `[4881]` clocks in the November 2026 rerun.)
 - **All single-chip examples pass on both WH and BH.** Wall-clock times, cold cache / warm cache:
 
   | Example | Cold | Warm |
@@ -57,5 +68,5 @@ Unseeded errors by fidelity: HiFi2 1.511, HiFi3 1.505, HiFi4 1.505 (mean_abs_err
 
   noc_tile_transfer prints "Result = 14 : Expected = 14"; it needs `TT_METAL_DPRINT_CORES='(0,0),(0,1)'`.
 - **The distributed_* examples fail**: they need 8 devices. The `wh_x8` build fails at the Ethernet firmware stage, which matches the known issue that it needs the micah/native-sim branch.
-- Logs live under `refs/sim-runs/`: `bh/`, `warm/`, `dprint/`, `ttnn/`, `multichip/`. The simulator binaries are in `~/sim/{wh,bh,wh_x2,wh_x8}`.
+- Logs lived under `refs/sim-runs/` on the build machine (not shipped in this repository): `bh/`, `warm/`, `dprint/`, `ttnn/`, `multichip/`. The simulator binaries are in `~/sim/{wh,bh,wh_x2,wh_x8}`.
 - The bracketed number in log lines is the simulated clock count. The seconds figure is host CPU time. The KHz figure is the effective simulation rate.

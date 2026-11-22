@@ -324,7 +324,7 @@
     uint16_t dst[DST_ROWS][ROW_SIZE];      // DST_ROWS = 1024, ROW_SIZE = 16: one copy, shared
     ...
     uint32_t l_regs[16][32]; // only 8 fully usable regs, but 16 sources easier to implement this way</code></pre>
-  <p><code>SRC_ROWS</code> is 64, <code>DST_ROWS</code> is 1024, <code>ROW_SIZE</code> is 16 and <code>REPLAY_BUF_SIZE</code> is 32 (<code>sim.h:47-54</code>), which matches the ISA docs. Two small notes. ttsim keeps 19-bit Src values in the top bits of a <code>uint32_t</code>. Its mutex array has 8 slots on Wormhole, although the docs count 7 usable mutexes (index 1 doesn't exist).</p>
+  <p><code>SRC_ROWS</code> is 64, <code>DST_ROWS</code> is 1024, <code>ROW_SIZE</code> is 16 and <code>REPLAY_BUF_SIZE</code> is 32, with <code>REPLAY_BUF_ENTRIES</code> defined as the same value (<code>sim.h:47-54</code>), which matches the ISA docs. Two small notes. ttsim keeps 19-bit Src values in the top bits of a <code>uint32_t</code>. Its mutex array has 8 slots on Wormhole, although the docs count 7 usable mutexes (index 1 doesn't exist).</p>
 
   <h2 id="push">How a TRISC pushes an instruction</h2>
   <p>If the coprocessor doesn't fetch, how does an instruction get in? Through a memory-mapped store. A Tensix instruction is a 32-bit word, and a TRISC pushes it with an ordinary <code>sw</code> of that word to <code>INSTRN_BUF_BASE = 0xFFE4_0000</code>. The address is the same for all three TRISCs, and each one's store lands in its own thread's FIFO. BRISC can also reach T1 and T2 through <code>0xFFE5_0000</code> and <code>0xFFE6_0000</code>. NCRISC has no mapping at all. If the FIFO is full, the store simply stalls the RISC-V until there's room <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/PushTensixInstruction.md">(PushTensixInstruction.md)</a>.</p>
@@ -484,7 +484,7 @@ PROVIDE(__instrn_buffer = 0xFFE40000);</code></pre>
 #define TTI_INSN(ENCODING) ({ __asm__ __volatile__(".4byte %0" ::"n"(unsigned((((ENCODING) &gt;&gt; 30) &amp; 3) | (((ENCODING) &amp; 0x3fffffff) &lt;&lt; 2)))); })
 ...
 #define TT_OP(opcode, params) ((opcode &lt;&lt; 24) + params)</code></pre>
-  <p>Two flavours appear here. <code>TTI_</code> ("immediate") instructions are compile-time constants and become a single <code>.ttinsn</code>. <code>TT_</code> instructions take runtime operands, so they're assembled in a register and stored through the <code>instrn_buffer</code> pointer, which is the plain <code>sw</code> path. In ttsim the two paths arrive at different functions, <code>tti()</code> and <code>tensix_inst_wr32()</code> in <code>tile.cpp</code>. Both end in <code>tensix_push_inst</code>. <code>TT_OP</code> shows the encoding: the opcode sits in the top byte.</p>
+  <p>Two flavours appear here. <code>TTI_</code> ("immediate") instructions are compile-time constants and become a single <code>.ttinsn</code>. <code>TT_</code> instructions take runtime operands, so they're assembled in a register and stored through the <code>instrn_buffer</code> pointer, which is the plain <code>sw</code> path. In ttsim the two paths arrive at different functions, <code>tti()</code> in <code>riscv_impl.h</code> (shown above) and <code>tensix_inst_wr32()</code> in <code>tile.cpp</code>. Both end in <code>tensix_push_inst</code>. <code>TT_OP</code> shows the encoding: the opcode sits in the top byte.</p>
 
   <div class="callout sim">Lab <a href="../sim-labs/b03-riscv-interpreter.html">B03</a> walks through ttsim's decode table and the TTI escape and counts instructions per core. Lab <a href="../sim-labs/b04-tensix-instructions.html">B04</a> follows the pushed instructions through MOP expansion to the backend units.</div>
 
@@ -799,7 +799,14 @@ inline void _llk_pack_dest_section_done_()
   <p>Everything above can be checked in the simulator, and I ran each experiment in this orb on ttsim b3620244 (Wormhole build) with the prebuilt tt-metal example <code>add_2_integers_in_compute</code>, which adds two BF16 tiles on core (0,0).</p>
 
   <h3>1. Counting pushes</h3>
-  <p>I built an instrumented copy of ttsim with <code>sim-labs/workbench/build_ttsim.sh push wh</code>. My instrumentation is <em>not</em> part of ttsim: it adds a few counters in <code>tti()</code> (the <code>.ttinsn</code> path), in <code>tensix_inst_wr32()</code> (the <code>sw</code> path) and in <code>tensix_push_inst_fifo()</code> (after the expanders), and prints them when the process exits. The patch is <a href="../sim-labs/patches/a04-push-counters.patch"><code>sim-labs/patches/a04-push-counters.patch</code></a>. To reproduce, run <code>build_ttsim.sh push wh</code> once to make the copy, then <code>(cd $LAB_HOME/ttsim-push &amp;&amp; patch -p1 &lt; …/sim-labs/patches/a04-push-counters.patch)</code>, then run <code>build_ttsim.sh push wh</code> again. Trimmed output:</p>
+  <p>I built an instrumented copy of ttsim with <code>sim-labs/workbench/build_ttsim.sh push wh</code>. My instrumentation is <em>not</em> part of ttsim: it adds a few counters in <code>tti()</code> (the <code>.ttinsn</code> path), in <code>tensix_inst_wr32()</code> (the <code>sw</code> path) and in <code>tensix_push_inst_fifo()</code> (after the expanders), and prints them when the process exits. The patch is <a href="../sim-labs/patches/a04-push-counters.patch"><code>sim-labs/patches/a04-push-counters.patch</code></a>. To reproduce, set up the workbench (lab <a href="../sim-labs/b00-workbench.html">B00</a>), run <code>build_ttsim.sh push wh</code> once to make the copy, apply the patch, and run <code>build_ttsim.sh push wh</code> again:</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout
+export LAB_HOME=~/ttlab/a04
+source $W/env.sh wh
+$W/build_ttsim.sh push wh
+(cd $LAB_HOME/ttsim-push &amp;&amp; patch -p1 &lt; $W/../patches/a04-push-counters.patch)
+$W/build_ttsim.sh push wh</code></pre>
+  <p>Output, with tt-metal's log lines and the lines for pipes 0 and 2 trimmed:</p>
 <pre><code>$ export TT_METAL_SIMULATOR=$LAB_HOME/sim-push-wh-release/libttsim.so
 $ $EX/metal_example_add_2_integers_in_compute
 Success: Result matches expected value!
@@ -818,8 +825,8 @@ A04 pipe1 after expanders: 10:1 28:8 37:6 a2:4 a3:1 a4:1 a6:1 b2:19 b3:2 b4:1 b5
   <ul>
     <li><b>NCRISC pushed nothing, as the hardware requires.</b> BRISC pushed 9 instructions on each of 72 tiles (72 × 9 = 648), all with plain <code>sw</code>, on every worker tile tt-metal brought up and not only the one running the kernel. That looks like firmware initialisation at boot. I didn't trace which instructions they are.</li>
     <li><b>The TRISCs mostly use <code>.ttinsn</code>.</b> A few <code>sw</code> pushes carry runtime operands (<code>TT_</code> rather than <code>TTI_</code> macros).</li>
-    <li><b>The MATH thread (pipe 1) gives the clearest picture.</b> TRISC1 pushed one <code>MOP</code> (opcode <code>0x01</code>) and zero <code>ELWADD</code>s. After the expanders, its FIFO received exactly 8 <code>ELWADD</code>s (<code>0x28</code>), which is 8 × (8 rows × 16) = 1024 elements, one 32×32 tile. Next to them are the handshake: one <code>SEMWAIT</code> (<code>0xa6</code>), one <code>SEMPOST</code> (<code>0xa4</code>), four <code>STALLWAIT</code>s (<code>0xa2</code>) and a <code>SEMINIT</code> (<code>0xa3</code>). Most of the rest are configuration writes (<code>SETC16 0xb2</code>, <code>RMWCIB* 0xb3–0xb6</code>).</li>
-    <li><b>The unpack thread shows the same pattern.</b> Its one <code>MOP</code> became 8 <code>UNPACR</code>s (<code>0x42</code>). Opcode names come from <code>TT_OP_*</code> in <code>ckernel_ops.h</code>.</li>
+    <li><b>The MATH thread (pipe 1) gives the clearest picture.</b> The "pushed" line is a histogram of TRISC1's 34 <code>.ttinsn</code> pushes by opcode (its 3 <code>sw</code> pushes are counted but not broken down). It holds one <code>MOP</code> (opcode <code>0x01</code>) and zero <code>ELWADD</code>s. After the expanders, its FIFO received exactly 8 <code>ELWADD</code>s (<code>0x28</code>), which is 8 × (8 rows × 16) = 1024 elements, one 32×32 tile. Next to them are the handshake: one <code>SEMWAIT</code> (<code>0xa6</code>), one <code>SEMPOST</code> (<code>0xa4</code>), four <code>STALLWAIT</code>s (<code>0xa2</code>) and a <code>SEMINIT</code> (<code>0xa3</code>). Most of the rest are configuration writes (<code>SETC16 0xb2</code>, <code>RMWCIB* 0xb3–0xb6</code>).</li>
+    <li><b>The unpack thread shows the same pattern.</b> In the pipe 0 lines (trimmed above), its one <code>MOP</code> became 8 <code>UNPACR</code>s (<code>0x42</code>). Opcode names come from <code>TT_OP_*</code> in <code>ckernel_ops.h</code>.</li>
   </ul>
 
   <h3>2. Removing the synchronization</h3>
@@ -840,7 +847,7 @@ Mismatch at index 1: expected 7.328125, got 0
 Mismatch at index 1023: expected 8.9375, got 0
 Error: Result does not match expected value!
 [4658] 0.2 seconds (25.4 KHz)</code></pre>
-  <p>All 1024 elements are wrong, and every one reads 0. The packer copied Dst before <code>ELWADD</code> wrote it. A control run with the unmodified kernel prints <code>Success: Result matches expected value!</code> at <code>[4682]</code>. (The bracketed number is ttsim's clock count. ttsim isn't a timing model, so don't read these as performance figures.)</p>
+  <p>All 1024 elements are wrong, and every one reads 0. (The "expected" values differ on every run, because the host program fills its inputs from <code>std::random_device</code>.) The packer copied Dst before <code>ELWADD</code> wrote it. A control run with the unmodified kernel prints <code>Success: Result matches expected value!</code> at <code>[4682]</code>. (The bracketed number is ttsim's clock count. ttsim isn't a timing model, so don't read these as performance figures.)</p>
 
   <div class="callout warn">ttsim is functional and deterministic: its threads interleave the same way every run, and here that interleaving exposed the race every time. On silicon, timing decides which thread wins, so a missing semaphore can pass a test for weeks and then fail under different load. A ttsim run that passes doesn't prove a kernel has no races. It only shows that one particular interleaving gave the right answer.</div>
 

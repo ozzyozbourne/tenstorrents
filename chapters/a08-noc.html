@@ -396,7 +396,7 @@
   <ul>
     <li><b>Posted vs non-posted.</b> A posted write saves the ack packet, but then the sender can never find out when the write has landed. &ldquo;Optionally posted (i.e. receiver does <em>not</em> send an acknowledgement packet in response once the write completes)&rdquo; (README.md:31).</li>
     <li><b>Atomics</b> act on L1 only, never DRAM or MMIO (Atomics.md:3). The menu is increment (on the low <i>n</i> bits of a word), compare-and-swap, and two swap variants (Atomics.md). Metalium's <code>noc_semaphore_inc</code> is an atomic increment.</li>
-    <li><b>Inline writes</b> carry their data in the header, so they cost a single flit. Blackhole has &ldquo;an unfortunate regression [so] that <code>NOC_CMD_WR_INLINE</code> can no longer safely be used to write to L1 addresses&rdquo; (BH README.md:44). ttsim enforces this: on Blackhole an inline write to L1 is <code>UndefinedBehavior</code> (<code>ttsim/src/tile.cpp:1558-1559</code>).</li>
+    <li><b>Inline writes</b> carry their data in the header, so they cost a single flit. On Blackhole, &ldquo;An unfortunate regression means that <code>NOC_CMD_WR_INLINE</code> can no longer safely be used to write to L1 addresses&rdquo; (BH README.md:44). ttsim enforces this: on Blackhole an inline write to L1 is <code>UndefinedBehavior</code> (<code>ttsim/src/tile.cpp:1558-1559</code>).</li>
     <li><b>Multicast</b> (the spec calls it broadcast) sends one packet that the routers <em>copy</em> into a tree, so each link carries the data once even though many tiles receive it. Only Tensix tiles receive; other tiles inside the rectangle &ldquo;opt out&rdquo; (README.md:33; RoutingPaths.md:23). Reads cannot be multicast (MemoryMap.md:59). Blackhole adds a <code>NOC_BRCST_EXCLUDE</code> register &ldquo;allowing for non-rectangular broadcasts&rdquo; (BH MemoryMap.md:56).</li>
   </ul>
   <p>How does one packet reach a whole rectangle? With X as the major axis (the default), &ldquo;packets will travel along the major axis as necessary, then along the minor axis as necessary, and finally on the major axis again as necessary&rdquo; (RoutingPaths.md:23). In the figure below, the packet goes right to the rectangle's first column, travels down that column, and at every row it forks rightwards.</p>
@@ -767,9 +767,13 @@
             src_tile_type, src_coordinate &amp; 63, src_coordinate &gt;&gt; 6, raw_src &amp; 63, raw_src &gt;&gt; 6, (unsigned long long)src_addr,
             dst_tile_type, dst_coordinate &amp; 63, dst_coordinate &gt;&gt; 6, raw_dst &amp; 63, raw_dst &gt;&gt; 6, (unsigned long long)dst_addr, noc_at_len_be);
     }</code></pre>
-<pre><code>export LAB_HOME=$HOME/ttlab/a08
-source sim-labs/workbench/env.sh wh
-sim-labs/workbench/build_ttsim.sh noclog wh      # copy, edit src/tile.cpp, rebuild (~4 s)
+<p>You don't have to type the edit in. The series ships it as <a href="../sim-labs/patches/a16-noclog.patch"><code>sim-labs/patches/a16-noclog.patch</code></a>, which is this logging plus a few extra fields that <a href="a16-multicast-sync.html">A16</a> uses (so its multicast-rectangle and atomic lines are a little longer than the ones shown below). With the workbench from lab <a href="../sim-labs/b00-workbench.html">B00</a>:</p>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; env.sh changes directory, so keep it absolute
+export LAB_HOME=$HOME/ttlab/a08
+source $W/env.sh wh
+$W/build_ttsim.sh noclog wh      # first run: copies ttsim to $LAB_HOME/ttsim-noclog and builds it
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $W/../patches/a16-noclog.patch)   # or edit src/tile.cpp by hand
+$W/build_ttsim.sh noclog wh      # rebuild (~4 s)
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so
 $EX/metal_example_loopback</code></pre>
   <p>The loopback example's single kernel reads each 2 KiB tile from a DRAM buffer into L1 and writes it back to another DRAM buffer, with a barrier after each (<code>programming_examples/loopback/kernels/loopback_dram_copy.cpp</code>). The run printed 100 NoC commands, 50 reads and 50 writes, then <code>Test Passed</code>. Here are the first eight, trimmed:</p>

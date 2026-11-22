@@ -59,16 +59,16 @@
     <li>Copy 32 bytes into the last 16 bytes of the core's own L1.</li>
   </ol>
   <p>Run each one in ttsim. All four stop within a few clocks of each other, around clock 4362, and each prints one line. But the lines carry four <em>different</em> labels: <code>NonContractualBehavior</code>, <code>UnsupportedFunctionality</code>, <code>UnimplementedFunctionality</code>, <code>UndefinedBehavior</code>. Silicon would treat these four bugs in four different ways too. It would compute the right answer for the first and quietly do the wrong thing for the second. For the third it would probably hang, and for the fourth nobody can say.</p>
-  <p>So what do the labels mean, and who is at fault: you, the simulator, or the spec? And what about the bugs that print nothing at all, the hang where five CPUs sit still while the host waits forever? This lab breaks kernels on purpose, one bug at a time, until the messages feel familiar. Everything below was run in this orb on the Wormhole model, at tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code>. Outputs are real and trimmed only where marked.</p>
+  <p>So what do the labels mean, and who is at fault: you, the simulator, or the spec? And what about the bugs that print nothing at all, the hang where five CPUs sit still while the host waits forever? This lab breaks kernels on purpose, one bug at a time, until the messages feel familiar. Everything below was run on the series' build machine (home directory <code>/home/user</code>, which is why that path appears in two outputs) on the Wormhole model, at tt-metal <code>7aad8aac</code> and ttsim <code>b3620244</code>. Outputs are real and trimmed only where marked.</p>
 
   <h2 id="setup">0. Setup</h2>
 <pre><code>export LAB_HOME=$HOME/ttlab/b09
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
-OV=/home/user/workspace/tenstorrent-from-zero/sim-labs/overlays/b09
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+source $W/env.sh wh
+OV=$W/../overlays/b09
 use() { rm -rf $LAB_HOME/kernels/tt_metal; cp -r $OV/$1/. $LAB_HOME/kernels/; }   # switch overlay
 export TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS=localhost:50909   # see the warning in section 5</code></pre>
-  <p>Each bug is a <em>kernel overlay</em> (<a href="b00-workbench.html">B00</a>): a modified copy of a stock kernel under <code>sim-labs/overlays/b09/&lt;case&gt;/</code>, at the same relative path the example's host code passes to <code>CreateKernel</code>. The function <code>use</code> swaps one in, and nothing has to be rebuilt. The cases are:</p>
+  <p>Each bug is a <em>kernel overlay</em> (<a href="b00-workbench.html">B00</a>): a modified copy of a stock kernel under <code>sim-labs/overlays/b09/&lt;case&gt;/</code>, at the same relative path the example's host code passes to <code>CreateKernel</code>. For the stock examples that path starts with <code>tt_metal/programming_examples/</code>, so, by the rule in B00, an overlay is only picked up under <code>$LAB_HOME/kernels/tt_metal/programming_examples/…</code>; each case directory already contains that tree, which is why <code>use</code> can copy it straight into <code>$LAB_HOME/kernels/</code>. The function <code>use</code> removes the previous case and swaps one in, and nothing has to be rebuilt. To get back to the stock kernels, <code>rm -rf $LAB_HOME/kernels/tt_metal</code>. The cases are:</p>
   <table class="t">
     <tr><th>Overlay</th><th>Kernel</th><th>Bug</th><th>Section</th></tr>
     <tr><td><code>ncb-unaligned</code></td><td>add_2_integers_in_riscv (BRISC)</td><td>4-byte load from <code>src0_l1 + 2</code></td><td>3</td></tr>
@@ -190,7 +190,7 @@ export TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS=localhost:50909   # see the warning
   </script>
 
   <h2 id="classes">3. Four kernel bugs, four categories</h2>
-  <p>All four overlays change the same 57-line BRISC kernel. Each was run with Watcher off. (With <code>TT_METAL_WATCHER=1</code>, the first three print the same line at a later clock, 6916 or 6917, the same in every rerun, because Watcher's code adds instructions before the kernel gets there. The fourth is caught by Watcher first, as section 4.1 shows.) Here is the relevant part of the stock kernel. It reads one <code>uint32_t</code> from each input buffer in DRAM into L1, adds them on the RISC-V, and writes the sum back:</p>
+  <p>All four overlays change the same 57-line BRISC kernel. Each was run with Watcher off. (With <code>TT_METAL_WATCHER=1</code>, the first three print the same line at a later clock, 6916 for the unaligned load and 6917 for the other two, the same in every rerun (the error fires inside the kernel, before any wall-clock-driven Watcher dump can change what the host does), because Watcher's code adds instructions before the kernel gets there. The fourth is caught by Watcher first, as section 4.1 shows.) Here is the relevant part of the stock kernel. It reads one <code>uint32_t</code> from each input buffer in DRAM into L1, adds them on the RISC-V, and writes the sum back:</p>
   <div class="filename">tt-metal/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp:30-43 @7aad8aac</div>
 <pre><code>    uint64_t src0_dram_noc_addr = src0.get_noc_addr(0);
     uint64_t src1_dram_noc_addr = src1.get_noc_addr(0);
@@ -435,7 +435,7 @@ TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1 timeout 600 $EX/metal_example_eltwise_bi
 grep "serving sockets" hang.log
 … | info | UMD | Simulation host serving sockets in /tmp/tt-umd-sim-server-0 (cluster.cpp:956)
 source $TT_METAL_HOME/python_env/bin/activate
-python -I $W/py/b09_cbpeek.py /tmp/tt-umd-sim-server-0
+python -I $W/py/b09_cbpeek.py /tmp/tt-umd-sim-server-0     # use the directory your own log line names
 cb  0: tiles_received=  4 tiles_acked=  2 in_flight=2
 cb  1: tiles_received=  4 tiles_acked=  2 in_flight=2
 cb 16: tiles_received= 64 tiles_acked= 64 in_flight=0</code></pre>
@@ -467,7 +467,7 @@ inline void math_dest_wait()
 {
     TTI_SEMWAIT(p_stall::STALL_MATH | p_stall::STALL_SFPU | p_stall::STALL_SYNC, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_MAX);
 }</code></pre>
-  <p>The "wait" is a Tensix <em>instruction</em>, <code>SEMWAIT</code>. The RISC-V pushes it into the math pipe's instruction FIFO and moves on, so it writes <code>MWDD</code> at once. The <em>coprocessor</em> is what stalls (<a href="../chapters/a04-inside-tensix.html">A04</a>: "the RISC-V runs ahead"). Waypoints follow the RISC-V's program counter, not the Tensix pipes. To see the pipes, attach lldb to the hung process running the <a href="#lldb">debug ttsim</a>, and print the simulator's own state for tile 0 (its <code>noc_id_logical</code> is <code>0x492</code>, that is x = 18, y = 18: worker (0,0)):</p>
+  <p>The "wait" is a Tensix <em>instruction</em>, <code>SEMWAIT</code>. The RISC-V pushes it into the math pipe's instruction FIFO and moves on, so it writes <code>MWDD</code> at once. The <em>coprocessor</em> is what stalls (<a href="../chapters/a04-inside-tensix.html">A04</a>: "the RISC-V runs ahead"). Waypoints follow the RISC-V's program counter, not the Tensix pipes. To see the pipes, attach lldb to the hung process running the <a href="#lldb">debug ttsim</a> (built in section 6; plain <code>lldb</code> works where there is no <code>lldb-20</code>), and print the simulator's own state for tile 0 (its <code>noc_id_logical</code> is <code>0x492</code>, that is x = 18, y = 18: worker (0,0)):</p>
 <pre><code>lldb-20 -b -p $(pgrep -n metal_example_e) -o 'p g_chip-&gt;t_tiles[0].tensix[0].inst_rd_ptr' …
 (condensed: values only, comments added)
 (uint32_t[3])  ([0] = 66, [1] = 67, [2] = 236)          # inst_rd_ptr  per pipe: unpack, math, pack
@@ -509,13 +509,13 @@ core(x= 0,y= 1) virtual(x=18,y=19): CWFW, NSW,   W,   W,   W  rmsg:H1G|BNt h_id:
   <p>Core (0,0)'s BRISC (writer0) is in <code>noc_semaphore_wait</code> (<code>NSW</code>, <code>dataflow_api.h:2115</code>) for the "ready" that was deleted. Core (0,1)'s NCRISC (reader1) is in its own <code>NSW</code>, waiting for "data sent", which writer0 will never send. Its BRISC (writer1) waits on the CB that reader1 would have filled (<code>CWFW</code>). The <code>k_ids</code> lines map each column to a kernel file (<code>2|1</code> and <code>4|3</code>; file names at the end of each dump). It is a circular wait across two cores, and the waypoints show it directly.</p>
 
   <h2 id="lldb">6. Debugging the simulator itself with lldb</h2>
-  <p>The UB in section 3.4 printed "access past end of tensix_sram", with no address and no core. When a message is not enough, debug the simulator. Its source is in the workbench, and lldb-20 is installed (gdb is not). Build a debug copy:</p>
+  <p>The UB in section 3.4 printed "access past end of tensix_sram", with no address and no core. When a message is not enough, debug the simulator. Its source is in the workbench, and lldb-20 is installed (gdb is not) on the machine these sessions were recorded on. Any recent lldb will do: a re-run with lldb 18 (plain <code>lldb</code> in place of <code>lldb-20</code>) printed the same frames and values, apart from code addresses inside <code>libttsim.so</code>. Build a debug copy:</p>
   <div class="filename">ttsim/src/rules.py:33-36 @b3620244</div>
 <pre><code>    config_compile_opts = {
         'debug': ['-g', '-Og', '-DDEBUG'],
         'release': ['-O2'],
     }</code></pre>
-<pre><code>$W/build_ttsim.sh dbg wh debug          # third argument picks the flavour; about 2 s
+<pre><code>$W/build_ttsim.sh dbg wh debug          # third argument picks the flavour; about 2 s. Output on the build machine:
 copied ttsim source to /home/user/ttlab/b09/ttsim-dbg (edit files in /home/user/ttlab/b09/ttsim-dbg/src/)
 export TT_METAL_SIMULATOR=/home/user/ttlab/b09/sim-dbg-wh-debug/libttsim.so</code></pre>
   <p><code>-DDEBUG</code> also switches on the internal <code>TTSIM_ASSERT</code> checks (<code>common.h:41-51</code>). The debug build ran stock <code>eltwise_binary</code> to <code>Test Passed</code> in the same 7959 clocks. Now put a breakpoint on the one function every error goes through. lldb sets it as "pending", because <code>libttsim.so</code> is <code>dlopen</code>ed later by UMD:</p>
@@ -577,7 +577,7 @@ Breakpoint 1: no locations (pending).
   <table class="t">
     <tr><th>Blind spot</th><th>Why</th><th>Evidence</th></tr>
     <tr><td>Missing <code>noc_async_*_barrier()</code></td><td>Every NoC transfer in stock ttsim completes inside the store that starts it, so data is always there before the next instruction.</td><td><a href="b05-noc-and-dram.html#barrier">B05 §5</a> (a patched ttsim that delays reads makes it fail); <code>overlays/a11/no-barrier</code></td></tr>
-    <tr><td>Races, contention, latency</td><td>ttsim is not a timing model. The order in which cores run is fixed by the clock loop, so every run is identical.</td><td><a href="b01-meet-ttsim.html">B01</a>: same clock count every run</td></tr>
+    <tr><td>Races, contention, latency</td><td>ttsim is not a timing model. The order in which cores run is fixed by the clock loop, so every run is identical.</td><td><a href="b01-meet-ttsim.html">B01</a>: same clock count every run. That holds for one chip with Watcher, DPRINT and wall-clock timeouts off. The exit clock of a two-chip run can differ between runs, because the host polls the two chips from separate threads (<a href="b10-two-chips.html#workload">B10 §3</a>); the values computed do not change.</td></tr>
     <tr><td>Reading memory nobody wrote</td><td>In ttsim, a fresh L1 reads as zeros.</td><td>A variant of the section 8 harness that reads L1 <code>0x100-0x10c</code> before writing anything gets <code>00000000</code></td></tr>
     <tr><td>Everything after the first error</td><td><code>_Exit(1)</code> stops at the first violation.</td><td>Section 1</td></tr>
     <tr><td>Bugs silicon would tolerate</td><td>ttsim refuses NCB that the hardware happens to handle. That is the opposite of a blind spot, but it surprises people.</td><td>Section 3.1 (unaligned load rounds down on WH)</td></tr>

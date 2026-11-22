@@ -274,7 +274,7 @@ We call this point the roofline.</code></pre>
   })();
   </script>
 
-  <p>Now the opening puzzle takes one line. On the H100 an element-wise bf16 add has intensity 1/6 FLOP/B, so it is limited to 3.35 TB/s × 1/6 ≈ 0.56 TFLOP/s. That is <b>0.056% of 989</b>. A Wormhole n150 behaves the same way: 288 GB/s × 1/6 = 48 GFLOP/s, 0.065% of its 74 TF. Element-wise operations sit far down the left slope on every chip. That is the 39% of BERT runtime spent on 0.2% of the FLOPs.</p>
+  <p>Now the opening puzzle takes one line. On the H100 an element-wise bf16 add has intensity 1/6 FLOP/B, so it is limited to 3.35 TB/s × 1/6 ≈ 0.56 TFLOP/s. That is <b>0.056% of 989</b>. A Wormhole n150 behaves the same way: 288 GB/s × 1/6 = 48 GFLOP/s, 0.065% of its 74 TF. Element-wise operations sit far down the left slope on every chip. That is the roofline's explanation for the 39% of BERT runtime spent on 0.2% of the FLOPs: those operators are limited by moving data, not by arithmetic. (Ivanov et al. reach the same conclusion from their measurements.)</p>
 
   <p>The ridge points tell you how much reuse a chip demands <i>(all derived from the sourced peaks and bandwidths)</i>:</p>
   <table>
@@ -544,7 +544,7 @@ tt_result = ttnn.add(tt_tensor1, tt_tensor2)</code></pre>
     <li><a href="https://horace.io/brrr_intro.html">Horace He, "Making Deep Learning Go Brrrr From First Principles"</a>: compute vs bandwidth vs overhead, with the factory, warehouse and shipping analogy.</li>
     <li><a href="https://gwern.net/doc/cs/hardware/2014-horowitz-2.pdf">Horowitz, "Computing's Energy Problem (and what we can do about it)" (ISSCC 2014)</a>: the 45 nm energy table, the 70 pJ instruction, the end of Dennard scaling and the 1000× specialization chart.</li>
     <li><a href="https://arxiv.org/abs/1506.02626">Han et al., "Learning both Weights and Connections" (2015)</a>: Figure 1 is the source of the widely copied 32-bit 5 pJ SRAM / 640 pJ DRAM rows.</li>
-    <li><a href="http://svmoore.pbworks.com/w/file/fetch/59055930/p162-mckee.pdf">McKee, "Reflections on the Memory Wall" (2004)</a>: the history of Wulf and McKee's 1995 note, by its co-author.</li>
+    <li><a href="https://doi.org/10.1145/977091.977115">McKee, "Reflections on the Memory Wall" (Computing Frontiers 2004)</a> (<a href="http://svmoore.pbworks.com/w/file/fetch/59055930/p162-mckee.pdf">PDF copy</a>): the history of Wulf and McKee's 1995 note, by its co-author.</li>
     <li><a href="https://arxiv.org/abs/2403.14123">Gholami et al., "AI and Memory Wall" (2024)</a>: the 3.0× / 1.6× / 1.4× per two years scaling data.</li>
     <li><a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/GEMM_FLOPS/GEMM_FLOPS.md">tt-metal tech report: Matrix Multiply FLOPS</a>: per-core matrix-engine throughput by fidelity, and measured matmul TFLOPS on Wormhole and Blackhole.</li>
     <li><a href="https://docs.tenstorrent.com/aibs/blackhole/specifications.html">Blackhole</a> and <a href="https://docs.tenstorrent.com/aibs/wormhole/specifications.html">Wormhole</a> spec pages: the official card specs used in the roofline.</li>

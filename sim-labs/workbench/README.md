@@ -17,6 +17,11 @@ Export `TT_METAL_HOME`, `TTSIM_HOME`, `LAB_HOME` or `SIM` before sourcing `env.s
 these. If `~/tt-metal` or `~/ttsim` is missing, `env.sh` falls back to `~/workspace/refs/...` (the
 series' own build machine).
 
+In every example below and on every lab page, `W` is this directory in your checkout. Set it once per shell
+(`W=/path/to/tenstorrent-from-zero/sim-labs/workbench`, adjusted to where you cloned the repository, and absolute,
+because `env.sh` changes directory). Patches are then `$W/../patches/` and kernel overlays `$W/../overlays/`;
+where this file writes `../patches/...` or `../overlays/...`, read `$W/../patches/...` and `$W/../overlays/...`.
+
 ## Scripts
 
 ### `source env.sh [wh|bh]`
@@ -36,7 +41,10 @@ Sets up one lab session, then changes into `$LAB_HOME/run`.
 Use a separate `LAB_HOME` per lab (default `~/ttlab`), for example `export LAB_HOME=~/ttlab/b01`.
 
 **Kernel overlay:** copy a kernel to `$LAB_HOME/kernels/<the relative path the host passes>`, edit
-it, and rerun. No rebuild is needed. Kernels are searched in the cwd first, then
+it, and rerun. No rebuild is needed. For the stock programming examples, and for any host program built with
+`build_host.sh` that uses `OVERRIDE_KERNEL_PREFIX`, that path starts with `tt_metal/programming_examples/`, so an
+overlay is only picked up under `$LAB_HOME/kernels/tt_metal/programming_examples/...`; anywhere else it is silently
+ignored. Kernels are searched in the cwd first, then
 `TT_METAL_KERNEL_PATH`, then `/usr/share/tenstorrent/kernels`, then the runtime root
 (`tt_metal/impl/kernels/kernel.cpp:48-95`). So run from `$LAB_HOME/run`, never from
 `$TT_METAL_HOME`, or the stock kernel silently wins.
@@ -53,7 +61,8 @@ $EX/metal_example_add_2_integers_in_riscv     # Success: Result is 21, [4501] cl
 Compiles and links one host program out of tree against `$TT_METAL_HOME/build_Release`, using the
 in-tree examples' flags (about 6 s). The object and binary are written next to `file.cpp`. The flags
 contain pinned `.cpmcache/` hashes and library versions, so regenerate them from
-`build_Release/build.ninja` if you move the tt-metal pin. Needs `clang++-20`.
+`build_Release/build.ninja` if you move the tt-metal pin. Needs `clang++-20`. `-lnsl` is passed only when
+the compiler can find `libnsl.so` (Debian 12 has it, Ubuntu 24.04 does not), which is what tt-metal's own link line does.
 
 ```bash
 cp $W/host/mm_fid.cpp $LAB_HOME/ && $W/build_host.sh $LAB_HOME/mm_fid.cpp
@@ -71,12 +80,20 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 
 - `host/mm_fid.cpp`: single-core matmul with `MM_FIDELITY=0|2|3|4` (numeric: LoFi=0, HiFi2=2, HiFi3=3, HiFi4=4; names silently mean LoFi) and `MM_SEED`;
   prints `mean_abs_err` and `result_hash`.
+- `host/mm_fid32.cpp` (chapter A06): `mm_fid.cpp` with one change, `.fp32_dest_acc_en = true` in the `ComputeConfig` at line 167,
+  so Dst accumulates in FP32. Same knobs; `MM_FIDELITY=0 MM_SEED=42` prints `result_hash = 6d9ab28ca8ce0383` at `[699743]`.
+- `host/gridinfo.cpp` (chapter A03): opens one device and prints `grid_size`, `logical_grid_size`, the compute grid,
+  `dram_grid_size` and `worker_core_from_logical_core()` for four logical cores. On `wh` the first line is
+  `grid_size            = 10x12` and logical (0,0) maps to (18,18); on `bh` it is `17x12` and (1,2).
 - `host/run_twice.cpp` (chapter A12): the stock `add_2_integers_in_compute` host program with the enqueue run twice on the same core;
   prints `run 1 finished`, `run 2 finished`, then the usual result check. Pair it with a kernel overlay.
 - `host/b06_scale_add.cpp` + `kernels/b06/{reader,compute,writer}.cpp` (lab B06): out = relu(a + b) over N bf16 tiles
   with your own three kernels; `b06_scale_add [n_tiles=8] [cb_pages=2]` prints `exact=`, `off_by_more_than_1ulp=` and
   PASS/FAIL. The host finds the kernels as `b06/*.cpp`, so run it with `TT_METAL_KERNEL_PATH=$W/kernels`, or copy
-  `kernels/b06` into `$LAB_HOME/kernels/` to edit them.
+  `kernels/b06` into `$LAB_HOME/kernels/` to edit them. `kernels/b06/compute_pair.cpp` is the two-tiles-per-iteration
+  compute kernel of the lab's breaks B and C2; the host never loads it by that name, so copy it over
+  `$LAB_HOME/kernels/b06/compute.cpp`. As shipped (`WAIT2 = 2`) `b06_scale_add 8 2` prints `exact=7704 ... PASS` at `[4865]`;
+  with `WAIT2 = 1` it prints `exact=6174 off_by_more_than_1ulp=1681 ... FAIL`.
 - `host/dbrw.cpp`: two-device MeshBuffer write/read on a `MeshShape(2,1)`. Needs the `wh_x2` simulator and `TT_METAL_MOCK_CLUSTER_DESC_PATH=.../wormhole_N300.yaml`.
 - `host/b10_inventory.cpp`, `host/b10_workload.cpp`, `host/b10_fabric.cpp`, `host/b10_fabric_send.cpp` (lab B10): on `wh_x2` with
   `wormhole_N300.yaml`, list each chip's Ethernet cores and peers; run one program per chip in a `MeshWorkload` (prints
@@ -89,10 +106,10 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
   is the stock `distributed_eltwise_add` with `MeshShape(2, 1)`; build it with `build_host.sh`. The Ethernet log comes from
   `../patches/b10-ethlog.patch` (`B10_ETHLOG=1`).
 - `harness/h.c`: calls `libttsim.so` directly with no tt-metal:
-  `gcc -O2 -o h harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
+  `gcc -O2 -o h $W/harness/h.c -ldl && ./h ~/sim/wh/libttsim_wh.so` prints `cfg[0] = 0x401e1e52`.
 - `harness/b09_step.c` (lab B09): drives `libttsim.so` like a host driver, with no tt-metal. It finds BAR0, programs two
   1 MiB TLBs onto one core, writes an 8-instruction RISC-V program to L1, releases BRISC from soft reset and steps the
-  clock one cycle at a time. `gcc -O2 -o b09_step harness/b09_step.c -ldl && ./b09_step ~/sim/wh/libttsim_wh.so [x y] [clocks]`
+  clock one cycle at a time. `gcc -O2 -o b09_step $W/harness/b09_step.c -ldl && ./b09_step ~/sim/wh/libttsim_wh.so [x y] [clocks]`
   (defaults 18 18 30) prints the running sum `5, 9, 12, 14, 15` after clocks 5-21. Wormhole only.
 - `py/b09_cbpeek.py` (lab B09): attaches tt-exalens to a hung run started with `TT_METAL_SIMULATOR_SERVE_OVER_SOCKETS=1`
   and prints `tiles_received`/`tiles_acked` for some CBs of one core:
@@ -101,6 +118,16 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
   on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
+- `py/a05_add.py` (chapter A05, lab B00): a seeded 32×32 bfloat16 `ttnn.add` compared with PyTorch's own bfloat16 add and
+  with the exact fp32 sum. On `wh` it prints `elements differing from torch bf16 add: 108/1024`,
+  `max abs diff vs torch bf16 add: 0.03125`, `PCC vs exact fp32 sum: 0.999999`, `largest difference in ulps: 1.0`, `PASS`,
+  and ttsim ends at `[4881]`. It is also the quickest check that `ttnn` imports and runs: activate
+  `$TT_METAL_HOME/python_env`, source `env.sh`, `python $W/py/a05_add.py`.
+- `py/a09_shard.py` (chapter A09, "From Python"): one 128×128 tensor placed in DRAM (interleaved), then height-sharded and
+  width-sharded in L1 over cores (0,0)-(3,0), with a ReLU on each; prints each buffer's address and memory layout and
+  whether the ReLU matches torch.
+- `py/a19_oneop.py` (chapter A19): runs exactly one TT-NN op (`add`, `matmul` or `addf32`), so that an empty
+  `TT_METAL_CACHE` afterwards holds only that op's kernels: `python -u $W/py/a19_oneop.py add`.
 - `py/a14_journey.py` (chapter A14): picks tile 0's 48 journey events out of a trace written by ttsim +
   `patches/a14-journey.patch`: `python3 $W/py/a14_journey.py $LAB_HOME/journey.trace [--json]`.
 - `py/a18_*.py` (chapter A18): TT-NN from the user's side. `a18_pad` and `a18_devtilize` (padding and pages,
@@ -116,7 +143,7 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
   and on the device. `B08_SRC=bf16` starts from a BF16 tile (needed on Wormhole, where FP32 typecast hits ttsim UB).
 - `host/b08_sfpu.cpp` (lab B08): one SFPU function over evenly spaced inputs vs a double reference, chosen with
   `B08_FN=copy|map|piecewise|sin|exp|recip` and `B08_FMT`, `B08_DST32`, `B08_U2D`, `B08_APPROX`, `B08_EXPT`, `B08_FOLD`.
-  Needs the overlay: `cp -r ../overlays/b08/. $LAB_HOME/kernels/`.
+  Needs the overlay: `cp -r $W/../overlays/b08/. $LAB_HOME/kernels/`.
 - `py/b04_trace.py` (lab B04): names and summarises the per-tile Tensix instruction trace written by a ttsim
   built with `../patches/b04-trace.patch` and `b04-mop.patch` (`stream`, `stalls`, `mops`, `hist`, `js`).
 - `py/b07_mvmul.py` (lab B07): reproduces every Dst element of an MVMUL dump bit for bit (independent and chained
@@ -125,12 +152,13 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/a19_cache_demo.py`, `py/a19_hit_vs_miss.py`, `py/a19_sqdiff_generic.py` (chapter A19): the TT-NN
   program cache growing per call, cache on vs off, and a custom `(a-b)^2` op run through `ttnn.generic_op`.
   Set `TT_METAL_CACHE=$LAB_HOME/jit` first so you can list the JIT-compiled kernels afterwards.
-- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py`, `py/b11_s0_add.py`, `py/b11_s1_probe.py`, `py/b11_s3_hifi.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
+- `py/b11_pytest.py`, `py/b11_explore.py`, `py/b11_traffic.py`, `py/b11_s0_add.py`, `py/b11_s1_probe.py`, `py/b11_s3_hifi.py`, `py/b11_s3_compare.py` (lab B11): run a slice of tt-metal's ttnn pytest suite
   under ttsim, restarting pytest after each simulator abort and reporting pass/fail/skip/abort counts; sweep one op over
   shapes, dtypes, layouts and memory configs with PCC and the JIT-compiled kernel list per case (private
   `TT_METAL_CACHE` per case); and run one matmul per memory config for NoC counting under `../patches/a20-counters.patch`.
   `b11_s0_add.py` is the 32×32 smoke test, `b11_s1_probe.py <add_fp32|sum_fp32|mm_fp32acc|trace>` runs one setup probe
-  per process, and `b11_s3_hifi.py` compares HiFi2/3/4 with FP32 accumulation (`B11_SAVE=<file>.pt` saves the outputs).
+  per process, and `b11_s3_hifi.py` compares HiFi2/3/4 with FP32 accumulation (`B11_SAVE=<file>.pt` saves the outputs;
+  `b11_s3_compare.py <wh.pt> <bh.pt>` compares two saved runs bit for bit).
   `../patches/b11-ten3868.patch` makes ttsim skip the dummy unpack Wormhole's LLK issues after unpack-to-Dst, which
   otherwise aborts many Wormhole ops on FP32 tensors or with `fp32_dest_acc_en`. It is a modelling workaround, not a ttsim
   bug fix: ttsim's check follows the ISA. `../patches/b11-api-count.patch` counts the host's PCIe reads, writes and clock calls.
@@ -145,6 +173,10 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 
 - `YAML::BadFile ... soc_descriptor.yaml`: there is no descriptor next to the `.so`.
 - `TT_FATAL: Root Directory is not set.`: `TT_METAL_RUNTIME_ROOT` is unset (source `env.sh`).
-- An edit has no effect: the cwd contains a `tt_metal/` tree; `cd $LAB_HOME/run`.
+- An edit has no effect: the cwd contains a `tt_metal/` tree (`cd $LAB_HOME/run`), or the overlay is not under
+  `$LAB_HOME/kernels/tt_metal/programming_examples/...`.
+- `/usr/bin/time: No such file or directory` (Ubuntu 24.04 has no GNU time by default): use the shell's `time`.
+- `llvm-ar: error: ... Invalid attribute group entry (Producer: 'LLVM20...' Reader: 'LLVM 18...')` while building
+  tt-metal, or a `ttnn` that does not import: see "Build problems on Ubuntu 24.04" in lab B00.
 - The JIT cache is `~/.cache/tt-metal-cache/`. Kernel hash directories are keyed on the kernel path, args and config
   (not file contents); edits are detected through `.dephash` sidecar files, so it rarely needs clearing.

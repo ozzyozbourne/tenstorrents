@@ -58,7 +58,7 @@
 
   <h2 id="setup">Setup</h2>
   <p>We use a lab directory of our own, the workbench's <code>mm_fid</code> host program (<a href="b00-workbench.html">B00</a>), and later an editable copy of ttsim:</p>
-<pre><code>W=~/workspace/tenstorrent-from-zero/sim-labs/workbench      # adjust to your checkout
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/b07
 source $W/env.sh wh
 cp $W/host/mm_fid.cpp $LAB_HOME/ &amp;&amp; $W/build_host.sh $LAB_HOME/mm_fid.cpp</code></pre>
@@ -111,7 +111,7 @@ mean_abs_err = 1.505054 max_abs_err = 6.000000 result_hash = ef7abcd145720383</c
     <li><b>Past HiFi2 almost nothing changes.</b> HiFi3 improves the mean error by about 0.003, and HiFi4 produces <em>exactly the same bits</em> as HiFi3: the same hash, for all five seeds. A whole extra phase, 128,000 more MVMULs on this core, changed nothing at all.</li>
     <li><b>Even HiFi4 is 1.5 away from the golden on average.</b> The outputs are about 160, and one BF16 step (ulp) at 160 is 1.0. So the "best" result is still 1.5 ulps off. Fidelity isn't what limits this matmul.</li>
   </ol>
-  <p>For contrast I ran two variants of <code>mm_fid</code> as well. <code>mm_fid32</code> adds <code>.fp32_dest_acc_en = true</code> to the <code>ComputeConfig</code>. <code>mm_fid_signed</code> draws inputs from [−1, 1) instead of [0, 1). Both are one-line <code>sed</code> edits, shown in the <a href="#exercises">exercises</a>. The chart below has all three data sets. Use the buttons to switch between them, and Play to add one fidelity at a time.</p>
+  <p>For contrast I ran two variants of <code>mm_fid</code> as well. <code>mm_fid32</code> adds <code>.fp32_dest_acc_en = true</code> to the <code>ComputeConfig</code>. <code>mm_fid_signed</code> draws inputs from [−1, 1) instead of [0, 1). Both are one-line <code>sed</code> edits, shown in the <a href="#exercises">exercises</a>. (The result of the first <code>sed</code> is also shipped ready-made as <code>$W/host/mm_fid32.cpp</code>.) The chart below has all three data sets. Use the buttons to switch between them, and Play to add one fidelity at a time.</p>
 
   <div class="viz" id="fig-err"><div class="modebar" id="err-modes"><span>Data:</span></div><div class="readout" id="err-read">Hover a point for its value.</div></div>
   <script>
@@ -519,6 +519,7 @@ exact (all bits) dot product of this slab: 3.48496389</code></pre>
 
   <h2 id="tile">Step 5: One tile, element by element</h2>
   <p>With <code>--json</code> the script rebuilds the 32×32 operand tiles of the first tile product from the phase-0 MVMULs (SrcB rows → in0, SrcA rows → in1), plus the Dst tile after that tile product and after all 20. It also computes the exact reference: the same BF16 operands, multiplied and summed in double precision, which is exact for these values.</p>
+<pre><code>cd $LAB_HOME/dumps; for f in 0 2 3 4; do python3 -I $W/py/b07_mvmul.py fid$f.txt --json fid$f.json | tail -n 1; done</code></pre>
 <pre class="out"><code>tile (0,0): after 1 tile product mean |Dst - exact| = 0.159058; after 20 = 2.203112; wrote fid0.json
 tile (0,0): after 1 tile product mean |Dst - exact| = 0.023189; after 20 = 1.529170; wrote fid2.json
 tile (0,0): after 1 tile product mean |Dst - exact| = 0.022671; after 20 = 1.523120; wrote fid3.json

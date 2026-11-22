@@ -57,14 +57,13 @@
   <h2 id="setup">Set up an instrumented simulator</h2>
   <p>Use the workbench from <a href="b00-workbench.html">B00</a> with a scratch directory of your own. <code>build_ttsim.sh</code> copies ttsim's source to <code>$LAB_HOME/ttsim-boot/</code> on first use and builds it in about 4 seconds:</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/b02
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench   # env.sh cds away, so use absolute paths
-P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 source $W/env.sh wh
 $W/build_ttsim.sh boot wh                     # first call: copy the source, build the stock simulator
 cd $LAB_HOME/ttsim-boot
-patch -p1 &lt; $P/b02-1-inventory.patch
-patch -p1 &lt; $P/b02-2-noc-map.patch
-patch -p1 &lt; $P/b02-3-soft-reset.patch
+patch -p1 &lt; $W/../patches/b02-1-inventory.patch
+patch -p1 &lt; $W/../patches/b02-2-noc-map.patch
+patch -p1 &lt; $W/../patches/b02-3-soft-reset.patch
 $W/build_ttsim.sh boot wh                     # rebuild with the patches
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-boot-wh-release/libttsim.so
 cd $LAB_HOME/run</code></pre>
@@ -159,7 +158,7 @@ Success: Result is 21
         case 0 | (10 &lt;&lt; 6):
             return {'A', 0}; // ARC tile (just one)</code></pre>
   <p>A coordinate is packed as <code>x | (y &lt;&lt; 6)</code>. Three different coordinates return <code>{'D', 0}</code>: the simulator sends all three to the same array, <code>g_dram[0]</code>. Keep that in mind. Anything not in the switch falls through to the Tensix and Ethernet arithmetic, and a router-only position such as (0,2) hits <code>TTSIM_ERROR(UnimplementedFunctionality, …)</code>.</p>
-  <p>Printing every access would flood the terminal: add_2 alone makes 4,539 host reads and 7,710 host writes. So the second patch prints only the <em>first</em> access to each coordinate by each initiator, counts the rest, and prints a table at exit. To tell host from device, <code>libttsim.cpp</code> sets a flag while it serves a BAR access, and <code>noc_cmd_ctrl</code> records which tile issued the command:</p>
+  <p>Printing every access would flood the terminal: add_2 alone makes 4,539 host reads and 7,710 host writes. (B01 counted 17,361 BAR writes for the same run. That counter sat one level higher, in <code>libttsim_pci_mem_wr_bytes</code>. A BAR write that only programs a TLB window never reaches a tile, and one multicast BAR write reaches many, so the two numbers count different things. The read counts agree: 4,539 both times.) So the second patch prints only the <em>first</em> access to each coordinate by each initiator, counts the rest, and prints a table at exit. To tell host from device, <code>libttsim.cpp</code> sets a flag while it serves a BAR access, and <code>noc_cmd_ctrl</code> records which tile issued the command:</p>
   <div class="filename">sim-labs/patches/b02-2-noc-map.patch (excerpt)</div>
 <pre><code>--- a/src/libttsim.cpp
 +++ b/src/libttsim.cpp
@@ -346,8 +345,8 @@ grep "B02 reset T5 (" r2.log</code></pre>
 <pre><code>[123] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
 [123] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
 [129] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47800 no change
-[271] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47000 start BRISC@0x0;
-[2143] B02 reset T5 (7,1) by BRISC: 0x47000 -&gt; 0x00000 start TRISC0@0x6140; start TRISC1@0x6740; start TRISC2@0x6d40; start NCRISC@0x5940;
+[271] B02 reset T5 (7,1) by host/NoC: 0x47800 -&gt; 0x47000 start BRISC@0x0 [0x3210306f];
+[2143] B02 reset T5 (7,1) by BRISC: 0x47000 -&gt; 0x00000 start TRISC0@0x6140 [0xffb001b7]; start TRISC1@0x6740 [0xffb001b7]; start TRISC2@0x6d40 [0xffb001b7]; start NCRISC@0x5940 [0xffb001b7];
 [4419] B02 reset T5 (7,1) by host/NoC: 0x00000 -&gt; 0x47800 stop BRISC@0x3fac; stop TRISC0@0x6318; stop TRISC1@0x68f4; stop TRISC2@0x6f00; stop NCRISC@0x5af8;</code></pre>
   <p>Six writes per tile, three of them redundant. The two at clock 123 arrive in the same clock on all 72 tiles at once, so they are broadcasts. UMD's <code>Cluster::assert_risc_reset()</code> broadcasts <code>ALL_TENSIX</code> to address <code>0xFFB121B0</code> over every Tensix row and column (<code>tt-umd-workload/src/cluster.cpp:1042-1060, 1411-1448</code>), and tt-metal calls it once when it creates its cluster (<code>tt_cluster.cpp:264-266</code>) and UMD calls it again in <code>deassert_resets_and_set_clock_state</code> (<code>cluster.cpp:1464-1467</code>). We did not trace which broadcast is which. The third, one tile per clock, is tt-metal's <code>assert_tensix_workers_impl</code> (<code>risc_firmware_initializer.cpp:412-422</code>), which asserts <code>RiscType::ALL</code> on each core through UMD's read-modify-write. The read is why each tile costs one clock.</p>
   <p>So the useful filter is level 1, which keeps only writes that start or stop something, plus <code>B02_TILE</code> to follow one tile. That brings 432 lines down to 9:</p>
@@ -470,7 +469,7 @@ grep "B02 reset T5 (" r2.log</code></pre>
 <pre><code>inline void deassert_all_reset() { WRITE_REG(RISCV_DEBUG_REG_SOFT_RESET_0, RISCV_SOFT_RESET_0_NONE); }
 
 inline void assert_just_ncrisc_reset() { WRITE_REG(RISCV_DEBUG_REG_SOFT_RESET_0, RISCV_SOFT_RESET_0_NCRISC); }</code></pre>
-  <p><code>RISCV_SOFT_RESET_0_NONE</code> is <code>0x00000</code>. Writing it also "releases" BRISC, but BRISC is already running, so ttsim's 1-to-0 rule leaves its PC alone. Our log's <code>by BRISC: 0x47000 -&gt; 0x00000</code> is that line executing. After this BRISC waits in <code>wait_ncrisc_trisc()</code> until all four siblings report done, and the host polls the go message until each BRISC reports that initialisation finished (<code>wait_until_cores_done(… RUN_MSG_INIT …)</code>, <code>risc_firmware_initializer.cpp:1595-1596</code>). In our scratch trace of T0, the host read the same L1 word, <code>0x4a0</code>, every 70 to 90 clocks from 336 until the launch at 4091.</p>
+  <p><code>RISCV_SOFT_RESET_0_NONE</code> is <code>0x00000</code>. Writing it also "releases" BRISC, but BRISC is already running, so ttsim's 1-to-0 rule leaves its PC alone. Our log's <code>by BRISC: 0x47000 -&gt; 0x00000</code> is that line executing. After this BRISC waits in <code>wait_ncrisc_trisc()</code> until all four siblings report done, and the host polls the go message until each BRISC reports that initialisation finished (<code>wait_until_cores_done(… RUN_MSG_INIT …)</code>, <code>risc_firmware_initializer.cpp:1595-1596</code>). In a scratch trace of every host access to T0, the host read the same L1 word, <code>0x4a0</code>, at clocks 336, 424 and 503 and then exactly every 72 clocks until 4031, with one last read at the launch at 4091. A period of 72 fits a loop that polls the 72 worker tiles in turn, one read (and so one clock) each. After the launch the same word is read on every clock until the kernel is done, 373 reads in all.</p>
   <div class="callout gpu"><b>Compared with a GPU.</b> CUDA programmers never see an SM come out of reset. The driver and the GPU's own firmware bring the chip up before your process exists, and a kernel launch only hands work to cores that are already running a scheduler. On Tenstorrent, with tt-metal, the boot is part of opening the device: the runtime library writes the firmware into every core's L1 and flips each core's reset bit itself, every time you open the device. That is more work, but it means the whole boot is ordinary, readable code, and a simulator can show you every step.</div>
 
   <h3>One more twist: NCRISC's IRAM dance</h3>

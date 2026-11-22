@@ -71,7 +71,7 @@ Compiled by a research subagent on 2026-10-30. Links were checked by HTTP fetch.
 | Formats | Down to FP8 | Includes BFP8/4/2 (16 elements share an exponent); math fidelity |
 | Software | Mostly closed | Apache-2.0; public ISA docs |
 | Power | 700 W | 300 W |
-| Price | Not listed | p150 $1,399; Galaxy Blackhole $110K (April 2026) |
+| Price | Not listed | p150 $1,399; Galaxy Blackhole $110K at launch (April 2026, The Register); $160,000 list on tenstorrent.com/hardware/galaxy when re-checked 2026-11-20 |
 
 - **Tenstorrent's original thesis:** conditional execution and sparsity (Vasiljevic and Bajic, IEEE Micro 2021). These are design-intent claims with no independent benchmarks.
 - **NoC hop latency:** about 9 cycles per hop (corsix part 3).
@@ -86,13 +86,14 @@ Compiled by a research subagent on 2026-10-30. Links were checked by HTTP fetch.
 | Year | 2021 | 2022 | 2023; cards shipped April 2025 |
 | Process | 12 nm | 12 nm | 6 nm |
 | Tensix cores | 120 | 80 (72 on n150) | 140 as presented / 120 shipped |
+| RISC-V cores (full die) | | 416 baby *(derived)* | 752 baby + 16 X280 = 768 (HC2024) |
 | SRAM | 120 MB | 120 MB | 180 MB shipped |
 | DRAM | LPDDR4, about 100 GB/s | 12 GB GDDR6, 288–336 GB/s | 32 GB GDDR6, 512 GB/s |
 | Ethernet | None | 16×100 GbE | 10×400 GbE |
 | Extra CPUs | | | 16 X280 |
 
 - **Galaxy Wormhole:** 32 chips, 9.3 PF FP8, 12 kW.
-- **Galaxy Blackhole:** 32 chips, about 23.8 PF FP8, $110K.
+- **Galaxy Blackhole:** 32 chips, about 23.8 PF FP8, $110K (launch reporting, April 2026). Re-checked 2026-11-20: tenstorrent.com/hardware/galaxy lists 32 Blackhole ASICs, "23 PFLOPS Block FP8", 1 TB GDDR6 at 16 TB/s, 10× 400 GbE links per ASIC, 8–10 kW average / 12 kW max, $160,000 list. The page no longer lists Wormhole Galaxy specifications (only a $70,000 starting price), so the Wormhole Galaxy line above can no longer be confirmed there.
 - **QuietBox:** 4 Blackhole chips, $11,999.
 - **Matrix engine:** 8×16 × 16×16 per cycle = 4,096 FLOP/cycle, about 4 TF per core at 1 GHz in LoFi. The multiplier is 7b×5b with fidelity phases. 80 cores × 4 TF ≈ 320 TF, close to the HC2024 figure of 328.
 

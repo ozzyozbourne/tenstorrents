@@ -103,7 +103,7 @@
         "<b>Open.</b> <code>MeshDevice::create_unit_mesh(0)</code> opens chip 0 as a 1×1 mesh and initialises it.",
         m.fw ? "<b>Firmware build, " + m.fw.toFixed(2) + " s.</b> On an empty cache, device init first JIT-compiles firmware for every RISC-V (brisc, ncrisc, trisc0-2, erisc…) and a precompiled header. This bar is most of the run." : "<b>Firmware build: 0 s.</b> The firmware ELFs are already in the cache, so this bar has vanished.",
         "<b>Write inputs.</b> Two 4-byte writes, host vector → DRAM. In slow-dispatch mode the host does each write itself.",
-        m.jit ? "<b>Kernel JIT, ~" + m.jit.toFixed(2) + " s.</b> The first enqueue of a program compiles <code>reader_writer_add_in_riscv.cpp</code> with riscv-tt-elf-g++ into a BRISC ELF. The cache is keyed on the source, so an edited kernel misses here (JIT cache " + m.hits + ")." : "<b>Kernel JIT: 0 s.</b> Same source, same args, same defines, so it is a cache hit (JIT cache 9/9). The compile bar is gone.",
+        m.jit ? "<b>Kernel JIT, ~" + m.jit.toFixed(2) + " s.</b> The first enqueue of a program compiles <code>reader_writer_add_in_riscv.cpp</code> with riscv-tt-elf-g++ into a BRISC ELF. The cache records a hash of the source and every header it includes, so an edited kernel misses here (JIT cache " + m.hits + ")." : "<b>Kernel JIT: 0 s.</b> Same source, same args, same defines, so it is a cache hit (JIT cache 9/9). The compile bar is gone.",
         "<b>Launch.</b> The kernel binary and the six runtime args are written into the core's L1, and BRISC is told to go.",
         "<b>Run.</b> The kernel itself: two NoC reads, one add, one NoC write. In ttsim this is <b>[4501] simulated clocks in all three scenarios</b>: the device work is identical; only host-side compilation changes.",
         "<b>Read back.</b> A blocking read of the 4-byte result. Commands run in FIFO order, so it cannot overtake the kernel.",
@@ -314,7 +314,7 @@ enum NOC : uint8_t {
 distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);</code></pre>
   <p>A <b>MeshWorkload</b> maps programs onto regions of the mesh. <code>device_range</code> covers the whole mesh (<code>MeshCoordinateRange(mesh_device-&gt;shape())</code>), which here is the single chip at (0,0). On a bigger mesh you could put different programs on different chips in one workload. The program is <em>moved</em> in, because the workload now owns it.</p>
   <p><code>EnqueueMeshWorkload</code> is where the orange JIT bar happens. In fast-dispatch mode it compiles the workload, loads the binaries and generates dispatch commands before enqueueing. In slow-dispatch mode the comment says it "normally JIT-compiles inside LaunchProgram":</p>
-  <div class="filename">tt-metal/tt_metal/distributed/distributed.cpp:127-138 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/distributed/distributed.cpp:127-138 @7aad8aac (condensed: the Mock test and its comment are abbreviated)</div>
 <pre><code>if (env.get_rtoptions().get_fast_dispatch() &amp;&amp; !emulated) {
     mesh_workload.impl().compile(mesh_cq.device());
     mesh_workload.impl().load_binaries(mesh_cq);
@@ -364,7 +364,7 @@ FORCE_INLINE T get_arg_val(int arg_idx) {
 }</code></pre>
   <p>It is one load from L1. There is no marshalling and no type information: argument 3 is "the L1 address of src0" only because the host put that word in position 3. Get the order wrong and the kernel happily reads from the wrong place.</p>
   <p><b><code>InterleavedAddrGen&lt;true&gt;</code></b> (<code>true</code> = DRAM) is a tiny struct that turns "page <i>id</i> of this interleaved buffer" into a <b>64-bit NoC address</b>:</p>
-  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:281-304 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_addrgen.h:281-305 @7aad8aac (trimmed)</div>
 <pre><code>struct InterleavedAddrGen {
     static constexpr bool is_dram = DRAM;
     uint32_t bank_base_address;  // Base address for the whole tensor.
@@ -569,7 +569,7 @@ noc_async_write_barrier();</code></pre>
   })();
   </script>
   <p>Here is how <code>load_blocking</code> achieves the right-hand ordering:</p>
-  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel.h:155-183 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/ckernel.h:155-183 @7aad8aac (trimmed: comment sub-bullets and the 16-bit <code>lhu</code> branch omitted)</div>
 <pre><code>// important note: FENCE on Wormhole is a NOP
 //
 // this code provides a blocking load by doing the following:
@@ -650,16 +650,18 @@ Thank you, Core {0, 0} on Device 0, for the completed task.</code></pre>
     <li><b>fmt-style formatting</b> (lines 64-68): <code>{}</code>, <code>{:x}</code>, <code>{:.5f}</code>, and bf16 values via <code>bf16_t</code>.</li>
     <li><b>Tiles</b> can be printed from circular buffers with <code>TSLICE</code>/<code>TileSlice</code> (lines 130-192). That is useful from <a href="a11-dataflow-and-cbs.html">A11</a> onwards, and lab B06 uses it to watch CB pointers.</li>
   </ul>
-  <div class="callout warn">DPRINT is not free. Under ttsim the add example rose from <code>[4501]</code> to between <code>[5944]</code> and <code>[6115]</code> simulated clocks with DPRINT on, varying from run to run (the research notes recorded 6611 on another run; the count depends on host polling). On silicon it adds real time and L1 traffic. Leave it off when measuring.</div>
+  <div class="callout warn">DPRINT is not free. Under ttsim the add example rose from <code>[4501]</code> to anywhere between about <code>[5000]</code> and <code>[6600]</code> simulated clocks with DPRINT on, and the number differs on every run (five reruns gave 4988, 5023, 5048, 5626 and 6170; the research notes recorded 6611). The count depends on when the host's print server polls, not on the kernel. Switching DPRINT on or off also changes the build key, so the first run after the switch recompiles the firmware and the kernel into a separate cache tree (0/9 hits once, then 9/9). On silicon it adds real time and L1 traffic. Leave it off when measuring.</div>
 
   <h2 id="sim">Run it in the simulator</h2>
   <div class="callout sim">Set up the workbench first: <a href="../sim-labs/b00-workbench.html">B00</a>. The hands-on version of this section, with more experiments, is <a href="../sim-labs/b01-meet-ttsim.html">B01 · Meet ttsim</a>.</div>
   <p>All runs below are on the Wormhole build of ttsim in this orb, using the prebuilt example binaries. I gave the JIT cache a private directory (<code>TT_METAL_CACHE</code>, <code>tt_metal/llrt/rtoptions.cpp:499-506</code>) so that "cold" really meant cold.</p>
-<pre><code>export LAB_HOME=$HOME/ttlab/a10
-source tenstorrent-from-zero/sim-labs/workbench/env.sh wh   # cds into $LAB_HOME/run
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench         # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/a10
+source $W/env.sh wh                                          # cds into $LAB_HOME/run
 export TT_METAL_CACHE=$LAB_HOME/cache
 rm -rf $LAB_HOME/cache                                       # truly cold
 /usr/bin/time -f "WALL %e s" $EX/metal_example_add_2_integers_in_riscv</code></pre>
+  <p>(<code>/usr/bin/time</code> is GNU time, a separate package on some systems; Ubuntu 24.04 does not install it by default. If it is missing, put the shell keyword <code>time</code> in front of the command instead and read the <code>real</code> line.)</p>
   <p>Output, trimmed to the interesting lines:</p>
 <pre><code>Success: Result is 21
 ... BuildKernels | JIT cache stats: 0/9 hits (0.0%) [0 cached, ...]
@@ -669,14 +671,14 @@ WALL 3.90 s</code></pre>
 <pre><code>... BuildKernels | JIT cache stats: 9/9 hits (100.0%) [9 cached, ...]
 [4501] 0.2 seconds (27.9 KHz)
 WALL 0.35 s</code></pre>
-  <p>The bracketed number is ttsim's simulated clock count. It is identical in both runs because the device did the same work. Across repeated runs I measured:</p>
+  <p>The bracketed number is ttsim's simulated clock count. It is identical in both runs because the device did the same work. Across repeated runs I measured the following. The wall times are from one idle machine; a re-run of the same three scenarios on a busy 4-core machine took 10.5 s, 0.8–0.9 s and 0.5–0.6 s, with the same hit counts and the same 4501 clocks, so read the wall column for its shape, not its values.</p>
   <table>
     <tr><th>Scenario</th><th>JIT cache hits</th><th>Wall time</th><th>Simulated clocks</th></tr>
     <tr><td>Empty cache (firmware, PCH and kernel all built)</td><td>0/9</td><td>3.75, 3.90, 3.92 s</td><td>4501</td></tr>
     <tr><td>Only the kernel's cache directory deleted</td><td>8/9</td><td>0.74, 0.76, 0.76 s</td><td>4501</td></tr>
     <tr><td>Warm</td><td>9/9</td><td>0.35, 0.36, 0.36, 0.36 s</td><td>4501</td></tr>
   </table>
-  <p>The cache directory shows most of what gets built: firmware for seven RISC-V types (<code>firmware/{brisc, ncrisc, trisc0, trisc1, trisc2, erisc, idle_erisc}</code>), precompiled headers under <code>pch/</code>, and one directory for our kernel, <code>kernels/reader_writer_add_in_riscv/&lt;hash&gt;/brisc/brisc.elf</code>. (I did not map each of the nine telemetry entries to a directory.) Only a <code>brisc</code> ELF is built for the kernel, because it was created for RISCV_0 only. Deleting just the <code>kernels/</code> directory gives the 8/9 case: one miss.</p>
+  <p>The cache directory shows most of what gets built: firmware for seven RISC-V types (<code>firmware/{brisc, ncrisc, trisc0, trisc1, trisc2, erisc, idle_erisc}</code>), precompiled headers under <code>pch/</code> (in a sibling <code>tt-metal-cache/</code> directory, outside the build-key directory that holds <code>firmware/</code> and <code>kernels/</code>), and one directory for our kernel, <code>kernels/reader_writer_add_in_riscv/&lt;hash&gt;/brisc/brisc.elf</code>. (I did not map each of the nine telemetry entries to a directory.) Only a <code>brisc</code> ELF is built for the kernel, because it was created for RISCV_0 only. Deleting just the <code>kernels/</code> directory gives the 8/9 case: one miss.</p>
 
   <h3>Edit the kernel: + becomes *</h3>
   <p>No rebuild of tt-metal is needed. The runtime looks for kernel sources in this order: absolute path, then the current directory, then <code>TT_METAL_KERNEL_PATH</code>, then the system kernel directory, then the root directory (<code>tt_metal/impl/kernels/kernel.cpp:50-95</code>). The workbench points <code>TT_METAL_KERNEL_PATH</code> at <code>$LAB_HOME/kernels</code>. So put an edited copy there under the <em>exact relative path the example asks for</em>, which includes the <code>tt_metal/programming_examples/</code> prefix from <code>OVERRIDE_KERNEL_PREFIX</code>:</p>
@@ -694,11 +696,12 @@ Error: Expected result of 21, got 98
 ... BuildKernels | JIT cache stats: 8/9 hits (88.9%) [8 cached, ...]
 [4501] 0.2 seconds (26.0 KHz)
 WALL 0.76 s</code></pre>
-  <p>14 × 7 = 98. The host's check fails as it should. The JIT noticed the new source: one miss, firmware still cached, 0.76 s. With DPRINT on, the kernel's own print line confirms that the inputs arrived intact:</p>
+  <p>14 × 7 = 98. The host's check fails as it should. The JIT noticed the new source: one miss, firmware still cached, 0.76 s. How it noticed is worth knowing. The <code>&lt;hash&gt;</code> in the cache path covers the kernel's <em>resolved source path</em> and its config, not the file's contents (<code>Kernel::compute_hash</code>, <code>tt_metal/impl/kernels/kernel.cpp:688-832</code>). The overlay copy lives at a different path from the stock file, so it got a second <code>&lt;hash&gt;</code> directory next to the first. When I then edited the overlay file in place (<code>*</code> to <code>-</code>, giving <code>got 7</code>), no new directory appeared: the same directory was rebuilt, again with 8/9 hits. That second mechanism is the <code>.dephash</code> files stored beside each object, which record a hash of the source and every header it included and force a rebuild when any of them changes. A13 covers both. With DPRINT on, the kernel's own print line confirms that the inputs arrived intact:</p>
 <pre><code>$ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_add_2_integers_in_riscv
 0:0-0:BR: Adding integers: 14 + 7
 Error: Expected result of 21, got 98
-[5944] 0.4 seconds (15.9 KHz)</code></pre>
+[5048] 0.2 seconds (25.8 KHz)</code></pre>
+  <p>(The clock count with DPRINT on is not repeatable; three runs of this command gave 5626, 5023 and 5048.)</p>
   <p>Delete the overlay file and the stock kernel is used again (<code>0:0-0:BR: Adding integers: 14 + 7</code>, <code>Success: Result is 21</code>).</p>
   <div class="callout warn">Never run the examples with the current directory set to <code>TT_METAL_HOME</code>. The current directory is searched <em>before</em> <code>TT_METAL_KERNEL_PATH</code>, so from there the stock kernel always wins and your edit is silently ignored. <code>env.sh</code> moves you into <code>$LAB_HOME/run</code> for this reason.</div>
 
@@ -716,7 +719,7 @@ Success: Result is 21</code></pre>
   <h3>The hello-world kernels</h3>
 <pre><code>TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_datamovement_kernel
 TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_compute_kernel</code></pre>
-  <p>The outputs are shown in the DPRINT section above. Without <code>TT_METAL_DPRINT_CORES</code>, the compute example prints its <code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES…</code> lines, no TR lines at all, and finishes at <code>[4385]</code> clocks instead of roughly 5100–6600 (<code>[6520]</code> on one run; with DPRINT on the count varies with host polling). With DPRINT on and a warm cache (10/10 and 11/11 hits), each took about 1.0–1.1 s of wall time. I did not break down why that is longer than the add example's 0.36 s.</p>
+  <p>The outputs are shown in the DPRINT section above. Without <code>TT_METAL_DPRINT_CORES</code>, the compute example prints its <code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES…</code> lines, no TR lines at all, and finishes at <code>[4385]</code> clocks instead of anything from about 5000 to 9200 (<code>[6520]</code> on one run, and 9156, 5038 and 5140 on three re-runs; with DPRINT on the count varies with host polling and is highest on the run that also compiles). With DPRINT on and a warm cache (10/10 and 11/11 hits), each took about 1.0–1.1 s of wall time. I did not break down why that is longer than the add example's 0.36 s.</p>
 
   <h2 id="recap">Recap</h2>
   <ul>
@@ -725,7 +728,7 @@ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_compute_kernel</code></p
     <li>Runtime args are 32-bit words in L1, read with <code>get_arg_val</code>. Compile-time args are baked into the binary. Addresses and counts go at runtime; layouts and sizes go at compile time.</li>
     <li>A kernel cannot touch DRAM. It asks the NoC to copy pages into L1 (<code>noc_async_read</code>), waits (<code>noc_async_read_barrier</code>), computes, and copies back. <code>InterleavedAddrGen</code> turns a page index into a bank plus a 64-bit NoC address.</li>
     <li>Baby RISC-V stores can retire before they land, and <code>fence</code> is a no-op. Before handing data the CPU stored to the NoC, force it into L1 with <code>load_blocking</code>. ttsim will not catch you if you forget.</li>
-    <li>Kernels are JIT-compiled on first enqueue and cached by content. The first run (3.8 s) is almost all compilation; a warm rerun takes 0.36 s, and the device work (4501 sim clocks) never changes.</li>
+    <li>Kernels are JIT-compiled on first enqueue and cached. The cache directory is named by a hash of the kernel's resolved path and config, and a content hash of the source and its headers (<code>.dephash</code>) triggers a rebuild in place when you edit it. The first run (3.8 s) is almost all compilation; a warm rerun takes 0.36 s, and the device work (4501 sim clocks) never changes.</li>
     <li>DPRINT, enabled with <code>TT_METAL_DPRINT_CORES</code>, prints per-RISC with prefixes BR, NC, TR0, TR1 and TR2. Each line must end in <code>\n</code>, and lines from different RISCs can interleave in any order.</li>
   </ul>
   <p>Next, <a href="a11-dataflow-and-cbs.html">A11</a> opens the <code>noc_async_*</code> black box and replaces the six hand-placed L1 buffers with <em>circular buffers</em>, the mechanism that lets a reader core and a compute core agree that a tile is ready without sharing a single variable.</p>
@@ -734,7 +737,7 @@ TT_METAL_DPRINT_CORES=0,0 $EX/metal_example_hello_world_compute_kernel</code></p
   <details class="quiz"><summary>The example allocates three L1 buffers in addition to the three DRAM buffers. Why can't the kernel add the DRAM values directly?</summary><p>A Tensix RISC-V has no load path to DRAM. Its loads and stores reach only its own L1 (and some local registers). DRAM is reachable only through the NoC, as an asynchronous copy into L1. So each input must first be copied to an L1 buffer, and the result must be stored in L1 before the NoC can copy it out. That is why there is one L1 buffer for each DRAM buffer.</p></details>
   <details class="quiz"><summary>You grow the DRAM buffers to 2048 bytes and set page_size = 2048 on the host, but leave the kernel's InterleavedAddrGen at sizeof(uint32_t). Does anything break for this example? When would it?</summary><p>(You do have to grow the buffer too: a 4-byte buffer with a 2048-byte page fails at creation with <code>TT_FATAL</code>, because an interleaved buffer's size must be divisible by its page size, <code>tt_metal/impl/buffers/buffer.cpp:285-290</code>.) For this example, probably not: the kernel only reads page 0, which lands in bank 0 at the buffer's base address whatever the page size. It breaks as soon as the kernel reads more than one page. The kernel computes bank and offset from its own <code>page_size</code>, so page 1 and later would be fetched from the wrong offsets. This is why the source comment says the parameters "must match", and why <code>TensorAccessor</code> (A11) derives them from the buffer through compile-time args.</p></details>
   <details class="quiz"><summary>You want to run the same kernel on 64 cores, each processing a different slice of a tensor. Which values go in compile-time args and which in runtime args?</summary><p>Each core's start tile index and tile count differ per core, and the buffer addresses can change between runs, so those are runtime args (<code>SetRuntimeArgs</code> per core, or <code>SetCommonRuntimeArgs</code> for the addresses if they are shared). The page/tile size, the data format and any flags that select code paths are the same everywhere and shape the code, so they are compile-time args. Then all 64 cores share a single compiled binary.</p></details>
-  <details class="quiz"><summary>Why is the second run of the example about ten times faster than the first, when the simulated clock count is identical?</summary><p>The clock count measures the device work, which is the same: write, launch, run, read. The difference is on the host. The first run JIT-compiles firmware for every RISC-V type plus a precompiled header at device open (about 3 s here), then compiles the kernel on first enqueue (about 0.4 s). Both results go into the JIT cache keyed by content, so the second run gets 9/9 hits and skips compilation entirely.</p></details>
+  <details class="quiz"><summary>Why is the second run of the example about ten times faster than the first, when the simulated clock count is identical?</summary><p>The clock count measures the device work, which is the same: write, launch, run, read. The difference is on the host. The first run JIT-compiles firmware for every RISC-V type plus a precompiled header at device open (about 3 s here), then compiles the kernel on first enqueue (about 0.4 s). Both results go into the JIT cache, and nothing they depend on has changed, so the second run gets 9/9 hits and skips compilation entirely.</p></details>
   <details class="quiz"><summary>A colleague removes the load_blocking line, runs on ttsim, sees "Success: Result is 21", and concludes the line is unnecessary. What is wrong with that reasoning?</summary><p>ttsim is a functional model. It does not reproduce the baby RISC-V store queue, where a store can retire before its write reaches L1, or the timing between the RISC-V and the NoC as separate L1 clients. On silicon, <code>noc_async_write</code> programs the NoC with stores to a different memory region, and these can overtake the pending L1 store, so the NoC can read the stale value. And because <code>fence</code> is a no-op, there is no cheaper fix. The test passing in a model without the hazard says nothing about hardware that has it.</p></details>
   <details class="quiz"><summary>The compute hello-world prints three lines with TR0, TR1 and TR2, but the source contains a single kernel_main. How?</summary><p>A compute kernel is compiled three times, once for each TRISC (UNPACK, MATH and PACK), with a different define each time. <code>DPRINT_UNPACK</code>, <code>DPRINT_MATH</code> and <code>DPRINT_PACK</code> each expand to a real print on only one of those builds and to nothing on the other two. So each TRISC runs its own binary and prints its own line. A12 builds on this "one source, three CPUs" idea.</p></details>
 

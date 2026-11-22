@@ -637,11 +637,11 @@ inline void ckernel_template::program()
   <h2 id="sim">Seeing it in ttsim</h2>
   <p>ttsim has no tracing switches (it reads no environment variables), so I made an instrumented copy. These are the steps I ran in this orb, on ttsim b3620244 (Wormhole build) and tt-metal 7aad8aac:</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/a13
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs   # env.sh changes directory, so use absolute paths
-source $W/workbench/env.sh wh
-$W/workbench/build_ttsim.sh mop wh     # copy to $LAB_HOME/ttsim-mop, build in ~4 s
-patch -p1 -d $LAB_HOME/ttsim-mop &lt; $W/patches/a13-mop-trace.patch
-$W/workbench/build_ttsim.sh mop wh     # rebuild with the hooks
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+source $W/env.sh wh
+$W/build_ttsim.sh mop wh     # copy to $LAB_HOME/ttsim-mop, build in ~4 s
+patch -p1 -d $LAB_HOME/ttsim-mop &lt; $W/../patches/a13-mop-trace.patch
+$W/build_ttsim.sh mop wh     # rebuild with the hooks
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-mop-wh-release/libttsim.so
 $EX/metal_example_eltwise_binary</code></pre>
   <p>The instrumentation is <em>not</em> part of ttsim. The whole change is <a href="../sim-labs/patches/a13-mop-trace.patch"><code>sim-labs/patches/a13-mop-trace.patch</code></a>, a <code>diff -u</code> against pristine ttsim b3620244. It adds a 256-entry opcode→name table generated from ttsim's own <code>data/wh/tensix_isa.json</code> (<code>src/a13_opnames.h</code>) and about 35 lines to <code>tensix.cpp</code>, mostly <code>ttsim_printf</code> calls in four places: <code>tensix_push_inst</code> (what the TRISC pushed), <code>mop_ingest</code> (the nine sampled config words), <code>mop_next</code> (each instruction the expander emits) and <code>tensix_frontend_step</code> (each replayed instruction). It logs only the tile whose TRISC1 pushes first, which is the one tile running the compute kernel, and only threads 0 and 1 until their third MOP. The core of the hook in <code>mop_next</code>:</p>
@@ -762,7 +762,7 @@ fs::path resolve_path(const fs::path&amp; given_file_name, ContextId context_id)
 #include "defines_generated.h"
 void kernel_main();
 #include "/home/user/workspace/refs/tt-metal/tt_metal/programming_examples/eltwise_binary/kernels/compute/tiles_add.cpp"</code></pre>
-  <p>Next to it are <code>chlkc_unpack.cpp</code>, <code>chlkc_pack.cpp</code> and <code>chlkc_isolate_sfpu.cpp</code> (the comment says the fourth is "only used on Quasar"), plus <code>defines_generated.h</code> (here just <code>#define NOC_MODE 0</code>) and <code>chlkc_descriptors.h</code>. That last file holds the per-CB tables from <a href="#layers">layer 2</a> and the math settings:</p>
+  <p>(The <code>#include</code> line is the absolute path of this orb's tt-metal checkout, and the hash in the directory name is this orb's too. Yours will show your own.) Next to it are <code>chlkc_unpack.cpp</code>, <code>chlkc_pack.cpp</code> and <code>chlkc_isolate_sfpu.cpp</code> (the comment says the fourth is "only used on Quasar"), plus <code>defines_generated.h</code> (here just <code>#define NOC_MODE 0</code>) and <code>chlkc_descriptors.h</code>. That last file holds the per-CB tables from <a href="#layers">layer 2</a> and the math settings:</p>
 <pre><code>#if defined(UCK_CHLKC_MATH)
 #include "llk_defs.h"
 constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast&lt;ckernel::MathFidelity&gt;(4);
@@ -902,7 +902,7 @@ constexpr uint8_t unpack_src_format[32] = {
         hasher.update(path);
         ++num_include_paths;
     });</code></pre>
-  <p>Read that carefully, because it isn't what the workbench README suggests. <code>source_</code> is the <em>caller-supplied path string</em>, not the file's contents (<code>kernel.cpp:134</code>: "Keep source_ as the caller-supplied path (metadata/watcher/hash)"). Contents are checked by a second mechanism. Every object and ELF has a <code>.dephash</code> sidecar that lists each file the compiler read with a hash of its contents: 155 files for <code>trisck.o</code>, including <code>tiles_add.cpp</code>, <code>eltwise_binary.h</code>, <code>llk_math_eltwise_binary.h</code> and <code>ckernel_template.h</code>. <code>need_compile</code> rebuilds when the object is missing or any listed hash differs (<code>build.cpp:897-900</code>). <code>process_include_paths</code> adds the resolved kernel's <em>directory</em> to the hash (<code>kernel.cpp:415-421</code>). So moving a kernel changes the hash directory, and editing it doesn't.</p>
+  <p>Read that carefully, because it is easy to assume the hash covers the kernel file's contents. It doesn't. <code>source_</code> is the <em>caller-supplied path string</em>, not the file's contents (<code>kernel.cpp:134</code>: "Keep source_ as the caller-supplied path (metadata/watcher/hash)"). Contents are checked by a second mechanism. Every object and ELF has a <code>.dephash</code> sidecar that lists each file the compiler read with a hash of its contents: 155 files for <code>trisck.o</code>, including <code>tiles_add.cpp</code>, <code>eltwise_binary.h</code>, <code>llk_math_eltwise_binary.h</code> and <code>ckernel_template.h</code>. <code>need_compile</code> rebuilds when the object is missing or any listed hash differs (<code>build.cpp:897-900</code>). <code>process_include_paths</code> adds the resolved kernel's <em>directory</em> to the hash (<code>kernel.cpp:415-421</code>). So moving a kernel changes the hash directory, and editing it doesn't.</p>
   <p>I tested both claims with a private cache (<code>TT_METAL_CACHE=$LAB_HOME/cache</code>) and <code>TT_METAL_LOG_KERNELS_COMPILE_COMMANDS=1</code>, counting compile commands with <code>grep -c "g++ compile cmd"</code>:</p>
   <table>
     <tr><th>Run</th><th>Compile commands</th><th>Kernel directories under <code>kernels/tiles_add/</code></th><th>Wall time</th></tr>
@@ -913,7 +913,7 @@ constexpr uint8_t unpack_src_format[32] = {
     <tr><td>5. Same again</td><td>0</td><td>the same two</td><td>0.45 s</td></tr>
     <tr><td>6. <code>TT_METAL_FORCE_JIT_COMPILE=1</code></td><td>13 (8 firmware + 5 kernel)</td><td>the same two</td><td>n/a</td></tr>
   </table>
-  <p>Run 4 is the interesting one: content changed, directory didn't, and exactly the three TRISC objects were rebuilt in place. Every run printed <code>Test Passed</code>. The wall times are host time in this orb, dominated by the compiler on cold runs; the simulated clock was <code>[7959]</code> in all of them. Here is what one kernel directory contains (sizes from <code>ls -la</code>):</p>
+  <p>Run 4 is the interesting one: content changed, directory didn't, and exactly the three TRISC objects were rebuilt in place. Every run printed <code>Test Passed</code>. The wall times are host time in this orb, dominated by the compiler on cold runs; the simulated clock was <code>[7959]</code> in all of them. The compile counts (13, 0, 3, 3, 0, 13) are the same on any machine. The kernel hash is not: it covers the include paths, so <code>6990101545042396689</code> and <code>5674410263751058075</code> are the names for this orb's tt-metal and <code>$LAB_HOME</code> locations, and a checkout somewhere else gets two different numbers (the build key <code>13101861097061555864</code> stayed the same on a second machine). File sizes shift by a few bytes for the same reason, because paths are embedded in the generated files and debug info. Here is what one kernel directory contains (sizes from <code>ls -la</code>):</p>
 <pre><code>tiles_add/6990101545042396689/
   chlkc_descriptors.h    4063 B   per-CB formats, tile dims, fidelity
   chlkc_isolate_sfpu.cpp  199 B

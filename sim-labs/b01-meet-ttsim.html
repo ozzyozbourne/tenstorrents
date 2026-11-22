@@ -56,10 +56,11 @@
 
   <h2 id="run">1. Run real programs on Wormhole and Blackhole</h2>
   <p>Set up the workbench from <a href="b00-workbench.html">B00</a>. Give each lab its own scratch directory so that labs never share output:</p>
-<pre><code>export LAB_HOME=$HOME/ttlab/b01
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b01
+source $W/env.sh wh
 $EX/metal_example_add_2_integers_in_riscv</code></pre>
-  <p><code>env.sh wh</code> points <code>TT_METAL_SIMULATOR</code> at <code>~/sim/wh/libttsim_wh.so</code>, sets slow dispatch, and changes directory into <code>$LAB_HOME/run</code>. That library is byte-identical to the one built from the pinned source: its md5sum <code>db0520ab…</code> matches <code>refs/ttsim/src/_out/release_wh/libttsim.so</code>. Here is the run, with most of the <code>info</code> lines removed:</p>
+  <p><code>env.sh wh</code> points <code>TT_METAL_SIMULATOR</code> at <code>~/sim/wh/libttsim_wh.so</code>, sets slow dispatch, and changes directory into <code>$LAB_HOME/run</code>. That library is byte-identical to the one built from the pinned source: on our build machine its md5sum <code>db0520ab…</code> matched <code>~/ttsim/src/_out/release_wh/libttsim.so</code>. The hash itself depends on your compiler (a build with Ubuntu 24.04's g++ equals the v1.15.0 release binary and gives <code>e9d6a01c…</code>), so compare your two files with <code>cmp</code> and do not expect our digits. Here is the run, with most of the <code>info</code> lines removed:</p>
 <pre><code>WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of the Data Movement kernels.
 … | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:159)
 [0] 0.0 seconds (0.0 KHz)
@@ -72,7 +73,7 @@ Success: Result is 21
 
 real	0m0.351s</code></pre>
   <p>The host program never knew it wasn't talking to a real card. UMD, the user-mode driver, read PCI config space and got vendor <code>0x1e52</code> (Tenstorrent) and device <code>0x401e</code> (Wormhole). Running <code>env.sh bh</code> gives <code>device_id=0xb140</code> (Blackhole) and firmware bundle 18.5.0. The two lines beginning with a number in brackets come from ttsim itself. Section 2 decodes them.</p>
-  <p>Now run three examples on each chip, twice each. The table summarises the twelve runs. Every cell is a real measurement, and "wall" is <code>/usr/bin/time</code> elapsed time on the warm second run:</p>
+  <p>Now run three examples on each chip, twice each. The table summarises the twelve runs. Every cell is a real measurement, and "wall" is <code>/usr/bin/time</code> elapsed time on the warm second run (GNU <code>time</code> is a separate package and is missing on a default Ubuntu 24.04; the shell's own <code>time $EX/…</code> gives the same <code>real</code> and <code>user</code> figures):</p>
   <table>
     <tr><th>Example</th><th>Result line</th><th class="num">WH clocks (run 1 / run 2)</th><th class="num">BH clocks (run 1 / run 2)</th><th class="num">wall, WH / BH</th></tr>
     <tr><td><code>add_2_integers_in_riscv</code></td><td>Success: Result is 21</td><td class="num">4501 / 4501</td><td class="num">6596 / 6596</td><td class="num">0.35 s / 0.42 s</td></tr>
@@ -134,8 +135,8 @@ wall=8.43 s user=8.72 s</code></pre>
   <p>The UMD side also clocks the simulator synchronously from the calling thread. Its comment explains why: "A background clock thread would race with reads/writes and produce non-reproducible runs" (<code>tt_sim_tt_device.cpp:418-427</code>).</p>
   <p>The stock matmul has a catch. It fills its inputs from <code>std::mt19937 rng(std::random_device{}())</code> (<code>matmul_single_core.cpp:203</code>), so every run multiplies different numbers. You can see it in the two Wormhole runs: PCC was 0.98139745 and then 0.98024255. Yet the clock count was 330591 both times. To compare results bit for bit, use the workbench's <code>mm_fid</code>. It is the same program with a seed (<code>MM_SEED</code>), a selectable fidelity (<code>MM_FIDELITY</code>), and a hash over the output:</p>
 <pre><code>mkdir -p $LAB_HOME/host
-cp /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/host/mm_fid.cpp $LAB_HOME/host/
-/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/build_host.sh $LAB_HOME/host/mm_fid.cpp
+cp $W/host/mm_fid.cpp $LAB_HOME/host/
+$W/build_host.sh $LAB_HOME/host/mm_fid.cpp
 MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid      # run it twice</code></pre>
 <pre><code>math_fidelity = 4
 Metalium vs Golden -- PCC = 0.9801915
@@ -377,7 +378,7 @@ env -u TT_METAL_SLOW_DISPATCH_MODE $EX/metal_example_add_2_integers_in_riscv</co
   <p>Read it line by line:</p>
   <ul>
     <li><strong>Only busy tiles are visited</strong>, lowest ID first. <code>next_busy_t_tile</code> scans a bitmask (<code>libttsim.cpp:211-219</code>), so 79 idle Tensix tiles cost nothing.</li>
-    <li><strong>Each active hart executes exactly one instruction</strong> per pass. <code>rv32_step</code> fetches, decodes and executes one word (<code>riscv_impl.h:1938-1978</code>). A stall is a replay: a load that cannot complete does <code>pc -= 4</code> and tries again next pass (<code>riscv_impl.h:731</code>).</li>
+    <li><strong>Each active hart executes exactly one instruction</strong> per pass. <code>rv32_step</code> fetches, decodes and executes one word (<code>riscv_impl.h:1938-1978</code>). A stall is a replay: a load that cannot complete does <code>pc -= 4</code> and tries again next pass (<code>riscv_impl.h:731-732</code>).</li>
     <li><strong>Each Tensix pipe tries its FIFO head.</strong> A handler returns <code>false</code> to stall. For example, <code>UNPACR</code> waits while its Src bank is still valid (<code>tensix.cpp:3169-3172</code>), and <code>MVMUL</code> waits until both Src banks are valid (<code>tensix.cpp:1766</code>).</li>
     <li><strong>The "hack": the repeat loop.</strong> If <em>any</em> Tensix instruction succeeded, the whole tile is clocked again <em>in the same clock</em>, and that includes another step for every hart.</li>
   </ul>
@@ -506,10 +507,9 @@ env -u TT_METAL_SLOW_DISPATCH_MODE $EX/metal_example_add_2_integers_in_riscv</co
   <h3>Proving it with an instrumented simulator</h3>
   <p>Claims about code are cheap, so let's measure. <code>build_ttsim.sh count wh</code> makes an editable copy of ttsim. In it we added seven counters to <code>libttsim.cpp</code>: calls to <code>libttsim_clock</code> (and how many had n = 1), BAR reads and writes, hart-steps, successful Tensix instructions, and extra passes. They are printed at <code>libttsim_exit</code>.</p>
 <p>The exact change is <a href="patches/b01-count.patch"><code>patches/b01-count.patch</code></a>, a <code>diff -u</code> against pristine ttsim <code>b3620244</code>. Make the copy, apply the patch, and rebuild:</p>
-<pre><code>W=/home/user/workspace/tenstorrent-from-zero/sim-labs
-$W/workbench/build_ttsim.sh count wh       # first use copies ttsim to $LAB_HOME/ttsim-count
-patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/patches/b01-count.patch
-$W/workbench/build_ttsim.sh count wh       # rebuild with the counters
+<pre><code>$W/build_ttsim.sh count wh       # first use copies ttsim to $LAB_HOME/ttsim-count
+patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/../patches/b01-count.patch
+$W/build_ttsim.sh count wh       # rebuild with the counters
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
 $EX/metal_example_add_2_integers_in_riscv
 …
@@ -535,8 +535,8 @@ Success: Result is 21
   <p style="text-align:center; font-family:var(--mono)">LoFi: 699,743 + 190,276 = 890,019 &nbsp;&nbsp;&nbsp; HiFi4: 330,591 + 559,476 = 890,067</p>
   <p>The two totals agree to within 48. The matmul tile needs about 890,000 passes either way, and these passes are mostly RISC-V instructions: loop counters, CB polling, <code>tti</code> pushes. Every extra MVMUL that succeeds buys one more pass inside the same clock. HiFi4 has more MVMULs, so it gets more free passes and needs fewer real clocks. The simulator's clock is cheaper exactly when the matrix engine is doing more work.</p>
   <p>To confirm it, remove the hack. Make a second copy (<code>ttsim-noloop</code>) and replace the <code>if (!any_tensix) break;</code> with an unconditional <code>break;</code>, so each tile gets exactly one pass per clock. <a href="patches/b01-noloop.patch"><code>patches/b01-noloop.patch</code></a> is the counters plus that one change:</p>
-<pre><code>$W/workbench/build_ttsim.sh noloop wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-noloop &lt; $W/patches/b01-noloop.patch
-$W/workbench/build_ttsim.sh noloop wh
+<pre><code>$W/build_ttsim.sh noloop wh &amp;&amp; patch -p1 -d $LAB_HOME/ttsim-noloop &lt; $W/../patches/b01-noloop.patch
+$W/build_ttsim.sh noloop wh
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noloop-wh-release/libttsim.so
 MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HOME/host/mm_fid</code></pre>
 <pre><code>[889442] COUNT clock_calls=889442 … tensix_insts=265474 …     # LoFi,  hash 213e53fed10c0383, wall 12.45 s
@@ -606,7 +606,7 @@ MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HO
     <tr><th>Modelled</th><th>Evidence</th></tr>
     <tr><td><strong>Functional behaviour</strong> of every implemented instruction: RISC-V, Tensix, NoC, DMA, ARC, Ethernet</td><td>Real tt-metal examples pass unmodified on WH and BH (section 1). The README says many tt-metal, ttnn and LLK tests pass, as well as whole LLMs.</td></tr>
     <tr><td><strong>Bit-exact numerics</strong>, NaN bit patterns included</td><td>README, "Numerical Accuracy": "designed to provide bit-exact numerical results relative to silicon for all computations". Our hashes repeat exactly.</td></tr>
-    <tr><td><strong>The ISA contract</strong>, strictly: anything undefined is fatal</td><td><code>ttsim_error</code> prints <code>[clock] ERROR: Category: func: msg</code> and calls <code>_Exit(1)</code> (<code>common.cpp:33-45</code>). For example, NoC writes must keep <code>(src&amp;15)==(dst&amp;15)</code> (<code>tile.cpp:1588-1589</code>), and <code>fence</code> on WH is rejected (<code>riscv_impl.h:1079-1084</code>).</td></tr>
+    <tr><td><strong>The ISA contract</strong>, strictly: anything undefined is fatal</td><td><code>ttsim_error</code> prints <code>[clock] ERROR: Category: func: msg</code> and calls <code>_Exit(1)</code> (<code>common.cpp:33-45</code>). For example, NoC writes must keep <code>(src&amp;15)==(dst&amp;15)</code> (<code>tile.cpp:1589-1590</code>), and <code>fence</code> on WH is rejected (<code>riscv_impl.h:1079-1084</code>).</td></tr>
     <tr><td><strong>Ordering that software creates</strong>: stalls on Src valid, semaphores, FIFO-full replays</td><td>Handlers return <code>false</code> and are retried (<code>tensix.cpp:1766, 3171</code>; <code>riscv_impl.h:1479-1484</code>).</td></tr>
   </table>
   <table>
@@ -688,6 +688,7 @@ MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HO
 000000000000c720 T libttsim_set_pci_dma_mem_callbacks
 000000000000ca20 T libttsim_tile_rd_bytes
 000000000000ca60 T libttsim_tile_wr_bytes</code></pre>
+  <p>The addresses are from our own g++ 12.2 build and change with the compiler. The v1.15.0 release binary exports the same ten names at other addresses (<code>libttsim_clock</code> at <code>ccd0</code>, <code>libttsim_init</code> at <code>c850</code>). Only the names matter.</p>
   <table>
     <tr><th>Function</th><th>Role</th><th>Source</th></tr>
     <tr><td><code>libttsim_init</code> / <code>libttsim_exit</code></td><td>Build and tear down the chip. A second <code>init</code> is a fatal ConfigurationError. <code>exit</code> prints the heartbeat.</td><td><code>libttsim.cpp:73-86</code></td></tr>
@@ -698,7 +699,7 @@ MM_SEED=42 MM_FIDELITY=0 $LAB_HOME/host/mm_fid; MM_SEED=42 MM_FIDELITY=4 $LAB_HO
     <tr><td><code>libttsim_tile_rd_bytes</code> / <code>wr_bytes</code></td><td>Transitional; on WH and BH they raise <code>UnsupportedFunctionality</code></td><td><code>:199-208</code></td></tr>
   </table>
   <p>UMD resolves 9 of them by name with <code>dlsym</code> right after the <code>dlopen</code> (<code>tt_sim_communicator.cpp:755-770</code>). The only one it skips there is <code>pci_config_wr32</code>. Because the surface is this small, you can drive the chip with no tt-metal at all. The workbench's 16-line <code>harness/h.c</code> <code>dlopen</code>s the library, calls <code>init</code>, reads config space, clocks 1000 times and exits:</p>
-<pre><code>$ gcc -o h sim-labs/workbench/harness/h.c -ldl &amp;&amp; ./h ~/sim/wh/libttsim_wh.so
+<pre><code>$ gcc -o h $W/harness/h.c -ldl &amp;&amp; ./h ~/sim/wh/libttsim_wh.so
 cfg[0] = 0x401e1e52 (device&lt;&lt;16 | vendor)
 [1000] 0.0 seconds (163.2 KHz)</code></pre>
   <p>Here the clock count is exactly what the caller asked for, because no host poll loop is involved. The rate is far higher because every Tensix core is still held in reset (<code>t_tile_init</code>), so there are no busy Tensix tiles to step. <a href="b09-breaking-things.html">B09</a> builds this into a full bare-metal harness.</p>
@@ -724,7 +725,7 @@ Error: Expected result of 21, got 98
 exit=255</code></pre>
   <p>14 × 7 = 98. The run shows four things:</p>
   <ul>
-    <li><strong>The overlay worked.</strong> tt-metal found your file through <code>TT_METAL_KERNEL_PATH</code>. The JIT cache keys on source content, so 1 of 9 kernels was rebuilt (8/9 hits).</li>
+    <li><strong>The overlay worked.</strong> tt-metal found your file through <code>TT_METAL_KERNEL_PATH</code>. The overlay copy is a different file path, and the JIT cache gives each kernel path its own directory, so 1 of 9 binaries was built fresh (8/9 hits). If you edit the same overlay file again, the cache notices through the source hashes it stores next to the ELF (<code>*.dephash</code>) and rebuilds it in place, again 8/9 hits. Exercise 1 relies on that.</li>
     <li><strong>The arithmetic is real.</strong> BRISC really executed a RISC-V <code>mul</code>, and the host read back the device's answer.</li>
     <li><strong>The clock count is unchanged at 4501.</strong> One <code>mul</code> replaced one <code>add</code>, so the instruction count, and therefore the poll count, stayed the same.</li>
     <li><strong>The host program's exit code (255) tells you it failed</strong>, which is convenient for scripts.</li>

@@ -198,7 +198,7 @@
     <li><b>Start at M<sub>b</sub> = 1</b>, the decode shape. Slide N<sub>b</sub> to 16. The point stops moving to the right well before the ridge: it approaches the pink line at 32 FLOP/B. Now switch the weights to bfp8 and then bfp4. The pink line jumps to 60 and then 114. At N<sub>b</sub> = 16 the attainable TFLOP/s rises 1.79× and 3.09×, because the activation tile still costs bf16 bytes. Tick "activations already in L1" and the ratios become exactly the pink lines' 1.88× and 3.56×. This is why decode weights ship in bfp8 or bfp4 (A22).</li>
     <li><b>Switch fidelity while DRAM-bound.</b> Nothing happens to the point. A lower fidelity raises a roof the kernel is not touching.</li>
     <li><b>Make the block 16×16</b> at HiFi4 on Wormhole. Intensity is 256 FLOP/B, just past the ridge at 228. Now choose LoFi. The ridge moves 4× to the right (910), and the same kernel is DRAM-bound again. Faster math makes reuse more important, not less (A15 said the same).</li>
-    <li><b>Turn on multicast.</b> When a whole grid row shares one in0 slab and a grid column shares one in1 slab (A16), the DRAM sees one effective block that is 8× (or 10×/11×) larger on each side. With bf16 weights, this is the only way in the figure that the matmul clears the LoFi ridge (bfp8 or bfp4 weights with activations in L1 also do it).</li>
+    <li><b>Turn on multicast.</b> When a whole grid row shares one in0 slab and a grid column shares one in1 slab (A16), the DRAM sees one effective block that is 8× (or 10×/11×) larger on each side. With bf16 weights, this is the only way in the figure that the matmul clears the LoFi ridge (on Wormhole, bfp8 or bfp4 weights with activations in L1 also do it; on Blackhole only bfp4 does).</li>
   </ul>
   <div class="callout key">For any op, compute two numbers: its <b>intensity</b> (FLOPs ÷ DRAM bytes, from the loop structure) and the <b>ridge</b> (compute roof ÷ bandwidth, from the table). Below the ridge, only fewer bytes help. Above it, only fewer cycles per FLOP help. If the measured time is far below <i>both</i> roofs, the wall is somewhere else: the NoC, latency, or the host.</div>
   <div class="callout gpu">Nsight Compute draws the same chart and reports "speed of light" percentages. Two differences matter. On a GPU, "DRAM bytes" depend on what the L2 cache catches, so you measure them rather than predict them. Here there is no cache: the bytes are exactly the reads your kernels issue, which is why the simulator can count them. And the GPU's compute roof is fixed per data type, while here the same bf16 operands give four different roofs, one per fidelity.</div>
@@ -237,7 +237,7 @@
     <tr><td>HiFi3</td><td>49,152</td><td>67,552</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99993</td><td>[5693]</td></tr>
     <tr><td>HiFi4</td><td>65,536</td><td>83,936</td><td>18,272</td><td>7,552</td><td>655,360</td><td>0.99993</td><td>[5710]</td></tr>
   </table>
-  <p>The matmul is 4 × 16 × 16 = 1,024 tile products, and each tile product is 16 <code>MVMUL</code>s per fidelity phase (A06). So the prediction is 16,384 × phases, and the counts match exactly. The math thread's total grows by exactly 16,384 per phase, so every extra instruction is an <code>MVMUL</code>. Unpack, pack and DRAM traffic are identical in all four rows. Fidelity is a <b>compute lever</b>: on silicon, the FPU time scales with phases, and nothing else changes.</p>
+  <p>The matmul is 4 × 16 × 16 = 1,024 tile products, and each tile product is 16 <code>MVMUL</code>s per fidelity phase (A06). So the prediction is 16,384 × phases, and the counts match exactly. From HiFi2 to HiFi3 to HiFi4 the math thread's total grows by exactly 16,384 per phase, so every extra instruction is an <code>MVMUL</code>. From LoFi to HiFi2 it grows by 17,408: the 16,384 <code>MVMUL</code>s plus 1,024 others, exactly one per tile product. The per-opcode counters name it: on the math thread <code>SETRWC</code> (opcode 0x37) goes from 3,232 at LoFi to 4,256 at HiFi2 and stays there for HiFi3 and HiFi4, and no other opcode changes. It is the instruction the matmul LLK appends to its MOP only when the fidelity is not LoFi, to reset the fidelity phase counter after the last phase (<code>set_end_op(TT_OP_SETRWC(…, p_setrwc::SET_F))</code>, commented "Reset fidelity phase", <code>tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_math_matmul.h:472-476</code>). Unpack, pack and DRAM traffic are identical in all four rows. Fidelity is a <b>compute lever</b>: on silicon, the FPU time scales with phases, and nothing else changes.</p>
   <p>Look at the last column. These are ttsim's bracketed clock counts at exit. LoFi did a quarter of the multiplies and "took" the most clocks. That is the warning from the top of the page in action. The simulator's clock counts how often the host polled it, not how long the hardware would work.</p>
   <p>Which fidelity do you need? The rule of thumb depends on the operands, because of how the multipliers split the work (A06). in1, the weights, goes to SrcA and the 5-bit side. in0 goes to SrcB and the 7-bit side. <code>tt-perf-report</code> encodes the rule by mantissa width (<code>perf_report.py:1151-1270</code>): HiFi2 is "sufficient for BFP8 multiplication", and "LoFi is sufficient with BFP4 weights". My runs agree. bfp4 weights gave PCC 0.99309 at both LoFi and HiFi2, to five digits, so HiFi2 spent twice the multiplies for nothing. With bfp8 weights, LoFi gave 0.99985 against 0.99991 at HiFi2.</p>
   <div class="callout warn">The two levers interact through the roofline. A DRAM-bound op gains nothing from lower fidelity. A compute-bound op gains nothing from a smaller format. Changing both "to be safe" can cost accuracy without any speed-up. Find the wall first.</div>
@@ -356,7 +356,7 @@ CircularBufferConfig cb_src0_config =
   })();
   </script>
 
-  <p>This is why a well-written reader issues a whole slab of reads before a single barrier (A15's blocked reader). It is also why the example's comment asks for two tiles per CB, and why the LLM report recommends <code>in0_block_w</code> of at least two. Overlap turns <i>sum of stages</i> into <i>max of stages</i>. The roofline assumes perfect overlap. A kernel with single-buffered CBs can sit far below both roofs, and the profiler would show it as the compute kernel waiting in <code>cb_wait_front</code>. The ops CSV even has columns for this: <code>DEVICE COMPUTE CB WAIT FRONT [ns]</code> and <code>DEVICE COMPUTE CB RESERVE BACK [ns]</code> (<code>process_ops_logs.py:96-97</code>).</p>
+  <p>This is why a well-written reader issues a whole slab of reads before a single barrier (A15's blocked reader). It is also why the example's comment asks for two tiles per CB. (The LLM report has a related tip, that <code>in0_block_w</code> "should be at least two if possible", <code>llms.md:1882</code>. It gives no reason, and <code>in0_block_w</code> is a block width along K rather than a CB depth, so do not read it as the same rule.) Overlap turns <i>sum of stages</i> into <i>max of stages</i>. The roofline assumes perfect overlap. A kernel with single-buffered CBs can sit far below both roofs, and the profiler would show it as the compute kernel waiting in <code>cb_wait_front</code>. The ops CSV even has columns for this: <code>DEVICE COMPUTE CB WAIT FRONT [ns]</code> and <code>DEVICE COMPUTE CB RESERVE BACK [ns]</code> (<code>process_ops_logs.py:96-97</code>).</p>
   <div class="callout warn">Analogy: an assembly line with a tray between each pair of stations. One tray: each worker waits for the next one to empty it. Two trays: each worker can start the next item at once. The analogy is accurate about the rule. Where it breaks is that real stage times are not constant. A DRAM read's latency depends on the bank, the route and other traffic, so extra depth is insurance against jitter as well as a way to overlap. Like the figure, the simulator cannot show you that jitter.</div>
 
   <h2 id="dispatch">Lever 6: dispatch overhead and trace</h2>
@@ -463,7 +463,7 @@ if (parameters.user_fused_activation.has_value() &amp;&amp;
   <p>Everything so far is either a model or a count. To learn where the 61 µs went, you need timestamps from silicon. tt-metal has three tools, and they stack.</p>
   <h3>1. The device profiler: timestamps from every RISC-V</h3>
   <p>Set <code>TT_METAL_DEVICE_PROFILER=1</code> at run time (profiling support is compiled in by default; <code>build_metal.sh --disable-profiler</code> removes it). The firmware and kernels then record zones. A zone is a pair of 64-bit timestamps written into a small L1 buffer per RISC, which the host collects when the device closes or when you call <code>ReadMeshDeviceProfilerResults</code>. You add your own zones with one macro:</p>
-  <div class="filename">tt-metal/tt_metal/hw/inc/api/debug/kernel_profiler.hpp:996-999 and 252-257 @7aad8aac</div>
+  <div class="filename">tt-metal/tt_metal/hw/inc/api/debug/kernel_profiler.hpp:996-999 and 253-257 @7aad8aac</div>
 <pre><code>#define DeviceZoneScopedN(name)                                                \
     DO_PRAGMA(message(PROFILER_MSG_NAME(name)));                               \
     auto constexpr hash = kernel_profiler::Hash16_CT(PROFILER_MSG_NAME(name)); \
@@ -563,15 +563,16 @@ case RISCV_DEBUG_REGS_WALL_CLOCK_1_AT: return uint32_t(g_clock &gt;&gt; 32); // 
         tile_rd_bytes(src_coordinate, src_addr, &amp;p_tile-&gt;sram[dst_addr], noc_at_len_be);</code></pre>
   <p>It extends A15's <code>a15-dram-read-count.patch</code> (reads only) and B04's per-tile trace (<code>b04-trace.patch</code>) into totals over the whole chip. As a check, the stock single-core matmul (A15) gave <code>dram_read cmds=16000 bytes=32768000</code>, <code>dram_write cmds=400 bytes=819200</code> and <code>MVMUL</code> = 512,000 = 8,000 tile products × 16 × 4 phases. All three are exactly as predicted. To reproduce every table on this page:</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/a20
-W=$PWD/tenstorrent-from-zero/sim-labs        # absolute: env.sh changes directory
-source $W/workbench/env.sh wh
-$W/workbench/build_ttsim.sh count wh          # first call copies ttsim to $LAB_HOME/ttsim-count
-(cd $LAB_HOME/ttsim-count &amp;&amp; patch -p1 &lt; $W/patches/a20-counters.patch)
-$W/workbench/build_ttsim.sh count wh          # rebuild with the counters
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+source $W/env.sh wh
+export TT_METAL_CACHE=$LAB_HOME/cache         # a private JIT cache, so other runs cannot interfere
+$W/build_ttsim.sh count wh                    # first call copies ttsim to $LAB_HOME/ttsim-count
+(cd $LAB_HOME/ttsim-count &amp;&amp; patch -p1 &lt; $W/../patches/a20-counters.patch)
+$W/build_ttsim.sh count wh                    # rebuild with the counters
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
 source $TT_METAL_HOME/python_env/bin/activate
-python $W/workbench/py/a20_count.py mm_bfp8_hifi2 &gt; bfp8.log 2&gt;&amp;1   # cases: mm_&lt;bf16|bfp8|bfp4&gt;_&lt;lofi|hifi2|hifi3|hifi4&gt;,
-python $W/workbench/py/a20_summary.py bfp8.log                         #   blk_m&lt;1|2|4&gt;, fuse_no, fuse_yes, grid_noact, grid_relu, add_dram, add_l1shard
+python $W/py/a20_count.py mm_bfp8_hifi2 &gt; bfp8.log 2&gt;&amp;1   # cases: mm_&lt;bf16|bfp8|bfp4&gt;_&lt;lofi|hifi2|hifi3|hifi4&gt;,
+python $W/py/a20_summary.py bfp8.log                         #   blk_m&lt;1|2|4&gt;, fuse_no, fuse_yes, grid_noact, grid_relu, add_dram, add_l1shard
 == bfp8.log
   noc dram_read    cmds=320 bytes=409600
   noc dram_write   cmds=64 bytes=131072

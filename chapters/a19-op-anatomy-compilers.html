@@ -117,7 +117,7 @@
 
     return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);
 }</code></pre>
-  <p><code>ttnn.add</code> follows the same shape. The Python name is a nanobind binding of the C++ <code>ttnn::add</code>. A macro expands that to <code>invoke_binary_ng(..., BinaryOpType::ADD, ...)</code> (<code>binary.cpp:20-44, 1230</code>). That function fills <code>BinaryNgDeviceOperation::operation_attributes_t</code>, about twenty fields long, and ends with the same one line: <code>return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);</code> (<code>binary_ng_device_operation.cpp:807</code>). Everything interesting happens inside <code>launch</code>.</p>
+  <p><code>ttnn.add</code> follows the same shape. The Python name is a nanobind binding of the C++ <code>ttnn::add</code>. A macro expands that to <code>invoke_binary_ng(..., BinaryOpType::ADD, ...)</code> (<code>binary.cpp:185-211, 1230</code>; the plain variant of the macro at lines 20-44 has the same shape). That function fills <code>BinaryNgDeviceOperation::operation_attributes_t</code>, about twenty fields long, and ends with the same one line: <code>return ttnn::device_operation::launch&lt;OperationType&gt;(operation_attributes, tensor_args);</code> (<code>binary_ng_device_operation.cpp:807</code>). Everything interesting happens inside <code>launch</code>.</p>
 
   <h2 id="lifecycle">The life of one call</h2>
   <p>Here is <code>launch</code>, trimmed to its spine:</p>
@@ -293,26 +293,27 @@ concept ProgramFactoryConcept = requires {
                             : (is_sfpu ? "eltwise_binary_sfpu_no_bcast.cpp" : "eltwise_binary_no_bcast.cpp"));</code></pre>
   <p>There are two kernel directories with overlapping file names: <code>kernels/</code> and <code>kernels_ng/</code> both contain a <code>reader_interleaved_no_bcast.cpp</code>. The compute kernel also depends on <code>is_sfpu</code>. Reading the code alone, you cannot easily tell which files a given call uses. So ask the machine instead. Point <code>TT_METAL_CACHE</code> at an empty directory, run exactly one op, and list what the JIT built:</p>
 <pre><code>add (32x32 bf16):
-  kernels/eltwise_binary_no_bcast/17004479259107570459:   trisc0 trisc1 trisc2
-  kernels/reader_interleaved_no_bcast/16205775118047441966: ncrisc
-  kernels/writer_interleaved_no_bcast/5600697495145128638:  brisc
+  kernels/eltwise_binary_no_bcast/755991111188418639:      trisc0 trisc1 trisc2
+  kernels/reader_interleaved_no_bcast/2340265801235945965: ncrisc
+  kernels/writer_interleaved_no_bcast/8401048097862775217: brisc
 matmul (64x64 @ 64x64 bf16):
-  kernels/bmm_large_block_zm_fused_bias_activation_metal2/9812065657012588232:    trisc0 trisc1 trisc2
-  kernels/reader_bmm_tile_layout_in0_receiver_metal2/10887230863831720782:         ncrisc
-  kernels/reader_bmm_tile_layout_in0_sender_padding_metal2/413359948367364653:     ncrisc
-  kernels/reader_bmm_tile_layout_in1_receiver_writer_padding_metal2/593917439117918801: brisc
-  kernels/reader_bmm_tile_layout_in1_sender_writer_padding_metal2/17922988459297141816: brisc</code></pre>
+  kernels/bmm_large_block_zm_fused_bias_activation_metal2/1438094618452085338:          trisc0 trisc1 trisc2
+  kernels/reader_bmm_tile_layout_in0_receiver_metal2/7349000999467460716:               ncrisc
+  kernels/reader_bmm_tile_layout_in0_sender_padding_metal2/1547735633515130401:         ncrisc
+  kernels/reader_bmm_tile_layout_in1_receiver_writer_padding_metal2/1033443621823085033: brisc
+  kernels/reader_bmm_tile_layout_in1_sender_writer_padding_metal2/8560337901632190498:   brisc</code></pre>
+  <p>The kernel names and processors are what matter. The hash digits repeat from run to run on one installation, but yours will differ from these. The JIT statistics line for these two runs reads <code>0/13</code> for the add and <code>0/15</code> for the matmul: the kernel sources above (5 and 7 compiled files) plus the 8 firmware sources that <a href="a18-ttnn-user.html#path">A18</a> counted.</p>
   <p>Each directory is <code>kernels/&lt;source basename&gt;/&lt;kernel hash&gt;/&lt;processor&gt;/</code>. The hash covers the defines, compile-time arguments, source and config (<code>tt_metal/impl/kernels/kernel.cpp:688-696, 832-837</code>). Change a define and you get a second directory next to the first. Inside each one, the JIT left the files it generated. They settle the which-file question for good:</p>
-<pre><code># reader_interleaved_no_bcast/16205775118047441966/kernel_includes.hpp
-#include "/home/user/workspace/refs/tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp"
+<pre><code># reader_interleaved_no_bcast/2340265801235945965/kernel_includes.hpp   (the path starts with your tt-metal checkout)
+#include "/root/tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp"
 
-# eltwise_binary_no_bcast/17004479259107570459/defines_generated.h
+# eltwise_binary_no_bcast/755991111188418639/defines_generated.h
 #define BINARY_OP add_tiles
 #define BINARY_OP_TYPE EltwiseBinaryType::ELWADD
 #define PROCESS_LHS_ACTIVATIONS(i)
 #define PROCESS_POST_ACTIVATIONS(i)
 ...
-# eltwise_binary_no_bcast/17004479259107570459/chlkc_descriptors.h
+# eltwise_binary_no_bcast/755991111188418639/chlkc_descriptors.h
 constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast&lt;ckernel::MathFidelity&gt;(4);
 constexpr uint8_t unpack_src_format[32] = { 5,5,5,255,255,...</code></pre>
   <p>Read these against what you know. The reader and writer come from <code>kernels_ng/</code>, the compute kernel from <code>kernels/</code>. The reader went to NCRISC and the writer to BRISC (A04). <code>BINARY_OP</code> is <code>add_tiles</code>, so this is the FPU path of A12–A14, ending in an <code>ELWADD</code> instruction. Fidelity is HiFi4 (4). Circular buffers 0, 1 and 2 hold format 5 (bf16, <code>Float16_b</code>), and every other CB slot is 255, unused. The matmul binary's descriptor says <code>MATH_FIDELITY ... (2)</code>, HiFi2, the matmul default you can override with a compute-kernel config (A06, A18). Its kernels have <code>_metal2</code> names because matmul is a Metal 2.0 spec factory. Here is the compute kernel those defines plug into:</p>
@@ -334,7 +335,7 @@ constexpr uint8_t unpack_src_format[32] = { 5,5,5,255,255,...</code></pre>
         cb_post_lhs.pop_front(n);
         cb_post_rhs.pop_front(n);</code></pre>
   <p>This is the acquire/commit/wait/release handshake from A12. <code>BINARY_OP</code> is a macro, so one source file serves add, sub and mul. Activations get fused in through <code>PROCESS_*_ACTIVATIONS</code>, which expand to nothing here. The device operation's real work is choosing these defines.</p>
-  <p>Changing the dtype changes the kernel. A float32 <code>ttnn.add</code> in the same orb built <code>eltwise_binary_sfpu_no_bcast</code> instead. For <code>ADD</code>, <code>is_binary_sfpu_op</code> picks the SFPU when both inputs are FLOAT32 (<code>binary_ng_device_operation.cpp:55-58</code>), and <code>resolve_fast_and_approximate_mode</code> defaults to <code>true</code> so that bf16 add keeps the FPU (<code>binary.cpp:922-925</code>).</p>
+  <p>Changing the dtype changes the kernel. A float32 <code>ttnn.add</code> on the same machine built <code>eltwise_binary_sfpu_no_bcast</code> instead. For <code>ADD</code>, <code>is_binary_sfpu_op</code> picks the SFPU when both inputs have the same dtype and it is FLOAT32 (or INT32, UINT32 or UINT16) (<code>binary_ng_device_operation.cpp:55-58</code>), and <code>resolve_fast_and_approximate_mode</code> defaults to <code>true</code> so that bf16 add keeps the FPU (<code>binary.cpp:922-925</code>).</p>
 
   <div class="callout key">A TT-NN op is mostly a <em>decision procedure</em>: from shapes, dtypes, layouts and memory configs it chooses kernel files, defines, compile-time arguments, circular buffers and a core split. The arithmetic itself lives in a few short kernels that it reuses. To learn what an op really does, list what the JIT built under <code>$TT_METAL_CACHE/.../kernels/</code>.</div>
 
@@ -381,7 +382,7 @@ private:
         ttsl::hash::hash_t to_hash() const;
     };</code></pre>
   <p>"Omits logical shape by design." An interleaved add of 32×32 and an add of 64×128 hit the <em>same</em> cached program. That is safe only because the shape-dependent quantities (tile count, how tiles split across cores, strides) are runtime arguments and not compile-time ones, and because the program's kernels already cover the whole worker grid. binary_ng therefore cannot rely on the framework's automatic address patching. It writes an override that re-runs the same argument builder its <code>create_descriptor</code> used:</p>
-  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:413-422 @7aad8aac</div>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp:413-421 @7aad8aac (last line cut mid-sentence)</div>
 <pre><code>// SINGLE SOURCE OF TRUTH for binary_ng per-core runtime args.  Run by BOTH create_descriptor()
 // (cache miss) and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit).
 //
@@ -410,13 +411,13 @@ matmul 64x64 @ 64x64 (new shape)   entries=6  wall= 1.70s  out@0x2d94c0
 add 64x128  again                  entries=6  wall= 0.01s  out@0x2d94c0
 check add 64x128 vs torch, max abs diff: 0.00390625
 ... JIT cache stats: 0/34 hits (0.0%) ...</code></pre>
-  <p>Read it line by line. The add with a new shape did <em>not</em> add an entry, but the matmul with a new shape did. That is the to_hash comment, confirmed by experiment. New op type, dtype or output memory config each made a new entry. The 64×128 add wrote its output at a different address from the 32×32 one (<code>0x2d6c40</code> against <code>0x2d5c40</code>) and still matched torch to within bf16 rounding, so the override really did rewrite the addresses and tile counts. Misses cost 0.5–2 s here, almost all of it JIT compilation: the JIT reported 0 hits out of 34 builds. Run the script again in a fresh process with the disk cache now warm, and every miss drops to about 0.02 s while the entry counts are unchanged ("34/34 hits"). The two racks really are separate.</p>
+  <p>Read it line by line. The add with a new shape did <em>not</em> add an entry, but the matmul with a new shape did. That is the to_hash comment, confirmed by experiment. New op type, dtype or output memory config each made a new entry. The 64×128 add wrote its output at a different address from the 32×32 one (<code>0x2d6c40</code> against <code>0x2d5c40</code>) and still matched torch to within bf16 rounding, so the override really did rewrite the addresses and tile counts. Misses cost 0.5–2 s in this run (0.4–1.5 s in a repeat; wall times depend on the machine and its load, while the entry counts and addresses repeat exactly), almost all of it JIT compilation: the JIT reported 0 hits out of 34 builds. Run the script again in a fresh process with the disk cache now warm, and every miss drops to 0.01–0.02 s while the entry counts are unchanged ("34/34 hits"). The two racks really are separate.</p>
   <p>How much does the program cache save once compiling is free? The script <code>a19_hit_vs_miss.py</code> runs 100 adds with the cache on, then off, then on again, with the disk JIT cache warm:</p>
 <pre><code>cache ON :  11.61 ms per ttnn.add   entries=1
 cache OFF:  13.04 ms per ttnn.add   entries=0
 cache ON :  11.32 ms per ttnn.add   entries=1
 ... JIT cache stats: 13/13 hits (100.0%) [13 cached, 303 build-once dedup, ...]</code></pre>
-  <p>About 1.4 ms per call, or 12%, in that run (a rerun printed 11.38 / 13.85 / 11.69 ms, about 2.3 ms or 18%: host wall time under the simulator varies), and most of the 11 ms is ttsim simulating the cores. Do not read these as silicon numbers (A17, B01). On hardware the device time for one tile is microseconds, so the same host-side saving is a much larger share of the total. The telemetry line has a clean count, though. With the cache off, every call rebuilt its <code>Program</code> and asked the JIT for its three kernels again, each answered from an in-process dedup table. 303 = 3 × 100 calls with the cache off + 3 for the first call after re-enabling. A run with 20 calls per phase printed 63 = 3 × 20 + 3. The 200 cache-on calls asked for nothing.</p>
+  <p>About 1.4 ms per call, or 12%, in that run (a rerun printed 11.38 / 13.85 / 11.69 ms, about 2.3 ms or 18%, and two runs on another machine printed 7.46 / 8.57 / 7.38 and 7.83 / 8.32 / 7.76 ms, about 1.1 and 0.5 ms: host wall time under the simulator varies, so treat the saving as "roughly a millisecond", not as a measured constant), and most of the 11 ms is ttsim simulating the cores. Do not read these as silicon numbers (A17, B01). On hardware the device time for one tile is microseconds, so the same host-side saving is a much larger share of the total. The telemetry line has a clean count, though. With the cache off, every call rebuilt its <code>Program</code> and asked the JIT for its three kernels again, each answered from an in-process dedup table. 303 = 3 × 100 calls with the cache off + 3 for the first call after re-enabling. A run with 20 calls per phase printed 63 = 3 × 20 + 3. The 200 cache-on calls asked for nothing.</p>
 
   <div class="callout warn"><b>The cache bug you will write.</b> If your op reads something on the device that is not in the key and not rewritten on a hit, the first call is right and later calls are wrong. The classic case is a scalar baked in as a compile-time argument but left out of the hash. binary_ng's attributes list spells this out: "Runtime scalar/tolerance values are excluded; they are patched as runtime args" (<code>binary_ng_device_operation.hpp:76</code>). Always test an op by calling it at least twice, with different tensors and values.</div>
 
@@ -447,7 +448,7 @@ Tensor generic_op(const std::vector&lt;Tensor&gt;&amp; io_tensors, const tt::tt_
         cb_push_back(16, 1); cb_pop_front(0, 1); cb_pop_front(1, 1);
     }</code></pre>
   <p>And the Python that describes the program, one <code>KernelDescriptor</code> per kernel. This is the same structure binary_ng builds in C++:</p>
-  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (sqdiff, trimmed)</div>
+  <div class="filename">tenstorrent-from-zero/sim-labs/workbench/py/a19_sqdiff_generic.py (sqdiff, trimmed; comment added)</div>
 <pre><code>    rd_rt[0][0] = [a.buffer_address(), b.buffer_address(), n_tiles]     # runtime args for core (0,0)
     reader = ttnn.KernelDescriptor(kernel_source=READER, source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
         core_ranges=core,
@@ -461,7 +462,7 @@ Tensor generic_op(const std::vector&lt;Tensor&gt;&amp; io_tensors, const tt::tt_
 call 1: a@0x2d6440 out@0x2d4c40 cache entries=1 max|err|=0.0019 PCC=1.00000
 call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</code></pre>
   <p>Every buffer moved between calls, yet there is one cache entry and every result matches torch. That is because generic_op's hash covers kernel sources, core ranges, compile-time arguments, defines and CB layout, but only the <em>number</em> of runtime arguments, not their values:</p>
-  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/device/generic_op_device_operation.cpp:57-72 @7aad8aac</div>
+  <div class="filename">tt-metal/ttnn/cpp/ttnn/operations/generic/device/generic_op_device_operation.cpp:57-73 @7aad8aac (comment lines elided)</div>
 <pre><code>    auto hash_kernel = [&amp;](const KernelDescriptor&amp; kernel) -&gt; size_t {
         return ttsl::hash::hash_objects_with_default_seed(
             kernel.kernel_source,
@@ -493,7 +494,7 @@ call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</cod
   <p>There are two roads through TT-MLIR, and they correspond to the two halves of this chapter:</p>
   <ol>
     <li><b>The TT-NN road.</b> TTIR is lowered to the <code>ttnn</code> dialect, where every op is a TT-NN call with a chosen layout, for example <code>memref&lt;2x4x!ttcore.tile&lt;32x32, bf16&gt;, #dram&gt;, &lt;interleaved&gt;</code>. The optimizer picks layouts and sharding, and the result is serialised to a <code>.ttnn</code> flatbuffer, "a compiled binary file intended to be loaded and executed by the TTNN backend runtime". At run time each op in that file becomes an ordinary TT-NN call, which enters <code>device_operation::launch</code> exactly as in Figure 2. The program cache, factories and kernels are the ones you just read.</li>
-    <li><b>The direct-to-metal (D2M) road.</b> TTIR is lowered to <code>d2m.generic</code> regions and then to <code>ttkernel</code>, so the compiler <em>generates</em> its own reader/compute/writer kernels instead of using TT-NN's hand-written ones. The <code>ttnn.jit</code> docs explain how this meets TT-NN: the D2M pipeline "wraps the generated kernels in <code>ttnn.generic</code> operations that contain the necessary host side program setup. Each <code>ttnn.generic</code> op requires a <code>ProgramDescriptor</code>." In other words, compiler-generated kernels enter tt-metal through the same <code>generic_op</code> door your <code>sqdiff</code> used. Its selling point is fusion: a <code>@ttnn_jit.jit()</code>-decorated chain like <code>exp → neg → exp → add → multiply</code> is compiled "into a single fused kernel" instead of five separate ops, each of which would write its intermediate tensor back to memory.</li>
+    <li><b>The direct-to-metal (D2M) road.</b> TTIR is lowered to <code>d2m.generic</code> regions and then to <code>ttkernel</code>, so the compiler <em>generates</em> its own reader/compute/writer kernels instead of using TT-NN's hand-written ones. The <code>ttnn.jit</code> docs explain how this meets TT-NN: the D2M pipeline "wraps the generated kernels in <code>ttnn.generic</code> operations that contain the necessary host side program setup. Each <code>ttnn.generic</code> op requires a <code>ProgramDescriptor</code> …" In other words, compiler-generated kernels enter tt-metal through the same <code>generic_op</code> door your <code>sqdiff</code> used. Its selling point is fusion: a <code>@ttnn_jit.jit()</code>-decorated chain like <code>exp → neg → exp → add → multiply</code> is compiled "into a single fused kernel" instead of five separate ops, each of which would write its intermediate tensor back to memory.</li>
   </ol>
 
   <div class="viz" id="fig-stack"></div>
@@ -503,22 +504,26 @@ call 2: a@0x2d5440 out@0x2d6440 cache entries=1 max|err|=0.0019 PCC=1.00000</cod
 
   <h2 id="sim">Run it in the simulator</h2>
   <div class="callout sim">This chapter's runs use TT-NN's Python API under ttsim. The workbench is set up in <a href="../sim-labs/b00-workbench.html">B00</a>, and <a href="../sim-labs/b11-ttnn-on-sim.html">B11</a> covers TT-NN on the simulator in depth. Remember that ttsim is a functional, bit-exact model, not a timing model, so the wall times below are simulator times.</div>
-<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs          # env.sh cds away, so use absolute paths
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
 export LAB_HOME=$HOME/ttlab/a19
-source $W/workbench/env.sh wh
+source $W/env.sh wh
 source $TT_METAL_HOME/python_env/bin/activate      # Python 3.11 with ttnn
 export TT_METAL_CACHE=$LAB_HOME/jit &amp;&amp; rm -rf $TT_METAL_CACHE   # a fresh, private JIT cache
 
-python -u $W/workbench/py/a19_cache_demo.py        # Figure 3 table; run twice for the warm numbers
-python -u $W/workbench/py/a19_hit_vs_miss.py       # cache on / off / on
-python -u $W/workbench/py/a19_sqdiff_generic.py    # the custom op
+python -u $W/py/a19_cache_demo.py        # Figure 3 table; run twice for the warm numbers
+python -u $W/py/a19_hit_vs_miss.py       # cache on / off / on
+python -u $W/py/a19_sqdiff_generic.py    # the custom op
+
+# one op on an empty cache (the listings in the kernels section); also: matmul, addf32
+export TT_METAL_CACHE=$LAB_HOME/jit_add &amp;&amp; rm -rf $TT_METAL_CACHE
+python -u $W/py/a19_oneop.py add
 
 # which kernels did the JIT build?
 cd $TT_METAL_CACHE/tt-metal-cache[0-9]*/kernels &amp;&amp; for k in *; do for v in $k/*; do
   echo "$v: $(ls $v | grep -E '^(brisc|ncrisc|trisc[0-2])$' | tr '\n' ' ')"; done; done
 grep -h include */*/kernel_includes.hpp */*/chlkc_math.cpp | sort -u</code></pre>
-  <p>Use <code>python -u</code>. If ttsim stops the process on an error, buffered output is lost and you will not see which call failed. For the single-op listings in <a href="#kernels">the kernels section</a>, I used a separate empty <code>TT_METAL_CACHE</code> per op and a script that runs only <code>ttnn.add</code> on 32×32 (PCC 0.99999 against torch) or only <code>ttnn.matmul</code> on 64×64 (PCC 0.99945). Each left exactly one program-cache entry. The 8×8 worker grid in the figure comes from <code>device.compute_with_storage_grid_size()</code>, which printed <code>8 8</code>, and <code>ttnn.split_work_to_cores(grid, n, True)</code> (row-major, which is what binary_ng passes for interleaved tensors, <code>binary_ng_program_factory.cpp:503-504, 643</code>) gave core (0,0) for 1 tile and cores (0,0)–(7,0), 1 tile each, for 8 tiles.</p>
-  <div class="callout warn"><b>An observed ttsim limit.</b> <code>ttnn.add</code> on two <code>float32</code> tensors, which takes the SFPU kernel, stopped the simulator on Wormhole:
+  <p>Use <code>python -u</code>. If ttsim stops the process on an error, buffered output is lost and you will not see which call failed. For the single-op listings in <a href="#kernels">the kernels section</a>, I used a separate empty <code>TT_METAL_CACHE</code> per op and <code>a19_oneop.py</code>, which runs only <code>ttnn.add</code> on 32×32 (it prints PCC 1.00000 against torch) or only <code>ttnn.matmul</code> on 64×64 (PCC 0.99998). Each left exactly one program-cache entry. The 8×8 worker grid in the figure comes from <code>device.compute_with_storage_grid_size()</code>, which printed <code>8 8</code>, and <code>ttnn.split_work_to_cores(grid, n, True)</code> (row-major, which is what binary_ng passes for interleaved tensors, <code>binary_ng_program_factory.cpp:503-504, 643</code>) gave core (0,0) for 1 tile and cores (0,0)–(7,0), 1 tile each, for 8 tiles.</p>
+  <div class="callout warn"><b>An observed ttsim limit.</b> <code>ttnn.add</code> on two <code>float32</code> tensors, which takes the SFPU kernel, stopped the simulator on Wormhole (<code>a19_oneop.py addf32</code>; the process exits with a non-zero status):
 <pre><code>[4716] ERROR: UndefinedBehavior: tensix_unpacr: unpack_to_dst=0 in_data_format=0 out_data_format=0</code></pre>
   Data format 0 is Float32. I did not investigate whether this is a ttsim modelling gap or a real misconfiguration that silicon tolerates. bf16 and bfp8 adds, mul and matmul all ran. Note this if you build labs on FP32 elementwise ops.</div>
 

@@ -340,10 +340,10 @@ template&lt;class T, class T_SEXT&gt; static void RV_XLEN_PREFIX(load)(RiscvHart
   <h2 id="decode">2. Lab step 1: read the generated decode table</h2>
   <p>Set up the lab and make an editable copy of ttsim. You need one extra variable compared with B00: <code>TT_METAL_CACHE</code>. It gives this lab its own JIT cache, so the kernel ELFs you disassemble in step 4 are definitely the ones that ran. The shared cache in <code>~/.cache/tt-metal-cache</code> fills up with builds from other labs.</p>
 <pre><code>export LAB_HOME=$HOME/ttlab/b03
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs
-source $W/workbench/env.sh wh
+W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+source $W/env.sh wh
 export TT_METAL_CACHE=$LAB_HOME/cache
-$W/workbench/build_ttsim.sh count wh      # first use copies pristine ttsim to $LAB_HOME/ttsim-count
+$W/build_ttsim.sh count wh      # first use copies pristine ttsim to $LAB_HOME/ttsim-count
 copied ttsim source to /home/user/ttlab/b03/ttsim-count (edit files in /home/user/ttlab/b03/ttsim-count/src/)
 export TT_METAL_SIMULATOR=/home/user/ttlab/b03/sim-count-wh-release/libttsim.so</code></pre>
   <p>The build generated <code>src/_out/riscv_decode.h</code>. Open it and you'll see why it is unreadable as is:</p>
@@ -506,11 +506,11 @@ $ $OD -d --no-show-raw-insn $C/firmware/brisc/brisc.elf | grep -B3 -A1 ' 4258:'
     <li><b>Wormhole only.</b> <code>0x8a60</code> is Wormhole's <code>MEM_MAP_END</code>. Blackhole has a different memory map and no NCRISC IRAM, so a <code>static_assert</code> stops a Blackhole build of the patched copy instead of letting it print wrong numbers.</li>
   </ul>
   <p>Apply, rebuild, run both examples:</p>
-<pre><code>$ patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/patches/b03-count.patch
+<pre><code>$ patch -p1 -d $LAB_HOME/ttsim-count &lt; $W/../patches/b03-count.patch
 patching file src/riscv_impl.h
 patching file src/sim.h
 patching file src/sim.cpp
-$ $W/workbench/build_ttsim.sh count wh
+$ $W/build_ttsim.sh count wh
 export TT_METAL_SIMULATOR=/home/user/ttlab/b03/sim-count-wh-release/libttsim.so
 $ export TT_METAL_SIMULATOR=$LAB_HOME/sim-count-wh-release/libttsim.so
 $ $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep -E 'Success|^\[[1-9]|B03'
@@ -622,9 +622,9 @@ Success: Result matches expected value!
 
 	/*Program flow will end here as ncrisc will go into reset*/
 0:	j 0b</code></pre>
-  <p>BRISC's side is <code>start_ncrisc_kernel_run</code> (<code>brisc.cc:306-322</code>): it writes the resume address into <code>NCRISC_RESET_PC</code>, asserts NCRISC's reset, waits 5 cycles, and deasserts. In ttsim, leaving reset sets <em>only</em> the PC (<code>tile.cpp:1096-1124</code>). The registers keep their values, so <code>ra</code> still held <code>0x5cd0</code> when the NCRISC reached <code>0xFFC00000</code>, and our window logic worked by luck of that detail. The kernel's start-up code restores the saved registers and returns to the same address, so the result is right, but the method depends on registers surviving reset. The NCRISC's total of 2,580 steps, 21 fewer than the TRISCs' 2,601, is presumably the time it spent held in reset.</p>
+  <p>BRISC's side is <code>start_ncrisc_kernel_run</code> (<code>brisc.cc:306-322</code>): it writes the resume address into <code>NCRISC_RESET_PC</code>, asserts NCRISC's reset, waits 5 cycles, and deasserts. In ttsim, leaving reset sets <em>only</em> the PC (<code>tile.cpp:1096-1124</code>). The registers keep their values, so <code>ra</code> still held <code>0x5cd0</code> when the NCRISC reached <code>0xFFC00000</code>, and our window logic worked by luck of that detail. This is a place where ttsim differs from the chip: the ISA says that on leaving soft reset "All GPRs will be set to zero" (<code>WormholeB0/TensixTile/SoftReset.md:41</code>), which is why the trampoline saves the registers to the stack before it spins. The kernel's start-up code restores the saved registers and returns to the same address, so the result is right, but the method depends on registers surviving reset. The NCRISC's total of 2,580 steps, 21 fewer than the TRISCs' 2,601, is presumably the time it spent held in reset.</p>
   <ul>
-    <li><b>Why does the math core run the fewest instructions?</b> TRISC1 has the smallest instruction cache of the five, ½ KiB (<code>BabyRISCV/README.md:10</code>), and it runs the fewest kernel steps here. The math work isn't in RISC-V code. It's in one <code>MOP</code> that the coprocessor expands into 8 <code>ELWADD</code>s (A04). The next step shows that <code>MOP</code> leaving the core.</li>
+    <li><b>Why does the math core run so few instructions?</b> (155 kernel steps; only the NCRISC reader, at 153, ran fewer.) TRISC1 has a ½ KiB instruction cache, where BRISC, TRISC0 and TRISC2 have 2 KiB (<code>BabyRISCV/README.md:10</code>; NCRISC's cache is also ½ KiB, but it has its 16 KiB IRAM as well), and it runs the fewest kernel steps of the three TRISCs here. The math work isn't in RISC-V code. It's in one <code>MOP</code> that the coprocessor expands into 8 <code>ELWADD</code>s (A04). The next step shows that <code>MOP</code> leaving the core.</li>
   </ul>
 
   <p>Here is the kernel window for TRISC1 as a timeline. The addresses are real; the horizontal axis is not to scale.</p>
@@ -740,9 +740,9 @@ Success: Result matches expected value!
          p_hart-&gt;pc -= 4; // replay TTI instruction
      }</code></pre>
   <p><code>B03_FIRST</code> is 40. The opcode is the top byte of the rotated word, since <code>TT_OP(opcode, params)</code> is <code>(opcode &lt;&lt; 24) + params</code> (<code>ckernel_ops.h:24</code>). This patch only sees the <code>.ttinsn</code> path. Pushes made with a plain <code>sw</code> to <code>0xFFE40000</code> (the <code>TT_</code> macros with runtime operands) go through <code>mem_wr</code> and <code>tile.cpp</code> instead. A04 counted those too: 4, 3 and 6 for the three TRISCs in this example. Build it as a second copy, with both patches:</p>
-<pre><code>$ $W/workbench/build_ttsim.sh tti wh &gt;/dev/null      # a fresh pristine copy in $LAB_HOME/ttsim-tti
-$ for p in count tti; do patch -p1 -d $LAB_HOME/ttsim-tti &lt; $W/patches/b03-$p.patch; done
-$ $W/workbench/build_ttsim.sh tti wh
+<pre><code>$ $W/build_ttsim.sh tti wh &gt;/dev/null      # a fresh pristine copy in $LAB_HOME/ttsim-tti
+$ for p in count tti; do patch -p1 -d $LAB_HOME/ttsim-tti &lt; $W/../patches/b03-$p.patch; done
+$ $W/build_ttsim.sh tti wh
 $ export TT_METAL_SIMULATOR=$LAB_HOME/sim-tti-wh-release/libttsim.so
 $ $EX/metal_example_add_2_integers_in_compute 2&gt;&amp;1 | grep -E 'ttinsn|first'
 [4682] B03 tile 0 BRISC  .ttinsn pushes=0  in kernel=0  fifo-full retries=0
@@ -769,9 +769,9 @@ B03   first 40 in kernel: STALLWAIT SETGPR SETGPR WRCFG SETGPR SETGPR WRCFG NOP 
 <pre><code>+static uint32_t s_b03_hot[RV32_CORES_PER_T_TILE][1024]; // tile 0 only: kernel steps by (pc - entry_pc) / 4
  …
 +    if (h-&gt;in_kernel &amp;&amp; p_hart-&gt;tile_id == 0 &amp;&amp; pc - h-&gt;entry_pc &lt; 4096) s_b03_hot[p_hart-&gt;riscv_id][(pc - h-&gt;entry_pc) / 4]++;</code></pre>
-<pre><code>$ $W/workbench/build_ttsim.sh hot wh &gt;/dev/null
-$ for p in count tti hotpc; do patch -p1 -d $LAB_HOME/ttsim-hot &lt; $W/patches/b03-$p.patch; done
-$ $W/workbench/build_ttsim.sh hot wh
+<pre><code>$ $W/build_ttsim.sh hot wh &gt;/dev/null
+$ for p in count tti hotpc; do patch -p1 -d $LAB_HOME/ttsim-hot &lt; $W/../patches/b03-$p.patch; done
+$ $W/build_ttsim.sh hot wh
 $ export TT_METAL_SIMULATOR=$LAB_HOME/sim-hot-wh-release/libttsim.so
 $ $EX/metal_example_add_2_integers_in_riscv 2&gt;&amp;1 | grep hottest
 B03   hottest: pc=0x8a80(entry+0x0) x1 [ffb007b7] pc=0x8a84(entry+0x4) x1 [6f078793] pc=0x8a88(entry+0x8) x1 [ef018713] pc=0x8a8c(entry+0xc) x1 [00f76e63]

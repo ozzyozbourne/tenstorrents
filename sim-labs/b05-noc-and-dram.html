@@ -58,10 +58,9 @@
   <p>A08 already showed a NoC log from an instrumented ttsim. This lab builds a slightly different logger: the format is easier to parse, multicast receivers get their own lines, and it then puts the log to work. All commands below were run in this orb on the Wormhole model, and every output shown is real, trimmed only where marked.</p>
 
   <h2 id="setup">0. Setup</h2>
-<pre><code>export LAB_HOME=$HOME/ttlab/b05
-source /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/env.sh wh
-W=/home/user/workspace/tenstorrent-from-zero/sim-labs/workbench
-P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches</code></pre>
+<pre><code>W=/path/to/tenstorrent-from-zero/sim-labs/workbench   # adjust to your checkout; absolute, because env.sh changes directory
+export LAB_HOME=$HOME/ttlab/b05
+source $W/env.sh wh</code></pre>
   <p><code>env.sh</code> points tt-metal at the stock Wormhole simulator, turns on slow dispatch, sets <code>TT_METAL_KERNEL_PATH=$LAB_HOME/kernels</code> for kernel overlays, and changes into <code>$LAB_HOME/run</code>. <a href="b00-workbench.html">B00</a> explains each variable. Patches for this lab live in <code>sim-labs/patches/b05-*.patch</code>: two for ttsim and three for kernels.</p>
 
   <h2 id="log">1. Build a NoC-logging simulator</h2>
@@ -74,7 +73,7 @@ P=/home/user/workspace/tenstorrent-from-zero/sim-labs/patches</code></pre>
   </ul>
   <p>Make an editable copy of ttsim and apply the patch:</p>
 <pre><code>$W/build_ttsim.sh noclog wh                 # first run copies ttsim to $LAB_HOME/ttsim-noclog
-(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch)
+(cd $LAB_HOME/ttsim-noclog &amp;&amp; patch -p1 &lt; $W/../patches/b05-noclog.patch)
 $W/build_ttsim.sh noclog wh                 # rebuild: about 1.5 s
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-noclog-wh-release/libttsim.so</code></pre>
   <div class="filename">sim-labs/patches/b05-noclog.patch (against ttsim/src/tile.cpp @b3620244, inserted after line 1466)</div>
@@ -144,7 +143,7 @@ Test Passed
 
   <h3>Which bank, in what order?</h3>
   <p>The DRAM tiles in the log are (0,11), (0,1), (0,5), (0,7), (5,1), … and the addresses alternate between <code>0x2d…</code> and <code>0x402d…</code>. A09 says page <i>p</i> of an interleaved buffer lives in bank <i>p</i> mod 12, at row ⌊<i>p</i>/12⌋, and that odd Wormhole banks are the second 1 GiB view of a controller. Rather than check 100 lines by eye, check them with a script. <code>noc_banks.py</code> reads the bank table (tile and 1 GiB offset per bank) from the same <code>soc_descriptor</code> sections the allocator uses, maps every DRAM end in the log to a bank, and tests the rule:</p>
-<pre><code>python3 -I /home/user/workspace/tenstorrent-from-zero/sim-labs/workbench/py/noc_banks.py $LAB_HOME/loopback.log</code></pre>
+<pre><code>python3 -I $W/py/noc_banks.py $LAB_HOME/loopback.log</code></pre>
 <pre><code>100 DRAM transfers: 50 reads, 50 writes
 
 bank  tile    half   reads  bytes_rd  writes  bytes_wr
@@ -393,7 +392,7 @@ grep NOCLOG $LAB_HOME/mcast.log</code></pre>
 <pre><code>K=$LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels
 mkdir -p $K
 cp $TT_METAL_HOME/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp $K/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-misalign-kernel.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b05-misalign-kernel.patch)
 $EX/metal_example_add_2_integers_in_riscv          # stock ttsim, Watcher off</code></pre>
 <pre><code>[0] 0.0 seconds (0.0 KHz)
 [4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match
@@ -415,11 +414,11 @@ terminate called after throwing an instance of 'std::runtime_error'
 …
 real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
   <p>This time ttsim prints no error, and with the logger loaded it prints <b>zero</b> NOCLOG lines (<code>grep -c NOCLOG</code> gives 0). The bad command never reached the NIU. Something stopped the kernel before its store to <code>NOC_CMD_CTRL</code>. That something was compiled into the kernel itself:</p>
-  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_raw.h:41-44 @7aad8aac</div>
-<pre><code>    WAYPOINT("NAOW");
-    DEBUG_SANITIZE_NOC_READ_TRANSACTION(noc, src_noc_addr, dst_local_l1_addr, size);
-    ncrisc_noc_fast_read&lt;noc_mode&gt;(noc, read_cmd_buf, src_noc_addr, dst_local_l1_addr, size, read_req_vc);
-    WAYPOINT("NAOD");</code></pre>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_raw.h:71-74 @7aad8aac (<code>noc_async_read_impl</code>, the branch a plain <code>noc_async_read</code> takes)</div>
+<pre><code>        WAYPOINT("NARW");
+        DEBUG_SANITIZE_NOC_READ_TRANSACTION(noc, src_noc_addr, dst_local_l1_addr, size);
+        ncrisc_noc_fast_read_any_len&lt;noc_mode&gt;(noc, read_cmd_buf, src_noc_addr, dst_local_l1_addr, size, read_req_vc);
+        WAYPOINT("NARD");</code></pre>
   <p>With Watcher off, <code>DEBUG_SANITIZE_NOC_READ_TRANSACTION</code> expands to almost nothing (<code>sanitize.h:1140</code>). With Watcher on, tt-metal compiles kernels with sanitizing enabled, and the macro calls <code>debug_sanitize_noc_and_worker_addr</code> (<code>sanitize.h:947-953</code>). For a DRAM target, that picks an alignment mask from <code>NOC_DRAM_READ_ALIGNMENT_BYTES</code>, which is 32 on Wormhole (<code>noc_parameters.h:295</code>), and compares both ends:</p>
   <div class="filename">tt-metal/tt_metal/hw/inc/internal/debug/sanitize.h:742-751 @7aad8aac</div>
 <pre><code>        if ((worker_addr &amp; alignment_mask) != (noc_addr &amp; alignment_mask)) {
@@ -433,7 +432,7 @@ real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
                 DEBUG_SANITIZE_NOC_TARGET,
                 DebugSanitizeNocAlignment);
         }</code></pre>
-  <p><code>debug_sanitize_post_addr_and_hang</code> writes a record into the core's Watcher mailbox in L1 (the address, length, which RISC and the return code), then enters <code>while (1) {}</code> (<code>sanitize.h:347-407</code>). The core is now parked, deliberately. On the host, Watcher's thread polls every core's mailbox. <code>TT_METAL_WATCHER=1</code> means once per second, and the watcher log shows dumps one second apart. It finds the record, turns <code>DebugSanitizeNocAlignment</code> into the text "invalid address alignment in NOC transaction" (<code>watcher_device_reader.cpp:885-887</code>), and throws. The 7.6 s wall time against 0.74 s is mostly that polling and Watcher's slower setup. (The watcher log, <code>$LAB_HOME/logs/generated/watcher/watcher.log</code>, shows core (0,0)'s BRISC at waypoint <code>R</code>, running, in every dump after the first.)</p>
+  <p><code>debug_sanitize_post_addr_and_hang</code> writes a record into the core's Watcher mailbox in L1 (the address, length, which RISC and the return code), then enters <code>while (1) {}</code> (<code>sanitize.h:347-407</code>). The core is now parked, deliberately. On the host, Watcher's thread polls every core's mailbox. <code>TT_METAL_WATCHER=1</code> means once per second, and the watcher log shows dumps one second apart. It finds the record, turns <code>DebugSanitizeNocAlignment</code> into the text "invalid address alignment in NOC transaction" (<code>watcher_device_reader.cpp:885-887</code>), and throws. The 7.6 s wall time against 0.74 s is mostly that polling and Watcher's slower setup. (The watcher log, <code>$LAB_HOME/logs/generated/watcher/watcher.log</code>, shows core (0,0)'s BRISC at waypoint <code>R</code>, running, in most dumps. When we re-ran it, the last dump, the one that found the record, showed <code>NARW</code>, the waypoint set just before the sanitizer macro.)</p>
 
   <p>The figure plays both runs side by side, as a sequence of who does what.</p>
   <div class="viz" id="fig-layers"></div>
@@ -456,14 +455,14 @@ real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
         log: "", text: "Without Watcher, <code>DEBUG_SANITIZE_NOC_READ_TRANSACTION</code> compiles to a length log (<code>sanitize.h:1140</code>). No check runs in the kernel." },
       { mode: "OFF", ev: [[0, 2, "stores … NOC_CMD_CTRL = 1"]], on: [0, 2],
         log: "[4343] NOCLOG READ noc=0 core=T(1,1) … src=D(0,11):0x2d4c40 dst=T(1,1):0x16dfe4 len=4",
-        text: "<code>ncrisc_noc_fast_read</code> programs the command buffer and writes 1 to <code>NOC_CMD_CTRL</code>. In ttsim that store calls <code>noc_cmd_ctrl</code> at once, the same code path silicon's NIU would take." },
+        text: "<code>ncrisc_noc_fast_read</code> (reached through <code>ncrisc_noc_fast_read_any_len</code>) programs the command buffer and writes 1 to <code>NOC_CMD_CTRL</code>. In ttsim that store calls <code>noc_cmd_ctrl</code> at once, the same code path silicon's NIU would take." },
       { mode: "OFF", ev: [[2, 2, "(0x40 & 31)=0 ≠ (0xe4 & 31)=4  →  UB"]], on: [2], bad: 2,
         log: "[4343] ERROR: UndefinedBehavior: noc_cmd_ctrl: read: alignment of src_addr=0x2d4c40 and dst_addr=0x16dfe4 does not match",
         text: "<b>Layer 2 fires.</b> The read branch sees a DRAM source and checks C32 (<code>tile.cpp:1610</code>). It fails, so <code>ttsim_error</code> prints and calls <code>_Exit(1)</code>. The host never gets to react: exit status 1 after 0.74 s." },
       { mode: "ON", ev: [[0, 0, "noc_async_read(D(0,11):0x2d4c40 → L1 0x16dfe4, 4 B)"]], on: [0],
         log: "", text: "<b>Watcher on</b> (<code>TT_METAL_WATCHER=1</code>). Same binary, same kernel source; tt-metal recompiles the kernel with sanitizing enabled." },
       { mode: "ON", ev: [[0, 1, "debug_sanitize_noc_and_worker_addr()"]], on: [0, 1],
-        log: "", text: "Now the macro calls the sanitizer before any NIU register is touched (<code>dataflow_api_raw.h:41-43</code>). The target is DRAM, so the mask is <code>NOC_DRAM_READ_ALIGNMENT_BYTES - 1</code> = 31." },
+        log: "", text: "Now the macro calls the sanitizer before any NIU register is touched (<code>dataflow_api_raw.h:71-72</code>). The target is DRAM, so the mask is <code>NOC_DRAM_READ_ALIGNMENT_BYTES - 1</code> = 31." },
       { mode: "ON", ev: [[1, 1, "0x16dfe4 & 31 ≠ 0x2d4c40 & 31  →  hang"]], on: [1], bad: 1,
         log: "", text: "<b>Layer 1 fires.</b> <code>sanitize.h:742</code> sees the mismatch, writes a record with <code>DebugSanitizeNocAlignment</code> into the core's L1 mailbox, and spins in <code>while (1)</code>. The store to <code>NOC_CMD_CTRL</code> never happens." },
       { mode: "ON", ev: [[1, 2, "nothing arrives", "skip"]], on: [1],
@@ -545,7 +544,7 @@ real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
 <pre><code>rm $LAB_HOME/kernels/tt_metal/programming_examples/add_2_integers_in_riscv/kernels/reader_writer_add_in_riscv.cpp
 K=$LAB_HOME/kernels/tt_metal/programming_examples/loopback/kernels; mkdir -p $K
 cp $TT_METAL_HOME/tt_metal/programming_examples/loopback/kernels/loopback_dram_copy.cpp $K/
-(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $P/b05-no-read-barrier.patch)
+(cd $LAB_HOME/kernels &amp;&amp; patch -p1 &lt; $W/../patches/b05-no-read-barrier.patch)
 export TT_METAL_SIMULATOR=$HOME/sim/wh/libttsim_wh.so      # stock ttsim
 $EX/metal_example_loopback</code></pre>
 <pre><code>Test Passed
@@ -580,7 +579,7 @@ inline __attribute__((always_inline)) bool ncrisc_noc_reads_flushed(uint32_t noc
   <h3>Make ttsim honest about one delay</h3>
   <p>The fix to the model is small: do not finish a Tensix read when it is issued. Queue it, and complete it on a later clock, doing the copy and the counter increment together, as the hardware's response would. Until then the read also counts as outstanding for its transaction ID, the counter that <code>noc_async_read_barrier_with_trid</code> polls (<code>noc_nonblocking_api.h:465-467</code>), so trid barriers wait for it too. That is <code>b05-delay-reads.patch</code>, applied on top of the logging patch:</p>
 <pre><code>$W/build_ttsim.sh lazy wh                     # copy
-(cd $LAB_HOME/ttsim-lazy &amp;&amp; patch -p1 &lt; $P/b05-noclog.patch &amp;&amp; patch -p1 &lt; $P/b05-delay-reads.patch)
+(cd $LAB_HOME/ttsim-lazy &amp;&amp; patch -p1 &lt; $W/../patches/b05-noclog.patch &amp;&amp; patch -p1 &lt; $W/../patches/b05-delay-reads.patch)
 $W/build_ttsim.sh lazy wh                     # rebuild
 export TT_METAL_SIMULATOR=$LAB_HOME/sim-lazy-wh-release/libttsim.so</code></pre>
   <div class="filename">sim-labs/patches/b05-delay-reads.patch (ttsim/src/tile.cpp and src/libttsim.cpp @b3620244, core of the change)</div>
@@ -714,7 +713,7 @@ terminate called after throwing an instance of 'std::runtime_error'</code></pre>
 Test Passed
 [102877] 13.1 seconds (7.8 KHz)
 real	4m44.401s</code></pre>
-  <p>It passes, and the reason is in the code. The delay is inserted by the sanitizer macro <em>before</em> the request is issued (<code>debug_insert_delay</code> at <code>sanitize.h:951</code>, which runs <code>riscv_wait</code> on the wall clock). It slows the core down. On silicon that perturbs the timing between cores and can expose races between <em>different</em> cores. It cannot open a window between a request and its completion inside ttsim, where that window is zero no matter how long the core waits beforehand. Also note the cost: 4 min 44 s of wall time for 50 tiles, because <code>riscv_wait</code> polls the clock register and every poll is a simulated step.</p>
+  <p>It passes, and the reason is in the code. The delay is inserted by the sanitizer macro <em>before</em> the request is issued (<code>debug_insert_delay</code> at <code>sanitize.h:951</code>, which runs <code>riscv_wait</code> on the wall clock). It slows the core down. On silicon that perturbs the timing between cores and can expose races between <em>different</em> cores. It cannot open a window between a request and its completion inside ttsim, where that window is zero no matter how long the core waits beforehand. Also note the cost: 4 min 44 s of wall time for 50 tiles. <code>riscv_wait</code> spins until the clock register has advanced by the delay, and ttsim's clock only advances as the host drives it (B01), so most of that wall time is the host, not the simulator: ttsim's own summary line reports 13.1 s. (The final clock count is not exactly repeatable with Watcher polling: a re-run gave <code>[103021]</code> in 4 min 50 s.)</p>
 
   <h2 id="overrun">6. Optional: running off the end of DRAM</h2>
   <p>ttsim also checks the size of the memory a transfer touches. Every DRAM access in <code>tile_rd_bytes</code> and <code>tile_wr_bytes</code> passes through:</p>
@@ -762,7 +761,7 @@ real	0m7.665s</code></pre>
 
   <h2 id="quiz">Check yourself</h2>
   <details class="quiz"><summary>1. A colleague's kernel passes in ttsim with Watcher on. Name two kinds of NoC bug it could still contain on silicon.</summary><p>Races that depend on timing: missing or misplaced barriers (section 5), and ordering between NoC 0 and NoC 1, or between VCs, which ttsim cannot reorder because every transfer is instant (A08). Also anything Watcher checks loosely, such as DRAM addresses below 12 GiB but beyond one tile's 2 GiB (section 6), if the code was never also run without Watcher on ttsim.</p></details>
-  <details class="quiz"><summary>2. Why does the Watcher run print no NOCLOG line for the misaligned read, even though the logging ttsim was loaded?</summary><p>The sanitizer runs before <code>ncrisc_noc_fast_read</code> and parks the core in <code>while (1)</code>, so the store to <code>NOC_CMD_CTRL</code> never happens and <code>noc_cmd_ctrl</code> is never called. The logger lives in <code>noc_cmd_ctrl</code>.</p></details>
+  <details class="quiz"><summary>2. Why does the Watcher run print no NOCLOG line for the misaligned read, even though the logging ttsim was loaded?</summary><p>The sanitizer runs before <code>ncrisc_noc_fast_read_any_len</code> and parks the core in <code>while (1)</code>, so the store to <code>NOC_CMD_CTRL</code> never happens and <code>noc_cmd_ctrl</code> is never called. The logger lives in <code>noc_cmd_ctrl</code>.</p></details>
   <details class="quiz"><summary>3. In stock ttsim, what value does the barrier's first read of <code>NIU_MST_RD_RESP_RECEIVED</code> return, relative to <code>noc_reads_num_issued</code>?</summary><p>Exactly equal. ttsim incremented <code>niu_mst_rd_resp_received</code> inside the issuing store (<code>tile.cpp:1621</code>), and the firmware incremented its count right after that store (<code>noc_nonblocking_api.h:449-451</code>). The loop condition is false on the first test.</p></details>
   <details class="quiz"><summary>4. Why is the race threshold in section 5 exactly 18/19 clocks, and why is that number meaningless for silicon?</summary><p>The log shows each write issued 18 ttsim clocks after its read, and the patch completes due reads at the start of a clock, before cores step. A read due at +18 is in L1 when the write executes at +18; one due at +19 is not. The 18 counts simulator steps of the RISC-V code between two stores. Silicon's window is set by DRAM and NoC latency and traffic, which ttsim does not model.</p></details>
   <details class="quiz"><summary>5. Bank 1's tile (0,1) is 1 NoC 0 hop from core (1,1) for read data, but writes to it take far more. How many, and why?</summary><p>A write from (1,1) to (0,1) carries its data on the request leg, from the core to the DRAM tile. NoC 0 only goes right and down: x from 1 to 0 wraps through 2…9, which is 9 hops, and y does not change. So 9 hops, against 1 hop for read data coming from (0,1) to (1,1). Using NoC 1 for the write would make it 1 hop, which is why the convention puts writers on NoC 1 (A08). Loopback uses NoC 0 for both.</p></details>
