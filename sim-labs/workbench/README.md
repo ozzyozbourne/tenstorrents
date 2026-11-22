@@ -118,6 +118,16 @@ Multichip configs from ttsim's `src/rules.py` `CONFIGS` (`wh_x2`, `wh_x8`, `bh_x
 - `py/bfp8_probe.py`, `py/bfp4_probe.py`, `py/bfp8_double.py` (chapter A05): quantize one BFP block
   on the host and on the simulated device and print both. Activate `$TT_METAL_HOME/python_env`,
   source `env.sh`, then run `python $W/py/bfp8_probe.py`.
+- `py/a05_add.py` (chapter A05, lab B00): a seeded 32×32 bfloat16 `ttnn.add` compared with PyTorch's own bfloat16 add and
+  with the exact fp32 sum. On `wh` it prints `elements differing from torch bf16 add: 108/1024`,
+  `max abs diff vs torch bf16 add: 0.03125`, `PCC vs exact fp32 sum: 0.999999`, `largest difference in ulps: 1.0`, `PASS`,
+  and ttsim ends at `[4881]`. It is also the quickest check that `ttnn` imports and runs: activate
+  `$TT_METAL_HOME/python_env`, source `env.sh`, `python $W/py/a05_add.py`.
+- `py/a09_shard.py` (chapter A09, "From Python"): one 128×128 tensor placed in DRAM (interleaved), then height-sharded and
+  width-sharded in L1 over cores (0,0)-(3,0), with a ReLU on each; prints each buffer's address and memory layout and
+  whether the ReLU matches torch.
+- `py/a19_oneop.py` (chapter A19): runs exactly one TT-NN op (`add`, `matmul` or `addf32`), so that an empty
+  `TT_METAL_CACHE` afterwards holds only that op's kernels: `python -u $W/py/a19_oneop.py add`.
 - `py/a14_journey.py` (chapter A14): picks tile 0's 48 journey events out of a trace written by ttsim +
   `patches/a14-journey.patch`: `python3 $W/py/a14_journey.py $LAB_HOME/journey.trace [--json]`.
 - `py/a18_*.py` (chapter A18): TT-NN from the user's side. `a18_pad` and `a18_devtilize` (padding and pages,

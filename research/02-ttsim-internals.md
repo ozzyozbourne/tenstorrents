@@ -181,7 +181,7 @@ Citations are `path:line` in the ttsim repo unless prefixed.
 - **Flavors:** release `-O2`, stripped; debug `-g -Og -DDEBUG`.
 - **Common flags:** `-std=c++20 -Werror -ffp-contract=off -march=x86-64-v3`.
 - **make.py options:** `-j`, `-v`, `-c`, `--env COLOR=1`, `--inherit-env`.
-- **Build state:** already built in this orb under refs/ttsim/src/_out (log: refs/build-logs/ttsim-build.log).
+- **Build state:** already built on the series' build machine ("this orb") under refs/ttsim/src/_out (log: refs/build-logs/ttsim-build.log). Neither path is shipped in this repository; lab B00 rebuilds ttsim from source.
 
 ## Environment variables read by tt-metal / UMD
 | Variable | Meaning |
