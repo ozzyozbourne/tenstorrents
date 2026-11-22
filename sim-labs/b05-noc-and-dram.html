@@ -414,7 +414,7 @@ terminate called after throwing an instance of 'std::runtime_error'
 …
 real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
   <p>This time ttsim prints no error, and with the logger loaded it prints <b>zero</b> NOCLOG lines (<code>grep -c NOCLOG</code> gives 0). The bad command never reached the NIU. Something stopped the kernel before its store to <code>NOC_CMD_CTRL</code>. That something was compiled into the kernel itself:</p>
-  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_raw.h:70-73 @7aad8aac (<code>noc_async_read_impl</code>, the branch a plain <code>noc_async_read</code> takes)</div>
+  <div class="filename">tt-metal/tt_metal/hw/inc/internal/dataflow/dataflow_api_raw.h:71-74 @7aad8aac (<code>noc_async_read_impl</code>, the branch a plain <code>noc_async_read</code> takes)</div>
 <pre><code>        WAYPOINT("NARW");
         DEBUG_SANITIZE_NOC_READ_TRANSACTION(noc, src_noc_addr, dst_local_l1_addr, size);
         ncrisc_noc_fast_read_any_len&lt;noc_mode&gt;(noc, read_cmd_buf, src_noc_addr, dst_local_l1_addr, size, read_req_vc);
@@ -462,7 +462,7 @@ real	0m7.624s          (exit status 134, SIGABRT)</code></pre>
       { mode: "ON", ev: [[0, 0, "noc_async_read(D(0,11):0x2d4c40 → L1 0x16dfe4, 4 B)"]], on: [0],
         log: "", text: "<b>Watcher on</b> (<code>TT_METAL_WATCHER=1</code>). Same binary, same kernel source; tt-metal recompiles the kernel with sanitizing enabled." },
       { mode: "ON", ev: [[0, 1, "debug_sanitize_noc_and_worker_addr()"]], on: [0, 1],
-        log: "", text: "Now the macro calls the sanitizer before any NIU register is touched (<code>dataflow_api_raw.h:70-72</code>). The target is DRAM, so the mask is <code>NOC_DRAM_READ_ALIGNMENT_BYTES - 1</code> = 31." },
+        log: "", text: "Now the macro calls the sanitizer before any NIU register is touched (<code>dataflow_api_raw.h:71-72</code>). The target is DRAM, so the mask is <code>NOC_DRAM_READ_ALIGNMENT_BYTES - 1</code> = 31." },
       { mode: "ON", ev: [[1, 1, "0x16dfe4 & 31 ≠ 0x2d4c40 & 31  →  hang"]], on: [1], bad: 1,
         log: "", text: "<b>Layer 1 fires.</b> <code>sanitize.h:742</code> sees the mismatch, writes a record with <code>DebugSanitizeNocAlignment</code> into the core's L1 mailbox, and spins in <code>while (1)</code>. The store to <code>NOC_CMD_CTRL</code> never happens." },
       { mode: "ON", ev: [[1, 2, "nothing arrives", "skip"]], on: [1],
