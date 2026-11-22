@@ -70,7 +70,7 @@ case EnvVarID::TT_METAL_SIMULATOR:
 P=$W/../patches                                      # the series' ttsim patches
 export LAB_HOME=$HOME/ttlab/b11
 source $W/env.sh wh                                  # or bh
-source $TT_METAL_HOME/python_env/bin/activate        # Python 3.11, ttnn, torch, pytest
+source $TT_METAL_HOME/python_env/bin/activate        # tt-metal's Python (3.11 here), ttnn, torch, pytest
 export TT_METAL_INSPECTOR=0                          # several runs share the orb: avoid the inspector's port clash
 export TT_METAL_CACHE=$LAB_HOME/jit                  # a private JIT cache you can list (section 3)</code></pre>
   <table>
